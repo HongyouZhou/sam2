@@ -383,15 +383,33 @@ class SAM2Train(SAM2Base):
             prev_sam_mask_logits,
         )
 
-        (
-            low_res_multimasks,
-            high_res_multimasks,
-            ious,
-            low_res_masks,
-            high_res_masks,
-            obj_ptr,
-            object_score_logits,
-        ) = sam_outputs
+        if len(sam_outputs) == 8:  # 包含BNDL输出
+            (
+                low_res_multimasks,
+                high_res_multimasks,
+                ious,
+                low_res_masks,
+                high_res_masks,
+                obj_ptr,
+                object_score_logits,
+                bndl_outputs,
+            ) = sam_outputs
+        else:
+            (
+                low_res_multimasks,
+                high_res_multimasks,
+                ious,
+                low_res_masks,
+                high_res_masks,
+                obj_ptr,
+                object_score_logits,
+            ) = sam_outputs
+            bndl_outputs = None
+
+        if bndl_outputs is not None:
+            current_out["multistep_bndl_outputs"] = [bndl_outputs]  # 新增：初始化为列表
+        else:
+            current_out["multistep_bndl_outputs"] = [None]
 
         current_out["multistep_pred_masks"] = low_res_masks
         current_out["multistep_pred_masks_high_res"] = high_res_masks
@@ -425,6 +443,7 @@ class SAM2Train(SAM2Base):
                 high_res_masks,
                 obj_ptr,
                 object_score_logits,
+                *_
             ) = final_sam_outputs
 
         # Use the final prediction (after all correction steps for output and eval)
@@ -469,6 +488,9 @@ class SAM2Train(SAM2Base):
         all_pred_ious = [ious]
         all_point_inputs = [point_inputs]
         all_object_score_logits = [object_score_logits]
+        if self.use_bndl_for_pixels:
+            all_bndl_outputs = current_out.get("multistep_bndl_outputs", [None])
+
         for _ in range(self.num_correction_pt_per_frame):
             # sample a new point from the error between prediction and ground-truth
             # (with a small probability, directly sample from GT masks instead of errors)
@@ -509,15 +531,31 @@ class SAM2Train(SAM2Base):
                     high_res_features=high_res_features,
                     multimask_output=multimask_output,
                 )
-            (
-                low_res_multimasks,
-                high_res_multimasks,
-                ious,
-                low_res_masks,
-                high_res_masks,
-                _,
-                object_score_logits,
-            ) = sam_outputs
+
+            if self.use_bndl_for_pixels:
+                (
+                    low_res_multimasks,
+                    high_res_multimasks,
+                    ious,
+                    low_res_masks,
+                    high_res_masks,
+                    _,
+                    object_score_logits,
+                    bndl_outputs,
+                ) = sam_outputs
+            else:
+                (
+                    low_res_multimasks,
+                    high_res_multimasks,
+                    ious,
+                    low_res_masks,
+                    high_res_masks,
+                    _,
+                    object_score_logits,
+                ) = sam_outputs
+
+            if self.use_bndl_for_pixels:
+                all_bndl_outputs.append(bndl_outputs)
             all_pred_masks.append(low_res_masks)
             all_pred_high_res_masks.append(high_res_masks)
             all_pred_multimasks.append(low_res_multimasks)
@@ -537,5 +575,7 @@ class SAM2Train(SAM2Base):
         current_out["multistep_pred_ious"] = all_pred_ious
         current_out["multistep_point_inputs"] = all_point_inputs
         current_out["multistep_object_score_logits"] = all_object_score_logits
+        if self.use_bndl_for_pixels:
+            current_out["multistep_bndl_outputs"] = all_bndl_outputs
 
         return point_inputs, sam_outputs

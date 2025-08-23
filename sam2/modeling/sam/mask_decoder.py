@@ -9,7 +9,8 @@ from typing import List, Optional, Tuple, Type
 import torch
 from torch import nn
 
-from sam2.modeling.sam2_utils import LayerNorm2d, MLP
+from BNDL.BNDL_upload.ViT_Sparse.utils.model_helpers import Proj_Model
+from sam2.modeling.sam2_utils import MLP, LayerNorm2d
 
 
 class MaskDecoder(nn.Module):
@@ -29,6 +30,11 @@ class MaskDecoder(nn.Module):
         dynamic_multimask_stability_thresh=0.98,
         pred_obj_scores: bool = False,
         pred_obj_scores_mlp: bool = False,
+        # BNDL related
+        use_bndl_for_pixels: bool = False,
+        bndl_replace_global_with_hyper: bool = False,
+        bndl_fuse_type: str = "sum",
+        bndl_hyper_in_sparse: bool = False,
         use_multimask_token_for_obj_ptr: bool = False,
     ) -> None:
         """
@@ -63,31 +69,35 @@ class MaskDecoder(nn.Module):
         self.use_multimask_token_for_obj_ptr = use_multimask_token_for_obj_ptr
 
         self.output_upscaling = nn.Sequential(
-            nn.ConvTranspose2d(
-                transformer_dim, transformer_dim // 4, kernel_size=2, stride=2
-            ),
+            nn.ConvTranspose2d(transformer_dim, transformer_dim // 4, kernel_size=2, stride=2),
             LayerNorm2d(transformer_dim // 4),
             activation(),
-            nn.ConvTranspose2d(
-                transformer_dim // 4, transformer_dim // 8, kernel_size=2, stride=2
-            ),
+            nn.ConvTranspose2d(transformer_dim // 4, transformer_dim // 8, kernel_size=2, stride=2),
             activation(),
         )
         self.use_high_res_features = use_high_res_features
         if use_high_res_features:
-            self.conv_s0 = nn.Conv2d(
-                transformer_dim, transformer_dim // 8, kernel_size=1, stride=1
-            )
-            self.conv_s1 = nn.Conv2d(
-                transformer_dim, transformer_dim // 4, kernel_size=1, stride=1
-            )
+            self.conv_s0 = nn.Conv2d(transformer_dim, transformer_dim // 8, kernel_size=1, stride=1)
+            self.conv_s1 = nn.Conv2d(transformer_dim, transformer_dim // 4, kernel_size=1, stride=1)
 
-        self.output_hypernetworks_mlps = nn.ModuleList(
-            [
-                MLP(transformer_dim, transformer_dim, transformer_dim // 8, 3)
-                for i in range(self.num_mask_tokens)
-            ]
-        )
+        # BNDL related
+        self.use_bndl_for_pixels = use_bndl_for_pixels
+        self.bndl_fuse_type = bndl_fuse_type
+        self.bndl_replace_global_with_hyper = bndl_replace_global_with_hyper
+        self.bndl_hyper_in_sparse = bndl_hyper_in_sparse
+        if self.use_bndl_for_pixels:
+            pixel_feat_dim = transformer_dim // 8  # C' after up-scaling
+            self.pixel_bndl = Proj_Model(
+                pixel_feat_dim,
+                self.num_mask_tokens,
+                enable_global_sparse=not self.bndl_replace_global_with_hyper,
+                enable_external_sparse=self.bndl_hyper_in_sparse,
+            )
+            if self.bndl_fuse_type == "conv":
+                self.fuse_conv = nn.Conv2d(num_multimask_outputs, num_multimask_outputs, 1, bias=False)
+        #########################################################
+
+        self.output_hypernetworks_mlps = nn.ModuleList([MLP(transformer_dim, transformer_dim, transformer_dim // 8, 3) for i in range(self.num_mask_tokens)])
 
         self.iou_prediction_head = MLP(
             transformer_dim,
@@ -133,7 +143,7 @@ class MaskDecoder(nn.Module):
           torch.Tensor: batched predictions of mask quality
           torch.Tensor: batched SAM token for mask output
         """
-        masks, iou_pred, mask_tokens_out, object_score_logits = self.predict_masks(
+        masks, iou_pred, mask_tokens_out, object_score_logits, bndl_outputs = self.predict_masks(
             image_embeddings=image_embeddings,
             image_pe=image_pe,
             sparse_prompt_embeddings=sparse_prompt_embeddings,
@@ -163,7 +173,7 @@ class MaskDecoder(nn.Module):
             sam_tokens_out = mask_tokens_out[:, 0:1]  # [b, 1, c] shape
 
         # Prepare output
-        return masks, iou_pred, sam_tokens_out, object_score_logits
+        return masks, iou_pred, sam_tokens_out, object_score_logits, bndl_outputs
 
     def predict_masks(
         self,
@@ -188,12 +198,8 @@ class MaskDecoder(nn.Module):
             )
             s = 1
         else:
-            output_tokens = torch.cat(
-                [self.iou_token.weight, self.mask_tokens.weight], dim=0
-            )
-        output_tokens = output_tokens.unsqueeze(0).expand(
-            sparse_prompt_embeddings.size(0), -1, -1
-        )
+            output_tokens = torch.cat([self.iou_token.weight, self.mask_tokens.weight], dim=0)
+        output_tokens = output_tokens.unsqueeze(0).expand(sparse_prompt_embeddings.size(0), -1, -1)
         tokens = torch.cat((output_tokens, sparse_prompt_embeddings), dim=1)
 
         # Expand per-image data in batch direction to be per-mask
@@ -203,9 +209,7 @@ class MaskDecoder(nn.Module):
             assert image_embeddings.shape[0] == tokens.shape[0]
             src = image_embeddings
         src = src + dense_prompt_embeddings
-        assert (
-            image_pe.size(0) == 1
-        ), "image_pe should have size 1 in batch dim (from `get_dense_pe()`)"
+        assert image_pe.size(0) == 1, "image_pe should have size 1 in batch dim (from `get_dense_pe()`)"
         pos_src = torch.repeat_interleave(image_pe, tokens.shape[0], dim=0)
         b, c, h, w = src.shape
 
@@ -224,14 +228,49 @@ class MaskDecoder(nn.Module):
             upscaled_embedding = act1(ln1(dc1(src) + feat_s1))
             upscaled_embedding = act2(dc2(upscaled_embedding) + feat_s0)
 
-        hyper_in_list: List[torch.Tensor] = []
+        # Generate hyper network embeddings
+        hyper_in_list: list[torch.Tensor] = []
         for i in range(self.num_mask_tokens):
-            hyper_in_list.append(
-                self.output_hypernetworks_mlps[i](mask_tokens_out[:, i, :])
-            )
+            hyper_in_list.append(self.output_hypernetworks_mlps[i](mask_tokens_out[:, i, :]))
         hyper_in = torch.stack(hyper_in_list, dim=1)
         b, c, h, w = upscaled_embedding.shape
-        masks = (hyper_in @ upscaled_embedding.view(b, c, h * w)).view(b, -1, h, w)
+
+        # Initialize outputs
+        bndl_outputs = None
+
+        if not self.use_bndl_for_pixels:
+            # Standard SAM approach
+            masks = (hyper_in @ upscaled_embedding.view(b, c, h * w)).view(b, -1, h, w)
+            bndl_outputs = None
+        else:
+            # Fixed: Pass [B, H, W, C] format to pixel_bndl for true pixel-level processing
+            pixel_feat = upscaled_embedding.permute(0, 2, 3, 1)  # [B, C, H, W] -> [B, H, W, C]
+            # 没必要做layer norm
+            # pixel_feat = torch.nn.functional.layer_norm(pixel_feat, (c,))
+
+            masks_bndl_raw, z_out, wei_lambda, inv_k, wei_lambda_w, inv_k_w = self.pixel_bndl(
+                pixel_feat,
+                external_pre_out_w=hyper_in if self.bndl_replace_global_with_hyper else None,
+            )
+
+            # 重塑BNDL输出：从[B, H, W, K]到[B, K, H, W]
+            masks_bndl = masks_bndl_raw.permute(0, 3, 1, 2)
+
+            bndl_outputs = {
+                "z_out": z_out,
+                "wei_lambda": wei_lambda,
+                "inv_k": inv_k,
+                "wei_lambda_w": wei_lambda_w,
+                "inv_k_w": inv_k_w,
+                "pixel_logits_raw": masks_bndl_raw,  # Now [B, H, W, K] format
+                "upscaled_shape": (b, c, h, w),
+            }
+
+            if self.bndl_fuse_type in ("sum", "conv"):
+                masks_hyper = (hyper_in @ upscaled_embedding.view(b, c, h * w)).view(b, -1, h, w)
+                masks = self._fuse_masks(masks_hyper, masks_bndl)
+            else:
+                masks = masks_bndl
 
         # Generate mask quality predictions
         iou_pred = self.iou_prediction_head(iou_token_out)
@@ -242,7 +281,17 @@ class MaskDecoder(nn.Module):
             # Obj scores logits - default to 10.0, i.e. assuming the object is present, sigmoid(10)=1
             object_score_logits = 10.0 * iou_pred.new_ones(iou_pred.shape[0], 1)
 
-        return masks, iou_pred, mask_tokens_out, object_score_logits
+        return masks, iou_pred, mask_tokens_out, object_score_logits, bndl_outputs
+
+    def _fuse_masks(self, masks_hyper, masks_bndl):
+        """Fuse hypernetwork and BNDL masks."""
+        if self.bndl_fuse_type == "sum":
+            return masks_hyper + masks_bndl
+        elif self.bndl_fuse_type == "conv":
+            fused_input = torch.cat([masks_hyper, masks_bndl], dim=1)  # [B, 2*K, H, W]
+            return self.fuse_conv(fused_input)  # [B, K, H, W]
+        else:
+            raise ValueError(f"Unknown fuse type: {self.bndl_fuse_type}")
 
     def _get_stability_scores(self, mask_logits):
         """
@@ -267,9 +316,7 @@ class MaskDecoder(nn.Module):
         multimask_logits = all_mask_logits[:, 1:, :, :]
         multimask_iou_scores = all_iou_scores[:, 1:]
         best_scores_inds = torch.argmax(multimask_iou_scores, dim=-1)
-        batch_inds = torch.arange(
-            multimask_iou_scores.size(0), device=all_iou_scores.device
-        )
+        batch_inds = torch.arange(multimask_iou_scores.size(0), device=all_iou_scores.device)
         best_multimask_logits = multimask_logits[batch_inds, best_scores_inds]
         best_multimask_logits = best_multimask_logits.unsqueeze(1)
         best_multimask_iou_scores = multimask_iou_scores[batch_inds, best_scores_inds]

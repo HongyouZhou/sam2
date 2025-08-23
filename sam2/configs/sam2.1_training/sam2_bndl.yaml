@@ -4,19 +4,25 @@ scratch:
   resolution: 1024
   train_batch_size: 1
   num_train_workers: 10
-  num_frames: 8
+  num_frames: 4
   max_num_objects: 3
   base_lr: 5.0e-6
   vision_lr: 3.0e-06
   phases_per_epoch: 1
-  num_epochs: 40
+  num_epochs: 100
 
 dataset:
   # PATHS to Dataset
   img_folder: /home/hongyou/dev/data/MOSE_release/train/JPEGImages # PATH to MOSE JPEGImages folder
   gt_folder: /home/hongyou/dev/data/MOSE_release/train/Annotations # PATH to MOSE Annotations folder
-  file_list_txt: training/assets/MOSE_sample_train_list.txt # Optional PATH to filelist containing a subset of videos to be used for training
-  multiplier: 2
+  file_list_txt: /home/hongyou/dev/ada_samp/sam2/training/assets/MOSE_sample_train_list.txt # Optional PATH to filelist containing a subset of videos to be used for training
+  multiplier: 4
+  # PATHS to MOSE-val dataset
+  val_img_folder: /home/hongyou/dev/data/MOSE_release/train/JPEGImages
+  val_gt_folder: /home/hongyou/dev/data/MOSE_release/train/Annotations
+  val_file_list_txt: /home/hongyou/dev/ada_samp/sam2/training/assets/MOSE_sample_val_list.txt
+  val_multiplier: 4
+
 
 # Video transforms
 vos:
@@ -54,9 +60,21 @@ vos:
           mean: [0.485, 0.456, 0.406]
           std: [0.229, 0.224, 0.225]
 
+  val_transforms:
+    - _target_: training.dataset.transforms.ComposeAPI
+      transforms:
+        - _target_: training.dataset.transforms.RandomResizeAPI   # same resize as train
+          sizes: ${scratch.resolution}
+          square: true
+          consistent_transform: True          # single deterministic resize
+        - _target_: training.dataset.transforms.ToTensorAPI
+        - _target_: training.dataset.transforms.NormalizeAPI
+          mean: [0.485, 0.456, 0.406]
+          std:  [0.229, 0.224, 0.225] 
+
 trainer:
   _target_: training.trainer.Trainer
-  mode: train_only
+  mode: train 
   max_epochs: ${times:${scratch.num_epochs},${scratch.phases_per_epoch}}
   accelerator: cuda
   seed_value: 123
@@ -173,6 +191,9 @@ trainer:
     multimask_min_pt_num: 0
     multimask_max_pt_num: 1
     use_mlp_for_obj_ptr_proj: true
+    # BNDL
+    use_bndl_for_pixels: true
+    bndl_fuse_type: sum
     # Compilation flag
     # compile_image_encoder: False
 
@@ -233,6 +254,39 @@ trainer:
         _partial_: true
         dict_key: all
 
+    # MOSE-val dataset
+    val:
+      _target_: training.dataset.sam2_datasets.TorchTrainMixedDataset
+      phases_per_epoch: 1
+      batch_sizes:
+        - 1
+
+      datasets:                                        # single MOSE-val dataset
+        - _target_: training.dataset.vos_dataset.VOSDataset
+          transforms: ${vos.val_transforms}
+          training: false                              # <-- IMPORTANT
+          video_dataset:
+            _target_: training.dataset.vos_raw_dataset.PNGRawDataset
+            img_folder: ${dataset.val_img_folder}
+            gt_folder:  ${dataset.val_gt_folder}
+            file_list_txt: ${dataset.val_file_list_txt}
+          # sampler:
+          #   _target_: training.dataset.vos_sampler.EvalSampler  # sample all frames/objects
+          sampler:
+            _target_: training.dataset.vos_sampler.RandomUniformSampler
+            num_frames: ${scratch.num_frames}
+            max_num_objects: ${scratch.max_num_objects}
+          multiplier: ${dataset.val_multiplier}
+
+      shuffle: False
+      num_workers: ${scratch.num_train_workers}
+      pin_memory: True
+      drop_last: False
+      collate_fn:
+        _target_: training.utils.data_utils.collate_fn
+        _partial_: true
+        dict_key: val   
+
   optim:
     amp:
       enabled: True
@@ -280,17 +334,36 @@ trainer:
 
   loss:
     all:
-      _target_: training.loss_fns.MultiStepMultiMasksAndIous
-      weight_dict:
-        loss_mask: 20
-        loss_dice: 1
-        loss_iou: 1
-        loss_class: 1
-      supervise_all_iou: true
-      iou_use_l1_loss: true
-      pred_obj_scores: true
-      focal_gamma_obj_score: 0.0
-      focal_alpha_obj_score: -1.0
+      # _target_: training.loss_fns.MultiStepMultiMasksAndIous
+      # weight_dict:
+      #   loss_mask: 20
+      #   loss_dice: 1
+      #   loss_iou: 1
+      #   loss_class: 1
+      # supervise_all_iou: true
+      # iou_use_l1_loss: true
+      # pred_obj_scores: true
+      # focal_gamma_obj_score: 0.0
+      # focal_alpha_obj_score: -1.0
+      _target_: training.loss_combined.CombinedSAMBNDLLoss
+      sam_loss:
+        _target_: training.loss_fns.MultiStepMultiMasksAndIous
+        weight_dict:
+          loss_mask: 20.0
+          loss_dice: 1.0
+          loss_iou: 1.0
+          loss_class: 1.0
+      bndl_loss:
+        _target_: training.loss_bndl.BNDLLoss
+        kl_weight: 1e-6
+      sam_weight: 1.0
+      bndl_weight: 1.0
+    val:
+      _target_: training.loss_combined.CombinedSAMBNDLLoss
+      sam_loss: ${trainer.loss.all.sam_loss}
+      bndl_loss: ${trainer.loss.all.bndl_loss}
+      sam_weight: ${trainer.loss.all.sam_weight}
+      bndl_weight: ${trainer.loss.all.bndl_weight}
 
   distributed:
     backend: nccl
@@ -304,6 +377,7 @@ trainer:
       should_log: True
     log_dir: ${launcher.experiment_log_dir}/logs
     log_freq: 10
+    log_scalar_frequency: 100
 
   # initialize from a SAM 2 checkpoint
   checkpoint:
@@ -312,19 +386,26 @@ trainer:
     model_weight_initializer:
       _partial_: True
       _target_: training.utils.checkpoint_utils.load_state_dict_into_model
-      strict: True
-      ignore_unexpected_keys: null
-      ignore_missing_keys: null
-
+      # ① 关闭严格检查
+      strict: False
+      # ② 告诉 loader：这些 key 即使缺失 / 多余也别抛错
+      # ignore_missing_keys: ["sam_mask_decoder.pixel_bndl.*"]
+      # ignore_unexpected_keys: ["sam_mask_decoder.pixel_bndl.*"]
+      ignore_missing_keys: [
+          "sam_mask_decoder.pixel_bndl.*",
+      ]
+      ignore_unexpected_keys: [
+          # "sam_mask_decoder.pixel_bndl.*",
+      ]
       state_dict:
         _target_: training.utils.checkpoint_utils.load_checkpoint_and_apply_kernels
-        checkpoint_path: ./checkpoints/sam2.1_hiera_base_plus.pt # PATH to SAM 2.1 checkpoint
+        checkpoint_path: /home/hongyou/dev/ada_samp/sam2/checkpoints/sam2.1_hiera_base_plus.pt # PATH to SAM 2.1 checkpoint
         ckpt_state_dict_keys: ['model']
 
 launcher:
   num_nodes: 1
   gpus_per_node: 8
-  experiment_log_dir: null # Path to log directory, defaults to ./sam2_logs/${config_name}
+  experiment_log_dir: /home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_weibull_loss # Path to log directory, defaults to ./sam2_logs/${config_name}
 
 # SLURM args if running on a cluster
 submitit:

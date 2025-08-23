@@ -88,6 +88,11 @@ class SAM2Base(torch.nn.Module):
         # hope to make recovery easier if there is a mistake and mitigate accumulation of errors
         soft_no_obj_ptr: bool = False,
         use_mlp_for_obj_ptr_proj: bool = False,
+        # Whether to use BNDL for pixels
+        use_bndl_for_pixels: bool = False,
+        bndl_fuse_type: str = 'sum',
+        bndl_replace_global_with_hyper: bool = False,
+        bndl_hyper_in_sparse: bool = False,
         # add no obj embedding to spatial frames
         no_obj_embed_spatial: bool = False,
         # extra arguments used to construct the SAM mask decoder; if not None, it should be a dict of kwargs to be passed into `MaskDecoder` class.
@@ -164,6 +169,10 @@ class SAM2Base(torch.nn.Module):
         self.sam_mask_decoder_extra_args = sam_mask_decoder_extra_args
         self.pred_obj_scores = pred_obj_scores
         self.pred_obj_scores_mlp = pred_obj_scores_mlp
+        self.use_bndl_for_pixels = use_bndl_for_pixels
+        self.bndl_fuse_type = bndl_fuse_type
+        self.bndl_replace_global_with_hyper = bndl_replace_global_with_hyper
+        self.bndl_hyper_in_sparse = bndl_hyper_in_sparse
         self.fixed_no_obj_ptr = fixed_no_obj_ptr
         self.soft_no_obj_ptr = soft_no_obj_ptr
         if self.fixed_no_obj_ptr:
@@ -235,6 +244,10 @@ class SAM2Base(torch.nn.Module):
             iou_prediction_use_sigmoid=self.iou_prediction_use_sigmoid,
             pred_obj_scores=self.pred_obj_scores,
             pred_obj_scores_mlp=self.pred_obj_scores_mlp,
+            use_bndl_for_pixels=self.use_bndl_for_pixels,
+            bndl_fuse_type=self.bndl_fuse_type,
+            bndl_replace_global_with_hyper=self.bndl_replace_global_with_hyper,
+            bndl_hyper_in_sparse=self.bndl_hyper_in_sparse,
             use_multimask_token_for_obj_ptr=self.use_multimask_token_for_obj_ptr,
             **(self.sam_mask_decoder_extra_args or {}),
         )
@@ -342,12 +355,7 @@ class SAM2Base(torch.nn.Module):
             boxes=None,
             masks=sam_mask_prompt,
         )
-        (
-            low_res_multimasks,
-            ious,
-            sam_output_tokens,
-            object_score_logits,
-        ) = self.sam_mask_decoder(
+        mask_decoder_outputs = self.sam_mask_decoder(
             image_embeddings=backbone_features,
             image_pe=self.sam_prompt_encoder.get_dense_pe(),
             sparse_prompt_embeddings=sparse_embeddings,
@@ -356,6 +364,23 @@ class SAM2Base(torch.nn.Module):
             repeat_image=False,  # the image is already batched
             high_res_features=high_res_features,
         )
+        
+        if len(mask_decoder_outputs) == 5:  # 包含BNDL输出
+            (
+                low_res_multimasks,
+                ious,
+                sam_output_tokens,
+                object_score_logits,
+                bndl_outputs,
+            ) = mask_decoder_outputs
+        else:  # 标准输出
+            (
+                low_res_multimasks,
+                ious,
+                sam_output_tokens,
+                object_score_logits,
+            ) = mask_decoder_outputs
+
         if self.pred_obj_scores:
             is_obj_appearing = object_score_logits > 0
 
@@ -402,15 +427,27 @@ class SAM2Base(torch.nn.Module):
                 obj_ptr = lambda_is_obj_appearing * obj_ptr
             obj_ptr = obj_ptr + (1 - lambda_is_obj_appearing) * self.no_obj_ptr
 
-        return (
-            low_res_multimasks,
-            high_res_multimasks,
-            ious,
-            low_res_masks,
-            high_res_masks,
-            obj_ptr,
-            object_score_logits,
-        )
+        if self.use_bndl_for_pixels:
+            return (
+                low_res_multimasks,
+                high_res_multimasks,
+                ious,
+                low_res_masks,
+                high_res_masks,
+                obj_ptr,
+                object_score_logits,
+                bndl_outputs,
+            )
+        else:
+            return (
+                low_res_multimasks,
+                high_res_multimasks,
+                ious,
+                low_res_masks,
+                high_res_masks,
+                obj_ptr,
+                object_score_logits,
+            )
 
     def _use_mask_as_output(self, backbone_features, high_res_features, mask_inputs):
         """
@@ -437,7 +474,7 @@ class SAM2Base(torch.nn.Module):
             )
         else:
             # produce an object pointer using the SAM decoder from the mask input
-            _, _, _, _, _, obj_ptr, _ = self._forward_sam_heads(
+            _, _, _, _, _, obj_ptr, _, *_ = self._forward_sam_heads(
                 backbone_features=backbone_features,
                 mask_inputs=self.mask_downsample(mask_inputs_float),
                 high_res_features=high_res_features,

@@ -15,6 +15,10 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Mapping, Optional
 
 import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib
+matplotlib.use('Agg')  # 使用非交互式后端
+import cv2
 
 import torch
 import torch.distributed as dist
@@ -136,6 +140,7 @@ class LoggingConf:
     log_visual_frequency: int = 100
     scalar_keys_to_log: Optional[Dict[str, Any]] = None
     log_batch_stats: bool = False
+    visualize_bndl: bool = False
 
 
 class Trainer:
@@ -466,6 +471,11 @@ class Trainer:
 
         # loss contains multiple sub-components we wish to log
         step_losses = {}
+        
+        # Log BNDL statistics from model outputs if available
+        bndl_outputs, _, _ = self._extract_bndl_outputs(outputs)
+        if bndl_outputs is not None:
+            self._log_bndl_statistics(bndl_outputs, self.steps[phase], phase)
         if isinstance(loss, dict):
             step_losses.update(
                 {f"Losses/{phase}_{key}_{k}": v for k, v in loss.items()}
@@ -647,7 +657,31 @@ class Trainer:
                             if k not in extra_loss_mts:
                                 extra_loss_mts[k] = AverageMeter(k, self.device, ":.2e")
                             extra_loss_mts[k].update(v.item(), batch_size)
-
+                    
+                    # 调试信息：检查可视化条件
+                    if data_iter % 7 == 0:
+                        logging.info(f"Val iter {data_iter}: data_iter > 0 = {data_iter > 0}, visualize_bndl = {self.logging_conf.visualize_bndl}")
+                    
+                    if (data_iter % 7 == 0 and self.logging_conf.visualize_bndl):
+                        # 只在主进程中执行可视化，避免多进程冲突
+                        if get_rank() == 0:
+                            logging.info(f"Starting BNDL visualization for iter {data_iter}")
+                            outputs_for_vis = model(batch)
+                            logging.info(f"Outputs keys: {list(outputs_for_vis.keys()) if isinstance(outputs_for_vis, dict) else 'Not a dict'}")
+                            
+                            # Extract BNDL outputs using the same method as training loop
+                            bndl_outputs, step_index, frame_index = self._extract_bndl_outputs(outputs_for_vis)
+                            
+                            if bndl_outputs is not None:
+                                vis_dir = os.path.join(self.logging_conf.log_dir, "bndl_visualizations", phase)
+                                makedir(vis_dir)
+                                self._create_unified_visualization(bndl_outputs, batch, vis_dir, data_iter, step_index, frame_index, 'full')
+                            else:
+                                logging.warning("No BNDL outputs found for visualization")
+                        else:
+                            # 非主进程跳过可视化，避免文件冲突
+                            pass
+                                                
             # measure elapsed time
             batch_time.update(time.time() - end)
             end = time.time()
@@ -1037,7 +1071,485 @@ class Trainer:
                 log_str = os.path.join(loss_str, k)
                 self.logger.log(log_str, loss[k], step)
         return core_loss
+    
+    def _log_bndl_statistics(self, bndl_outputs, step, phase):
+        """Log BNDL statistics including pixel-level uncertainty and PAvsPU"""
+        if bndl_outputs is None:
+            return
+            
+        # Pixel-level parameters (lambda and k)
+        if ('wei_lambda' in bndl_outputs and 'inv_k' in bndl_outputs and 
+            bndl_outputs['wei_lambda'] is not None and bndl_outputs['inv_k'] is not None):
+            lambda_mean = bndl_outputs['wei_lambda'].mean().detach()
+            k_mean = (1. / (bndl_outputs['inv_k'] + 1e-6)).mean().detach()
+            self.logger.log(f"Stats/{phase}_lambda_pixel", lambda_mean, step)
+            self.logger.log(f"Stats/{phase}_k_pixel", k_mean, step)
+            
+            # Log pixel uncertainty if available
+            if 'pixel_uncertainty' in bndl_outputs and bndl_outputs['pixel_uncertainty'] is not None:
+                uncertainty_mean = bndl_outputs['pixel_uncertainty'].mean().detach()
+                self.logger.log(f"Stats/{phase}_pixel_uncertainty", uncertainty_mean, step)
+            
+            # Log PAvsPU scores if available
+            if 'pixel_pavpu' in bndl_outputs and bndl_outputs['pixel_pavpu'] is not None:
+                pavpu_scores = bndl_outputs['pixel_pavpu']
+                for i, threshold in enumerate([0.01, 0.05, 0.1]):
+                    if i < len(pavpu_scores):
+                        self.logger.log(f"Stats/{phase}_pavpu_{threshold}", pavpu_scores[i], step)
+        
+        # Global w statistics (original BNDL)
+        if ('wei_lambda_w' in bndl_outputs and 
+            'inv_k_w' in bndl_outputs and
+            bndl_outputs['wei_lambda_w'] is not None and 
+            bndl_outputs['inv_k_w'] is not None):
+            lambda_w_mean = bndl_outputs['wei_lambda_w'].mean().detach()
+            k_w_mean = (1. / (bndl_outputs['inv_k_w'] + 1e-6)).mean().detach()
+            self.logger.log(f"Stats/{phase}_lambda_w", lambda_w_mean, step)
+            self.logger.log(f"Stats/{phase}_k_w", k_w_mean, step)
 
+    def _extract_pixel_bndl_model(self, model):
+        """Extract the pixel_bndl model from the main SAM2 model"""
+        try:
+            # Navigate to the mask decoder's pixel_bndl
+            if hasattr(model, 'module'):  # Handle DDP wrapper
+                logging.info("Found DDP wrapper, extracting module")
+                model = model.module
+            
+            # Debug: log model structure
+            logging.info(f"Model type: {type(model)}")
+            logging.info(f"Model attributes: {[attr for attr in dir(model) if not attr.startswith('_')]}")
+            
+            # Try different possible paths to find the mask decoder
+            mask_decoder = None
+            
+            # Path 1: SAM2Base structure
+            if hasattr(model, 'sam_mask_decoder'):
+                logging.info("Found sam_mask_decoder")
+                mask_decoder = model.sam_mask_decoder
+            # Path 2: Direct mask_decoder
+            elif hasattr(model, 'mask_decoder'):
+                logging.info("Found mask_decoder")
+                mask_decoder = model.mask_decoder
+            # Path 3: Check if model is the mask decoder itself
+            elif hasattr(model, 'pixel_bndl'):
+                logging.info("Model itself has pixel_bndl")
+                mask_decoder = model
+            else:
+                logging.warning("No mask decoder found in model")
+                # Log more details about the model structure
+                logging.info(f"Model class: {model.__class__.__name__}")
+                logging.info(f"Model module: {model.__class__.__module__}")
+                
+                # Check for nested attributes
+                for attr in dir(model):
+                    if not attr.startswith('_'):
+                        try:
+                            attr_value = getattr(model, attr)
+                            if hasattr(attr_value, 'pixel_bndl'):
+                                logging.info(f"Found pixel_bndl in {attr}")
+                                mask_decoder = attr_value
+                                break
+                        except:
+                            continue
+            
+            if mask_decoder is not None:
+                if hasattr(mask_decoder, 'pixel_bndl'):
+                    logging.info("Found pixel_bndl in mask_decoder")
+                    return mask_decoder.pixel_bndl
+                else:
+                    logging.warning("pixel_bndl not found in mask_decoder")
+                    logging.info(f"mask_decoder attributes: {[attr for attr in dir(mask_decoder) if not attr.startswith('_')]}")
+            else:
+                logging.warning("No mask decoder found in model")
+            
+            return None
+        except Exception as e:
+            logging.warning(f"Failed to extract pixel_bndl model: {e}")
+            import traceback
+            logging.warning(f"Traceback: {traceback.format_exc()}")
+            return None
+
+    def _extract_pixel_features(self, bndl_outputs):
+        """Extract pixel features needed for uncertainty sampling"""
+        try:
+            # We need the intermediate features that were used to generate pixel_logits_raw
+            # This should be available in the BNDL outputs
+            logging.info(f"Available BNDL outputs keys: {list(bndl_outputs.keys())}")
+            
+            if 'z_out' in bndl_outputs:
+                z_out = bndl_outputs['z_out']
+                logging.info(f"Found z_out with shape: {z_out.shape}")
+                return z_out  # [B, H, W, C']
+            else:
+                logging.warning("z_out not found in BNDL outputs for uncertainty sampling")
+                # Try alternative feature sources
+                if 'upscaled_embedding' in bndl_outputs:
+                    logging.info("Using upscaled_embedding as alternative feature source")
+                    return bndl_outputs['upscaled_embedding']
+                return None
+        except Exception as e:
+            logging.warning(f"Failed to extract pixel features: {e}")
+            import traceback
+            logging.warning(f"Traceback: {traceback.format_exc()}")
+            return None
+
+    def _extract_bndl_outputs(self, outputs):
+        """提取BNDL输出"""
+        for frame_idx, outs in enumerate(outputs):
+            if "multistep_bndl_outputs" in outs:
+                bndl_outputs_list = outs["multistep_bndl_outputs"]
+                
+                # Use the last valid BNDL output (highest resolution)
+                for i in reversed(range(len(bndl_outputs_list))):
+                    if bndl_outputs_list[i] is not None:
+                        return bndl_outputs_list[i], i, frame_idx 
+        return None, None, None
+            
+
+    def _has_global_params(self, bndl_outputs):
+        """检查是否有全局权重参数"""
+        return ('wei_lambda_w' in bndl_outputs and 'inv_k_w' in bndl_outputs and
+                bndl_outputs['wei_lambda_w'] is not None and 
+                bndl_outputs['inv_k_w'] is not None)
+
+    def _extract_pixel_params(self, bndl_outputs, batch_idx=0):
+        """提取并处理像素级参数"""
+        b, c, h, w = bndl_outputs['upscaled_shape']
+        
+        lambda_vals = bndl_outputs['wei_lambda'].detach().cpu().numpy()  # [B, H, W, C]
+        inv_k_vals = bndl_outputs['inv_k'].detach().cpu().numpy()       # [B, H, W, C] 
+        k_vals = 1.0 / (inv_k_vals + 1e-6)
+        
+        # Extract specific batch - now working with [B, H, W, C] format
+        lambda_batch = lambda_vals[batch_idx]  # [H, W, C]
+        k_batch = k_vals[batch_idx]           # [H, W, C]
+        
+        # Handle channel dimension - average across channels if multiple channels
+        if lambda_batch.shape[-1] > 1:
+            lambda_img = lambda_batch.mean(axis=-1)  # [H, W]
+            k_img = k_batch.mean(axis=-1)           # [H, W]
+        else:
+            lambda_img = lambda_batch.squeeze(-1)   # [H, W]
+            k_img = k_batch.squeeze(-1)            # [H, W]
+        
+        return lambda_img, k_img
+
+    def _extract_original_image(self, batch, frame_idx=0, batch_idx=0):
+        """提取并处理原始图像，对应指定的帧索引"""
+        if not hasattr(batch, 'img_batch'):
+            return None
+            
+        try:
+            img_batch = batch.img_batch
+            if hasattr(img_batch, 'cpu'):
+                img_batch = img_batch.cpu().numpy()
+            
+            # Extract specific batch and frame
+            if len(img_batch.shape) == 5:  # [T, B, C, H, W]
+                T = img_batch.shape[0]
+                safe_t = max(0, min(int(frame_idx), T - 1))
+                orig_tensor = img_batch[safe_t, batch_idx]  # [C, H, W]
+            elif len(img_batch.shape) == 4:  # [B, C, H, W]
+                orig_tensor = img_batch[batch_idx]  # [C, H, W]
+            else:
+                logging.warning(f"Unexpected img_batch shape: {img_batch.shape}")
+                return None
+            
+            # Convert [C, H, W] -> [H, W, C]
+            if len(orig_tensor.shape) == 3 and orig_tensor.shape[0] in [1, 3]:
+                original_img = orig_tensor.transpose(1, 2, 0)
+            else:
+                return None
+            
+            # Denormalize if needed (ImageNet normalization)
+            if original_img.min() < -1 or original_img.max() > 2:
+                mean = np.array([0.485, 0.456, 0.406])
+                std = np.array([0.229, 0.224, 0.225])
+                if len(original_img.shape) == 3 and original_img.shape[-1] == 3:
+                    original_img = original_img * std + mean
+            
+            # Clip to valid range
+            original_img = np.clip(original_img, 0, 1)
+            
+            # Ensure 3 channels
+            if len(original_img.shape) == 2:
+                original_img = np.stack([original_img] * 3, axis=-1)
+            elif len(original_img.shape) == 3 and original_img.shape[-1] == 1:
+                original_img = np.repeat(original_img, 3, axis=-1)
+            
+            return original_img
+            
+        except Exception as e:
+            logging.warning(f"Failed to process original image: {e}")
+            return None
+
+    def _upsample_params_to_image_size(self, lambda_img, k_img, target_shape):
+        """将参数图上采样到目标图像尺寸"""
+        target_h, target_w = target_shape[:2]
+        
+        if lambda_img.shape != (target_h, target_w):
+            lambda_img = cv2.resize(lambda_img, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+            k_img = cv2.resize(k_img, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+        
+        return lambda_img, k_img
+
+    def _visualize_pixel_parameters(self, bndl_outputs, batch, vis_dir, data_iter, step_index, frame_index):
+        """精简的像素级参数可视化"""
+        lambda_img, k_img = self._extract_pixel_params(bndl_outputs)
+        original_img = self._extract_original_image(batch, frame_idx=frame_index)
+        
+        if original_img is not None:
+            lambda_img, k_img = self._upsample_params_to_image_size(lambda_img, k_img, original_img.shape)
+        
+        has_uncertainty = ('pixel_uncertainty' in bndl_outputs and 
+                          bndl_outputs['pixel_uncertainty'] is not None)
+        
+        # 根据是否有不确定性数据决定布局
+        rows = 4 if has_uncertainty else 3
+        fig, axes = plt.subplots(rows, 3, figsize=(18, 6*rows))
+        
+        self._plot_common_elements(axes, original_img, lambda_img, k_img, step_index, has_uncertainty)
+        
+        plt.tight_layout()
+        save_path = os.path.join(vis_dir, f"epoch_{self.epoch}_iter_{data_iter}_step_{step_index}_pixel_params.png")
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        logging.info(f"BNDL pixel visualization saved: {save_path}")
+
+    def _create_unified_visualization(self, bndl_outputs, batch, vis_dir, data_iter, step_index, frame_index, layout_type='basic'):
+        """统一的BNDL可视化方法，替代多个重复的方法"""
+        try:
+            lambda_img, k_img = self._extract_pixel_params(bndl_outputs)
+            original_img = self._extract_original_image(batch, frame_idx=frame_index)
+            
+            if original_img is not None:
+                lambda_img, k_img = self._upsample_params_to_image_size(lambda_img, k_img, original_img.shape)
+            
+            has_uncertainty = ('pixel_uncertainty' in bndl_outputs and 
+                              bndl_outputs['pixel_uncertainty'] is not None)
+            
+            # 根据布局类型和是否有不确定性决定行数
+            if layout_type == 'full' and has_uncertainty:
+                rows = 4
+            else:
+                rows = 3
+                
+            fig, axes = plt.subplots(rows, 3, figsize=(18, 6*rows))
+            
+            self._plot_common_elements(axes, original_img, lambda_img, k_img, step_index, bndl_outputs, has_uncertainty)
+            
+            plt.tight_layout()
+            save_path = os.path.join(vis_dir, f"epoch_{self.epoch}_iter_{data_iter}_step_{step_index}_unified_{layout_type}.png")
+            plt.savefig(save_path, dpi=150)
+            plt.close()
+            
+            logging.info(f"Unified BNDL visualization saved: {save_path}")
+            
+        except Exception as e:
+            logging.warning(f"Failed to create unified BNDL visualization: {e}")
+
+    def _plot_common_elements(self, axes, original_img, lambda_img, k_img, step_index, bndl_outputs, has_uncertainty=False):
+        """统一的绘图元素，减少代码重复"""
+        # 第一行：原始图像和参数热图
+        self._plot_original_image(axes[0, 0], original_img)
+        self._plot_parameter_heatmap(axes[0, 1], lambda_img, f'Lambda (λ) Step {step_index}', 'viridis')
+        self._plot_parameter_heatmap(axes[0, 2], k_img, f'Shape (k) Step {step_index}', 'plasma')
+        
+        # 第二行：参数叠加或分布
+        if original_img is not None and original_img.shape[:2] == lambda_img.shape:
+            self._plot_parameter_overlays(axes[1, :], original_img, lambda_img, k_img, step_index)
+        else:
+            self._plot_parameter_distributions(axes[1, :], lambda_img, k_img, step_index)
+        
+        # 第三行：全局参数
+        if has_uncertainty:
+            self._plot_global_parameters_in_layout(axes[2, :], bndl_outputs, step_index)
+            # 第四行：不确定性可视化
+            self._plot_uncertainty_visualization(axes[3, :], bndl_outputs, step_index)
+        else:
+            self._plot_global_parameters_in_layout(axes[2, :], bndl_outputs, step_index)
+
+    def _plot_parameter_heatmap(self, ax, param_img, title, cmap):
+        """精简的参数热图绘制"""
+        im = ax.imshow(param_img, cmap=cmap, interpolation='nearest')
+        ax.set_title(f'{title}\nMean: {param_img.mean():.4f}')
+        ax.axis('off')
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    def _plot_parameter_overlays(self, axes, original_img, lambda_img, k_img, step_index):
+        """精简的参数叠加图"""
+        lambda_norm, k_norm = self._normalize_parameters_robust(lambda_img, k_img)
+        
+        # Lambda叠加
+        axes[0].imshow(original_img)
+        axes[0].imshow(lambda_norm, cmap='viridis', alpha=0.6, interpolation='nearest')
+        axes[0].set_title(f'Lambda Overlay (Step {step_index})')
+        axes[0].axis('off')
+        
+        # K叠加
+        axes[1].imshow(original_img)
+        axes[1].imshow(k_norm, cmap='plasma', alpha=0.6, interpolation='nearest')
+        axes[1].set_title(f'K Overlay (Step {step_index})')
+        axes[1].axis('off')
+        
+        # 组合叠加
+        axes[2].imshow(original_img)
+        combined = np.zeros((*lambda_img.shape, 3))
+        combined[:, :, 1] = lambda_norm  # Green for lambda
+        combined[:, :, 0] = k_norm       # Red for k
+        axes[2].imshow(combined, alpha=0.6, interpolation='nearest')
+        axes[2].set_title(f'Combined Overlay (Step {step_index})')
+        axes[2].axis('off')
+
+    def _plot_parameter_distributions(self, axes, lambda_img, k_img, step_index):
+        """绘制参数分布图"""
+        axes[0].hist(lambda_img.flatten(), bins=50, alpha=0.7, color='green')
+        axes[0].set_title(f'Lambda Distribution (Step {step_index})\nMean: {lambda_img.mean():.4f}')
+        
+        axes[1].hist(k_img.flatten(), bins=50, alpha=0.7, color='red')
+        axes[1].set_title(f'K Distribution (Step {step_index})\nMean: {k_img.mean():.4f}')
+        
+        param_diff = lambda_img - k_img
+        im = axes[2].imshow(param_diff, cmap='RdBu', interpolation='nearest')
+        axes[2].set_title(f'Lambda - K Difference (Step {step_index})')
+        axes[2].axis('off')
+        plt.colorbar(im, ax=axes[2], fraction=0.046, pad=0.04)
+
+    def _plot_global_parameters_in_layout(self, axes, bndl_outputs, step_index):
+        """Plot global weight parameters within the unified layout"""
+        try:
+            lambda_w = bndl_outputs['wei_lambda_w'].detach().cpu().numpy()
+            k_w = (1.0 / (bndl_outputs['inv_k_w'] + 1e-6)).detach().cpu().numpy()
+            
+            if len(lambda_w.shape) == 3:  # [B, K, C']
+                lambda_w_vis = lambda_w[0]  # Use first batch
+                k_w_vis = k_w[0] if len(k_w.shape) == 3 else k_w[0:1]
+                
+                # Lambda_w heatmap
+                im1 = axes[0].imshow(lambda_w_vis, cmap='viridis', interpolation='nearest', aspect='auto')
+                axes[0].set_title(f'Global Lambda_w (Step {step_index})\nMean: {lambda_w_vis.mean():.4f}')
+                axes[0].set_xlabel('Feature Dimension')
+                axes[0].set_ylabel('Mask Token')
+                plt.colorbar(im1, ax=axes[0], fraction=0.046, pad=0.04)
+                
+                # K_w heatmap
+                im2 = axes[1].imshow(k_w_vis, cmap='plasma', interpolation='nearest', aspect='auto')
+                axes[1].set_title(f'Global K_w (Step {step_index})\nMean: {k_w_vis.mean():.4f}')
+                axes[1].set_xlabel('Feature Dimension' if len(k_w_vis.shape) == 2 and k_w_vis.shape[1] > 1 else 'Single Value')
+                axes[1].set_ylabel('Mask Token')
+                plt.colorbar(im2, ax=axes[1], fraction=0.046, pad=0.04)
+                
+                # Global parameter statistics
+                axes[2].text(0.5, 0.5, f'Global Parameters Summary:\n\nLambda_w:\nMean: {lambda_w_vis.mean():.4f}\nStd: {lambda_w_vis.std():.4f}\n\nK_w:\nMean: {k_w_vis.mean():.4f}\nStd: {k_w_vis.std():.4f}', 
+                           ha='center', va='center', transform=axes[2].transAxes, fontsize=10)
+                axes[2].set_title(f'Global Parameters Stats (Step {step_index})')
+                axes[2].axis('off')
+                
+            else:
+                # Handle other shapes
+                for i in range(3):
+                    axes[i].text(0.5, 0.5, f'Global Parameters\nShape: {lambda_w.shape}\nNot visualized', 
+                               ha='center', va='center', transform=axes[i].transAxes)
+                    axes[i].set_title(f'Global Params {i+1} (Step {step_index})')
+                    axes[i].axis('off')
+                    
+        except Exception as e:
+            logging.warning(f"Failed to plot global parameters in layout: {e}")
+            for i in range(3):
+                axes[i].text(0.5, 0.5, 'Global Parameters\nVisualization\nFailed', 
+                           ha='center', va='center', transform=axes[i].transAxes)
+                axes[i].set_title('Error')
+                axes[i].axis('off')
+
+    def _plot_original_image(self, ax, original_img):
+        """绘制原始图像"""
+        if original_img is not None:
+            ax.imshow(original_img)
+            ax.set_title('Original Image')
+            ax.axis('off')
+        else:
+            ax.text(0.5, 0.5, 'No Image\nAvailable', 
+                   ha='center', va='center', transform=ax.transAxes, fontsize=12)
+            ax.set_title('Original Image')
+            ax.axis('off')
+
+    def _normalize_parameters_robust(self, lambda_img, k_img):
+        """稳健的参数归一化，处理异常值"""
+        try:
+            # 使用百分位数进行稳健归一化，避免异常值影响
+            lambda_min = np.percentile(lambda_img, 1)
+            lambda_max = np.percentile(lambda_img, 99)
+            lambda_range = lambda_max - lambda_min
+            if lambda_range < 1e-6:
+                lambda_range = 1e-6
+            
+            k_min = np.percentile(k_img, 1)
+            k_max = np.percentile(k_img, 99)
+            k_range = k_max - k_min
+            if k_range < 1e-6:
+                k_range = 1e-6
+            
+            lambda_norm = (lambda_img - lambda_min) / lambda_range
+            k_norm = (k_img - k_min) / k_range
+            
+            # 限制在[0, 1]范围内
+            lambda_norm = np.clip(lambda_norm, 0, 1)
+            k_norm = np.clip(k_norm, 0, 1)
+            
+            return lambda_norm, k_norm
+            
+        except Exception as e:
+            logging.warning(f"Parameter normalization failed: {e}")
+            # 返回原始值作为fallback
+            return lambda_img, k_img
+
+    def _plot_uncertainty_visualization(self, axes, bndl_outputs, step_index):
+        """绘制不确定性可视化"""
+        try:
+            if 'pixel_uncertainty' in bndl_outputs and bndl_outputs['pixel_uncertainty'] is not None:
+                uncertainty = bndl_outputs['pixel_uncertainty'].detach().cpu().numpy()
+                
+                if len(uncertainty.shape) == 4:  # [B, H, W, C]
+                    uncertainty_vis = uncertainty[0].mean(axis=-1)  # Average across channels
+                elif len(uncertainty.shape) == 3:  # [B, H, W]
+                    uncertainty_vis = uncertainty[0]
+                else:
+                    uncertainty_vis = uncertainty
+                
+                # Uncertainty heatmap
+                im1 = axes[0].imshow(uncertainty_vis, cmap='hot', interpolation='nearest')
+                axes[0].set_title(f'Pixel Uncertainty (Step {step_index})\nMean: {uncertainty_vis.mean():.4f}')
+                axes[0].axis('off')
+                plt.colorbar(im1, ax=axes[0], fraction=0.046, pad=0.04)
+                
+                # Uncertainty histogram
+                axes[1].hist(uncertainty_vis.flatten(), bins=50, alpha=0.7, color='orange')
+                axes[1].set_title(f'Uncertainty Distribution (Step {step_index})\nMean: {uncertainty_vis.mean():.4f}')
+                axes[1].set_xlabel('Uncertainty Value')
+                axes[1].set_ylabel('Frequency')
+                
+                # Uncertainty statistics
+                axes[2].text(0.5, 0.5, f'Uncertainty Summary:\n\nMean: {uncertainty_vis.mean():.4f}\nStd: {uncertainty_vis.std():.4f}\nMin: {uncertainty_vis.min():.4f}\nMax: {uncertainty_vis.max():.4f}', 
+                           ha='center', va='center', transform=axes[2].transAxes, fontsize=10)
+                axes[2].set_title(f'Uncertainty Stats (Step {step_index})')
+                axes[2].axis('off')
+                
+            else:
+                # No uncertainty data available
+                for i in range(3):
+                    axes[i].text(0.5, 0.5, 'No Uncertainty\nData Available', 
+                               ha='center', va='center', transform=axes[i].transAxes, fontsize=10)
+                    axes[i].set_title(f'Uncertainty {i+1} (Step {step_index})')
+                    axes[i].axis('off')
+                    
+        except Exception as e:
+            logging.warning(f"Failed to plot uncertainty visualization: {e}")
+            for i in range(3):
+                axes[i].text(0.5, 0.5, 'Uncertainty\nVisualization\nFailed', 
+                           ha='center', va='center', transform=axes[i].transAxes)
+                axes[i].set_title('Error')
+                axes[i].axis('off')
 
 def print_model_summary(model: torch.nn.Module, log_dir: str = ""):
     """
