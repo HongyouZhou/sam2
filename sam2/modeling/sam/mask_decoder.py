@@ -243,10 +243,7 @@ class MaskDecoder(nn.Module):
             masks = (hyper_in @ upscaled_embedding.view(b, c, h * w)).view(b, -1, h, w)
             bndl_outputs = None
         else:
-            # Fixed: Pass [B, H, W, C] format to pixel_bndl for true pixel-level processing
             pixel_feat = upscaled_embedding.permute(0, 2, 3, 1)  # [B, C, H, W] -> [B, H, W, C]
-            # 没必要做layer norm
-            # pixel_feat = torch.nn.functional.layer_norm(pixel_feat, (c,))
 
             masks_bndl_raw, z_out, wei_lambda, inv_k, wei_lambda_w, inv_k_w = self.pixel_bndl(
                 pixel_feat,
@@ -262,8 +259,11 @@ class MaskDecoder(nn.Module):
                 "inv_k": inv_k,
                 "wei_lambda_w": wei_lambda_w,
                 "inv_k_w": inv_k_w,
-                "pixel_logits_raw": masks_bndl_raw,  # Now [B, H, W, K] format
-                "upscaled_shape": (b, c, h, w),
+                "masks_bndl_raw": masks_bndl_raw.detach(),      # [B, H, W, K] 用于计算PAvPU
+                "upscaled_shape": (b, c, h, w),                 # 用于计算PAvPU
+                "hyper_in": hyper_in.detach(),                  # 用于计算PAvPU
+                "mask_tokens_out": mask_tokens_out.detach(),    # 用于计算PAvPU
+                "pixel_feat": pixel_feat.detach(),              # 用于计算PAvPU
             }
 
             if self.bndl_fuse_type in ("sum", "conv"):

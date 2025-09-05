@@ -44,6 +44,8 @@ from training.utils.logger import Logger, setup_logging
 # Import BNDL uncertainty and PAvPU functions
 from BNDL.BNDL_upload.ViT_Sparse.utils.model_helpers import pixel_uncertain_sampling, pixel_pavpu_calculation
 
+from training.utils.dataset_evaluator import DistributedDatasetEvaluator
+
 from training.utils.train_utils import (
     AverageMeter,
     collect_dict_keys,
@@ -482,7 +484,14 @@ class Trainer:
         if bndl_outputs is not None:
             # Calculate PAvPU if in validation phase and targets are available
             if phase == "val" and targets is not None:
-                bndl_outputs = self._calculate_pavpu_for_bndl(bndl_outputs, batch, targets, phase)
+                # Use frame_index to get the corresponding mask for the current frame
+                # targets shape: [4, 2, 1024, 1024] -> [frames, batch_size, height, width]
+                # We need to extract the specific frame and transpose to [batch_size, height, width]
+                if frame_index is not None and targets.shape[0] > frame_index:
+                    current_frame_targets = targets[frame_index]  # Shape: [2, 1024, 1024]
+                else:
+                    current_frame_targets = targets[0] if targets.shape[0] > 0 else targets  # Fallback to first frame
+                bndl_outputs = self._calculate_pavpu_for_bndl(bndl_outputs, batch, current_frame_targets)
             self._log_bndl_statistics(bndl_outputs, self.steps[phase], phase)
         if isinstance(loss, dict):
             step_losses.update(
@@ -501,7 +510,7 @@ class Trainer:
 
         self.steps[phase] += 1
 
-        ret_tuple = {loss_str: loss}, batch_size, step_losses
+        ret_tuple = {loss_str: loss}, batch_size, step_losses 
 
         if phase in self.meters and key in self.meters[phase]:
             meters_dict = self.meters[phase][key]
@@ -640,53 +649,65 @@ class Trainer:
             batch = batch.to(self.device, non_blocking=True)
 
             # compute output
-            with torch.no_grad():
-                with torch.cuda.amp.autocast(
-                    enabled=(self.optim_conf.amp.enabled if self.optim_conf else False),
-                    dtype=(
-                        get_amp_type(self.optim_conf.amp.amp_dtype)
-                        if self.optim_conf
-                        else None
-                    ),
-                ):
-                    for phase, model in zip(curr_phases, curr_models, strict=False):
-                        loss_dict, batch_size, extra_losses = self._step(
-                            batch,
-                            model,
-                            phase,
-                        )
+            with torch.no_grad(), torch.cuda.amp.autocast(
+                enabled=(self.optim_conf.amp.enabled if self.optim_conf else False),
+                dtype=(
+                    get_amp_type(self.optim_conf.amp.amp_dtype)
+                    if self.optim_conf
+                    else None
+                ),
+            ):
+                for phase, model in zip(curr_phases, curr_models, strict=False):
+                    loss_dict, batch_size, extra_losses = self._step(
+                        batch,
+                        model,
+                        phase,
+                    )
 
-                        assert len(loss_dict) == 1
-                        loss_key, loss = loss_dict.popitem()
+                    assert len(loss_dict) == 1
+                    loss_key, loss = loss_dict.popitem()
 
-                        loss_mts[loss_key].update(loss.item(), batch_size)
+                    loss_mts[loss_key].update(loss.item(), batch_size)
 
-                        for k, v in extra_losses.items():
-                            if k not in extra_loss_mts:
-                                extra_loss_mts[k] = AverageMeter(k, self.device, ":.2e")
-                            extra_loss_mts[k].update(v.item(), batch_size)
+                    for k, v in extra_losses.items():
+                        if k not in extra_loss_mts:
+                            extra_loss_mts[k] = AverageMeter(k, self.device, ":.2e")
+                        extra_loss_mts[k].update(v.item(), batch_size)
                     
-                    if (random.random() < 0.15 and self.logging_conf.visualize_bndl):  # 使用概率随机挑选，而不是固定的每7次
-                        if get_rank() == 0:
-                            logging.info(f"Starting BNDL visualization for iter {data_iter}")
-                            outputs_for_vis = model(batch)
-                            logging.info(f"Outputs keys: {list(outputs_for_vis.keys()) if isinstance(outputs_for_vis, dict) else 'Not a dict'}")
-                            
-                            # Extract BNDL outputs using the same method as training loop
-                            bndl_outputs, step_index, frame_index = self._extract_bndl_outputs(outputs_for_vis)
-                            
-                            if bndl_outputs is not None:
-                                vis_dir = os.path.join(self.logging_conf.log_dir, "bndl_visualizations", phase)
-                                makedir(vis_dir)
-                                # Ensure PAvPU is calculated for visualization
-                                if "pixel_uncertainty" not in bndl_outputs or bndl_outputs["pixel_uncertainty"] is None:
-                                    bndl_outputs = self._calculate_pavpu_for_bndl(bndl_outputs, batch, batch.masks, phase)
-                                self._create_unified_visualization(bndl_outputs, batch, outputs_for_vis, vis_dir, data_iter, step_index, frame_index, 'full')
-                            else:
-                                logging.warning("No BNDL outputs found for visualization")
-                        else:
-                            # 非主进程跳过可视化，避免文件冲突
-                            pass
+                    outputs = self.model(batch)
+
+                    bndl_outputs, step_index, frame_index = self._extract_bndl_outputs(outputs)
+                    # Use frame_index to get the corresponding mask for the current frame
+                    # batch.masks shape: [4, 2, 1024, 1024] -> [frames, batch_size, height, width]
+                    # We need to extract the specific frame and transpose to [batch_size, height, width]
+                    if frame_index is not None and batch.masks.shape[0] > frame_index:
+                        current_frame_masks = batch.masks[frame_index]  # Shape: [2, 1024, 1024]
+                    else:
+                        current_frame_masks = batch.masks[0] if batch.masks.shape[0] > 0 else batch.masks  # Fallback to first frame
+                    bndl_outputs = self._calculate_pavpu_for_bndl(bndl_outputs, batch, current_frame_masks)
+                    # BNDL visualization and evaluation (moved inside the for loop)
+                    if (random.random() < 0.15 and self.logging_conf.visualize_bndl) and get_rank() == 0:
+                        logging.info(f"Starting BNDL visualization for iter {data_iter}")
+                        # Use bndl_outputs already returned from _step instead of re-extracting
+                        vis_dir = os.path.join(self.logging_conf.log_dir, "bndl_visualizations", phase)
+                        makedir(vis_dir)
+                        # Ensure PAvPU is calculated for visualization
+                        self._create_unified_visualization(bndl_outputs, batch, outputs, vis_dir, data_iter, step_index, frame_index, 'full')
+                    
+                    # Dataset evaluation using BNDL outputs
+                    pixel_predictions = bndl_outputs.get('masks_bndl_raw') 
+                    if pixel_predictions is not None and 'pixel_uncertainty' in bndl_outputs:
+                        try:
+                            self.dataset_evaluator.add_batch_data(
+                                uncertainty=bndl_outputs['pixel_uncertainty'],
+                                pred_logits=pixel_predictions,
+                                gt_masks=current_frame_masks
+                            )
+                            logging.info(f"Added batch {data_iter} to dataset evaluator (batch size: {pixel_predictions.shape[0]})")
+                        except Exception as e:
+                            logging.warning(f"Failed to add batch {data_iter} to dataset evaluator: {e}")
+                    else:
+                        logging.warning(f"Skipping batch {data_iter}: missing BNDL outputs or uncertainty data")
                                                 
             # measure elapsed time
             batch_time.update(time.time() - end)
@@ -713,6 +734,39 @@ class Trainer:
 
             if data_iter % 10 == 0:
                 dist.barrier()
+
+        # 记录数据集评估器的状态
+        try:
+            total_images = self.dataset_evaluator.get_total_images_across_all_processes()
+            logging.info(f"Dataset evaluator status: {len(self.dataset_evaluator)} images on rank {self.rank}, {total_images} total across all processes")
+        except Exception as e:
+            logging.warning(f"Failed to get total images across processes: {e}")
+            logging.info(f"Dataset evaluator status: {len(self.dataset_evaluator)} images on rank {self.rank}")
+        
+        if len(self.dataset_evaluator) > 0:
+            try:
+                # 评估相关性
+                correlation_results = self.dataset_evaluator.evaluate_dataset_correlation()
+                logging.info(f"Correlation evaluation completed with {len(correlation_results)} metrics")
+                
+                # 生成可视化
+                self.dataset_evaluator.create_dataset_correlation_visualization(
+                    title=f"Epoch {self.epoch} - Dataset Analysis",
+                    save_name=f"epoch_{self.epoch}_dataset_analysis.png"
+                )
+                # 保存结果
+                self.dataset_evaluator.save_correlation_results(
+                    save_name=f"epoch_{self.epoch}_results.json"
+                )
+                logging.info(f"Dataset evaluation completed for epoch {self.epoch}")
+                # 重置evaluator
+                self.dataset_evaluator.reset()
+            except Exception as e:
+                logging.warning(f"Dataset evaluation failed: {e}")
+                import traceback
+                logging.warning(f"Traceback: {traceback.format_exc()}")
+        else:
+            logging.warning(f"No data collected for dataset evaluation in epoch {self.epoch}")
 
         self.est_epoch_time[phase] = batch_time.avg * iters_per_epoch
         self._log_timers(phase)
@@ -902,7 +956,7 @@ class Trainer:
             enabled=self.optim_conf.amp.enabled,
             dtype=get_amp_type(self.optim_conf.amp.amp_dtype),
         ):
-            loss_dict, batch_size, extra_losses = self._step(
+            loss_dict, batch_size, extra_losses= self._step(
                 batch,
                 self.model,
                 phase,
@@ -1062,6 +1116,13 @@ class Trainer:
 
         logging.info("Finished setting up components: Model, loss, optim, meters etc.")
 
+        self.dataset_evaluator = DistributedDatasetEvaluator(
+            save_dir=os.path.join(self.logging_conf.log_dir, "dataset_evaluation"),
+            distributed=True,
+            rank=dist.get_rank(),
+            world_size=dist.get_world_size()
+        )
+
     def _construct_optimizers(self):
         self.optim = construct_optimizer(
             self.model,
@@ -1116,88 +1177,30 @@ class Trainer:
     def _extract_pixel_bndl_model(self, model):
         """Extract the pixel_bndl model from the main SAM2 model"""
         try:
-            # Navigate to the mask decoder's pixel_bndl
-            if hasattr(model, 'module'):  # Handle DDP wrapper
-                logging.info("Found DDP wrapper, extracting module")
+            # Handle DDP wrapper
+            if hasattr(model, 'module'):
                 model = model.module
             
-            # Debug: log model structure
-            # logging.info(f"Model type: {type(model)}")
-            # logging.info(f"Model attributes: {[attr for attr in dir(model) if not attr.startswith('_')]}")
-            
-            # Try different possible paths to find the mask decoder
+            # Try to find mask decoder with pixel_bndl
             mask_decoder = None
             
-            # Path 1: SAM2Base structure
+            # Check common paths
             if hasattr(model, 'sam_mask_decoder'):
-                logging.info("Found sam_mask_decoder")
                 mask_decoder = model.sam_mask_decoder
-            # Path 2: Direct mask_decoder
             elif hasattr(model, 'mask_decoder'):
-                logging.info("Found mask_decoder")
                 mask_decoder = model.mask_decoder
-            # Path 3: Check if model is the mask decoder itself
             elif hasattr(model, 'pixel_bndl'):
-                logging.info("Model itself has pixel_bndl")
                 mask_decoder = model
-            else:
-                logging.warning("No mask decoder found in model")
-                # Log more details about the model structure
-                logging.info(f"Model class: {model.__class__.__name__}")
-                logging.info(f"Model module: {model.__class__.__module__}")
-                
-                # Check for nested attributes
-                for attr in dir(model):
-                    if not attr.startswith('_'):
-                        try:
-                            attr_value = getattr(model, attr)
-                            if hasattr(attr_value, 'pixel_bndl'):
-                                logging.info(f"Found pixel_bndl in {attr}")
-                                mask_decoder = attr_value
-                                break
-                        except Exception:
-                            continue
             
-            if mask_decoder is not None:
-                if hasattr(mask_decoder, 'pixel_bndl'):
-                    logging.info("Found pixel_bndl in mask_decoder")
-                    return mask_decoder.pixel_bndl
-                else:
-                    logging.warning("pixel_bndl not found in mask_decoder")
-                    logging.info(f"mask_decoder attributes: {[attr for attr in dir(mask_decoder) if not attr.startswith('_')]}")
-            else:
-                logging.warning("No mask decoder found in model")
+            # Return pixel_bndl if found
+            if mask_decoder and hasattr(mask_decoder, 'pixel_bndl'):
+                return mask_decoder.pixel_bndl
             
             return None
         except Exception as e:
             logging.warning(f"Failed to extract pixel_bndl model: {e}")
-            import traceback
-            logging.warning(f"Traceback: {traceback.format_exc()}")
             return None
 
-    def _extract_pixel_features(self, bndl_outputs):
-        """Extract pixel features needed for uncertainty sampling"""
-        try:
-            # We need the intermediate features that were used to generate pixel_logits_raw
-            # This should be available in the BNDL outputs
-            logging.info(f"Available BNDL outputs keys: {list(bndl_outputs.keys())}")
-            
-            if 'z_out' in bndl_outputs:
-                z_out = bndl_outputs['z_out']
-                logging.info(f"Found z_out with shape: {z_out.shape}")
-                return z_out  # [B, H, W, C']
-            else:
-                logging.warning("z_out not found in BNDL outputs for uncertainty sampling")
-                # Try alternative feature sources
-                if 'upscaled_embedding' in bndl_outputs:
-                    logging.info("Using upscaled_embedding as alternative feature source")
-                    return bndl_outputs['upscaled_embedding']
-                return None
-        except Exception as e:
-            logging.warning(f"Failed to extract pixel features: {e}")
-            import traceback
-            logging.warning(f"Traceback: {traceback.format_exc()}")
-            return None
 
     def _extract_bndl_outputs(self, outputs):
         """提取BNDL输出"""
@@ -1211,255 +1214,101 @@ class Trainer:
                         return bndl_outputs_list[i], i, frame_idx 
         return None, None, None
 
-    def _calculate_pavpu_for_bndl(self, bndl_outputs, batch, targets, phase):
+    def _calculate_pavpu_for_bndl(self, bndl_outputs, batch, targets):
         """Calculate PAvPU metric for BNDL outputs during validation"""
-        try:
-            # Extract pixel BNDL model for uncertainty sampling
-            pixel_bndl_model = self._extract_pixel_bndl_model(self.model)
-            if pixel_bndl_model is None:
-                logging.warning("Could not extract pixel_bndl model for PAvPU calculation")
-                return bndl_outputs
+        # Extract pixel BNDL model for uncertainty sampling
+        pixel_bndl_model = self._extract_pixel_bndl_model(self.model)
+        if pixel_bndl_model is None:
+            logging.warning("Could not extract pixel_bndl model for PAvPU calculation")
+            return bndl_outputs
+        
+        # Extract pixel features from BNDL outputs
+        pixel_feat = bndl_outputs['pixel_feat']
+        hyper_in = bndl_outputs['hyper_in']
+        
+        # Perform pixel-level uncertainty sampling
+        pixel_uncertainty, mean_pixel_logits = pixel_uncertain_sampling(
+            pixel_bndl_model, 
+            pixel_feat, 
+            external_pre_out_w=hyper_in,
+            sample_num=50
+        )
+        
+        # Prepare ground truth masks for PAvPU calculation
+        pixel_targets = self._prepare_targets_for_pavpu(targets, bndl_outputs)
+        
+        # Calculate PAvPU scores
+        pixel_predictions = bndl_outputs.get('masks_bndl_raw', mean_pixel_logits)
+
+        if pixel_predictions.shape != pixel_targets.shape:
+            if (pixel_predictions.shape[1:3] != pixel_targets.shape[1:3]):
+                pixel_targets = F.interpolate(
+                    pixel_targets.permute(0, 3, 1, 2),
+                    size=pixel_predictions.shape[1:3],
+                    mode='bilinear',
+                    align_corners=False
+                ).permute(0, 2, 3, 1)
+                logging.info(f"Aligned spatial dimensions for PAvPU calculation")
             
-            # Extract pixel features from BNDL outputs
-            pixel_feat = self._extract_pixel_features(bndl_outputs)
-            if pixel_feat is None:
-                logging.warning("Could not extract pixel features for PAvPU calculation")
-                return bndl_outputs
-            
-            # Get external weights (hyper_in) if available
-            external_pre_out_w = None
-            if hasattr(self.model, 'module'):
-                mask_decoder = getattr(self.model.module, 'sam_mask_decoder', None) or getattr(self.model.module, 'mask_decoder', None)
-            else:
-                mask_decoder = getattr(self.model, 'sam_mask_decoder', None) or getattr(self.model, 'mask_decoder', None)
-            
-            if mask_decoder and hasattr(mask_decoder, 'bndl_replace_global_with_hyper') and mask_decoder.bndl_replace_global_with_hyper:
-                # Extract hyper_in from BNDL outputs or regenerate it
-                external_pre_out_w = self._extract_hyper_in_from_bndl_outputs(bndl_outputs, batch, mask_decoder)
-            
-            # Perform pixel-level uncertainty sampling
-            pixel_uncertainty, mean_pixel_logits = pixel_uncertain_sampling(
-                pixel_bndl_model, 
-                pixel_feat, 
-                external_pre_out_w=external_pre_out_w,
-                sample_num=20  # Reduced sample number for speed during validation
-            )
-            
-            # Prepare ground truth masks for PAvPU calculation
-            pixel_targets = self._prepare_targets_for_pavpu(targets, bndl_outputs)
-            
-            # Calculate PAvPU scores
-            if pixel_targets is not None:
-                pixel_predictions = bndl_outputs.get('pixel_logits_raw', mean_pixel_logits)
-                if pixel_predictions is not None:
-                    # Ensure correct format [B, H, W, K] and validate dimensions
-                    if len(pixel_predictions.shape) == 4:
-                        if pixel_predictions.shape[1] == pixel_predictions.shape[2]:
-                            # Already in [B, H, W, K] format
-                            pass
-                        elif pixel_predictions.shape[-1] != pixel_predictions.shape[-2]:
-                            # Likely [B, K, H, W] format, transpose to [B, H, W, K]
-                            pixel_predictions = pixel_predictions.permute(0, 2, 3, 1)
-                    else:
-                        logging.warning(f"Unexpected pixel_predictions shape: {pixel_predictions.shape}")
-                        return bndl_outputs
-                    
-                    # Validate that dimensions match between predictions and targets
-                    if pixel_predictions.shape != pixel_targets.shape:
-                        logging.warning(f"Shape mismatch - predictions: {pixel_predictions.shape}, targets: {pixel_targets.shape}")
-                        # Try to fix common mismatches
-                        if len(pixel_targets.shape) == 4 and len(pixel_predictions.shape) == 4:
-                            B_pred, H_pred, W_pred, K_pred = pixel_predictions.shape
-                            B_targ, H_targ, W_targ, K_targ = pixel_targets.shape
-                            
-                            # Fix batch dimension mismatch
-                            if B_pred != B_targ:
-                                min_batch = min(B_pred, B_targ)
-                                pixel_predictions = pixel_predictions[:min_batch]
-                                pixel_targets = pixel_targets[:min_batch]
-                                logging.info(f"Fixed batch dimension mismatch: using first {min_batch} samples")
-                            
-                            # Fix spatial dimension mismatch (resolution difference)
-                            if H_pred != H_targ or W_pred != W_targ:
-                                # Resize targets to match predictions resolution
-                                pixel_targets_resized = F.interpolate(
-                                    pixel_targets.permute(0, 3, 1, 2),  # [B, H, W, K] -> [B, K, H, W]
-                                    size=(H_pred, W_pred),
-                                    mode='bilinear',
-                                    align_corners=False
-                                ).permute(0, 2, 3, 1)  # [B, K, H, W] -> [B, H, W, K]
-                                pixel_targets = pixel_targets_resized
-                                logging.info(f"Resized targets from {H_targ}x{W_targ} to {H_pred}x{W_pred}")
-                            
-                            # Fix mask dimension mismatch
-                            if K_pred != K_targ:
-                                min_k = min(K_pred, K_targ)
-                                pixel_predictions = pixel_predictions[..., :min_k]
-                                pixel_targets = pixel_targets[..., :min_k]
-                                logging.info(f"Fixed mask dimension mismatch by truncating to K={min_k}")
-                                
-                            # Final validation
-                            if pixel_predictions.shape != pixel_targets.shape:
-                                logging.warning(f"Still shape mismatch after fixes - predictions: {pixel_predictions.shape}, targets: {pixel_targets.shape}")
-                                return bndl_outputs
-                            else:
-                                logging.info(f"Successfully fixed shape mismatch! Final shapes: {pixel_predictions.shape}")
-                        else:
-                            logging.warning("Cannot fix dimension mismatch, skipping PAvPU calculation")
-                            return bndl_outputs
-                    
-                    pavpu_scores = pixel_pavpu_calculation(
-                        pixel_uncertainty, 
-                        pixel_predictions, 
-                        pixel_targets,
-                        thresholds=[0.01, 0.05, 0.1]
-                    )
-                    
-                    # Add PAvPU results to BNDL outputs
-                    bndl_outputs['pixel_uncertainty'] = pixel_uncertainty
-                    bndl_outputs['pixel_pavpu'] = pavpu_scores
-                    bndl_outputs['mean_pixel_logits'] = mean_pixel_logits
-                    
-                    logging.info(f"PAvPU scores calculated: {pavpu_scores}")
-                else:
-                    logging.warning("No pixel predictions found for PAvPU calculation")
-            else:
-                logging.warning("No valid targets found for PAvPU calculation")
+
+        pavpu_scores = pixel_pavpu_calculation(
+            pixel_uncertainty, 
+            pixel_predictions, 
+            pixel_targets,
+            thresholds=[0.01, 0.05, 0.1]
+        )
+        
+        # Add PAvPU results to BNDL outputs
+        bndl_outputs['pixel_uncertainty'] = pixel_uncertainty.detach()
+        bndl_outputs['pixel_pavpu'] = pavpu_scores
+        bndl_outputs['mean_pixel_logits'] = mean_pixel_logits.detach()
+        
+        logging.info(f"PAvPU scores calculated: {pavpu_scores}")
                 
-        except Exception as e:
-            logging.warning(f"Failed to calculate PAvPU: {e}")
-            import traceback
-            logging.warning(f"PAvPU calculation traceback: {traceback.format_exc()}")
         
         return bndl_outputs
-
-    def _extract_hyper_in_from_bndl_outputs(self, bndl_outputs, batch, mask_decoder):
-        """Extract hyper_in (external_pre_out_w) from BNDL outputs or regenerate it"""
-        try:
-            # First check if hyper_in is stored in BNDL outputs
-            if 'hyper_in' in bndl_outputs and bndl_outputs['hyper_in'] is not None:
-                logging.info("Found hyper_in in BNDL outputs")
-                return bndl_outputs['hyper_in']
-            
-            # If not stored, we need to regenerate it by running the mask decoder's hypernetwork
-            # This requires reconstructing the transformer output tokens
-            
-            # Extract the upscaled shape info
-            upscaled_shape = bndl_outputs.get('upscaled_shape')
-            if upscaled_shape is None:
-                logging.warning("No upscaled_shape found in BNDL outputs for hyper_in extraction")
-                return None
-            
-            b, c, h, w = upscaled_shape
-            num_mask_tokens = mask_decoder.num_mask_tokens
-            
-            # Try to regenerate hyper_in by running the hypernetwork MLPs
-            if hasattr(mask_decoder, 'output_hypernetworks_mlps'):
-                try:
-                    device = next(mask_decoder.parameters()).device
-                    
-                    # Check if we have stored mask_tokens_out in BNDL outputs
-                    mask_tokens_out = bndl_outputs.get('mask_tokens_out')
-                    
-                    if mask_tokens_out is not None:
-                        logging.info("Using stored mask_tokens_out for hyper_in generation")
-                        # Use the actual mask tokens from the forward pass
-                        batch_size = mask_tokens_out.shape[0]
-                    else:
-                        logging.info("Using mask token embeddings as fallback for hyper_in generation")
-                        # Fallback: use the mask token embeddings
-                        mask_tokens_out = mask_decoder.mask_tokens.weight.unsqueeze(0).expand(b, -1, -1)  # [B, K, C]
-                        batch_size = b
-                    
-                    # Generate hyper_in using the hypernetwork MLPs
-                    hyper_in_list = []
-                    for i in range(num_mask_tokens):
-                        hyper_out = mask_decoder.output_hypernetworks_mlps[i](mask_tokens_out[:, i, :])  # [B, C']
-                        hyper_in_list.append(hyper_out)
-                    
-                    # Stack to get [B, K, C'] format
-                    hyper_in = torch.stack(hyper_in_list, dim=1)
-                    
-                    logging.info(f"Generated hyper_in with shape: {hyper_in.shape}")
-                    return hyper_in
-                    
-                except Exception as e:
-                    logging.warning(f"Failed to regenerate hyper_in: {e}")
-                    return None
-            else:
-                logging.warning("No output_hypernetworks_mlps found in mask_decoder")
-                return None
-                
-        except Exception as e:
-            logging.warning(f"Failed to extract hyper_in from BNDL outputs: {e}")
-            return None
-    
+ 
     def _prepare_targets_for_pavpu(self, targets, bndl_outputs):
         """Prepare ground truth targets in the correct format for PAvPU calculation"""
         try:
-            # targets should be in a format that can be converted to [B, H, W, K]
             if targets is None:
                 return None
             
-            # Handle different target formats
+            # Extract target tensor
             if isinstance(targets, torch.Tensor):
-                # Direct tensor case
                 target_tensor = targets
-            elif isinstance(targets, list | tuple):
-                # List of tensors, take the first one
-                if len(targets) > 0:
-                    target_tensor = targets[0]
-                else:
-                    return None
+            elif isinstance(targets, list | tuple) and len(targets) > 0:
+                target_tensor = targets[0]
             elif hasattr(targets, 'masks'):
-                # Nested structure
                 target_tensor = targets.masks
             else:
                 logging.warning(f"Unknown target format: {type(targets)}")
                 return None
             
-            # Convert to correct shape [B, H, W, K] with bounds checking
-            logging.info(f"Original target shape: {target_tensor.shape}")
-            
-            if len(target_tensor.shape) == 4:
-                # Check different possible 4D formats
-                if target_tensor.shape[0] < target_tensor.shape[1] and target_tensor.shape[2] == target_tensor.shape[3]:
-                    # Format: [K, B, H, W] -> [B, H, W, K]
-                    target_tensor = target_tensor.permute(1, 2, 3, 0)
-                    logging.info(f"Transposed targets from [K, B, H, W] to [B, H, W, K]: {target_tensor.shape}")
-                elif target_tensor.shape[1] > target_tensor.shape[0] and target_tensor.shape[1] > target_tensor.shape[2]:
-                    # Format: [B, K, H, W] -> [B, H, W, K]
-                    target_tensor = target_tensor.permute(0, 2, 3, 1)
-                    logging.info(f"Transposed targets from [B, K, H, W] to [B, H, W, K]: {target_tensor.shape}")
-                # else: already in [B, H, W, K] format or [B, H, W, C] format
-                
-            elif len(target_tensor.shape) == 3:
-                # [B, H, W] format, add mask dimension
+            # Handle the new format: [B, H, W] -> [B, H, W, 1]
+            # This is for single-class segmentation where targets are [batch_size, height, width]
+            if len(target_tensor.shape) == 3:
+                # Add channel dimension for single class: [B, H, W] -> [B, H, W, 1]
                 target_tensor = target_tensor.unsqueeze(-1)
-                logging.info(f"Added mask dimension to targets: {target_tensor.shape}")
-                
+            elif len(target_tensor.shape) == 4:
+                # Handle common format conversions
+                if target_tensor.shape[0] < target_tensor.shape[1] and target_tensor.shape[2] == target_tensor.shape[3]:
+                    target_tensor = target_tensor.permute(1, 2, 3, 0)  # [K, B, H, W] -> [B, H, W, K]
+                elif target_tensor.shape[1] > target_tensor.shape[0] and target_tensor.shape[1] > target_tensor.shape[2]:
+                    target_tensor = target_tensor.permute(0, 2, 3, 1)  # [B, K, H, W] -> [B, H, W, K]
             elif len(target_tensor.shape) == 5:
-                # [B, T, K, H, W] format, take first frame and transpose
-                target_tensor = target_tensor[:, 0, :, :, :].permute(0, 2, 3, 1)
-                logging.info(f"Used first frame from 5D targets: {target_tensor.shape}")
-                
+                target_tensor = target_tensor[:, 0, :, :, :].permute(0, 2, 3, 1)  # [B, T, K, H, W] -> [B, H, W, K]
             else:
                 logging.warning(f"Unexpected target shape: {target_tensor.shape}")
                 return None
             
-            # Validate tensor values are in reasonable range
-            if torch.isnan(target_tensor).any():
-                logging.warning("NaN values detected in targets")
-                target_tensor = torch.nan_to_num(target_tensor, nan=0.0)
-            
-            # Clamp to reasonable range
+            # Clean and validate tensor
+            target_tensor = torch.nan_to_num(target_tensor, nan=0.0)
             target_tensor = torch.clamp(target_tensor, 0.0, 1.0)
             
-            # Ensure it's on the correct device
-            if hasattr(bndl_outputs.get('pixel_logits_raw', None), 'device'):
-                target_tensor = target_tensor.to(bndl_outputs['pixel_logits_raw'].device)
+            target_tensor = target_tensor.to(bndl_outputs['masks_bndl_raw'].device)
             
-            return target_tensor
+            return target_tensor.detach()
             
         except Exception as e:
             logging.warning(f"Failed to prepare targets for PAvPU: {e}")
@@ -1554,8 +1403,17 @@ class Trainer:
         return lambda_img, k_img
 
     def _create_unified_visualization(self, bndl_outputs, batch, outputs_for_vis, vis_dir, data_iter, step_index, frame_index, layout_type='basic'):
-        """统一的BNDL可视化方法，替代多个重复的方法"""
+        """统一的BNDL可视化方法，使用重构后的模块"""
         try:
+            # 导入重构后的模块
+            from .utils.visualization_utils import VisualizationUtils
+            from .utils.bndl_visualizer import BNDLVisualizer
+            
+            # 初始化可视化器
+            viz_utils = VisualizationUtils()
+            bndl_viz = BNDLVisualizer()
+            
+            # 提取参数和图像
             lambda_img, k_img = self._extract_pixel_params(bndl_outputs)
             original_img = self._extract_original_image(batch, frame_idx=frame_index)
             
@@ -1567,751 +1425,45 @@ class Trainer:
             
             # 根据布局类型和是否有不确定性决定行数
             if layout_type == 'full' and has_uncertainty:
-                rows = 5
+                rows = 4
             else:
                 rows = 3
                 
-            fig, axes = plt.subplots(rows, 3, figsize=(18, 6*rows))
+            # 使用重构后的工具创建图表布局
+            fig, axes = viz_utils.create_figure_layout(rows, 3, (18, 6*rows))
             
-            self._plot_common_elements(axes, original_img, lambda_img, k_img, step_index, bndl_outputs, has_uncertainty, batch, outputs_for_vis)
+            # 绘制通用元素
+            self._plot_common_elements_refactored(axes, original_img, lambda_img, k_img, step_index, 
+                                                bndl_outputs, has_uncertainty, batch, outputs_for_vis, bndl_viz, viz_utils)
             
-            plt.tight_layout()
+            # 使用重构后的工具保存和关闭图表
             save_path = os.path.join(vis_dir, f"epoch_{self.epoch}_iter_{data_iter}_step_{step_index}_unified_{layout_type}.png")
-            plt.savefig(save_path, dpi=150)
-            plt.close()
+            viz_utils.save_and_close_figure(fig, save_path, dpi=150)
             
             logging.info(f"Unified BNDL visualization saved: {save_path}")
             
         except Exception as e:
             logging.warning(f"Failed to create unified BNDL visualization: {e}")
 
-    def _plot_common_elements(self, axes, original_img, lambda_img, k_img, step_index, bndl_outputs, has_uncertainty=False, batch=None, outputs_for_vis=None):
-        """统一的绘图元素，减少代码重复"""
-        # 第一行：原始图像和参数热图
-        self._plot_original_image(axes[0, 0], original_img)
-        self._plot_parameter_heatmap(axes[0, 1], lambda_img, f'Lambda (λ) Step {step_index}', 'viridis')
-        self._plot_parameter_heatmap(axes[0, 2], k_img, f'Shape (k) Step {step_index}', 'plasma')
+    def _plot_common_elements_refactored(self, axes, original_img, lambda_img, k_img, step_index, 
+                                        bndl_outputs, has_uncertainty=False, batch=None, outputs_for_vis=None, 
+                                        bndl_viz=None, viz_utils=None):
+        viz_utils.plot_original_image(axes[0, 0], original_img)
+        viz_utils.plot_parameter_heatmap(axes[0, 1], lambda_img, f'Lambda (λ) Step {step_index}', 'viridis')
+        viz_utils.plot_parameter_heatmap(axes[0, 2], k_img, f'Shape (k) Step {step_index}', 'plasma')
         
-        # 第二行：参数叠加或分布，包含不确定性叠加
         if original_img is not None and original_img.shape[:2] == lambda_img.shape:
             if has_uncertainty:
-                self._plot_parameter_and_uncertainty_overlays(axes[1, :], original_img, lambda_img, k_img, bndl_outputs, step_index)
+                bndl_viz.plot_parameter_and_uncertainty_overlays(axes[1, :], original_img, lambda_img, k_img, bndl_outputs, step_index)
             else:
-                self._plot_parameter_overlays(axes[1, :], original_img, lambda_img, k_img, step_index)
+                viz_utils.plot_parameter_overlays(axes[1, :], original_img, lambda_img, k_img, step_index)
         else:
-            self._plot_parameter_distributions(axes[1, :], lambda_img, k_img, step_index)
+            viz_utils.plot_parameter_distributions(axes[1, :], lambda_img, k_img, step_index)
         
-        # 第三行：全局参数
+        bndl_viz.plot_global_parameters_in_layout(axes[2, :], bndl_outputs, step_index)
         if has_uncertainty:
-            self._plot_global_parameters_in_layout(axes[2, :], bndl_outputs, step_index)
-            self._plot_uncertainty_visualization(axes[3, :], bndl_outputs, step_index)
-            self._plot_correlation_analysis(axes[4, :], bndl_outputs, step_index, batch, outputs_for_vis)
-        else:
-            self._plot_global_parameters_in_layout(axes[2, :], bndl_outputs, step_index)
+            bndl_viz.plot_uncertainty_visualization(axes[3, :], bndl_outputs, step_index)
 
-    def _plot_parameter_heatmap(self, ax, param_img, title, cmap):
-        """精简的参数热图绘制"""
-        im = ax.imshow(param_img, cmap=cmap, interpolation='nearest')
-        ax.set_title(f'{title}\nMean: {param_img.mean():.4f}')
-        ax.axis('off')
-        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-
-    def _plot_parameter_overlays(self, axes, original_img, lambda_img, k_img, step_index):
-        """精简的参数叠加图"""
-        lambda_norm, k_norm = self._normalize_parameters_robust(lambda_img, k_img)
-        
-        # Lambda叠加
-        axes[0].imshow(original_img)
-        axes[0].imshow(lambda_norm, cmap='viridis', alpha=0.6, interpolation='nearest')
-        axes[0].set_title(f'Lambda Overlay (Step {step_index})')
-        axes[0].axis('off')
-        
-        # K叠加
-        axes[1].imshow(original_img)
-        axes[1].imshow(k_norm, cmap='plasma', alpha=0.6, interpolation='nearest')
-        axes[1].set_title(f'K Overlay (Step {step_index})')
-        axes[1].axis('off')
-        
-        # 组合叠加
-        axes[2].imshow(original_img)
-        combined = np.zeros((*lambda_img.shape, 3))
-        combined[:, :, 1] = lambda_norm  # Green for lambda
-        combined[:, :, 0] = k_norm       # Red for k
-        axes[2].imshow(combined, alpha=0.6, interpolation='nearest')
-        axes[2].set_title(f'Combined Overlay (Step {step_index})')
-        axes[2].axis('off')
-
-    def _plot_parameter_and_uncertainty_overlays(self, axes, original_img, lambda_img, k_img, bndl_outputs, step_index):
-        """参数和不确定性叠加图，包含PAvPU可视化"""
-        try:
-            lambda_norm, k_norm = self._normalize_parameters_robust(lambda_img, k_img)
-            
-            # Extract uncertainty for overlay
-            uncertainty = None
-            if 'pixel_uncertainty' in bndl_outputs and bndl_outputs['pixel_uncertainty'] is not None:
-                uncertainty_tensor = bndl_outputs['pixel_uncertainty'].detach().cpu().numpy()
-                
-                if len(uncertainty_tensor.shape) == 4:  # [B, H, W, C]
-                    uncertainty = uncertainty_tensor[0].mean(axis=-1)  # Average across channels
-                elif len(uncertainty_tensor.shape) == 3:  # [B, H, W]
-                    uncertainty = uncertainty_tensor[0]
-                else:
-                    uncertainty = uncertainty_tensor
-                
-                # Resize uncertainty to match original image if needed
-                if uncertainty.shape != lambda_img.shape:
-                    uncertainty = cv2.resize(uncertainty, (lambda_img.shape[1], lambda_img.shape[0]), interpolation=cv2.INTER_LINEAR)
-                
-                # Normalize uncertainty
-                uncertainty_norm = (uncertainty - uncertainty.min()) / (uncertainty.max() - uncertainty.min() + 1e-8)
-            
-            # Lambda overlay
-            axes[0].imshow(original_img)
-            axes[0].imshow(lambda_norm, cmap='viridis', alpha=0.6, interpolation='nearest')
-            axes[0].set_title(f'Lambda Overlay (Step {step_index})')
-            axes[0].axis('off')
-            
-            # Uncertainty overlay
-            if uncertainty is not None:
-                axes[1].imshow(original_img)
-                axes[1].imshow(uncertainty_norm, cmap='hot', alpha=0.7, interpolation='nearest')
-                axes[1].set_title(f'Uncertainty Overlay (Step {step_index})\nMean: {uncertainty.mean():.4f}')
-                axes[1].axis('off')
-            else:
-                # Fallback to K overlay if no uncertainty
-                axes[1].imshow(original_img)
-                axes[1].imshow(k_norm, cmap='plasma', alpha=0.6, interpolation='nearest')
-                axes[1].set_title(f'K Overlay (Step {step_index})')
-                axes[1].axis('off')
-            
-            # Combined overlay with PAvPU information
-            axes[2].imshow(original_img)
-            
-            if uncertainty is not None:
-                # Create RGB overlay: Red=uncertainty, Green=lambda, Blue=k
-                combined = np.zeros((*lambda_img.shape, 3))
-                combined[:, :, 0] = uncertainty_norm  # Red for uncertainty
-                combined[:, :, 1] = lambda_norm       # Green for lambda
-                combined[:, :, 2] = k_norm            # Blue for k
-                axes[2].imshow(combined, alpha=0.6, interpolation='nearest')
-                
-                # Add PAvPU text if available
-                pavpu_text = ""
-                if 'pixel_pavpu' in bndl_outputs and bndl_outputs['pixel_pavpu'] is not None:
-                    pavpu_scores = bndl_outputs['pixel_pavpu']
-                    thresholds = [0.01, 0.05, 0.1]
-                    pavpu_text = "\nPAvPU: "
-                    for thresh, score in zip(thresholds, pavpu_scores, strict=False):
-                        pavpu_text += f"p={thresh:.2f}:{score:.1f}% "
-                
-                axes[2].set_title(f'Multi-layer Overlay (Step {step_index}){pavpu_text}')
-            else:
-                # Fallback combined overlay
-                combined = np.zeros((*lambda_img.shape, 3))
-                combined[:, :, 1] = lambda_norm  # Green for lambda
-                combined[:, :, 0] = k_norm       # Red for k
-                axes[2].imshow(combined, alpha=0.6, interpolation='nearest')
-                axes[2].set_title(f'Combined Overlay (Step {step_index})')
-            
-            axes[2].axis('off')
-            
-        except Exception as e:
-            logging.warning(f"Failed to plot parameter and uncertainty overlays: {e}")
-            # Fallback to regular parameter overlays
-            self._plot_parameter_overlays(axes, original_img, lambda_img, k_img, step_index)
-
-    def _plot_parameter_distributions(self, axes, lambda_img, k_img, step_index):
-        """绘制参数分布图"""
-        axes[0].hist(lambda_img.flatten(), bins=50, alpha=0.7, color='green')
-        axes[0].set_title(f'Lambda Distribution (Step {step_index})\nMean: {lambda_img.mean():.4f}')
-        
-        axes[1].hist(k_img.flatten(), bins=50, alpha=0.7, color='red')
-        axes[1].set_title(f'K Distribution (Step {step_index})\nMean: {k_img.mean():.4f}')
-        
-        param_diff = lambda_img - k_img
-        im = axes[2].imshow(param_diff, cmap='RdBu', interpolation='nearest')
-        axes[2].set_title(f'Lambda - K Difference (Step {step_index})')
-        axes[2].axis('off')
-        plt.colorbar(im, ax=axes[2], fraction=0.046, pad=0.04)
-
-    def _plot_global_parameters_in_layout(self, axes, bndl_outputs, step_index):
-        """Plot global weight parameters within the unified layout"""
-        try:
-            lambda_w = bndl_outputs['wei_lambda_w'].detach().cpu().numpy()
-            k_w = (1.0 / (bndl_outputs['inv_k_w'] + 1e-6)).detach().cpu().numpy()
-            
-            if len(lambda_w.shape) == 3:  # [B, K, C']
-                lambda_w_vis = lambda_w[0]  # Use first batch
-                k_w_vis = k_w[0] if len(k_w.shape) == 3 else k_w[0:1]
-                
-                # Lambda_w heatmap
-                im1 = axes[0].imshow(lambda_w_vis, cmap='viridis', interpolation='nearest', aspect='auto')
-                axes[0].set_title(f'Global Lambda_w (Step {step_index})\nMean: {lambda_w_vis.mean():.4f}')
-                axes[0].set_xlabel('Feature Dimension')
-                axes[0].set_ylabel('Mask Token')
-                plt.colorbar(im1, ax=axes[0], fraction=0.046, pad=0.04)
-                
-                # K_w heatmap
-                im2 = axes[1].imshow(k_w_vis, cmap='plasma', interpolation='nearest', aspect='auto')
-                axes[1].set_title(f'Global K_w (Step {step_index})\nMean: {k_w_vis.mean():.4f}')
-                axes[1].set_xlabel('Feature Dimension' if len(k_w_vis.shape) == 2 and k_w_vis.shape[1] > 1 else 'Single Value')
-                axes[1].set_ylabel('Mask Token')
-                plt.colorbar(im2, ax=axes[1], fraction=0.046, pad=0.04)
-                
-                # Global parameter statistics
-                axes[2].text(0.5, 0.5, f'Global Parameters Summary:\n\nLambda_w:\nMean: {lambda_w_vis.mean():.4f}\nStd: {lambda_w_vis.std():.4f}\n\nK_w:\nMean: {k_w_vis.mean():.4f}\nStd: {k_w_vis.std():.4f}', 
-                           ha='center', va='center', transform=axes[2].transAxes, fontsize=10)
-                axes[2].set_title(f'Global Parameters Stats (Step {step_index})')
-                axes[2].axis('off')
-                
-            else:
-                # Handle other shapes
-                for i in range(3):
-                    axes[i].text(0.5, 0.5, f'Global Parameters\nShape: {lambda_w.shape}\nNot visualized', 
-                               ha='center', va='center', transform=axes[i].transAxes, fontsize=10)
-                    axes[i].set_title(f'Global Params {i+1} (Step {step_index})')
-                    axes[i].axis('off')
-                    
-        except Exception as e:
-            logging.warning(f"Failed to plot global parameters in layout: {e}")
-            for i in range(3):
-                axes[i].text(0.5, 0.5, 'Global Parameters\nVisualization\nFailed', 
-                           ha='center', va='center', transform=axes[i].transAxes)
-                axes[i].set_title('Error')
-                axes[i].axis('off')
-
-    def _plot_original_image(self, ax, original_img):
-        """绘制原始图像"""
-        if original_img is not None:
-            ax.imshow(original_img)
-            ax.set_title('Original Image')
-            ax.axis('off')
-        else:
-            ax.text(0.5, 0.5, 'No Image\nAvailable', 
-                   ha='center', va='center', transform=ax.transAxes, fontsize=12)
-            ax.set_title('Original Image')
-            ax.axis('off')
-
-    def _normalize_parameters_robust(self, lambda_img, k_img):
-        """稳健的参数归一化，处理异常值"""
-        try:
-            # 使用百分位数进行稳健归一化，避免异常值影响
-            lambda_min = np.percentile(lambda_img, 1)
-            lambda_max = np.percentile(lambda_img, 99)
-            lambda_range = lambda_max - lambda_min
-            if lambda_range < 1e-6:
-                lambda_range = 1e-6
-            
-            k_min = np.percentile(k_img, 1)
-            k_max = np.percentile(k_img, 99)
-            k_range = k_max - k_min
-            if k_range < 1e-6:
-                k_range = 1e-6
-            
-            lambda_norm = (lambda_img - lambda_min) / lambda_range
-            k_norm = (k_img - k_min) / k_range
-            
-            # 限制在[0, 1]范围内
-            lambda_norm = np.clip(lambda_norm, 0, 1)
-            k_norm = np.clip(k_norm, 0, 1)
-            
-            return lambda_norm, k_norm
-            
-        except Exception as e:
-            logging.warning(f"Parameter normalization failed: {e}")
-            # 返回原始值作为fallback
-            return lambda_img, k_img
-
-    def _plot_uncertainty_visualization(self, axes, bndl_outputs, step_index):
-        """绘制不确定性和PAvPU可视化"""
-        try:
-            if 'pixel_uncertainty' in bndl_outputs and bndl_outputs['pixel_uncertainty'] is not None:
-                uncertainty = bndl_outputs['pixel_uncertainty'].detach().cpu().numpy()
-                
-                if len(uncertainty.shape) == 4:  # [B, H, W, C]
-                    uncertainty_vis = uncertainty[0].mean(axis=-1)  # Average across channels
-                elif len(uncertainty.shape) == 3:  # [B, H, W]
-                    uncertainty_vis = uncertainty[0]
-                else:
-                    uncertainty_vis = uncertainty
-                
-                # Uncertainty heatmap
-                im1 = axes[0].imshow(uncertainty_vis, cmap='hot', interpolation='nearest')
-                axes[0].set_title(f'Pixel Uncertainty (Step {step_index})\nMean: {uncertainty_vis.mean():.4f}')
-                axes[0].axis('off')
-                plt.colorbar(im1, ax=axes[0], fraction=0.046, pad=0.04)
-                
-                # PAvPU visualization
-                if 'pixel_pavpu' in bndl_outputs and bndl_outputs['pixel_pavpu'] is not None:
-                    pavpu_scores = bndl_outputs['pixel_pavpu']
-                    thresholds = [0.01, 0.05, 0.1]
-                    
-                    # PAvPU bar chart
-                    bars = axes[1].bar(
-                        range(len(thresholds)), pavpu_scores, 
-                        color=['lightblue', 'skyblue', 'deepskyblue'], alpha=0.8
-                    )
-                    axes[1].set_xlabel('Uncertainty Threshold')
-                    axes[1].set_ylabel('PAvPU Score (%)')
-                    axes[1].set_title(f'PAvPU Scores (Step {step_index})')
-                    axes[1].set_xticks(range(len(thresholds)))
-                    axes[1].set_xticklabels([f'{t:.2f}' for t in thresholds])
-                    
-                    # Add value labels on bars
-                    for bar, score in zip(bars, pavpu_scores, strict=False):
-                        height = bar.get_height()
-                        axes[1].text(bar.get_x() + bar.get_width()/2., height + 0.5,
-                                   f'{score:.1f}%', ha='center', va='bottom', fontsize=9)
-                else:
-                    # Uncertainty histogram if no PAvPU
-                    axes[1].hist(uncertainty_vis.flatten(), bins=50, alpha=0.7, color='orange')
-                    axes[1].set_title(f'Uncertainty Distribution (Step {step_index})')
-                    axes[1].set_xlabel('Uncertainty Value')
-                    axes[1].set_ylabel('Frequency')
-                
-                # Combined statistics including PAvPU
-                stats_text = f'Uncertainty Summary:\nMean: {uncertainty_vis.mean():.4f}\nStd: {uncertainty_vis.std():.4f}\nMin: {uncertainty_vis.min():.4f}\nMax: {uncertainty_vis.max():.4f}'
-                
-                if 'pixel_pavpu' in bndl_outputs and bndl_outputs['pixel_pavpu'] is not None:
-                    pavpu_scores = bndl_outputs['pixel_pavpu']
-                    stats_text += '\n\nPAvPU Scores:\n'
-                    for thresh, score in zip([0.01, 0.05, 0.1], pavpu_scores, strict=False):
-                        stats_text += f'p={thresh:.2f}: {score:.1f}%\n'
-                
-                axes[2].text(0.5, 0.5, stats_text, 
-                           ha='center', va='center', transform=axes[2].transAxes, fontsize=9)
-                axes[2].set_title(f'Statistics (Step {step_index})')
-                axes[2].axis('off')
-                
-            else:
-                # No uncertainty data available
-                for i in range(3):
-                    axes[i].text(0.5, 0.5, 'No Uncertainty\nData Available', 
-                               ha='center', va='center', transform=axes[i].transAxes, fontsize=10)
-                    axes[i].set_title(f'Uncertainty {i+1} (Step {step_index})')
-                    axes[i].axis('off')
-                    
-        except Exception as e:
-            logging.warning(f"Failed to plot uncertainty visualization: {e}")
-            for i in range(3):
-                axes[i].text(0.5, 0.5, 'Uncertainty\nVisualization\nFailed', 
-                           ha='center', va='center', transform=axes[i].transAxes)
-                axes[i].set_title('Error')
-                axes[i].axis('off')
-                
-    def _plot_correlation_analysis(self, axes, bndl_outputs, step_index, batch, outputs_for_vis):
-        """
-        Calculate IoU, DICE, and Mask accuracy metrics and plot their correlations
-        with uncertainty values, similar to loss_fns.py calculations
-        """
-        try:
-            # Extract predictions and targets
-            pred_masks = None
-            gt_masks = None
-            uncertainty = None
-            
-            # Get predictions from bndl_outputs or outputs_for_vis
-            if 'pixel_logits_raw' in bndl_outputs and bndl_outputs['pixel_logits_raw'] is not None:
-                pred_logits = bndl_outputs['pixel_logits_raw']
-            elif 'mean_pixel_logits' in bndl_outputs and bndl_outputs['mean_pixel_logits'] is not None:
-                pred_logits = bndl_outputs['mean_pixel_logits']
-            elif outputs_for_vis is not None and 'masks' in outputs_for_vis:
-                pred_logits = outputs_for_vis['masks']
-            else:
-                # No predictions available
-                for i in range(3):
-                    axes[i].text(0.5, 0.5, 'No Predictions\nAvailable', 
-                               ha='center', va='center', transform=axes[i].transAxes)
-                    axes[i].set_title(f'Correlation Analysis {i+1}')
-                    axes[i].axis('off')
-                return
-            
-            # Get ground truth masks from batch
-            if hasattr(batch, 'masks') and batch.masks is not None:
-                gt_masks = batch.masks
-            else:
-                # No ground truth available
-                for i in range(3):
-                    axes[i].text(0.5, 0.5, 'No Ground Truth\nAvailable', 
-                               ha='center', va='center', transform=axes[i].transAxes)
-                    axes[i].set_title(f'Correlation Analysis {i+1}')
-                    axes[i].axis('off')
-                return
-            
-            # Get uncertainty values
-            if 'pixel_uncertainty' in bndl_outputs and bndl_outputs['pixel_uncertainty'] is not None:
-                uncertainty = bndl_outputs['pixel_uncertainty'].detach().cpu()
-            else:
-                # No uncertainty available
-                for i in range(3):
-                    axes[i].text(0.5, 0.5, 'No Uncertainty\nData Available', 
-                               ha='center', va='center', transform=axes[i].transAxes)
-                    axes[i].set_title(f'Correlation Analysis {i+1}')
-                    axes[i].axis('off')
-                return
-            
-            # Convert to tensors and ensure proper format
-            if hasattr(pred_logits, 'detach'):
-                pred_logits = pred_logits.detach().cpu()
-            if hasattr(gt_masks, 'detach'):
-                gt_masks = gt_masks.detach().cpu()
-            
-            # Handle different tensor shapes and convert to [B, H, W, K] format
-            pred_logits = self._normalize_tensor_format(pred_logits, 'predictions')
-            gt_masks = self._normalize_tensor_format(gt_masks, 'targets')
-            uncertainty = self._normalize_tensor_format(uncertainty, 'uncertainty')
-            
-            if pred_logits is None or gt_masks is None or uncertainty is None:
-                for i in range(3):
-                    axes[i].text(0.5, 0.5, 'Format Error\nCheck Logs', 
-                               ha='center', va='center', transform=axes[i].transAxes)
-                    axes[i].set_title(f'Correlation Analysis {i+1}')
-                    axes[i].axis('off')
-                return
-            
-            # Ensure batch dimensions match first
-            min_batch = min(pred_logits.shape[0], gt_masks.shape[0], uncertainty.shape[0])
-            pred_logits = pred_logits[:min_batch]
-            gt_masks = gt_masks[:min_batch]
-            uncertainty = uncertainty[:min_batch]
-            
-            # Ensure spatial dimensions match
-            pred_logits, gt_masks, uncertainty = self._align_spatial_dimensions(pred_logits, gt_masks, uncertainty)
-            
-            if pred_logits is None or gt_masks is None or uncertainty is None:
-                for i in range(3):
-                    axes[i].text(0.5, 0.5, 'Alignment\nFailed', 
-                               ha='center', va='center', transform=axes[i].transAxes)
-                    axes[i].set_title(f'Correlation Analysis {i+1}')
-                    axes[i].axis('off')
-                return
-            
-            # Calculate metrics similar to loss_fns.py
-            iou_scores = self._calculate_iou_metric(pred_logits, gt_masks)
-            dice_scores = self._calculate_dice_metric(pred_logits, gt_masks)
-            mask_acc = self._calculate_mask_accuracy(pred_logits, gt_masks)
-            
-            if iou_scores is None or dice_scores is None or mask_acc is None:
-                for i in range(3):
-                    axes[i].text(0.5, 0.5, 'Metric Calculation\nFailed', 
-                               ha='center', va='center', transform=axes[i].transAxes)
-                    axes[i].set_title(f'Correlation Analysis {i+1}')
-                    axes[i].axis('off')
-                return
-            
-            # Flatten for correlation analysis
-            uncertainty_flat = uncertainty.flatten().numpy()
-            iou_flat = iou_scores.flatten().numpy()
-            dice_flat = dice_scores.flatten().numpy()
-            acc_flat = mask_acc.flatten().numpy()
-            
-            # Ensure all arrays have the same size
-            min_size = min(len(uncertainty_flat), len(iou_flat), len(dice_flat), len(acc_flat))
-            uncertainty_flat = uncertainty_flat[:min_size]
-            iou_flat = iou_flat[:min_size]
-            dice_flat = dice_flat[:min_size]
-            acc_flat = acc_flat[:min_size]
-            
-            # Remove any invalid values
-            valid_mask = ~(np.isnan(uncertainty_flat) | np.isnan(iou_flat) | 
-                          np.isnan(dice_flat) | np.isnan(acc_flat) |
-                          np.isinf(uncertainty_flat) | np.isinf(iou_flat) |
-                          np.isinf(dice_flat) | np.isinf(acc_flat))
-            
-            if np.sum(valid_mask) < 10:  # Need at least 10 valid points
-                for i in range(3):
-                    axes[i].text(0.5, 0.5, 'Insufficient\nValid Data', 
-                               ha='center', va='center', transform=axes[i].transAxes)
-                    axes[i].set_title(f'Correlation Analysis {i+1}')
-                    axes[i].axis('off')
-                return
-            
-            uncertainty_valid = uncertainty_flat[valid_mask]
-            iou_valid = iou_flat[valid_mask]
-            dice_valid = dice_flat[valid_mask]
-            acc_valid = acc_flat[valid_mask]
-            
-            # Plot 1: IoU vs Uncertainty
-            self._plot_metric_uncertainty_correlation(
-                axes[0], uncertainty_valid, iou_valid, 
-                'IoU vs Uncertainty', 'Uncertainty', 'IoU Score', step_index
-            )
-            
-            # Plot 2: DICE vs Uncertainty  
-            self._plot_metric_uncertainty_correlation(
-                axes[1], uncertainty_valid, dice_valid,
-                'DICE vs Uncertainty', 'Uncertainty', 'DICE Score', step_index
-            )
-            
-            # Plot 3: Mask Accuracy vs Uncertainty
-            self._plot_metric_uncertainty_correlation(
-                axes[2], uncertainty_valid, acc_valid,
-                'Mask Accuracy vs Uncertainty', 'Uncertainty', 'Mask Accuracy', step_index
-            )
-            
-            logging.info(f"Correlation analysis completed for step {step_index}")
-            
-        except Exception as e:
-            logging.warning(f"Failed to plot correlation analysis: {e}")
-            import traceback
-            logging.warning(f"Traceback: {traceback.format_exc()}")
-            for i in range(3):
-                axes[i].text(0.5, 0.5, 'Correlation\nAnalysis\nFailed', 
-                           ha='center', va='center', transform=axes[i].transAxes)
-                axes[i].set_title('Error')
-                axes[i].axis('off')
-
-    def _normalize_tensor_format(self, tensor, name):
-        """Normalize tensor to [B, H, W, K] format with better shape handling"""
-        try:
-            if tensor is None:
-                return None
-            
-            if not hasattr(tensor, 'shape'):
-                tensor = torch.tensor(tensor)
-            
-            shape = tensor.shape
-            logging.info(f"{name} original shape: {shape}")
-            
-            if len(shape) == 5:  # [B, T, K, H, W] or [T, B, K, H, W] or [K, B, T, H, W]
-                # Take first frame and rearrange
-                if shape[0] <= 4 and shape[1] >= shape[0]:  # [K, B, T, H, W] or [T, B, K, H, W]
-                    if shape[2] <= 4:  # [T, B, K, H, W]
-                        tensor = tensor[0]  # [B, K, H, W]
-                    else:  # [K, B, T, H, W]
-                        tensor = tensor[:, :, 0]  # [K, B, H, W]
-                        tensor = tensor.permute(1, 0, 2, 3)  # [B, K, H, W]
-                else:  # [B, T, K, H, W]
-                    tensor = tensor[:, 0]  # [B, K, H, W]
-                shape = tensor.shape
-            
-            if len(shape) == 4:
-                B, dim1, dim2, dim3 = shape
-                # Better heuristic for determining format
-                if dim1 <= 4 and dim2 > 16 and dim3 > 16:  # [B, K, H, W]
-                    tensor = tensor.permute(0, 2, 3, 1)  # [B, H, W, K]
-                elif dim2 == dim3 and dim1 > 16:  # [B, H, W, K] (already correct)
-                    pass
-                elif dim1 > 16 and dim2 > 16 and dim3 <= 4:  # [B, H, W, K] (already correct)
-                    pass
-                else:
-                    # Fallback: if uncertain, assume the largest dimensions are spatial
-                    spatial_dims = sorted([(i, d) for i, d in enumerate(shape[1:], 1)], key=lambda x: x[1], reverse=True)
-                    if spatial_dims[0][1] == spatial_dims[1][1]:  # Two largest dims are equal (likely H, W)
-                        h_idx, w_idx = spatial_dims[0][0], spatial_dims[1][0]
-                        remaining_idx = [i for i in [1, 2, 3] if i not in [h_idx, w_idx]][0]
-                        # Reorder to [B, H, W, K]
-                        perm = [0, h_idx, w_idx, remaining_idx]
-                        tensor = tensor.permute(*perm)
-            elif len(shape) == 3:  # [B, H, W]
-                tensor = tensor.unsqueeze(-1)  # [B, H, W, 1]
-            elif len(shape) == 2:  # [H, W]
-                tensor = tensor.unsqueeze(0).unsqueeze(-1)  # [1, H, W, 1]
-            else:
-                logging.warning(f"Unsupported {name} shape: {shape}")
-                return None
-                
-            logging.info(f"{name} normalized shape: {tensor.shape}")
-            return tensor
-            
-        except Exception as e:
-            logging.warning(f"Failed to normalize {name} tensor: {e}")
-            return None
-
-    def _align_spatial_dimensions(self, pred_logits, gt_masks, uncertainty):
-        """Align spatial dimensions of all tensors with better error handling"""
-        try:
-            # Get target spatial dimensions (use predictions as reference)
-            B_pred, target_h, target_w, K_pred = pred_logits.shape
-            
-            # Handle gt_masks
-            B_gt, H_gt, W_gt, K_gt = gt_masks.shape
-            if (H_gt, W_gt) != (target_h, target_w):
-                # Convert to float for interpolation, then back to original dtype
-                gt_dtype = gt_masks.dtype
-                gt_masks_float = gt_masks.float()
-                
-                # Reshape to [B, K, H, W] for interpolation
-                gt_masks_reshaped = gt_masks_float.permute(0, 3, 1, 2)
-                gt_masks_resized = F.interpolate(
-                    gt_masks_reshaped, size=(target_h, target_w), 
-                    mode='bilinear', align_corners=False
-                )
-                gt_masks = gt_masks_resized.permute(0, 2, 3, 1).to(gt_dtype)
-                logging.info(f"Resized gt_masks from {H_gt}x{W_gt} to {target_h}x{target_w}")
-            
-            # Handle uncertainty 
-            if len(uncertainty.shape) == 4:  # [B, H, W, C]
-                B_unc, H_unc, W_unc, C_unc = uncertainty.shape
-                if (H_unc, W_unc) != (target_h, target_w):
-                    uncertainty_reshaped = uncertainty.permute(0, 3, 1, 2)
-                    uncertainty_resized = F.interpolate(
-                        uncertainty_reshaped, size=(target_h, target_w),
-                        mode='bilinear', align_corners=False
-                    )
-                    uncertainty = uncertainty_resized.permute(0, 2, 3, 1)
-                    logging.info(f"Resized uncertainty from {H_unc}x{W_unc} to {target_h}x{target_w}")
-            elif len(uncertainty.shape) == 3:  # [B, H, W]
-                B_unc, H_unc, W_unc = uncertainty.shape
-                if (H_unc, W_unc) != (target_h, target_w):
-                    uncertainty_resized = F.interpolate(
-                        uncertainty.unsqueeze(1), size=(target_h, target_w),
-                        mode='bilinear', align_corners=False
-                    )
-                    uncertainty = uncertainty_resized.squeeze(1)
-                    logging.info(f"Resized uncertainty from {H_unc}x{W_unc} to {target_h}x{target_w}")
-                # Convert back to 4D for consistency
-                uncertainty = uncertainty.unsqueeze(-1)
-            
-            # Handle channel dimension mismatch
-            if gt_masks.shape[-1] != pred_logits.shape[-1]:
-                K_min = min(gt_masks.shape[-1], pred_logits.shape[-1])
-                gt_masks = gt_masks[..., :K_min]
-                pred_logits = pred_logits[..., :K_min]
-                logging.info(f"Truncated to {K_min} channels for consistency")
-            
-            return pred_logits, gt_masks, uncertainty
-            
-        except Exception as e:
-            logging.warning(f"Failed to align spatial dimensions: {e}")
-            import traceback
-            logging.warning(f"Alignment traceback: {traceback.format_exc()}")
-            return None, None, None
-
-    def _calculate_iou_metric(self, pred_logits, gt_masks):
-        """Calculate IoU metric similar to iou_loss in loss_fns.py"""
-        try:
-            # Ensure inputs have the same shape
-            if pred_logits.shape != gt_masks.shape:
-                logging.warning(f"Shape mismatch in IoU calculation: pred {pred_logits.shape} vs gt {gt_masks.shape}")
-                return None
-            
-            # Apply sigmoid to convert logits to probabilities
-            pred_probs = torch.sigmoid(pred_logits)
-            
-            # Convert to binary masks (threshold at 0.5)
-            pred_masks = pred_probs > 0.5
-            gt_binary = gt_masks > 0.5
-            
-            # Flatten spatial dimensions: [B, H, W, K] -> [B, K, H*W]
-            pred_flat = pred_masks.permute(0, 3, 1, 2).flatten(2)  # [B, K, H*W]
-            gt_flat = gt_binary.permute(0, 3, 1, 2).flatten(2)    # [B, K, H*W]
-            
-            # Calculate intersection and union
-            intersection = torch.sum(pred_flat & gt_flat, dim=2).float()  # [B, K]
-            union = torch.sum(pred_flat | gt_flat, dim=2).float()         # [B, K]
-            
-            # Calculate IoU with numerical stability
-            iou = intersection / torch.clamp(union, min=1e-6)
-            
-            # Expand back to spatial dimensions for correlation analysis
-            # [B, K] -> [B, H, W, K]
-            B, H, W, K = pred_logits.shape
-            iou_expanded = iou.unsqueeze(1).unsqueeze(1).expand(B, H, W, K)
-            
-            return iou_expanded
-            
-        except Exception as e:
-            logging.warning(f"Failed to calculate IoU metric: {e}")
-            return None
-
-    def _calculate_dice_metric(self, pred_logits, gt_masks):
-        """Calculate DICE metric similar to dice_loss in loss_fns.py"""
-        try:
-            # Ensure inputs have the same shape
-            if pred_logits.shape != gt_masks.shape:
-                logging.warning(f"Shape mismatch in DICE calculation: pred {pred_logits.shape} vs gt {gt_masks.shape}")
-                return None
-            
-            # Apply sigmoid to convert logits to probabilities
-            pred_probs = torch.sigmoid(pred_logits)
-            
-            # Flatten spatial dimensions for DICE calculation: [B, H, W, K] -> [B, H*W, K]
-            pred_flat = pred_probs.view(pred_probs.shape[0], -1, pred_probs.shape[-1])
-            gt_flat = gt_masks.view(gt_masks.shape[0], -1, gt_masks.shape[-1])
-            
-            # Calculate DICE coefficient
-            numerator = 2 * (pred_flat * gt_flat).sum(1)  # [B, K]
-            denominator = pred_flat.sum(1) + gt_flat.sum(1)  # [B, K]
-            
-            # DICE score (1 - DICE loss)
-            dice = (numerator + 1) / (denominator + 1)
-            
-            # Expand back to spatial dimensions
-            B, H, W, K = pred_logits.shape
-            dice_expanded = dice.unsqueeze(1).unsqueeze(1).expand(B, H, W, K)
-            
-            return dice_expanded
-            
-        except Exception as e:
-            logging.warning(f"Failed to calculate DICE metric: {e}")
-            return None
-
-    def _calculate_mask_accuracy(self, pred_logits, gt_masks):
-        """Calculate pixel-wise mask accuracy"""
-        try:
-            # Ensure inputs have the same shape
-            if pred_logits.shape != gt_masks.shape:
-                logging.warning(f"Shape mismatch in accuracy calculation: pred {pred_logits.shape} vs gt {gt_masks.shape}")
-                return None
-            
-            # Apply sigmoid and threshold
-            pred_probs = torch.sigmoid(pred_logits)
-            pred_binary = pred_probs > 0.5
-            gt_binary = gt_masks > 0.5
-            
-            # Calculate pixel-wise accuracy
-            correct = (pred_binary == gt_binary).float()
-            
-            return correct
-            
-        except Exception as e:
-            logging.warning(f"Failed to calculate mask accuracy: {e}")
-            return None
-
-    def _plot_metric_uncertainty_correlation(self, ax, uncertainty, metric, title, xlabel, ylabel, step_index):
-        """Plot correlation between uncertainty and a metric"""
-        try:
-            # Subsample for performance if too many points
-            if len(uncertainty) > 10000:
-                indices = np.random.choice(len(uncertainty), 10000, replace=False)
-                uncertainty = uncertainty[indices]
-                metric = metric[indices]
-            
-            # Create scatter plot with alpha for density
-            ax.scatter(uncertainty, metric, alpha=0.6, s=1, c=metric, cmap='viridis')
-            
-            # Calculate and plot correlation coefficient
-            if len(uncertainty) > 1 and len(metric) > 1:
-                correlation = np.corrcoef(uncertainty, metric)[0, 1]
-                if not np.isnan(correlation):
-                    ax.text(0.05, 0.95, f'Corr: {correlation:.3f}', 
-                           transform=ax.transAxes, bbox=dict(boxstyle="round", facecolor='white', alpha=0.8))
-            
-            # Add trend line
-            try:
-                z = np.polyfit(uncertainty, metric, 1)
-                p = np.poly1d(z)
-                x_trend = np.linspace(uncertainty.min(), uncertainty.max(), 100)
-                ax.plot(x_trend, p(x_trend), "r--", alpha=0.8, linewidth=1)
-            except:
-                pass
-            
-            ax.set_xlabel(xlabel)
-            ax.set_ylabel(ylabel)
-            ax.set_title(f'{title} (Step {step_index})')
-            ax.grid(True, alpha=0.3)
-            
-            # Add basic statistics
-            stats_text = f'Mean: {metric.mean():.3f}\nStd: {metric.std():.3f}'
-            ax.text(0.05, 0.05, stats_text, transform=ax.transAxes, 
-                   bbox=dict(boxstyle="round", facecolor='white', alpha=0.8), fontsize=8)
-            
-        except Exception as e:
-            logging.warning(f"Failed to plot {title}: {e}")
-            ax.text(0.5, 0.5, f'{title}\nPlot Failed', 
-                   ha='center', va='center', transform=ax.transAxes)
-            ax.set_title(f'{title} (Error)')
 
 def print_model_summary(model: torch.nn.Module, log_dir: str = ""):
     """

@@ -213,6 +213,7 @@ class MultiStepMultiMasksAndIous(nn.Module):
                 losses, src_masks, target_masks, ious, num_objects, object_score_logits
             )
         losses[CORE_LOSS_KEY] = self.reduce_loss(losses)
+        losses["sam_core_loss"] = losses[CORE_LOSS_KEY]
         return losses
 
     def _update_losses(

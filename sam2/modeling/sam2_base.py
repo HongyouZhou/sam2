@@ -883,15 +883,29 @@ class SAM2Base(torch.nn.Module):
             prev_sam_mask_logits,
         )
 
-        (
-            _,
-            _,
-            _,
-            low_res_masks,
-            high_res_masks,
-            obj_ptr,
-            object_score_logits,
-        ) = sam_outputs
+        if self.use_bndl_for_pixels:
+            (
+                _,
+                _,
+                _,
+                low_res_masks,
+                high_res_masks,
+                obj_ptr,
+                object_score_logits,
+                bndl_outputs,
+            ) = sam_outputs
+            # Optionally expose BNDL outputs for downstream consumers
+            current_out["bndl_outputs"] = bndl_outputs
+        else:
+            (
+                _,
+                _,
+                _,
+                low_res_masks,
+                high_res_masks,
+                obj_ptr,
+                object_score_logits,
+            ) = sam_outputs
 
         current_out["pred_masks"] = low_res_masks
         current_out["pred_masks_high_res"] = high_res_masks

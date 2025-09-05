@@ -27,9 +27,9 @@ class CombinedSAMBNDLLoss(nn.Module):
         # add sam loss (add prefix to distinguish)
         for k, v in sam_losses.items():
             if k == CORE_LOSS_KEY:
-                combined_losses["core_loss"] = v * self.sam_weight
+                combined_losses["sam_core_loss"] = v * self.sam_weight
             else:
-                combined_losses[f"{k}"] = v
+                combined_losses[f"sam_{k}"] = v
 
         # add bndl loss (add prefix to distinguish)
         for k, v in bndl_losses.items():
@@ -39,6 +39,6 @@ class CombinedSAMBNDLLoss(nn.Module):
                 combined_losses[f"bndl_{k}"] = v
 
         # compute total core loss
-        combined_losses[CORE_LOSS_KEY] = combined_losses["core_loss"] + combined_losses["bndl_core_loss"]
+        combined_losses[CORE_LOSS_KEY] = combined_losses["sam_core_loss"] + combined_losses["bndl_core_loss"]
 
         return combined_losses

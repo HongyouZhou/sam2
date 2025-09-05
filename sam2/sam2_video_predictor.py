@@ -800,7 +800,38 @@ class SAM2VideoPredictor(SAM2Base):
             "obj_ptr": obj_ptr,
             "object_score_logits": object_score_logits,
         }
+        # Preserve BNDL outputs for downstream visualization if available
+        if "bndl_outputs" in current_out and current_out["bndl_outputs"] is not None:
+            compact_current_out["bndl_outputs"] = current_out["bndl_outputs"]
         return compact_current_out, pred_masks_gpu
+
+    @torch.inference_mode()
+    def get_bndl_outputs(self, inference_state, frame_idx, obj_idx=0):
+        """Return BNDL outputs stored for a given frame/object, if available.
+
+        This enables visualization scripts to fetch BNDL statistics produced during inference.
+        """
+        try:
+            obj_output_dict = inference_state["output_dict_per_obj"].get(obj_idx, None)
+            if obj_output_dict is None:
+                return None
+            # Prefer conditioning outputs if present, otherwise fall back to non-conditioning
+            out = obj_output_dict["cond_frame_outputs"].get(frame_idx)
+            if out is None:
+                out = obj_output_dict["non_cond_frame_outputs"].get(frame_idx)
+            if out is None:
+                return None
+            # New inference path stores under 'bndl_outputs'; training path may use 'multistep_bndl_outputs'
+            if "bndl_outputs" in out and out["bndl_outputs"] is not None:
+                return out["bndl_outputs"]
+            if "multistep_bndl_outputs" in out and out["multistep_bndl_outputs"]:
+                # take the last valid step
+                for bndl_out in reversed(out["multistep_bndl_outputs"]):
+                    if bndl_out is not None:
+                        return bndl_out
+            return None
+        except Exception:
+            return None
 
     def _run_memory_encoder(
         self,
