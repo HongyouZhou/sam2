@@ -10,8 +10,8 @@ import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 
-from metric_calculator import MetricCalculator
-from visualization_utils import VisualizationUtils
+from .metric_calculator import MetricCalculator
+from .visualization_utils import VisualizationUtils
 
 
 class BNDLVisualizer:

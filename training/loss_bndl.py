@@ -174,20 +174,32 @@ class BNDLLoss(nn.Module):
         KL_x, part1_x, part2_x, part3_x = kl_term(bndl_outputs["wei_lambda"], bndl_outputs["inv_k"], "pixel")
 
         # Prompt-level KL散度 (Global sparsity via hyper_in)
-        KL_w, part1_w, part2_w, part3_w = 0.0, 0.0, 0.0, 0.0
-        if (self.use_global_w_kl and 
-            bndl_outputs.get("wei_lambda_w") is not None and 
-            bndl_outputs.get("inv_k_w") is not None):
-            KL_w, part1_w, part2_w, part3_w = kl_term(bndl_outputs["wei_lambda_w"], bndl_outputs["inv_k_w"], "prompt_hyper_in")
+        # Initialize prompt-level terms as tensors on the right device
+        dev = bndl_outputs["wei_lambda"].device
+        KL_w = torch.tensor(0.0, device=dev)
+        part1_w = torch.tensor(0.0, device=dev)
+        part2_w = torch.tensor(0.0, device=dev)
+        part3_w = torch.tensor(0.0, device=dev)
+
+        has_prompt_terms = (
+            self.use_global_w_kl
+            and bndl_outputs.get("wei_lambda_w") is not None
+            and bndl_outputs.get("inv_k_w") is not None
+        )
+        if has_prompt_terms:
+            KL_w, part1_w, part2_w, part3_w = kl_term(
+                bndl_outputs["wei_lambda_w"], bndl_outputs["inv_k_w"], "prompt_hyper_in"
+            )
 
         # 像素KL保持主导地位，prompt KL作为辅助正则化
         pixel_kl_weight = self.kl_weight
-        prompt_kl_weight = self.kl_weight * 0.05 if KL_w != 0 else 0  # 增加到0.05，但仍保持适中
+        # 增加到0.05，但仍保持适中；无 prompt 项时为 0
+        prompt_kl_weight = self.kl_weight * 0.05 if has_prompt_terms else 0.0
         
         # 添加自适应权重调整
-        if KL_w != 0:
+        if has_prompt_terms:
             # 如果prompt KL过大，降低其权重
-            kl_ratio = KL_w.abs() / (KL_x.abs() + 1e-8)
+            kl_ratio = (KL_w.abs() / (KL_x.abs() + 1e-8)).item()
             if kl_ratio > 10.0:  # 如果prompt KL比pixel KL大10倍以上
                 prompt_kl_weight = prompt_kl_weight * 0.1  # 进一步降低权重
         

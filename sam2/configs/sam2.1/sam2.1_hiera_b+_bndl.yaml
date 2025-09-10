@@ -119,5 +119,5 @@ model:
   use_bndl_for_pixels: true
   bndl_fuse_type: none
   bndl_replace_global_with_hyper: true
-  bndl_hyper_in_sparse: true
+  bndl_hyper_in_sparse: false 
   

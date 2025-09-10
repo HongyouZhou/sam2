@@ -9,7 +9,7 @@ scratch:
   base_lr: 5.0e-6
   vision_lr: 3.0e-06
   phases_per_epoch: 1
-  num_epochs: 100
+  num_epochs: 50
 
 dataset:
   # PATHS to Dataset
@@ -312,28 +312,51 @@ trainer:
           - pattern: '*pos_embed*'
             value: 1.0
 
+    # options:
+    #   lr:
+    #     - scheduler:
+    #         _target_: fvcore.common.param_scheduler.CosineParamScheduler
+    #         start_value: ${scratch.base_lr}
+    #         end_value: ${divide:${scratch.base_lr},10}
+    #     - scheduler:
+    #         _target_: fvcore.common.param_scheduler.CosineParamScheduler
+    #         start_value: ${scratch.vision_lr}
+    #         end_value: ${divide:${scratch.vision_lr},10}
+    #       param_names:
+    #         - 'image_encoder.*'
+    #   weight_decay:
+    #     - scheduler:
+    #         _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+    #         value: 0.1
+    #     - scheduler:
+    #         _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+    #         value: 0.0
+    #       param_names:
+    #         - '*bias*'
+    #       module_cls_names: ['torch.nn.LayerNorm']
     options:
       lr:
         - scheduler:
             _target_: fvcore.common.param_scheduler.CosineParamScheduler
-            start_value: ${scratch.base_lr}
-            end_value: ${divide:${scratch.base_lr},10}
+            start_value: 1.0e-6          # 通用/其余模块很小的LR
+            end_value: 1.0e-7
         - scheduler:
             _target_: fvcore.common.param_scheduler.CosineParamScheduler
-            start_value: ${scratch.vision_lr}
-            end_value: ${divide:${scratch.vision_lr},10}
+            start_value: 1.0e-7          # 骨干极小LR（基本冻结）
+            end_value: 1.0e-7
           param_names:
             - 'image_encoder.*'
+        - scheduler:
+            _target_: fvcore.common.param_scheduler.CosineParamScheduler
+            start_value: 1.0e-4          # 仅 BNDL 有较高LR
+            end_value: 5.0e-5
+          param_names:
+            - 'sam_mask_decoder.pixel_bndl.*'
+    # 可选：把 weight_decay 从 0.1 降到 0.01，更温和
       weight_decay:
         - scheduler:
             _target_: fvcore.common.param_scheduler.ConstantParamScheduler
-            value: 0.1
-        - scheduler:
-            _target_: fvcore.common.param_scheduler.ConstantParamScheduler
-            value: 0.0
-          param_names:
-            - '*bias*'
-          module_cls_names: ['torch.nn.LayerNorm']
+            value: 0.01
 
   loss:
     all:
@@ -365,7 +388,7 @@ trainer:
         _target_: training.loss_bndl.BNDLLoss
         kl_weight: 1e-4
       sam_weight: 1.0
-      bndl_weight: 1.0
+      bndl_weight: 0.5
     # val:
     #   _target_: training.loss_combined.CombinedSAMBNDLLoss
     #   sam_loss: ${trainer.loss.all.sam_loss}
@@ -394,12 +417,12 @@ trainer:
     log_dir: ${launcher.experiment_log_dir}/logs
     log_freq: 10
     log_scalar_frequency: 100
-    visualize_bndl: True
+    visualize_bndl: true
 
   # initialize from a SAM 2 checkpoint
   checkpoint:
     save_dir: ${launcher.experiment_log_dir}/checkpoints
-    save_freq: 0 # 0 only last checkpoint is saved.
+    save_freq: 5 # 0 only last checkpoint is saved.
     model_weight_initializer:
       _partial_: True
       _target_: training.utils.checkpoint_utils.load_state_dict_into_model
@@ -418,7 +441,7 @@ trainer:
 launcher:
   num_nodes: 1
   gpus_per_node: 8
-  experiment_log_dir: /home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_003_06 # Path to log directory, defaults to ./sam2_logs/${config_name}
+  experiment_log_dir: /home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_004_01 # Path to log directory, defaults to ./sam2_logs/${config_name}
 
 # SLURM args if running on a cluster
 submitit:

@@ -630,14 +630,33 @@ def inference_3_clicks(
                 )
 
                 cur_idx = obj_ids_after.index(obj_id)
-                pred_bool = (masks[cur_idx : cur_idx + 1] > score_thresh).cpu().numpy().astype(bool)[0, 0]
+                # Ensure masks have correct shape for indexing
+                if masks.dim() == 4:  # [B, C, H, W]
+                    mask_logits_2d = masks[cur_idx, 0]
+                elif masks.dim() == 3:  # [C, H, W]
+                    mask_logits_2d = masks[0]
+                else:
+                    print(f"Warning: Unexpected masks shape: {masks.shape}")
+                    mask_logits_2d = masks.squeeze()
+                # Align to GT resolution if needed
+                if tuple(mask_logits_2d.shape[-2:]) != gt_bool.shape:
+                    import torch.nn.functional as F
+                    h, w = gt_bool.shape
+                    mask_logits_2d = F.interpolate(
+                        mask_logits_2d.unsqueeze(0).unsqueeze(0),
+                        size=(h, w),
+                        mode="bilinear",
+                        align_corners=False,
+                    )[0, 0]
+                pred_bool = (mask_logits_2d > score_thresh).cpu().numpy().astype(bool)
+                
                 pt3_xy, lb3_i = sample_error_click(gt_bool, pred_bool)
 
                 predictor.add_new_points_or_box(
                     state,
                     frame_idx=0,
                     obj_id=obj_id,
-                    points=np.array(pt3_xy, dtype=np.float32),
+                    points=np.array([pt3_xy], dtype=np.float32),
                     labels=np.array([lb3_i], dtype=np.int32),
                     clear_old_points=False,
                 )
@@ -652,8 +671,24 @@ def inference_3_clicks(
 
         # Propagate through entire video
         video_segments = {}
-        for f_idx, out_obj_ids, out_logits in predictor.propagate_in_video(state):
-            seg = {oid: (out_logits[i] > score_thresh).cpu().numpy() for i, oid in enumerate(out_obj_ids)}
+        for f_idx, out_obj_ids, out_logits in predictor.propagate_in_video(state, start_frame_idx=0, max_frame_num_to_track=0):
+            # Resize outputs to original image size if needed
+            seg = {}
+            for i, oid in enumerate(out_obj_ids):
+                mask_logits = out_logits[i]
+                # Ensure 2D spatial logits [H, W]
+                if mask_logits.ndim == 3:
+                    mask_logits = mask_logits.squeeze(0)
+                # If logits are not at original resolution, upsample before thresholding
+                if tuple(mask_logits.shape[-2:]) != (H, W):
+                    import torch.nn.functional as F  # local import to avoid global dependency
+                    mask_logits = F.interpolate(
+                        mask_logits.unsqueeze(0).unsqueeze(0),  # [1,1,h,w]
+                        size=(H, W),
+                        mode="bilinear",
+                        align_corners=False,
+                    )[0, 0]
+                seg[oid] = (mask_logits > score_thresh).cpu().numpy()
             video_segments[f_idx] = seg
 
         # Save PNG masks
@@ -681,7 +716,7 @@ def run_single_dataset(
     dataset_name: str,
     predictor,
     output_path: Path,
-    split: str | None = None,
+    split: str | list[str] | None = None,
     score_thresh: float = 0.0,
     num_workers: int | None = None,
     video_subset: list[str] | None = None,
@@ -696,6 +731,12 @@ def run_single_dataset(
     config = DATASET_CONFIGS[dataset_name]
     if split is None:
         split = config["default_split"]
+    
+    # Handle both single split and multiple splits
+    if isinstance(split, list):
+        # If multiple splits, use the first one for now (can be extended later)
+        split = split[0]
+    
     # For type-checkers: split is now a string
     assert isinstance(split, str)
 
@@ -1019,6 +1060,12 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=None, help="Number of evaluation processes")
     p.add_argument("--output_path", default="./outputs/zs_04_09_sam", help="Root output directory")
 
+    # Multimask configuration for video predictor (safe via Hydra overrides)
+    p.add_argument("--enable_multimask", action="store_true", default=True, help="Enable multimask output with predicted-IoU selection on the interaction frame")
+    p.add_argument("--multimask_min_pts", type=int, default=1, help="Minimum number of points to trigger multimask (box counts as 2)")
+    p.add_argument("--multimask_max_pts", type=int, default=2, help="Maximum number of points to trigger multimask (box counts as 2)")
+    p.add_argument("--multimask_for_tracking", action="store_true", default=False, help="Also enable multimask during tracking frames (not just the first click)")
+
     # Visualization and subset options
     p.add_argument("--save_vis", action="store_true", default=True, help="Save visualizations")
     p.add_argument("--enhanced_vis", action="store_true", default=True, help="Generate enhanced multi-object visualizations")
@@ -1037,10 +1084,23 @@ def main():
 
     # Load SAM-2 predictor
     print("Loading SAM-2 checkpoint...")
+    hydra_overrides_extra = []
+    if args.enable_multimask:
+        hydra_overrides_extra += [
+            "++model.multimask_output_in_sam=true",
+            f"++model.multimask_min_pt_num={args.multimask_min_pts}",
+            f"++model.multimask_max_pt_num={args.multimask_max_pts}",
+        ]
+        if args.multimask_for_tracking:
+            hydra_overrides_extra += [
+                "++model.multimask_output_for_tracking=true",
+            ]
+
     predictor = build_sam2_video_predictor(
         config_file=args.sam2_cfg,
         ckpt_path=args.sam2_checkpoint,
         device=args.device,
+        hydra_overrides_extra=hydra_overrides_extra,
     )
     print("SAM-2 loaded successfully!")
 
@@ -1056,6 +1116,10 @@ def main():
                 config = DATASET_CONFIGS[dataset_name]
                 root = Path(config["root"])
                 split = config["default_split"]
+                
+                # Handle both single split and multiple splits
+                if isinstance(split, list):
+                    split = split[0]
 
                 if config["has_split_subdir"]:
                     jpeg_dir = root / split / "JPEGImages"

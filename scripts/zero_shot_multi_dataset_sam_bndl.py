@@ -4,7 +4,6 @@
 
 import argparse
 import json
-import random
 import shutil
 from pathlib import Path
 
@@ -13,8 +12,8 @@ import matplotlib
 import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image, ImageDraw, ImageFont
-from tqdm import tqdm
+from PIL import Image
+from typing import Any
 
 matplotlib.use("Agg")  # Use non-interactive backend to avoid Qt issues
 import logging
@@ -44,16 +43,11 @@ from training.utils.dataset_evaluator import DistributedDatasetEvaluator
 from sam2.build_sam import build_sam2_video_predictor
 
 # ----------  Click sampling ----------
-from sam2.modeling.sam2_utils import (
-    sample_one_point_from_error_center,
-)
 
-# ----------  Import refactored visualization modules ----------
+# ----------  Import refactored visualization modules (lazy import inside function) ----------
 import sys
 
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "training", "utils"))
-from visualization_utils import VisualizationUtils
-from bndl_visualizer import BNDLVisualizer
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -160,20 +154,16 @@ def extract_hyper_in_from_bndl_outputs(bndl_outputs, batch, mask_decoder):
         # Try to regenerate hyper_in by running the hypernetwork MLPs
         if hasattr(mask_decoder, "output_hypernetworks_mlps"):
             try:
-                device = next(mask_decoder.parameters()).device
-
                 # Check if we have stored mask_tokens_out in BNDL outputs
                 mask_tokens_out = bndl_outputs.get("mask_tokens_out")
 
                 if mask_tokens_out is not None:
                     logger.info("Using stored mask_tokens_out for hyper_in generation")
                     # Use the actual mask tokens from the forward pass
-                    batch_size = mask_tokens_out.shape[0]
                 else:
                     logger.info("Using mask token embeddings as fallback for hyper_in generation")
                     # Fallback: use the mask token embeddings
                     mask_tokens_out = mask_decoder.mask_tokens.weight.unsqueeze(0).expand(b, -1, -1)  # [B, K, C]
-                    batch_size = b
 
                 # Generate hyper_in using the hypernetwork MLPs
                 hyper_in_list = []
@@ -396,51 +386,47 @@ def log_bndl_statistics(bndl_outputs, step, phase, dataset_name, statistics_dict
     """Log BNDL statistics including pixel-level uncertainty and PAvPU"""
     if bndl_outputs is None:
         return statistics_dict or {}
-    
+
     if statistics_dict is None:
         statistics_dict = {}
-    
+
     # Pixel-level parameters (lambda and k)
-    if ('wei_lambda' in bndl_outputs and 'inv_k' in bndl_outputs and 
-        bndl_outputs['wei_lambda'] is not None and bndl_outputs['inv_k'] is not None):
-        lambda_mean = bndl_outputs['wei_lambda'].mean().detach().cpu().item()
-        k_mean = (1. / (bndl_outputs['inv_k'] + 1e-6)).mean().detach().cpu().item()
-        
+    if "wei_lambda" in bndl_outputs and "inv_k" in bndl_outputs and bndl_outputs["wei_lambda"] is not None and bndl_outputs["inv_k"] is not None:
+        lambda_mean = bndl_outputs["wei_lambda"].mean().detach().cpu().item()
+        k_mean = (1.0 / (bndl_outputs["inv_k"] + 1e-6)).mean().detach().cpu().item()
+
         key_prefix = f"{dataset_name}_{phase}"
         statistics_dict[f"{key_prefix}_lambda_pixel"] = lambda_mean
         statistics_dict[f"{key_prefix}_k_pixel"] = k_mean
-        
+
         logger.info(f"BNDL Stats - {key_prefix}: lambda_pixel={lambda_mean:.4f}, k_pixel={k_mean:.4f}")
-        
+
         # Log pixel uncertainty if available
-        if 'pixel_uncertainty' in bndl_outputs and bndl_outputs['pixel_uncertainty'] is not None:
-            uncertainty_mean = bndl_outputs['pixel_uncertainty'].mean().detach().cpu().item()
+        if "pixel_uncertainty" in bndl_outputs and bndl_outputs["pixel_uncertainty"] is not None:
+            uncertainty_mean = bndl_outputs["pixel_uncertainty"].mean().detach().cpu().item()
             statistics_dict[f"{key_prefix}_pixel_uncertainty"] = uncertainty_mean
             logger.info(f"BNDL Stats - {key_prefix}: pixel_uncertainty={uncertainty_mean:.4f}")
-        
+
         # Log PAvPU scores if available
-        if 'pixel_pavpu' in bndl_outputs and bndl_outputs['pixel_pavpu'] is not None:
-            pavpu_scores = bndl_outputs['pixel_pavpu']
+        if "pixel_pavpu" in bndl_outputs and bndl_outputs["pixel_pavpu"] is not None:
+            pavpu_scores = bndl_outputs["pixel_pavpu"]
             for i, threshold in enumerate([0.01, 0.05, 0.1]):
                 if i < len(pavpu_scores):
-                    score = pavpu_scores[i].item() if hasattr(pavpu_scores[i], 'item') else pavpu_scores[i]
+                    score = pavpu_scores[i].item() if hasattr(pavpu_scores[i], "item") else pavpu_scores[i]
                     statistics_dict[f"{key_prefix}_pavpu_{threshold}"] = score
                     logger.info(f"BNDL Stats - {key_prefix}: pavpu_{threshold}={score:.4f}")
-    
+
     # Global w statistics (original BNDL)
-    if ('wei_lambda_w' in bndl_outputs and 
-        'inv_k_w' in bndl_outputs and
-        bndl_outputs['wei_lambda_w'] is not None and 
-        bndl_outputs['inv_k_w'] is not None):
-        lambda_w_mean = bndl_outputs['wei_lambda_w'].mean().detach().cpu().item()
-        k_w_mean = (1. / (bndl_outputs['inv_k_w'] + 1e-6)).mean().detach().cpu().item()
-        
+    if "wei_lambda_w" in bndl_outputs and "inv_k_w" in bndl_outputs and bndl_outputs["wei_lambda_w"] is not None and bndl_outputs["inv_k_w"] is not None:
+        lambda_w_mean = bndl_outputs["wei_lambda_w"].mean().detach().cpu().item()
+        k_w_mean = (1.0 / (bndl_outputs["inv_k_w"] + 1e-6)).mean().detach().cpu().item()
+
         key_prefix = f"{dataset_name}_{phase}"
         statistics_dict[f"{key_prefix}_lambda_w"] = lambda_w_mean
         statistics_dict[f"{key_prefix}_k_w"] = k_w_mean
-        
+
         logger.info(f"BNDL Stats - {key_prefix}: lambda_w={lambda_w_mean:.4f}, k_w={k_w_mean:.4f}")
-    
+
     return statistics_dict
 
 
@@ -565,9 +551,15 @@ def normalize_parameters_robust(lambda_img, k_img):
 def create_bndl_visualization_refactored(bndl_outputs, batch, outputs_for_vis, vis_dir, data_iter, step_index, frame_index, layout_type="full"):
     """Create comprehensive BNDL visualization using refactored modules"""
     try:
-        # Initialize refactored visualization modules
-        viz_utils = VisualizationUtils()
-        bndl_viz = BNDLVisualizer()
+        # Initialize refactored visualization modules via lazy import
+        try:
+            from visualization_utils import VisualizationUtils  # type: ignore
+            from bndl_visualizer import BNDLVisualizer  # type: ignore
+
+            viz_utils = VisualizationUtils()
+            bndl_viz = BNDLVisualizer()
+        except Exception:
+            return
 
         # Extract parameters and image
         lambda_img, k_img = extract_pixel_params(bndl_outputs)
@@ -603,17 +595,28 @@ def create_bndl_visualization_refactored(bndl_outputs, batch, outputs_for_vis, v
         logger.warning(f"Traceback: {traceback.format_exc()}")
 
 
-def plot_common_elements_refactored(axes, original_img, lambda_img, k_img, step_index, bndl_outputs, has_uncertainty=False, batch=None, outputs_for_vis=None, bndl_viz=None, viz_utils=None):
+def plot_common_elements_refactored(
+    axes, original_img, lambda_img, k_img, step_index, bndl_outputs, has_uncertainty=False, batch=None, outputs_for_vis=None, bndl_viz: Any = None, viz_utils: Any = None
+):
     """Plot common visualization elements using refactored modules"""
+    if viz_utils is None or bndl_viz is None:
+        return
     # First row: original image and parameter heatmaps
     viz_utils.plot_original_image(axes[0, 0], original_img)
-    viz_utils.plot_parameter_heatmap(axes[0, 1], lambda_img, f"Lambda (λ) Step {step_index}", "viridis")
+    viz_utils.plot_parameter_heatmap(axes[0, 1], lambda_img, f"Lambda (lambda) Step {step_index}", "viridis")
     viz_utils.plot_parameter_heatmap(axes[0, 2], k_img, f"Shape (k) Step {step_index}", "plasma")
 
     # Second row: parameter overlays or distributions, including uncertainty overlays
     if original_img is not None and original_img.shape[:2] == lambda_img.shape:
         if has_uncertainty:
-            bndl_viz.plot_parameter_and_uncertainty_overlays(axes[1, :], original_img, lambda_img, k_img, bndl_outputs, step_index)
+            bndl_viz.plot_parameter_and_uncertainty_overlays(
+                axes[1, :],
+                original_img,
+                lambda_img,
+                k_img,
+                bndl_outputs,
+                step_index,
+            )
         else:
             viz_utils.plot_parameter_overlays(axes[1, :], original_img, lambda_img, k_img, step_index)
     else:
@@ -627,42 +630,8 @@ def plot_common_elements_refactored(axes, original_img, lambda_img, k_img, step_
         bndl_viz.plot_uncertainty_visualization(axes[3, :], bndl_outputs, step_index)
 
 
-def _sample_pos_neg(gt_mask: np.ndarray, dilate_iter: int = 5, full_mask: np.ndarray | None = None, current_obj_id: int | None = None):
-    """Sample positive and negative points from GT mask"""
-    # Positive point: random pixel inside GT
-    ys, xs = np.where(gt_mask)
-    assert len(xs) > 0, "GT mask is empty."
-    idx = random.randrange(len(xs))
-    pos_xy = (int(xs[idx]), int(ys[idx]))
-
-    # Negative point: background pixel near boundary
-    kernel = np.ones((3, 3), np.uint8)
-    dilated = cv2.dilate(gt_mask.astype(np.uint8), kernel, iterations=dilate_iter) > 0
-    ring = np.logical_and(dilated, ~gt_mask)
-    ys_n, xs_n = np.where(ring)
-    if len(xs_n) == 0:  # fallback to any background
-        ys_n, xs_n = np.where(~gt_mask)
-    
-    # Handle case where object covers entire image (no background pixels)
-    if len(xs_n) == 0:
-        if full_mask is not None and current_obj_id is not None:
-            # Try to sample negative point from other objects
-            other_objects_mask = (full_mask > 0) & (full_mask != current_obj_id)
-            if np.any(other_objects_mask):
-                ys_other, xs_other = np.where(other_objects_mask)
-                idx_other = random.randrange(len(xs_other))
-                neg_xy = (int(xs_other[idx_other]), int(ys_other[idx_other]))
-                return pos_xy, neg_xy
-        
-        return pos_xy, None  # Return None for negative point when no background exists
-    
-    idx_n = random.randrange(len(xs_n))
-    neg_xy = (int(xs_n[idx_n]), int(ys_n[idx_n]))
-    return pos_xy, neg_xy
-
-
 @torch.inference_mode()
-# Remove autocast to reduce memory usage for large images
+@torch.autocast(device_type="cuda", dtype=torch.bfloat16)
 def inference_3_clicks_with_bndl(
     predictor,
     jpeg_dir: Path,
@@ -693,18 +662,22 @@ def inference_3_clicks_with_bndl(
     # Create BNDL visualization directory
     if save_bndl_vis and vis_dir is not None:
         vis_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # Initialize statistics collection
     dataset_statistics = {} if collect_statistics else None
     total_frames_processed = 0
-    
+
     # Initialize dataset evaluator for correlation analysis like in SAM trainer
-    dataset_evaluator = DistributedDatasetEvaluator(
-        save_dir=str(vis_dir / "dataset_evaluation") if vis_dir else str(Path("./dataset_evaluation")),
-        distributed=False,  # Single process for zero-shot evaluation
-        rank=0,
-        world_size=1
-    ) if collect_statistics else None
+    dataset_evaluator = (
+        DistributedDatasetEvaluator(
+            save_dir=str(vis_dir / "dataset_evaluation") if vis_dir else str(Path("./dataset_evaluation")),
+            distributed=False,  # Single process for zero-shot evaluation
+            rank=0,
+            world_size=1,
+        )
+        if collect_statistics
+        else None
+    )
 
     for v_idx, vid in enumerate(video_names, 1):
         print(f"[{v_idx:03}/{len(video_names)}] {vid}")
@@ -714,15 +687,6 @@ def inference_3_clicks_with_bndl(
         # Initialize predictor state
         state = predictor.init_state(str(video_dir))
         H, W = state["video_height"], state["video_width"]
-        
-        # Memory optimization: reduce processing resolution for very large images
-        max_size = 512 if dataset_name == "Hypersim" else 1024  # Smaller max size for Hypersim
-        if max(H, W) > max_size:
-            scale_factor = max_size / max(H, W)
-            new_H, new_W = int(H * scale_factor), int(W * scale_factor)
-            print(f"Large image detected ({H}x{W}), processing at reduced resolution ({new_H}x{new_W})")
-            # Note: The actual resizing would need to be implemented in the predictor
-            # For now, we'll add more aggressive memory management
 
         # Read first frame GT to determine object IDs
         first_mask_path = ann_dir / vid / f"{frame_names[0]}.png"
@@ -737,20 +701,14 @@ def inference_3_clicks_with_bndl(
             print(f"Warning: No objects found in first frame of video {vid}")
             continue
 
-        # Apply more aggressive object limit for memory management
-        # Reduce max objects for large datasets like CITYSCAPES and Hypersim
+        # Apply object limit if specified (select largest areas)
         effective_max_objects = max_objects
-        if dataset_name in ["CITYSCAPES", "Hypersim"] and max_objects is None:
-            effective_max_objects = 3  # Limit memory-intensive datasets to 3 objects max
-        elif dataset_name in ["CITYSCAPES", "Hypersim"] and max_objects is not None:
-            effective_max_objects = min(max_objects, 3)
-        
         if effective_max_objects and len(all_obj_ids) > effective_max_objects:
             # Select objects with largest areas for more meaningful evaluation
             obj_areas = {}
             for oid in all_obj_ids:
                 obj_areas[oid] = np.sum(first_mask == oid)
-            
+
             # Sort by area and take top N objects
             sorted_objs = sorted(obj_areas.items(), key=lambda x: x[1], reverse=True)
             obj_ids = [oid for oid, _ in sorted_objs[:effective_max_objects]]
@@ -773,7 +731,6 @@ def inference_3_clicks_with_bndl(
             # Clear GPU memory before processing each object to prevent OOM
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-                torch.cuda.synchronize()
 
             if prompt_method == "gt_box":
                 # Use tight GT bounding box as prompt
@@ -821,16 +778,33 @@ def inference_3_clicks_with_bndl(
                 )
 
                 cur_idx = obj_ids_after.index(obj_id)
-                pred_bool = (masks[cur_idx : cur_idx + 1] > score_thresh).cpu().numpy().astype(bool)[0, 0]
-                gt_t = torch.from_numpy(gt_bool[None, None]).bool()
-                pred_t = torch.from_numpy(pred_bool[None, None]).bool()
-                pt3_xy, lb3_i = sample_error_click(gt_t, pred_t)
+                # Ensure mask shape matches GT for error-click sampling
+                mask_logits = masks[cur_idx : cur_idx + 1]
+                if mask_logits.dim() == 4:
+                    # [B, C, H', W'] -> take first channel
+                    mask_logits_2d = mask_logits[0, 0]
+                elif mask_logits.dim() == 3:
+                    # [C, H', W'] or [B, H', W'] -> squeeze leading
+                    mask_logits_2d = mask_logits.squeeze(0)
+                else:
+                    mask_logits_2d = mask_logits
+                if tuple(mask_logits_2d.shape[-2:]) != gt_bool.shape:
+                    import torch.nn.functional as F
+                    h, w = gt_bool.shape
+                    mask_logits_2d = F.interpolate(
+                        mask_logits_2d.unsqueeze(0).unsqueeze(0),
+                        size=(h, w),
+                        mode="bilinear",
+                        align_corners=False,
+                    )[0, 0]
+                pred_bool = (mask_logits_2d > score_thresh).cpu().numpy().astype(bool)
+                pt3_xy, lb3_i = sample_error_click(gt_bool, pred_bool)
 
                 predictor.add_new_points_or_box(
                     state,
                     frame_idx=0,
                     obj_id=obj_id,
-                    points=np.array(pt3_xy, dtype=np.float32),
+                    points=np.array([pt3_xy], dtype=np.float32),
                     labels=np.array([lb3_i], dtype=np.int32),
                     clear_old_points=False,
                 )
@@ -847,92 +821,85 @@ def inference_3_clicks_with_bndl(
         video_segments = {}
         bndl_vis_count = 0
         video_statistics = {} if collect_statistics else None
-        
-        for f_idx, out_obj_ids, out_logits in predictor.propagate_in_video(state):
-            seg = {oid: (out_logits[i] > score_thresh).cpu().numpy() for i, oid in enumerate(out_obj_ids)}
+
+        for f_idx, out_obj_ids, out_logits in predictor.propagate_in_video(state, start_frame_idx=0, max_frame_num_to_track=0):
+            seg = {}
+            for i, oid in enumerate(out_obj_ids):
+                mask_logits = out_logits[i]
+                if mask_logits.ndim == 3:
+                    mask_logits = mask_logits.squeeze(0)
+                if tuple(mask_logits.shape[-2:]) != (H, W):
+                    import torch.nn.functional as F
+                    mask_logits = F.interpolate(
+                        mask_logits.unsqueeze(0).unsqueeze(0),
+                        size=(H, W),
+                        mode="bilinear",
+                        align_corners=False,
+                    )[0, 0]
+                seg[oid] = (mask_logits > score_thresh).cpu().numpy()
             video_segments[f_idx] = seg
-            
+
             # Collect BNDL statistics if enabled (with memory optimization)
             if collect_statistics:
-                try:
-                    # Clear memory before statistics collection
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    
-                    # Extract BNDL outputs from predictor state for each object
-                    if hasattr(predictor, "get_bndl_outputs") and out_obj_ids:
-                        # Process objects in smaller batches for memory efficiency
-                        # Reduce to first 2 objects for Hypersim, 3 for others
-                        max_obj_stats = 2 if dataset_name == "Hypersim" else 3
-                        for obj_idx, obj_id in enumerate(out_obj_ids[:max_obj_stats]):
-                            try:
-                                bndl_outputs = predictor.get_bndl_outputs(state, f_idx, obj_idx)
-                                if bndl_outputs is not None:
-                                    # Calculate PAvPU if we have ground truth
-                                    first_mask_path = ann_dir / vid / f"{frame_names[f_idx]}.png"
-                                    if first_mask_path.exists():
-                                        gt_mask = np.array(Image.open(first_mask_path))
-                                        # Convert to tensor format for PAvPU calculation and move to same device as BNDL outputs
-                                        gt_tensor = torch.from_numpy(gt_mask).float().unsqueeze(0)  # [1, H, W]
-                                        # Move to the same device as BNDL outputs
-                                        if 'pixel_logits_raw' in bndl_outputs:
-                                            gt_tensor = gt_tensor.to(bndl_outputs['pixel_logits_raw'].device)
-                                        elif 'wei_lambda' in bndl_outputs:
-                                            gt_tensor = gt_tensor.to(bndl_outputs['wei_lambda'].device)
-                                        bndl_outputs = calculate_pavpu_for_bndl(bndl_outputs, None, gt_tensor, "eval", predictor)
-                                        
-                                        # Clean up ground truth tensor immediately
-                                        del gt_tensor, gt_mask
-                                    
-                                    # Log statistics
-                                    video_statistics = log_bndl_statistics(
-                                        bndl_outputs, 
-                                        f_idx, 
-                                        "eval", 
-                                        f"{dataset_name}_{vid}_obj{obj_id}", 
-                                        video_statistics
-                                    )
-                                    total_frames_processed += 1
-                                    
-                                    # Skip dataset evaluator for Hypersim to save memory
-                                    if dataset_evaluator and 'pixel_uncertainty' in bndl_outputs and dataset_name != "Hypersim":
-                                        try:
-                                            # Get predictions from current frame
-                                            pred_logits = out_logits[obj_idx] if obj_idx < len(out_logits) else None
-                                            # Get current frame mask path (not just first frame)
-                                            current_mask_path = ann_dir / vid / f"{frame_names[f_idx]}.png"
-                                            if pred_logits is not None and current_mask_path.exists():
-                                                # Load current frame ground truth
-                                                current_gt_mask = np.array(Image.open(current_mask_path))
-                                                current_gt_tensor = torch.from_numpy(current_gt_mask).float().unsqueeze(0)
-                                                if 'pixel_logits_raw' in bndl_outputs:
-                                                    current_gt_tensor = current_gt_tensor.to(bndl_outputs['pixel_logits_raw'].device)
-                                                elif 'wei_lambda' in bndl_outputs:
-                                                    current_gt_tensor = current_gt_tensor.to(bndl_outputs['wei_lambda'].device)
-                                                
-                                                dataset_evaluator.add_batch_data(
-                                                    uncertainty=bndl_outputs['pixel_uncertainty'],
-                                                    pred_logits=pred_logits.unsqueeze(0),  # Add batch dimension
-                                                    gt_masks=current_gt_tensor
-                                                )
-                                                logger.info(f"Added frame {f_idx} obj {obj_id} to dataset evaluator")
-                                                
-                                                # Clean up immediately after adding to evaluator
-                                                del current_gt_mask, current_gt_tensor
-                                        except Exception as e:
-                                            logger.warning(f"Failed to add frame {f_idx} obj {obj_id} to dataset evaluator: {e}")
-                                    
-                                    # Clean up bndl_outputs after processing
-                                    del bndl_outputs
-                                    
-                            except Exception as e:
-                                logger.warning(f"Failed to process BNDL outputs for obj {obj_idx}: {e}")
-                            
-                            # Clear cache after each object for all datasets
-                            if torch.cuda.is_available():
-                                torch.cuda.empty_cache()
-                except Exception as e:
-                    logger.warning(f"Failed to collect BNDL statistics for video {vid}, frame {f_idx}: {e}")
+                max_obj_stats = 2 if dataset_name == "Hypersim" else 3
+                for obj_idx, obj_id in enumerate(out_obj_ids[:max_obj_stats]):
+                    try:
+                        bndl_outputs = predictor.get_bndl_outputs(state, f_idx, obj_idx)
+                        if bndl_outputs is not None:
+                            # Calculate PAvPU if we have ground truth
+                            first_mask_path = ann_dir / vid / f"{frame_names[f_idx]}.png"
+                            if first_mask_path.exists():
+                                gt_mask = np.array(Image.open(first_mask_path))
+                                # Convert to tensor format for PAvPU calculation and move to same device as BNDL outputs
+                                gt_tensor = torch.from_numpy(gt_mask).float().unsqueeze(0)  # [1, H, W]
+                                # Move to the same device as BNDL outputs
+                                if "pixel_logits_raw" in bndl_outputs:
+                                    gt_tensor = gt_tensor.to(bndl_outputs["pixel_logits_raw"].device)
+                                elif "wei_lambda" in bndl_outputs:
+                                    gt_tensor = gt_tensor.to(bndl_outputs["wei_lambda"].device)
+                                bndl_outputs = calculate_pavpu_for_bndl(bndl_outputs, None, gt_tensor, "eval", predictor)
+
+                                # Clean up ground truth tensor immediately
+                                del gt_tensor, gt_mask
+
+                            # Log statistics
+                            video_statistics = log_bndl_statistics(bndl_outputs, f_idx, "eval", f"{dataset_name}_{vid}_obj{obj_id}", video_statistics)
+                            total_frames_processed += 1
+
+                            # Skip dataset evaluator for Hypersim to save memory
+                            if dataset_evaluator and "pixel_uncertainty" in bndl_outputs and dataset_name != "Hypersim":
+                                try:
+                                    # Get predictions from current frame
+                                    pred_logits = out_logits[obj_idx] if obj_idx < len(out_logits) else None
+                                    # Get current frame mask path (not just first frame)
+                                    current_mask_path = ann_dir / vid / f"{frame_names[f_idx]}.png"
+                                    if pred_logits is not None and current_mask_path.exists():
+                                        # Load current frame ground truth
+                                        current_gt_mask = np.array(Image.open(current_mask_path))
+                                        current_gt_tensor = torch.from_numpy(current_gt_mask).float().unsqueeze(0)
+                                        if "pixel_logits_raw" in bndl_outputs:
+                                            current_gt_tensor = current_gt_tensor.to(bndl_outputs["pixel_logits_raw"].device)
+                                        elif "wei_lambda" in bndl_outputs:
+                                            current_gt_tensor = current_gt_tensor.to(bndl_outputs["wei_lambda"].device)
+
+                                        dataset_evaluator.add_batch_data(
+                                            uncertainty=bndl_outputs["pixel_uncertainty"],
+                                            pred_logits=pred_logits.unsqueeze(0),  # Add batch dimension
+                                            gt_masks=current_gt_tensor,
+                                        )
+                                        logger.info(f"Added frame {f_idx} obj {obj_id} to dataset evaluator")
+
+                                        # Clean up immediately after adding to evaluator
+                                        del current_gt_mask, current_gt_tensor
+                                except Exception as e:
+                                    logger.warning(f"Failed to add frame {f_idx} obj {obj_id} to dataset evaluator: {e}")
+
+                            # Clean up bndl_outputs after processing
+                            del bndl_outputs
+
+                    except Exception as e:
+                        logger.warning(f"Failed to process BNDL outputs for obj {obj_idx}: {e}")
+
 
             # Generate BNDL visualizations for selected frames (reduced for memory)
             if save_bndl_vis and vis_dir is not None and bndl_vis_count < 2:  # Limit to 2 visualizations per video
@@ -941,12 +908,26 @@ def inference_3_clicks_with_bndl(
                     # This requires accessing the internal state or outputs
                     # For now, we'll create a mock batch for visualization
                     if hasattr(predictor, "get_bndl_outputs") and out_obj_ids:
-                        # Use the first object for visualization with memory cleanup
-                        if torch.cuda.is_available():
-                            torch.cuda.empty_cache()
-                        
+                        # Use the first object for visualization
+
                         bndl_outputs = predictor.get_bndl_outputs(state, f_idx, 0)
                         if bndl_outputs is not None:
+                            # Calculate PAvPU for visualization (same as in statistics collection)
+                            current_mask_path = ann_dir / vid / f"{frame_names[f_idx]}.png"
+                            if current_mask_path.exists():
+                                gt_mask = np.array(Image.open(current_mask_path))
+                                # Convert to tensor format for PAvPU calculation and move to same device as BNDL outputs
+                                gt_tensor = torch.from_numpy(gt_mask).float().unsqueeze(0)  # [1, H, W]
+                                # Move to the same device as BNDL outputs
+                                if "pixel_logits_raw" in bndl_outputs:
+                                    gt_tensor = gt_tensor.to(bndl_outputs["pixel_logits_raw"].device)
+                                elif "wei_lambda" in bndl_outputs:
+                                    gt_tensor = gt_tensor.to(bndl_outputs["wei_lambda"].device)
+                                bndl_outputs = calculate_pavpu_for_bndl(bndl_outputs, None, gt_tensor, "eval", predictor)
+                                
+                                # Clean up ground truth tensor immediately
+                                del gt_tensor, gt_mask
+                            
                             # Create visualization
                             vis_path = vis_dir / vid
                             vis_path.mkdir(parents=True, exist_ok=True)
@@ -990,22 +971,15 @@ def inference_3_clicks_with_bndl(
                             bndl_vis_count += 1
                 except Exception as e:
                     logger.warning(f"Failed to create BNDL visualization for frame {f_idx}: {e}")
-            
+
             # Clear output logits after all usage to free memory
             del out_logits
-            
-            # Clean up memory after processing each frame
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            
-            # For very large videos, clean up old frame data to prevent accumulation
-            if f_idx > 10 and f_idx % 5 == 0 and torch.cuda.is_available():  # Every 5 frames after frame 10
-                torch.cuda.synchronize()
-                import gc
-                gc.collect()
 
-        # Save PNG masks and clear video_segments periodically to prevent memory buildup
-        processed_frames = []
+            # Clean up memory after processing each frame (removed to match original flow)
+
+            # Removed extra periodic GPU sync/GC to match original flow
+
+        # Save PNG masks
         for f_idx in list(video_segments.keys()):
             seg = video_segments[f_idx]
             save_masks_to_dir(
@@ -1018,19 +992,7 @@ def inference_3_clicks_with_bndl(
                 per_obj_png_file=False,
                 output_palette=DAVIS_PALETTE,
             )
-            processed_frames.append(f_idx)
-            
-            # Clear processed frames from memory every 20 frames
-            if len(processed_frames) >= 20:
-                # Create a copy of processed_frames to avoid modifying list during iteration
-                frames_to_clear = processed_frames.copy()
-                for pf_idx in frames_to_clear:
-                    if pf_idx in video_segments:
-                        del video_segments[pf_idx]
-                processed_frames.clear()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-        
+
         # Clear any remaining frames
         video_segments.clear()
 
@@ -1038,56 +1000,50 @@ def inference_3_clicks_with_bndl(
         (out_dir / vid).mkdir(parents=True, exist_ok=True)
         with open(out_dir / vid / "query_points.json", "w") as f:
             json.dump({int(k): v for k, v in obj_points.items()}, f, indent=2)
-        
+
         # Merge video statistics into dataset statistics
         if collect_statistics and video_statistics and dataset_statistics is not None:
             dataset_statistics.update(video_statistics)
             print(f"Collected BNDL statistics for video {vid}: {len(video_statistics)} metrics")
 
-        # Final cleanup after each video
+        # Final cleanup after each video (keep consistent with original)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-            # Force garbage collection
-            import gc
-            gc.collect()
-    
+
     # Generate dataset evaluation plots like in SAM trainer validation phase
     if collect_statistics and dataset_evaluator and len(dataset_evaluator) > 0:
         try:
             print(f"\nGenerating dataset correlation analysis for {dataset_name}...")
-            
+
             # Evaluate correlation like in SAM trainer
             correlation_results = dataset_evaluator.evaluate_dataset_correlation()
             logger.info(f"Correlation evaluation completed with {len(correlation_results)} metrics")
-            
-            # Create visualization like in SAM trainer  
+
+            # Create visualization like in SAM trainer
             dataset_evaluator.create_dataset_correlation_visualization(
-                title=f"{dataset_name} Zero-shot Analysis - Dataset Correlation",
-                save_name=f"{dataset_name.lower()}_zeroshot_dataset_analysis.png"
+                title=f"{dataset_name} Zero-shot Analysis - Dataset Correlation", save_name=f"{dataset_name.lower()}_zeroshot_dataset_analysis.png"
             )
-            
+
             # Save results like in SAM trainer
-            dataset_evaluator.save_correlation_results(
-                save_name=f"{dataset_name.lower()}_zeroshot_results.json"
-            )
-            
+            dataset_evaluator.save_correlation_results(save_name=f"{dataset_name.lower()}_zeroshot_results.json")
+
             print(f"Dataset evaluation plots saved for {dataset_name}")
             logger.info(f"Dataset evaluation completed for {dataset_name}")
-            
+
         except Exception as e:
             logger.warning(f"Dataset evaluation failed for {dataset_name}: {e}")
             import traceback
+
             logger.warning(f"Traceback: {traceback.format_exc()}")
     elif collect_statistics and dataset_evaluator:
         logger.warning(f"No data collected for dataset evaluation in {dataset_name} (collected: {len(dataset_evaluator) if dataset_evaluator else 0})")
-    
+
     # Print final statistics summary
     if collect_statistics and dataset_statistics:
         print(f"\nBNDL Statistics Summary for {dataset_name}:")
         print(f"Total frames processed: {total_frames_processed}")
         print(f"Total statistics collected: {len(dataset_statistics)}")
-        
+
         # Calculate average statistics
         avg_stats = {}
         # Create a copy of items to avoid "dictionary changed size during iteration" error
@@ -1097,7 +1053,7 @@ def inference_3_clicks_with_bndl(
                 avg_stats[key] = values
             elif isinstance(values, list) and len(values) > 0:
                 avg_stats[key] = sum(values) / len(values)
-        
+
         if avg_stats:
             print("Average BNDL Statistics:")
             for key, value in avg_stats.items():
@@ -1105,7 +1061,7 @@ def inference_3_clicks_with_bndl(
                     print(f"  {key}: {value:.4f}")
                 else:
                     print(f"  {key}: {value}")
-    
+
     return dataset_statistics if collect_statistics else None
 
 
@@ -1113,19 +1069,27 @@ def run_single_dataset_with_bndl(
     dataset_name: str,
     predictor,
     output_path: Path,
-    split: str | None = None,
+    split: str | list[str] | None = None,
     score_thresh: float = 0.0,
     num_workers: int | None = None,
     video_subset: list[str] | None = None,
     save_bndl_vis: bool = True,
     prompt_method: str = "gt_box",
     first_frame_only: bool = False,
+    max_objects: int | None = None,
+    collect_statistics: bool = False,
 ) -> tuple[float, float, float, dict]:
     """Run evaluation on a single dataset with BNDL UQ analysis and return metrics"""
 
     config = DATASET_CONFIGS[dataset_name]
     if split is None:
         split = config["default_split"]
+    
+    # Handle both single split and multiple splits
+    if isinstance(split, list):
+        # If multiple splits, use the first one for now (can be extended later)
+        split = split[0]
+    
     assert isinstance(split, str)
 
     root = Path(config["root"])
@@ -1181,8 +1145,9 @@ def run_single_dataset_with_bndl(
             save_bndl_vis=save_bndl_vis,
             vis_dir=bndl_vis_dir,
             dataset_name=dataset_name,
-            collect_statistics=True,
+            collect_statistics=collect_statistics,
             prompt_method=prompt_method,
+            max_objects=max_objects,
         )
     except Exception as e:
         print(f"Error during inference for {dataset_name}: {e}")
@@ -1267,6 +1232,27 @@ def run_single_dataset_with_bndl(
 
     except Exception as e:
         print(f"Error during evaluation of {dataset_name}: {e}")
+        
+        # Clean up temporary files even if evaluation failed
+        try:
+            if first_frame_only:
+                gt_tmp = output_path / f"{dataset_name.lower()}_tmp_gt_first"
+                pred_tmp = output_path / f"{dataset_name.lower()}_tmp_pred_first"
+            else:
+                gt_tmp = output_path / f"{dataset_name.lower()}_tmp_gt"
+                pred_tmp = output_path / f"{dataset_name.lower()}_tmp_pred"
+            
+            # Remove temporary directories if they exist
+            if gt_tmp.exists():
+                shutil.rmtree(gt_tmp)
+                print(f"Cleaned up temporary GT directory: {gt_tmp}")
+            if pred_tmp.exists():
+                shutil.rmtree(pred_tmp)
+                print(f"Cleaned up temporary prediction directory: {pred_tmp}")
+                
+        except Exception as cleanup_e:
+            print(f"Warning: Failed to clean up temporary files for {dataset_name}: {cleanup_e}")
+        
         return 0.0, 0.0, 0.0, {}
 
     eval_time = time.time() - eval_start_time
@@ -1276,7 +1262,7 @@ def run_single_dataset_with_bndl(
 
     if save_bndl_vis and bndl_vis_dir is not None:
         print(f"BNDL UQ visualizations saved to: {bndl_vis_dir}")
-    
+
     # Save BNDL statistics to file
     if dataset_statistics:
         stats_file = output_path / f"{dataset_name.lower()}_bndl_statistics.json"
@@ -1284,10 +1270,30 @@ def run_single_dataset_with_bndl(
             json.dump(dataset_statistics, f, indent=2)
         print(f"BNDL statistics saved to: {stats_file}")
 
+    # Clean up temporary files
+    try:
+        if first_frame_only:
+            gt_tmp = output_path / f"{dataset_name.lower()}_tmp_gt_first"
+            pred_tmp = output_path / f"{dataset_name.lower()}_tmp_pred_first"
+        else:
+            gt_tmp = output_path / f"{dataset_name.lower()}_tmp_gt"
+            pred_tmp = output_path / f"{dataset_name.lower()}_tmp_pred"
+        
+        # Remove temporary directories if they exist
+        if gt_tmp.exists():
+            shutil.rmtree(gt_tmp)
+            print(f"Cleaned up temporary GT directory: {gt_tmp}")
+        if pred_tmp.exists():
+            shutil.rmtree(pred_tmp)
+            print(f"Cleaned up temporary prediction directory: {pred_tmp}")
+            
+    except Exception as e:
+        print(f"Warning: Failed to clean up temporary files for {dataset_name}: {e}")
+
     return j_f_val, j_val, f_val, (dataset_statistics or {})
 
 
-def create_comparison_plots_with_bndl(results: dict[str, tuple[float, float, float]], output_path: Path, all_statistics: dict = None):
+def create_comparison_plots_with_bndl(results: dict[str, tuple[float, float, float]], output_path: Path, all_statistics: dict | None = None):
     """Create comparison plots for all datasets with BNDL UQ information and dataset correlation analysis"""
 
     # Prepare data for plotting
@@ -1447,28 +1453,23 @@ def parse_args():
     p.add_argument("--output_path", default="./outputs/zs_04_09_sam_bndl", help="Root output directory")
     p.add_argument("--first_frame_only", action="store_true", help="Evaluate only the first frame per video by copying only the first PNG")
 
+    # Multimask configuration for video predictor (safe via Hydra overrides)
+    p.add_argument("--enable_multimask", action="store_true", default=True, help="Enable multimask output with predicted-IoU selection on the interaction frame")
+    p.add_argument("--multimask_min_pts", type=int, default=1, help="Minimum number of points to trigger multimask (box counts as 2)")
+    p.add_argument("--multimask_max_pts", type=int, default=2, help="Maximum number of points to trigger multimask (box counts as 2)")
+    p.add_argument("--multimask_for_tracking", action="store_true", default=False, help="Also enable multimask during tracking frames (not just the first click)")
+
     # BNDL UQ visualization options
     p.add_argument("--save_bndl_vis", action="store_true", default=True, help="Generate BNDL UQ visualizations")
     p.add_argument("--video_limit", type=int, default=None, help="Limit number of videos per dataset (for quick testing)")
-    p.add_argument("--max_objects", type=int, default=5, help="Maximum number of objects to process per video (default: 5, reduced for memory optimization)")
-    p.add_argument("--enable_memory_optimization", action="store_true", default=True, help="Enable memory optimization features")
-    p.add_argument("--pytorch_cuda_alloc_conf", default="expandable_segments:True", help="PyTorch CUDA memory allocator configuration")
+    p.add_argument("--max_objects", type=int, default=20, help="Maximum number of objects to process per video (default: 20)")
+    p.add_argument("--collect_statistics", action="store_true", default=False, help="Collect BNDL statistics (uses extra GPU memory)")
 
     return p.parse_args()
 
 
 def main():
     args = parse_args()
-    
-    # Set PyTorch CUDA memory allocator configuration for better memory management
-    if args.enable_memory_optimization:
-        import os
-        os.environ["PYTORCH_CUDA_ALLOC_CONF"] = args.pytorch_cuda_alloc_conf
-        print(f"Set PYTORCH_CUDA_ALLOC_CONF={args.pytorch_cuda_alloc_conf}")
-        
-        # Set additional memory optimization environment variables
-        os.environ["CUDA_LAUNCH_BLOCKING"] = "1"  # For debugging CUDA OOM issues
-        print("Enabled memory optimization features")
 
     # Create output directory
     output_path = Path(args.output_path)
@@ -1476,18 +1477,25 @@ def main():
 
     # Load SAM-2 predictor
     print("Loading SAM-2 checkpoint...")
+    hydra_overrides_extra = []
+    if args.enable_multimask:
+        hydra_overrides_extra += [
+            "++model.multimask_output_in_sam=true",
+            f"++model.multimask_min_pt_num={args.multimask_min_pts}",
+            f"++model.multimask_max_pt_num={args.multimask_max_pts}",
+        ]
+        if args.multimask_for_tracking:
+            hydra_overrides_extra += [
+                "++model.multimask_output_for_tracking=true",
+            ]
+
     predictor = build_sam2_video_predictor(
         config_file=args.sam2_cfg,
         ckpt_path=args.sam2_checkpoint,
         device=args.device,
+        hydra_overrides_extra=hydra_overrides_extra,
     )
     print("SAM-2 loaded successfully!")
-    
-    # Clear memory after loading model
-    if args.enable_memory_optimization and torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-        print("Cleared CUDA cache after model loading")
 
     # Run evaluation on each dataset with BNDL UQ analysis
     results = {}
@@ -1502,6 +1510,10 @@ def main():
                 config = DATASET_CONFIGS[dataset_name]
                 root = Path(config["root"])
                 split = config["default_split"]
+                
+                # Handle both single split and multiple splits
+                if isinstance(split, list):
+                    split = split[0]
 
                 if config["has_split_subdir"]:
                     jpeg_dir = root / split / "JPEGImages"
@@ -1524,6 +1536,8 @@ def main():
                 save_bndl_vis=args.save_bndl_vis,
                 prompt_method=args.prompt_method,
                 first_frame_only=args.first_frame_only,
+                max_objects=args.max_objects,
+                collect_statistics=args.collect_statistics,
             )
 
             results[dataset_name] = (j_f, j, f)
@@ -1535,13 +1549,7 @@ def main():
             print(f"Error evaluating {dataset_name}: {e}")
             continue
         finally:
-            # Clean up memory after each dataset
-            if args.enable_memory_optimization and torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-                import gc
-                gc.collect()
-                print(f"Cleaned up memory after {dataset_name}")
+            pass
 
     total_time = time.time() - total_start_time
 
@@ -1562,7 +1570,7 @@ def main():
         print(f"\n{'=' * 80}")
         print("BNDL STATISTICS SUMMARY")
         print(f"{'=' * 80}")
-        
+
         # Create a copy of items to avoid "dictionary changed size during iteration" error
         statistics_items = list(all_statistics.items())
         for dataset_name, stats in statistics_items:
@@ -1571,11 +1579,11 @@ def main():
                 # Calculate averages for key metrics
                 # Create a copy of stats items to avoid iteration error
                 stats_items = list(stats.items())
-                lambda_pixel_values = [v for k, v in stats_items if 'lambda_pixel' in k]
-                k_pixel_values = [v for k, v in stats_items if 'k_pixel' in k]
-                uncertainty_values = [v for k, v in stats_items if 'pixel_uncertainty' in k]
-                pavpu_values = [v for k, v in stats_items if 'pavpu' in k]
-                
+                lambda_pixel_values = [v for k, v in stats_items if "lambda_pixel" in k]
+                k_pixel_values = [v for k, v in stats_items if "k_pixel" in k]
+                uncertainty_values = [v for k, v in stats_items if "pixel_uncertainty" in k]
+                pavpu_values = [v for k, v in stats_items if "pavpu" in k]
+
                 if lambda_pixel_values:
                     print(f"  Average Lambda (pixel): {np.mean(lambda_pixel_values):.4f} ± {np.std(lambda_pixel_values):.4f}")
                 if k_pixel_values:
@@ -1587,7 +1595,7 @@ def main():
                 print(f"  Total metrics collected: {len(stats)}")
             else:
                 print("  No statistics collected")
-        
+
         # Save combined statistics
         combined_stats_file = output_path / "all_datasets_bndl_statistics.json"
         with open(combined_stats_file, "w") as f:

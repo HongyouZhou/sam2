@@ -94,7 +94,7 @@ class MaskDecoder(nn.Module):
                 enable_external_sparse=self.bndl_hyper_in_sparse,
             )
             if self.bndl_fuse_type == "conv":
-                self.fuse_conv = nn.Conv2d(num_multimask_outputs, num_multimask_outputs, 1, bias=False)
+                self.fuse_conv = nn.Conv2d(2 * num_multimask_outputs, num_multimask_outputs, 1, bias=False)
         #########################################################
 
         self.output_hypernetworks_mlps = nn.ModuleList([MLP(transformer_dim, transformer_dim, transformer_dim // 8, 3) for i in range(self.num_mask_tokens)])
@@ -235,14 +235,11 @@ class MaskDecoder(nn.Module):
         hyper_in = torch.stack(hyper_in_list, dim=1)
         b, c, h, w = upscaled_embedding.shape
 
-        # Initialize outputs
         bndl_outputs = None
+        masks_sam = (hyper_in @ upscaled_embedding.view(b, c, h * w)).view(b, -1, h, w)
+        masks = masks_sam
 
-        if not self.use_bndl_for_pixels:
-            # Standard SAM approach
-            masks = (hyper_in @ upscaled_embedding.view(b, c, h * w)).view(b, -1, h, w)
-            bndl_outputs = None
-        else:
+        if self.use_bndl_for_pixels:
             pixel_feat = upscaled_embedding.permute(0, 2, 3, 1)  # [B, C, H, W] -> [B, H, W, C]
 
             masks_bndl_raw, z_out, wei_lambda, inv_k, wei_lambda_w, inv_k_w = self.pixel_bndl(
@@ -259,16 +256,17 @@ class MaskDecoder(nn.Module):
                 "inv_k": inv_k,
                 "wei_lambda_w": wei_lambda_w,
                 "inv_k_w": inv_k_w,
-                "masks_bndl_raw": masks_bndl_raw.detach(),      # [B, H, W, K] 用于计算PAvPU
-                "upscaled_shape": (b, c, h, w),                 # 用于计算PAvPU
-                "hyper_in": hyper_in.detach(),                  # 用于计算PAvPU
-                "mask_tokens_out": mask_tokens_out.detach(),    # 用于计算PAvPU
-                "pixel_feat": pixel_feat.detach(),              # 用于计算PAvPU
+                "masks_bndl_raw": masks_bndl_raw.detach(),      # [B, H, W, K]
+                "upscaled_shape": (b, c, h, w),
+                "hyper_in": hyper_in.detach(),
+                "mask_tokens_out": mask_tokens_out.detach(),
+                "pixel_feat": pixel_feat.detach(),
+                "masks_bndl": masks_bndl.detach(),
+                "masks_hyper": masks_sam.detach(),
             }
 
             if self.bndl_fuse_type in ("sum", "conv"):
-                masks_hyper = (hyper_in @ upscaled_embedding.view(b, c, h * w)).view(b, -1, h, w)
-                masks = self._fuse_masks(masks_hyper, masks_bndl)
+                masks = self._fuse_masks(masks_sam, masks_bndl)
             else:
                 masks = masks_bndl
 

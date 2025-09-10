@@ -92,16 +92,52 @@ def sample_error_click(
     Sample one error-based click from prediction vs GT difference.
     Returns ((x, y), label) where label is 1 for positive, 0 for negative.
     """
-    if gt_bool.dtype != bool:
-        gt_bool = gt_bool.astype(bool)
-    if pred_bool.dtype != bool:
-        pred_bool = pred_bool.astype(bool)
+    try:
+        if gt_bool.dtype != bool:
+            gt_bool = gt_bool.astype(bool)
+        if pred_bool.dtype != bool:
+            pred_bool = pred_bool.astype(bool)
 
-    gt_t = torch.from_numpy(gt_bool[None, None]).bool()
-    pred_t = torch.from_numpy(pred_bool[None, None]).bool()
-    pt3, lb3 = sample_one_point_from_error_center(gt_t, pred_t, padding=True)
-    pt3_xy = tuple(map(int, pt3.squeeze().tolist()))
-    lb3_i = int(lb3.squeeze().item())
-    return pt3_xy, lb3_i
+        # Ensure both arrays have the same shape
+        if gt_bool.shape != pred_bool.shape:
+            print(f"Warning: Shape mismatch - gt_bool: {gt_bool.shape}, pred_bool: {pred_bool.shape}")
+            # Resize pred_bool to match gt_bool if needed
+            if len(gt_bool.shape) == 2 and len(pred_bool.shape) == 2:
+                from PIL import Image
+                pred_bool = np.array(Image.fromarray(pred_bool.astype(np.uint8)).resize((gt_bool.shape[1], gt_bool.shape[0]), Image.NEAREST)).astype(bool)
+            else:
+                raise ValueError(f"Cannot handle shape mismatch: gt_bool {gt_bool.shape} vs pred_bool {pred_bool.shape}")
+
+        gt_t = torch.from_numpy(gt_bool[None, None]).bool()
+        pred_t = torch.from_numpy(pred_bool[None, None]).bool()
+        
+        
+        pt3, lb3 = sample_one_point_from_error_center(gt_t, pred_t, padding=True)
+         
+        # Ensure correct tensor shapes
+        if pt3.dim() == 3 and pt3.shape[0] == 1 and pt3.shape[1] == 1 and pt3.shape[2] == 2:
+            # Expected shape [1, 1, 2]
+            pt3_xy = (int(pt3[0, 0, 0].item()), int(pt3[0, 0, 1].item()))
+        else:
+            # Fallback to squeeze method
+            pt3_xy = tuple(map(int, pt3.squeeze().tolist()))
+            
+        if lb3.dim() == 2 and lb3.shape[0] == 1 and lb3.shape[1] == 1:
+            # Expected shape [1, 1]
+            lb3_i = int(lb3[0, 0].item())
+        else:
+            # Fallback to squeeze method
+            lb3_i = int(lb3.squeeze().item())
+            
+        return pt3_xy, lb3_i
+        
+    except Exception as e:
+        print(f"Error in sample_error_click: {e}")
+        print(f"gt_bool shape: {gt_bool.shape}, dtype: {gt_bool.dtype}")
+        print(f"pred_bool shape: {pred_bool.shape}, dtype: {pred_bool.dtype}")
+        import traceback
+        traceback.print_exc()
+        # Return a fallback point
+        return (0, 0), 1
 
 

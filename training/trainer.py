@@ -694,8 +694,8 @@ class Trainer:
                         # Ensure PAvPU is calculated for visualization
                         self._create_unified_visualization(bndl_outputs, batch, outputs, vis_dir, data_iter, step_index, frame_index, 'full')
                     
-                    # Dataset evaluation using BNDL outputs
-                    pixel_predictions = bndl_outputs.get('masks_bndl_raw') 
+                    # Dataset evaluation using BNDL outputs (use postprocessed masks)
+                    pixel_predictions = bndl_outputs.get('masks_bndl_postprocessed', bndl_outputs.get('masks_bndl_raw'))
                     if pixel_predictions is not None and 'pixel_uncertainty' in bndl_outputs:
                         try:
                             self.dataset_evaluator.add_batch_data(
@@ -1404,46 +1404,42 @@ class Trainer:
 
     def _create_unified_visualization(self, bndl_outputs, batch, outputs_for_vis, vis_dir, data_iter, step_index, frame_index, layout_type='basic'):
         """统一的BNDL可视化方法，使用重构后的模块"""
-        try:
-            # 导入重构后的模块
-            from .utils.visualization_utils import VisualizationUtils
-            from .utils.bndl_visualizer import BNDLVisualizer
+        from .utils.visualization_utils import VisualizationUtils
+        from .utils.bndl_visualizer import BNDLVisualizer
+        
+        # 初始化可视化器
+        viz_utils = VisualizationUtils()
+        bndl_viz = BNDLVisualizer()
+        
+        # 提取参数和图像
+        lambda_img, k_img = self._extract_pixel_params(bndl_outputs)
+        original_img = self._extract_original_image(batch, frame_idx=frame_index)
+        
+        if original_img is not None:
+            lambda_img, k_img = self._upsample_params_to_image_size(lambda_img, k_img, original_img.shape)
+        
+        has_uncertainty = ('pixel_uncertainty' in bndl_outputs and 
+                          bndl_outputs['pixel_uncertainty'] is not None)
+        
+        # 根据布局类型和是否有不确定性决定行数
+        if layout_type == 'full' and has_uncertainty:
+            rows = 4
+        else:
+            rows = 3
             
-            # 初始化可视化器
-            viz_utils = VisualizationUtils()
-            bndl_viz = BNDLVisualizer()
+        # 使用重构后的工具创建图表布局
+        fig, axes = viz_utils.create_figure_layout(rows, 3, (18, 6*rows))
+        
+        # 绘制通用元素
+        self._plot_common_elements_refactored(axes, original_img, lambda_img, k_img, step_index, 
+                                            bndl_outputs, has_uncertainty, batch, outputs_for_vis, bndl_viz, viz_utils)
+        
+        # 使用重构后的工具保存和关闭图表
+        save_path = os.path.join(vis_dir, f"epoch_{self.epoch}_iter_{data_iter}_step_{step_index}_unified_{layout_type}.png")
+        viz_utils.save_and_close_figure(fig, save_path, dpi=150)
+        
+        logging.info(f"Unified BNDL visualization saved: {save_path}")
             
-            # 提取参数和图像
-            lambda_img, k_img = self._extract_pixel_params(bndl_outputs)
-            original_img = self._extract_original_image(batch, frame_idx=frame_index)
-            
-            if original_img is not None:
-                lambda_img, k_img = self._upsample_params_to_image_size(lambda_img, k_img, original_img.shape)
-            
-            has_uncertainty = ('pixel_uncertainty' in bndl_outputs and 
-                              bndl_outputs['pixel_uncertainty'] is not None)
-            
-            # 根据布局类型和是否有不确定性决定行数
-            if layout_type == 'full' and has_uncertainty:
-                rows = 4
-            else:
-                rows = 3
-                
-            # 使用重构后的工具创建图表布局
-            fig, axes = viz_utils.create_figure_layout(rows, 3, (18, 6*rows))
-            
-            # 绘制通用元素
-            self._plot_common_elements_refactored(axes, original_img, lambda_img, k_img, step_index, 
-                                                bndl_outputs, has_uncertainty, batch, outputs_for_vis, bndl_viz, viz_utils)
-            
-            # 使用重构后的工具保存和关闭图表
-            save_path = os.path.join(vis_dir, f"epoch_{self.epoch}_iter_{data_iter}_step_{step_index}_unified_{layout_type}.png")
-            viz_utils.save_and_close_figure(fig, save_path, dpi=150)
-            
-            logging.info(f"Unified BNDL visualization saved: {save_path}")
-            
-        except Exception as e:
-            logging.warning(f"Failed to create unified BNDL visualization: {e}")
 
     def _plot_common_elements_refactored(self, axes, original_img, lambda_img, k_img, step_index, 
                                         bndl_outputs, has_uncertainty=False, batch=None, outputs_for_vis=None, 
