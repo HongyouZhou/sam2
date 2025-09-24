@@ -9,7 +9,7 @@ from typing import List, Optional, Tuple, Type
 import torch
 from torch import nn
 
-from BNDL.BNDL_upload.ViT_Sparse.utils.model_helpers import Proj_Model
+from BNDL.BNDL_upload.ViT_Sparse.utils.bndl import BNDL
 from sam2.modeling.sam2_utils import MLP, LayerNorm2d
 
 
@@ -87,7 +87,7 @@ class MaskDecoder(nn.Module):
         self.bndl_hyper_in_sparse = bndl_hyper_in_sparse
         if self.use_bndl_for_pixels:
             pixel_feat_dim = transformer_dim // 8  # C' after up-scaling
-            self.pixel_bndl = Proj_Model(
+            self.pixel_bndl = BNDL(
                 pixel_feat_dim,
                 self.num_mask_tokens,
                 enable_global_sparse=not self.bndl_replace_global_with_hyper,
@@ -242,7 +242,7 @@ class MaskDecoder(nn.Module):
         if self.use_bndl_for_pixels:
             pixel_feat = upscaled_embedding.permute(0, 2, 3, 1)  # [B, C, H, W] -> [B, H, W, C]
 
-            masks_bndl_raw, z_out, wei_lambda, inv_k, wei_lambda_w, inv_k_w = self.pixel_bndl(
+            masks_bndl_raw, z_out, wei_lambda, inv_k, out_w, wei_lambda_w, inv_k_w = self.pixel_bndl(
                 pixel_feat,
                 external_pre_out_w=hyper_in if self.bndl_replace_global_with_hyper else None,
             )
@@ -261,8 +261,11 @@ class MaskDecoder(nn.Module):
                 "hyper_in": hyper_in.detach(),
                 "mask_tokens_out": mask_tokens_out.detach(),
                 "pixel_feat": pixel_feat.detach(),
+                # Provide gradient-carrying pixel features for auxiliary losses during training
+                "pixel_feat_grad": pixel_feat if self.training else None,
                 "masks_bndl": masks_bndl.detach(),
                 "masks_hyper": masks_sam.detach(),
+                "out_w": out_w.detach(),
             }
 
             if self.bndl_fuse_type in ("sum", "conv"):

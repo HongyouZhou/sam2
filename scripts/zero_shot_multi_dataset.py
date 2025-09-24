@@ -570,6 +570,8 @@ def inference_3_clicks(
         print(f"Processing {len(obj_ids)} objects in video {vid}: {obj_ids}")
 
         obj_points: dict[int, list] = {}
+        # New: record full prompt spec per object for reuse (box or three clicks with labels)
+        prompt_specs: dict[int, dict] = {}
 
         for obj_id in obj_ids:
             gt_bool = first_mask == obj_id
@@ -604,6 +606,13 @@ def inference_3_clicks(
                     (int(cx), int(cy)),
                 ]
 
+                # Record full box prompt for reuse
+                prompt_specs[obj_id] = {
+                    "type": "box",
+                    "frame_idx": 0,
+                    "box": [int(x0), int(y0), int(x1), int(y1)],
+                }
+
             else:
                 # three_clicks (legacy)
                 try:
@@ -616,11 +625,16 @@ def inference_3_clicks(
                     print(f"Warning: Object {obj_id} in video {vid} covers entire image and no other objects available for negative sampling, using only positive point")
                     pts = np.array([pos_xy], dtype=np.float32)
                     lbl = np.array([1], dtype=np.int32)
+                    clicks = [{"xy": [int(pos_xy[0]), int(pos_xy[1])], "label": 1}]
                 else:
                     pts = np.array([[pos_xy, neg_xy]], dtype=np.float32)
                     lbl = np.array([[1, 0]], dtype=np.int32)
                     pts = pts.reshape(-1, 2)
                     lbl = lbl.reshape(-1)
+                    clicks = [
+                        {"xy": [int(pos_xy[0]), int(pos_xy[1])], "label": 1},
+                        {"xy": [int(neg_xy[0]), int(neg_xy[1])], "label": 0},
+                    ]
                 _, obj_ids_after, masks = predictor.add_new_points_or_box(
                     state,
                     frame_idx=0,
@@ -667,6 +681,10 @@ def inference_3_clicks(
                     (int(pt3_xy[0]), int(pt3_xy[1])),
                 ]
 
+                # Record three clicks with labels for reuse
+                clicks.append({"xy": [int(pt3_xy[0]), int(pt3_xy[1])], "label": int(lb3_i)})
+                prompt_specs[obj_id] = {"type": "three_clicks", "frame_idx": 0, "clicks": clicks}
+
         print(f"Generated query points for video {vid}: {obj_points}")
 
         # Propagate through entire video
@@ -708,6 +726,10 @@ def inference_3_clicks(
         (out_dir / vid).mkdir(parents=True, exist_ok=True)
         with open(out_dir / vid / "query_points.json", "w") as f:
             json.dump({int(k): v for k, v in obj_points.items()}, f, indent=2)
+
+        # New: Save full prompt specs for reuse by other models
+        with open(out_dir / vid / "query_prompts.json", "w") as f:
+            json.dump({int(k): v for k, v in prompt_specs.items()}, f, indent=2)
 
         torch.cuda.empty_cache()
 
@@ -764,6 +786,21 @@ def run_single_dataset(
     print(f"Annotation directory: {ann_dir}")
     print(f"JPEG dir exists: {jpeg_dir.exists()}")
     print(f"Ann dir exists: {ann_dir.exists()}")
+
+    # Handle file_list_txt if specified in config
+    if "file_list_txt" in config:
+        file_list_path = Path(config["file_list_txt"])
+        if file_list_path.exists():
+            with open(file_list_path, 'r') as f:
+                video_names_from_list = [line.strip() for line in f if line.strip()]
+            print(f"Using file list from {file_list_path}: {len(video_names_from_list)} videos")
+            # Filter video_subset if provided
+            if video_subset is not None:
+                video_subset = [v for v in video_subset if v in video_names_from_list]
+            else:
+                video_subset = video_names_from_list
+        else:
+            print(f"Warning: file_list_txt specified but file not found: {file_list_path}")
 
     if jpeg_dir.exists():
         video_dirs = [d for d in jpeg_dir.iterdir() if d.is_dir()]

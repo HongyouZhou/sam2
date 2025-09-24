@@ -34,7 +34,7 @@ from tools.vos_inference import (
 )
 
 # ----------  BNDL uncertainty and PAvPU functions ----------
-from BNDL.BNDL_upload.ViT_Sparse.utils.model_helpers import pixel_pavpu_calculation, pixel_uncertain_sampling
+from BNDL.BNDL_upload.ViT_Sparse.utils.bndl import pixel_pavpu_calculation, pixel_uncertain_sampling
 
 # ----------  Dataset Evaluator from SAM2 training ----------
 from training.utils.dataset_evaluator import DistributedDatasetEvaluator
@@ -645,6 +645,7 @@ def inference_3_clicks_with_bndl(
     collect_statistics: bool = True,
     max_objects: int | None = None,
     prompt_method: str = "gt_box",
+    reuse_prompts_root: Path | None = None,
 ):
     """
     3-click interactive inference with BNDL UQ analysis:
@@ -716,6 +717,20 @@ def inference_3_clicks_with_bndl(
         else:
             obj_ids = all_obj_ids
 
+        # Try to load reused prompts (from first model outputs)
+        prompts_json = None
+        if reuse_prompts_root is not None:
+            candidate = reuse_prompts_root / f"{dataset_name.lower()}_pred" / vid / "query_prompts.json"
+            if candidate.exists():
+                try:
+                    with open(candidate) as f:
+                        prompts_json = {int(k): v for k, v in json.load(f).items()}
+                    print(f"Loaded reused prompts for video {vid} from {candidate}")
+                except Exception as e:
+                    print(f"Warning: Failed to load reused prompts {candidate}: {e}")
+            else:
+                print(f"Reused prompts not found for {vid}: {candidate}")
+
         print(f"Processing {len(obj_ids)} objects in video {vid}: {obj_ids}")
 
         obj_points: dict[int, list] = {}
@@ -734,11 +749,22 @@ def inference_3_clicks_with_bndl(
 
             if prompt_method == "gt_box":
                 # Use tight GT bounding box as prompt
-                try:
-                    x0, y0, x1, y1 = compute_tight_box_from_bool_mask(gt_bool)
-                except Exception as e:
-                    print(f"Error computing box for object {obj_id} in video {vid}: {e}")
-                    continue
+                if prompts_json and obj_id in prompts_json and prompts_json[obj_id].get("type") == "box":
+                    try:
+                        x0, y0, x1, y1 = prompts_json[obj_id]["box"]
+                    except Exception as e:
+                        print(f"Warning: Invalid reused box for obj {obj_id}, fallback to GT box: {e}")
+                        try:
+                            x0, y0, x1, y1 = compute_tight_box_from_bool_mask(gt_bool)
+                        except Exception as e2:
+                            print(f"Error computing box for object {obj_id} in video {vid}: {e2}")
+                            continue
+                else:
+                    try:
+                        x0, y0, x1, y1 = compute_tight_box_from_bool_mask(gt_bool)
+                    except Exception as e:
+                        print(f"Error computing box for object {obj_id} in video {vid}: {e}")
+                        continue
 
                 _, _, _ = predictor.add_new_points_or_box(
                     state,
@@ -754,66 +780,104 @@ def inference_3_clicks_with_bndl(
                 ]
             else:
                 # three_clicks (legacy)
-                try:
-                    pos_xy, neg_xy = sample_pos_neg(gt_bool, full_mask=first_mask, current_obj_id=obj_id)
-                except Exception as e:
-                    print(f"Error sampling points for object {obj_id} in video {vid}: {e}")
-                    continue
+                reused = False
+                if prompts_json and obj_id in prompts_json and prompts_json[obj_id].get("type") == "three_clicks":
+                    clicks = prompts_json[obj_id].get("clicks", [])
+                    init_pts: list[list[int]] = []
+                    init_lbl: list[int] = []
+                    if len(clicks) >= 1:
+                        init_pts.append(clicks[0]["xy"]); init_lbl.append(int(clicks[0]["label"]))
+                    if len(clicks) >= 2:
+                        init_pts.append(clicks[1]["xy"]); init_lbl.append(int(clicks[1]["label"]))
+                    if init_pts:
+                        pts = np.array(init_pts, dtype=np.float32)
+                        lbl = np.array(init_lbl, dtype=np.int32)
+                        _, _, _ = predictor.add_new_points_or_box(
+                            state,
+                            frame_idx=0,
+                            obj_id=obj_id,
+                            points=pts,
+                            labels=lbl,
+                        )
+                    if len(clicks) >= 3:
+                        pt3 = np.array([clicks[2]["xy"]], dtype=np.float32)
+                        lb3 = np.array([int(clicks[2]["label"])], dtype=np.int32)
+                        predictor.add_new_points_or_box(
+                            state,
+                            frame_idx=0,
+                            obj_id=obj_id,
+                            points=pt3,
+                            labels=lb3,
+                            clear_old_points=False,
+                        )
+                    obj_points[obj_id] = [
+                        clicks[0]["xy"] if len(clicks) >= 1 else None,
+                        clicks[1]["xy"] if len(clicks) >= 2 else None,
+                        clicks[2]["xy"] if len(clicks) >= 3 else None,
+                    ]
+                    reused = True
 
-                if neg_xy is None:
-                    print(f"Warning: Object {obj_id} in video {vid} covers entire image and no other objects available for negative sampling, using only positive point")
-                    pts = np.array([pos_xy], dtype=np.float32)
-                    lbl = np.array([1], dtype=np.int32)
-                else:
-                    pts = np.array([[pos_xy, neg_xy]], dtype=np.float32)
-                    lbl = np.array([[1, 0]], dtype=np.int32)
-                    pts = pts.reshape(-1, 2)
-                    lbl = lbl.reshape(-1)
-                _, obj_ids_after, masks = predictor.add_new_points_or_box(
-                    state,
-                    frame_idx=0,
-                    obj_id=obj_id,
-                    points=pts,
-                    labels=lbl,
-                )
+                if not reused:
+                    try:
+                        pos_xy, neg_xy = sample_pos_neg(gt_bool, full_mask=first_mask, current_obj_id=obj_id)
+                    except Exception as e:
+                        print(f"Error sampling points for object {obj_id} in video {vid}: {e}")
+                        continue
 
-                cur_idx = obj_ids_after.index(obj_id)
-                # Ensure mask shape matches GT for error-click sampling
-                mask_logits = masks[cur_idx : cur_idx + 1]
-                if mask_logits.dim() == 4:
-                    # [B, C, H', W'] -> take first channel
-                    mask_logits_2d = mask_logits[0, 0]
-                elif mask_logits.dim() == 3:
-                    # [C, H', W'] or [B, H', W'] -> squeeze leading
-                    mask_logits_2d = mask_logits.squeeze(0)
-                else:
-                    mask_logits_2d = mask_logits
-                if tuple(mask_logits_2d.shape[-2:]) != gt_bool.shape:
-                    import torch.nn.functional as F
-                    h, w = gt_bool.shape
-                    mask_logits_2d = F.interpolate(
-                        mask_logits_2d.unsqueeze(0).unsqueeze(0),
-                        size=(h, w),
-                        mode="bilinear",
-                        align_corners=False,
-                    )[0, 0]
-                pred_bool = (mask_logits_2d > score_thresh).cpu().numpy().astype(bool)
-                pt3_xy, lb3_i = sample_error_click(gt_bool, pred_bool)
+                    if neg_xy is None:
+                        print(f"Warning: Object {obj_id} in video {vid} covers entire image and no other objects available for negative sampling, using only positive point")
+                        pts = np.array([pos_xy], dtype=np.float32)
+                        lbl = np.array([1], dtype=np.int32)
+                    else:
+                        pts = np.array([[pos_xy, neg_xy]], dtype=np.float32)
+                        lbl = np.array([[1, 0]], dtype=np.int32)
+                        pts = pts.reshape(-1, 2)
+                        lbl = lbl.reshape(-1)
+                    _, obj_ids_after, masks = predictor.add_new_points_or_box(
+                        state,
+                        frame_idx=0,
+                        obj_id=obj_id,
+                        points=pts,
+                        labels=lbl,
+                    )
 
-                predictor.add_new_points_or_box(
-                    state,
-                    frame_idx=0,
-                    obj_id=obj_id,
-                    points=np.array([pt3_xy], dtype=np.float32),
-                    labels=np.array([lb3_i], dtype=np.int32),
-                    clear_old_points=False,
-                )
+                    cur_idx = obj_ids_after.index(obj_id)
+                    # Ensure mask shape matches GT for error-click sampling
+                    mask_logits = masks[cur_idx : cur_idx + 1]
+                    if mask_logits.dim() == 4:
+                        # [B, C, H', W'] -> take first channel
+                        mask_logits_2d = mask_logits[0, 0]
+                    elif mask_logits.dim() == 3:
+                        # [C, H', W'] or [B, H', W'] -> squeeze leading
+                        mask_logits_2d = mask_logits.squeeze(0)
+                    else:
+                        mask_logits_2d = mask_logits
+                    if tuple(mask_logits_2d.shape[-2:]) != gt_bool.shape:
+                        import torch.nn.functional as F
+                        h, w = gt_bool.shape
+                        mask_logits_2d = F.interpolate(
+                            mask_logits_2d.unsqueeze(0).unsqueeze(0),
+                            size=(h, w),
+                            mode="bilinear",
+                            align_corners=False,
+                        )[0, 0]
+                    pred_bool = (mask_logits_2d > score_thresh).cpu().numpy().astype(bool)
+                    pt3_xy, lb3_i = sample_error_click(gt_bool, pred_bool)
 
-                obj_points[obj_id] = [
-                    (int(pos_xy[0]), int(pos_xy[1])),
-                    (int(neg_xy[0]), int(neg_xy[1])) if neg_xy is not None else None,
-                    (int(pt3_xy[0]), int(pt3_xy[1])),
-                ]
+                    predictor.add_new_points_or_box(
+                        state,
+                        frame_idx=0,
+                        obj_id=obj_id,
+                        points=np.array([pt3_xy], dtype=np.float32),
+                        labels=np.array([lb3_i], dtype=np.int32),
+                        clear_old_points=False,
+                    )
+
+                    obj_points[obj_id] = [
+                        (int(pos_xy[0]), int(pos_xy[1])),
+                        (int(neg_xy[0]), int(neg_xy[1])) if neg_xy is not None else None,
+                        (int(pt3_xy[0]), int(pt3_xy[1])),
+                    ]
 
         print(f"Generated query points for video {vid}: {obj_points}")
 
@@ -1078,6 +1142,7 @@ def run_single_dataset_with_bndl(
     first_frame_only: bool = False,
     max_objects: int | None = None,
     collect_statistics: bool = False,
+    reuse_prompts_root: Path | None = None,
 ) -> tuple[float, float, float, dict]:
     """Run evaluation on a single dataset with BNDL UQ analysis and return metrics"""
 
@@ -1120,6 +1185,21 @@ def run_single_dataset_with_bndl(
     print(f"JPEG dir exists: {jpeg_dir.exists()}")
     print(f"Ann dir exists: {ann_dir.exists()}")
 
+    # Handle file_list_txt if specified in config
+    if "file_list_txt" in config:
+        file_list_path = Path(config["file_list_txt"])
+        if file_list_path.exists():
+            with open(file_list_path, 'r') as f:
+                video_names_from_list = [line.strip() for line in f if line.strip()]
+            print(f"Using file list from {file_list_path}: {len(video_names_from_list)} videos")
+            # Filter video_subset if provided
+            if video_subset is not None:
+                video_subset = [v for v in video_subset if v in video_names_from_list]
+            else:
+                video_subset = video_names_from_list
+        else:
+            print(f"Warning: file_list_txt specified but file not found: {file_list_path}")
+
     if jpeg_dir.exists():
         video_dirs = [d for d in jpeg_dir.iterdir() if d.is_dir()]
         print(f"Found {len(video_dirs)} video directories in JPEG dir")
@@ -1148,6 +1228,7 @@ def run_single_dataset_with_bndl(
             collect_statistics=collect_statistics,
             prompt_method=prompt_method,
             max_objects=max_objects,
+            reuse_prompts_root=reuse_prompts_root,
         )
     except Exception as e:
         print(f"Error during inference for {dataset_name}: {e}")
@@ -1465,6 +1546,9 @@ def parse_args():
     p.add_argument("--max_objects", type=int, default=20, help="Maximum number of objects to process per video (default: 20)")
     p.add_argument("--collect_statistics", action="store_true", default=False, help="Collect BNDL statistics (uses extra GPU memory)")
 
+    # Reuse prompts from first model outputs
+    p.add_argument("--reuse_prompts_root", type=str, default=None, help="Root dir of first-run outputs to reuse prompts (expects {dataset}_pred/*/query_prompts.json)")
+
     return p.parse_args()
 
 
@@ -1538,6 +1622,7 @@ def main():
                 first_frame_only=args.first_frame_only,
                 max_objects=args.max_objects,
                 collect_statistics=args.collect_statistics,
+                reuse_prompts_root=Path(args.reuse_prompts_root) if args.reuse_prompts_root else None,
             )
 
             results[dataset_name] = (j_f, j, f)

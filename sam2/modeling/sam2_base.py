@@ -7,8 +7,8 @@
 import torch
 import torch.distributed
 import torch.nn.functional as F
-
 from torch.nn.init import trunc_normal_
+import random
 
 from sam2.modeling.sam.mask_decoder import MaskDecoder
 from sam2.modeling.sam.prompt_encoder import PromptEncoder
@@ -95,9 +95,47 @@ class SAM2Base(torch.nn.Module):
         bndl_hyper_in_sparse: bool = False,
         # add no obj embedding to spatial frames
         no_obj_embed_spatial: bool = False,
+        # DSU options
+        use_dsu: bool = False,
+        dsu_strength_mu: float = 0.1,
+        dsu_strength_sigma: float = 0.1,
+        dsu_prob: float = 1.0,
+        dsu_apply_high_res: bool = False,
+        dsu_stats_eps: float = 1e-6,
         # extra arguments used to construct the SAM mask decoder; if not None, it should be a dict of kwargs to be passed into `MaskDecoder` class.
         sam_mask_decoder_extra_args=None,
         compile_image_encoder: bool = False,
+        # AdCo options (optional auxiliary contrastive loss)
+        use_adco: bool = False,
+        adco_proj_dim: int = 256,
+        adco_queue_size: int = 65536,
+        adco_temperature: float = 0.2,
+        adco_loss_weight: float = 0.1,
+        # Whether AdCo uses uncertainty for ROI weighting (can be disabled)
+        adco_use_uncertainty: bool = True,
+        # Uncertainty-aware controls
+        adco_gate_by_uncertainty: bool = True,
+        adco_gate_floor: float = 0.2,
+        adco_tau_beta: float = 0.5,
+        adco_uncertainty_mask_threshold: float | None = None,
+        adco_scale_neg_by_uq: bool = True,
+        adco_curriculum_warmup_steps: int = 0,
+        # ProCo options (prototype contrastive, optional)
+        use_proco: bool = False,
+        proco_proj_dim: int = 256,
+        proco_num_obj_prototypes: int = 128,
+        proco_num_bg_prototypes: int = 32,
+        proco_temperature: float = 0.1,
+        proco_loss_weight: float = 0.1,
+        # MoCo options (momentum contrast, optional)
+        use_moco: bool = False,
+        moco_proj_dim: int = 256,
+        moco_queue_size: int = 65536,
+        moco_momentum: float = 0.996,
+        moco_temperature: float = 0.2,
+        moco_loss_weight: float = 0.1,
+        # ROI view sharing option
+        share_roi_views: bool = True,
     ):
         super().__init__()
 
@@ -187,8 +225,58 @@ class SAM2Base(torch.nn.Module):
             self.no_obj_embed_spatial = torch.nn.Parameter(torch.zeros(1, self.mem_dim))
             trunc_normal_(self.no_obj_embed_spatial, std=0.02)
 
+        # DSU settings
+        self.use_dsu = use_dsu
+        self.dsu_strength_mu = float(dsu_strength_mu)
+        self.dsu_strength_sigma = float(dsu_strength_sigma)
+        self.dsu_prob = float(dsu_prob)
+        self.dsu_apply_high_res = bool(dsu_apply_high_res)
+        self.dsu_stats_eps = float(dsu_stats_eps)
+
         self._build_sam_heads()
         self.max_cond_frames_in_attn = max_cond_frames_in_attn
+
+        # AdCo components
+        self.use_adco = bool(use_adco)
+        self.adco_proj_dim = int(adco_proj_dim)
+        self.adco_queue_size = int(adco_queue_size)
+        self.adco_temperature = float(adco_temperature)
+        self.adco_loss_weight = float(adco_loss_weight)
+        ############################################################
+        self.adco_use_uncertainty = bool(adco_use_uncertainty)
+        self.adco_gate_by_uncertainty = bool(adco_gate_by_uncertainty)
+        self.adco_gate_floor = float(adco_gate_floor)
+        self.adco_tau_beta = float(adco_tau_beta)
+        self.adco_uncertainty_mask_threshold = adco_uncertainty_mask_threshold
+        self.adco_scale_neg_by_uq = bool(adco_scale_neg_by_uq)
+        self.adco_curriculum_warmup_steps = int(adco_curriculum_warmup_steps)
+        self._adco_step_count = 0
+        self.adco_grl_scale = 1.0
+        if self.use_adco:
+            self._build_adco_components()
+
+        # ProCo components
+        self.use_proco = bool(use_proco)
+        self.proco_proj_dim = int(proco_proj_dim)
+        self.proco_num_obj_prototypes = int(proco_num_obj_prototypes)
+        self.proco_num_bg_prototypes = int(proco_num_bg_prototypes)
+        self.proco_temperature = float(proco_temperature)
+        self.proco_loss_weight = float(proco_loss_weight)
+        if self.use_proco:
+            self._build_proco_components()
+
+        # MoCo components
+        self.use_moco = bool(use_moco)
+        self.moco_proj_dim = int(moco_proj_dim)
+        self.moco_queue_size = int(moco_queue_size)
+        self.moco_momentum = float(moco_momentum)
+        self.moco_temperature = float(moco_temperature)
+        self.moco_loss_weight = float(moco_loss_weight)
+        if self.use_moco:
+            self._build_moco_components()
+
+        # ROI sharing control
+        self.share_roi_views = bool(share_roi_views)
 
         # Model compilation
         if compile_image_encoder:
@@ -202,6 +290,413 @@ class SAM2Base(torch.nn.Module):
                 fullgraph=True,
                 dynamic=False,
             )
+
+    def _dsu_perturb(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        DSU-style feature statistic perturbation on BCHW features.
+        Active only during training and when `use_dsu=True`.
+        """
+        if not self.training or not self.use_dsu:
+            return x
+        if self.dsu_strength_mu <= 0.0 and self.dsu_strength_sigma <= 0.0:
+            return x
+
+        orig_dtype = x.dtype
+        x_f32 = x.float()
+        # Per-sample, per-channel stats
+        mu = x_f32.mean(dim=(2, 3), keepdim=True)
+        var = x_f32.var(dim=(2, 3), keepdim=True, unbiased=False)
+        std = torch.sqrt(var + self.dsu_stats_eps)
+
+        x_hat = (x_f32 - mu) / (std + 1e-12)
+
+        # Per-sample gating
+        if self.dsu_prob >= 1.0:
+            gate = 1.0
+        elif self.dsu_prob <= 0.0:
+            gate = 0.0
+        else:
+            gate = torch.bernoulli(
+                torch.full((x.size(0), 1, 1, 1), float(self.dsu_prob), device=x.device, dtype=x_f32.dtype)
+            )
+
+        # Sample noise
+        if isinstance(gate, torch.Tensor):
+            eps_mu = torch.randn_like(mu) * self.dsu_strength_mu * gate
+            eps_sigma = torch.randn_like(std) * self.dsu_strength_sigma * gate
+        else:
+            eps_mu = torch.randn_like(mu) * self.dsu_strength_mu * gate
+            eps_sigma = torch.randn_like(std) * self.dsu_strength_sigma * gate
+
+        mu_tilde = mu + eps_mu * std
+        sigma_tilde = torch.clamp(std * (1.0 + eps_sigma), min=self.dsu_stats_eps)
+
+        x_out = x_hat * sigma_tilde + mu_tilde
+        return x_out.to(orig_dtype)
+
+    def _build_adco_components(self) -> None:
+        """Build AdCo projection head and adversarial negatives."""
+        # AdCo operates on global vectors from pixel features (C' = hidden_dim // 8)
+        adco_in_dim = max(8, self.hidden_dim // 8)
+        self.adco_proj = torch.nn.Sequential(
+            torch.nn.Linear(adco_in_dim, self.adco_proj_dim, bias=True),
+            torch.nn.ReLU(inplace=True),
+            torch.nn.Linear(self.adco_proj_dim, self.adco_proj_dim, bias=False),
+        )
+        # Learnable negatives (K x D), adversarially updated by gradient reversal
+        neg = torch.randn(self.adco_queue_size, self.adco_proj_dim) * 0.01
+        neg = F.normalize(neg, dim=1)
+        self.adco_negatives = torch.nn.Parameter(neg)
+        # Gradient reversal on negatives to approximate adversarial ascent
+        # Use fixed gradient reversal scale (standard GRL implementation)
+        self.adco_negatives.register_hook(lambda g: (-1.0 * g) if g is not None else g)
+
+    def _build_proco_components(self) -> None:
+        """Build ProCo projection head and prototype banks (object/background)."""
+        # Use the same pixel feature input dim heuristic as AdCo
+        proco_in_dim = max(8, self.hidden_dim // 8)
+        self.proco_proj = torch.nn.Sequential(
+            torch.nn.Linear(proco_in_dim, self.proco_proj_dim, bias=True),
+            torch.nn.ReLU(inplace=True),
+            torch.nn.Linear(self.proco_proj_dim, self.proco_proj_dim, bias=False),
+        )
+        # Learnable prototypes (Proxy-NCA style)
+        obj_proto = torch.randn(self.proco_num_obj_prototypes, self.proco_proj_dim) * 0.01
+        bg_proto = torch.randn(self.proco_num_bg_prototypes, self.proco_proj_dim) * 0.01
+        self.proco_obj_prototypes = torch.nn.Parameter(F.normalize(obj_proto, dim=1))
+        self.proco_bg_prototypes = torch.nn.Parameter(F.normalize(bg_proto, dim=1))
+
+    def _build_moco_components(self) -> None:
+        """Build MoCo projection heads (query and key) and the queue."""
+        in_dim = max(8, self.hidden_dim // 8)
+        # Query encoder head
+        self.moco_proj_q = torch.nn.Sequential(
+            torch.nn.Linear(in_dim, self.moco_proj_dim, bias=True),
+            torch.nn.ReLU(inplace=True),
+            torch.nn.Linear(self.moco_proj_dim, self.moco_proj_dim, bias=False),
+        )
+        # Key encoder head (same arch), initialized as copy, not directly optimized
+        self.moco_proj_k = torch.nn.Sequential(
+            torch.nn.Linear(in_dim, self.moco_proj_dim, bias=True),
+            torch.nn.ReLU(inplace=True),
+            torch.nn.Linear(self.moco_proj_dim, self.moco_proj_dim, bias=False),
+        )
+        # Initialize key with query params
+        for p_k, p_q in zip(self.moco_proj_k.parameters(), self.moco_proj_q.parameters()):
+            p_k.data.copy_(p_q.data)
+            p_k.requires_grad = False
+        # Create the queue as a buffer (D x K)
+        self.register_buffer("moco_queue", F.normalize(torch.randn(self.moco_proj_dim, self.moco_queue_size), dim=0))
+        self.register_buffer("moco_queue_ptr", torch.zeros(1, dtype=torch.long))
+
+    @torch.no_grad()
+    def _moco_momentum_update_key_encoder(self) -> None:
+        """Momentum update of the key encoder."""
+        m = self.moco_momentum
+        for p_k, p_q in zip(self.moco_proj_k.parameters(), self.moco_proj_q.parameters()):
+            p_k.data = p_k.data * m + p_q.data * (1.0 - m)
+
+    @torch.no_grad()
+    def _moco_dequeue_and_enqueue(self, keys: torch.Tensor) -> None:
+        """Enqueue keys and dequeue the oldest ones."""
+        keys = F.normalize(keys, dim=1)  # [N, D]
+        batch_size = keys.shape[0]
+        K = self.moco_queue_size
+        ptr = int(self.moco_queue_ptr.item())
+        assert K % batch_size == 0, "Queue size must be divisible by batch size"
+        # Transpose to (D x N) to fit queue layout (D x K)
+        self.moco_queue[:, ptr:ptr + batch_size] = keys.t()
+        ptr = (ptr + batch_size) % K
+        self.moco_queue_ptr[0] = ptr
+
+    @torch.no_grad()
+    def _concat_all_gather(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Gather tensors from all processes, supporting single process as fallback."""
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            tensors_gather = [torch.zeros_like(tensor) for _ in range(torch.distributed.get_world_size())]
+            torch.distributed.all_gather(tensors_gather, tensor, async_op=False)
+            output = torch.cat(tensors_gather, dim=0)
+            return output
+        return tensor
+
+    @torch.no_grad()
+    def _adco_random_crop(self, feat: torch.Tensor, min_scale: float = 0.6) -> torch.Tensor:
+        """Random spatial crop on [B, H, W, C] features; fallback to center if tiny."""
+        B, H, W, C = feat.shape
+        if H < 4 or W < 4:
+            return feat
+        crop_h = max(2, int(H * (min_scale + (1 - min_scale) * random.random())))
+        crop_w = max(2, int(W * (min_scale + (1 - min_scale) * random.random())))
+        if crop_h >= H and crop_w >= W:
+            return feat
+        top = 0 if H == crop_h else random.randint(0, H - crop_h)
+        left = 0 if W == crop_w else random.randint(0, W - crop_w)
+        return feat[:, top:top + crop_h, left:left + crop_w, :]
+
+    @torch.no_grad()
+    def _adco_roi_view(
+        self,
+        feat: torch.Tensor,                # [B, H, W, C]
+        min_scale: float = 0.6,
+        boundary_ignore: int = 2,
+        uncert: torch.Tensor | None = None # [B, H, W] or None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Masked ROI pooling to form a global vector per sample without slicing.
+
+        Returns (z, roi_weight): z is [B, C], roi_weight is [B] to reflect
+        the effective proportion of confident pixels in the ROI when uncertainty is provided.
+        """
+        B, H, W, C = feat.shape
+        device = feat.device
+
+        tops, lefts, hs, ws = [], [], [], []
+        for _ in range(B):
+            ch = max(2, int(H * (min_scale + (1 - min_scale) * random.random())))
+            cw = max(2, int(W * (min_scale + (1 - min_scale) * random.random())))
+            t = 0 if H == ch else random.randint(0, H - ch)
+            l = 0 if W == cw else random.randint(0, W - cw)
+            tops.append(t)
+            lefts.append(l)
+            hs.append(ch)
+            ws.append(cw)
+
+        mask = torch.zeros(B, H, W, 1, device=device, dtype=feat.dtype)
+        for i, (t, left, ch, cw) in enumerate(zip(tops, lefts, hs, ws)):
+            t0 = t + boundary_ignore
+            l0 = left + boundary_ignore
+            t1 = t + ch - boundary_ignore
+            l1 = left + cw - boundary_ignore
+            if t0 < t1 and l0 < l1:
+                mask[i, t0:t1, l0:l1, 0] = 1.0
+            else:
+                mask[i, t:t + ch, left:left + cw, 0] = 1.0
+
+        if uncert is not None:
+            u = uncert.unsqueeze(-1).to(feat.dtype)  # [B, H, W, 1]
+            # Base weight is (1 - uncertainty)
+            w = torch.clamp(1.0 - u, 0.0, 1.0) * mask
+            # Optional hard masking: keep only confident pixels (u <= t)
+            if self.adco_uncertainty_mask_threshold is not None:
+                thr = float(self.adco_uncertainty_mask_threshold)
+                keep = (u <= thr).to(feat.dtype)
+                w = w * keep
+            num = (feat * w).sum(dim=(1, 2))          # [B, C]
+            den = (w.sum(dim=(1, 2)) + 1e-6)          # [B, 1]
+            z = num / den
+            roi_weight = (w.sum(dim=(1, 2)).squeeze(-1) / (mask.sum(dim=(1, 2)).squeeze(-1) + 1e-6))
+        else:
+            num = (feat * mask).sum(dim=(1, 2))
+            den = (mask.sum(dim=(1, 2)) + 1e-6)
+            z = num / den
+            roi_weight = torch.ones(B, device=device, dtype=feat.dtype)
+
+        return z, roi_weight
+
+    def compute_adco_loss(
+        self,
+        pixel_feat: torch.Tensor,                                # [B, H, W, C']
+        pixel_uncertainty: torch.Tensor | None = None,
+        neg_sample_M: int | None = 1024,
+        roi_z1: torch.Tensor | None = None,
+        roi_z2: torch.Tensor | None = None,
+        roi_w1: torch.Tensor | None = None,
+        roi_w2: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        ROI views + symmetric InfoNCE with normalized/subsampled negative bank.
+        """
+        assert self.use_adco and pixel_feat is not None and pixel_feat.ndim == 4
+
+        # Two ROI views (masked pooling) and their ROI weights
+        if (roi_z1 is None) or (roi_z2 is None):
+            z1, w1 = self._adco_roi_view(pixel_feat, min_scale=0.6, boundary_ignore=2, uncert=pixel_uncertainty)
+            z2, w2 = self._adco_roi_view(pixel_feat, min_scale=0.6, boundary_ignore=2, uncert=pixel_uncertainty)
+        else:
+            z1 = roi_z1
+            z2 = roi_z2
+            # If external weights are provided, use them; else default to ones
+            if (roi_w1 is None) or (roi_w2 is None):
+                B = z1.shape[0]
+                device = z1.device
+                dtype = z1.dtype
+                w1 = torch.ones(B, device=device, dtype=dtype)
+                w2 = torch.ones(B, device=device, dtype=dtype)
+            else:
+                w1 = roi_w1
+                w2 = roi_w2
+
+        # Projection + L2 normalize
+        q1 = F.normalize(self.adco_proj(z1), dim=1)
+        q2 = F.normalize(self.adco_proj(z2), dim=1)
+        k1 = F.normalize(self.adco_proj(z1).detach(), dim=1)
+        k2 = F.normalize(self.adco_proj(z2).detach(), dim=1)
+
+        # Normalize negative bank and optionally subsample
+        neg_bank = F.normalize(self.adco_negatives, dim=1)  # [K, D]
+        if (neg_sample_M is not None) and (neg_sample_M < neg_bank.size(0)):
+            idx = torch.randint(0, neg_bank.size(0), (neg_sample_M,), device=neg_bank.device)
+            neg_bank = neg_bank.index_select(dim=0, index=idx)  # [M, D]
+        # Temperature scheduling by uncertainty (per-sample)
+        # roi_conf in [0,1], approximate low-uncertainty proportion in ROI
+        roi_conf = None
+        if pixel_uncertainty is not None and self.adco_use_uncertainty:
+            roi_conf = torch.clamp((w1 + w2) * 0.5, 0.0, 1.0)  # [B]
+            # mean_u ~ (1 - roi_conf)
+            if self.adco_tau_beta > 0.0:
+                tau = self.adco_temperature * (1.0 + self.adco_tau_beta * (1.0 - roi_conf))  # [B]
+            else:
+                tau = torch.full_like(roi_conf, float(self.adco_temperature))
+        else:
+            tau = float(self.adco_temperature)
+
+        def info_nce(q: torch.Tensor, k: torch.Tensor, w: torch.Tensor | None = None) -> torch.Tensor:
+            # Support scalar or per-sample temperature
+            if isinstance(tau, torch.Tensor):
+                tau_b = tau.view(-1, 1)
+            else:
+                tau_b = tau
+            pos = (q * k).sum(dim=1, keepdim=True) / tau_b              # [B, 1]
+            neg = (q @ neg_bank.t()) / tau_b                             # [B, M or K]
+            logits = torch.cat([pos, neg], dim=1)                     # [B, 1+M]
+            labels = torch.zeros(logits.size(0), dtype=torch.long, device=logits.device)
+            loss_per = F.cross_entropy(logits, labels, reduction="none")
+            if w is not None:
+                ww = w / (w.mean().detach() + 1e-6)
+                return (loss_per * ww).mean()
+            return loss_per.mean()
+
+        roi_w = (w1 + w2) * 0.5  # [B]
+        loss = 0.5 * info_nce(q1, k2, roi_w) + 0.5 * info_nce(q2, k1, roi_w)
+
+        # Global gating by ROI confidence and curriculum
+        if self.adco_use_uncertainty and roi_conf is not None:
+            gate = torch.clamp(roi_conf, min=float(self.adco_gate_floor), max=1.0)  # [B]
+            # curriculum warmup from 0 to 1 (apply to all cases when using uncertainty)
+            if self.adco_curriculum_warmup_steps > 0:
+                progress = min(1.0, float(self._adco_step_count + 1) / float(self.adco_curriculum_warmup_steps))
+                gate = gate * progress
+            # Apply global gate
+            loss = loss * gate.mean()
+
+            # Scale GRL strength by uncertainty-aware gate (higher confidence -> stronger adversary)
+            # Only update GRL scale when gate_by_uncertainty is enabled
+            if self.adco_gate_by_uncertainty and self.adco_scale_neg_by_uq:
+                self.adco_grl_scale = float(gate.mean().detach().clamp(0.5, 1.0).item())  # min 0.5
+            else:
+                self.adco_grl_scale = 1.0
+        else:
+            self.adco_grl_scale = 1.0
+
+        # Step count for curriculum
+        self._adco_step_count += 1
+        return loss
+
+    def compute_proco_loss(
+        self,
+        pixel_feat: torch.Tensor,                                # [B, H, W, C']
+        use_background: bool = True,
+        roi_z1: torch.Tensor | None = None,
+        roi_z2: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Prototype contrastive (Proxy-NCA/Proto-InfoNCE) with learnable prototypes.
+        - Query q comes from ROI-averaged pixel feature (two views averaged for stability).
+        - Positive is nearest object prototype; negatives are remaining object prototypes
+          and optional background prototypes.
+        """
+        assert self.use_proco and pixel_feat is not None and pixel_feat.ndim == 4
+
+        # Two ROI views for invariance, then average for a single query per sample
+        if (roi_z1 is None) or (roi_z2 is None):
+            with torch.no_grad():
+                z1, _ = self._adco_roi_view(pixel_feat, min_scale=0.6, boundary_ignore=2, uncert=None)
+                z2, _ = self._adco_roi_view(pixel_feat, min_scale=0.6, boundary_ignore=2, uncert=None)
+                z = 0.5 * (z1 + z2)  # [B, C']
+        else:
+            z = 0.5 * (roi_z1 + roi_z2)
+
+        # Projection + L2 normalize
+        q = F.normalize(self.proco_proj(z), dim=1)  # [B, D]
+
+        # Normalize prototype banks
+        obj_bank = F.normalize(self.proco_obj_prototypes, dim=1)  # [Ko, D]
+        if use_background and (self.proco_num_bg_prototypes > 0):
+            bg_bank = F.normalize(self.proco_bg_prototypes, dim=1)  # [Kb, D]
+        else:
+            bg_bank = None
+
+        # Similarity to object prototypes and choose nearest as positive
+        sim_obj = q @ obj_bank.t()  # [B, Ko]
+        pos_idx = torch.argmax(sim_obj, dim=1)  # [B]
+        pos_sim = sim_obj.gather(dim=1, index=pos_idx.view(-1, 1))  # [B, 1]
+
+        # Negatives: all other object prototypes + optional background prototypes
+        if obj_bank.size(0) > 1:
+            arange = torch.arange(obj_bank.size(0), device=q.device).view(1, -1)
+            mask_other = (arange != pos_idx.view(-1, 1))  # [B, Ko]
+            neg_obj = sim_obj[mask_other].view(q.size(0), -1)  # [B, Ko-1]
+        else:
+            neg_obj = torch.empty(q.size(0), 0, device=q.device, dtype=q.dtype)
+
+        if bg_bank is not None:
+            sim_bg = q @ bg_bank.t()  # [B, Kb]
+            neg_all = torch.cat([neg_obj, sim_bg], dim=1) if neg_obj.numel() > 0 else sim_bg
+        else:
+            neg_all = neg_obj
+
+        # Build logits and CE target
+        tau = float(self.proco_temperature)
+        if neg_all.numel() == 0:
+            # Edge case: only one object prototype and no background prototypes
+            logits = pos_sim / tau
+        else:
+            logits = torch.cat([pos_sim, neg_all], dim=1) / tau  # [B, 1+Kneg]
+        labels = torch.zeros(logits.size(0), dtype=torch.long, device=logits.device)
+        loss = F.cross_entropy(logits, labels)
+        return loss
+
+    def compute_moco_loss(
+        self,
+        pixel_feat: torch.Tensor,                                # [B, H, W, C']
+        roi_z1: torch.Tensor | None = None,
+        roi_z2: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        MoCo-style contrastive loss with momentum key encoder and queue negatives.
+        """
+        assert self.use_moco and pixel_feat is not None and pixel_feat.ndim == 4
+
+        # Build or use shared two ROI views
+        if (roi_z1 is None) or (roi_z2 is None):
+            z1, _ = self._adco_roi_view(pixel_feat, min_scale=0.6, boundary_ignore=2, uncert=None)
+            z2, _ = self._adco_roi_view(pixel_feat, min_scale=0.6, boundary_ignore=2, uncert=None)
+        else:
+            z1 = roi_z1
+            z2 = roi_z2
+
+        # Query projection
+        q = F.normalize(self.moco_proj_q(z1), dim=1)  # [B, D]
+
+        # Key projection with momentum update
+        with torch.no_grad():
+            self._moco_momentum_update_key_encoder()
+            k = F.normalize(self.moco_proj_k(z2), dim=1)  # [B, D]
+
+        # Positives: per-sample dot
+        l_pos = (q * k).sum(dim=1, keepdim=True)  # [B, 1]
+        # Negatives: queue
+        l_neg = q @ self.moco_queue  # [B, K]
+
+        logits = torch.cat([l_pos, l_neg], dim=1) / float(self.moco_temperature)
+        labels = torch.zeros(logits.size(0), dtype=torch.long, device=logits.device)
+        loss = F.cross_entropy(logits, labels)
+
+        # Update queue with keys from all GPUs if distributed
+        with torch.no_grad():
+            keys_all = self._concat_all_gather(k)
+            self._moco_dequeue_and_enqueue(keys_all)
+
+        return loss
 
     @property
     def device(self):
@@ -428,6 +923,43 @@ class SAM2Base(torch.nn.Module):
             obj_ptr = obj_ptr + (1 - lambda_is_obj_appearing) * self.no_obj_ptr
 
         if self.use_bndl_for_pixels:
+            pixel_feat = bndl_outputs.get("pixel_feat", None)
+            shared_z1 = None
+            shared_z2 = None
+            shared_w1 = None
+            shared_w2 = None
+            # Build one pair of ROI views once (if enabled) and pass to all losses; methods handle None.
+            if self.training and self.share_roi_views and (pixel_feat is not None):
+                uncert = bndl_outputs.get("pixel_uncertainty", None) if self.adco_use_uncertainty else None
+                shared_z1, shared_w1 = self._adco_roi_view(pixel_feat, min_scale=0.6, boundary_ignore=2, uncert=uncert)
+                shared_z2, shared_w2 = self._adco_roi_view(pixel_feat, min_scale=0.6, boundary_ignore=2, uncert=uncert)
+            # Optional per-frame uncertainty for AdCo
+            pixel_uncertainty = bndl_outputs.get("pixel_uncertainty", None) if self.adco_use_uncertainty else None
+            if self.use_adco and self.training and (pixel_feat is not None):
+                adco_loss = self.compute_adco_loss(
+                    pixel_feat=pixel_feat,
+                    pixel_uncertainty=pixel_uncertainty,
+                    roi_z1=shared_z1,
+                    roi_z2=shared_z2,
+                    roi_w1=shared_w1,
+                    roi_w2=shared_w2,
+                )
+                bndl_outputs["adco_aux_loss"] = adco_loss
+            if self.use_proco and self.training and (pixel_feat is not None):
+                proco_loss = self.compute_proco_loss(
+                    pixel_feat=pixel_feat,
+                    use_background=True,
+                    roi_z1=shared_z1,
+                    roi_z2=shared_z2,
+                )
+                bndl_outputs["proco_aux_loss"] = proco_loss
+            if self.use_moco and self.training and (pixel_feat is not None):
+                moco_loss = self.compute_moco_loss(
+                    pixel_feat=pixel_feat,
+                    roi_z1=shared_z1,
+                    roi_z2=shared_z2,
+                )
+                bndl_outputs["moco_aux_loss"] = moco_loss
             return (
                 low_res_multimasks,
                 high_res_multimasks,
@@ -657,7 +1189,7 @@ class SAM2Base(torch.nn.Module):
                         pos_and_ptrs.append((t_diff, out["obj_ptr"]))
                 # If we have at least one object pointer, add them to the across attention
                 if len(pos_and_ptrs) > 0:
-                    pos_list, ptrs_list = zip(*pos_and_ptrs)
+                    pos_list, ptrs_list = zip(*pos_and_ptrs, strict=True)
                     # stack object pointers along dim=0 into [ptr_seq_len, B, C] shape
                     obj_ptrs = torch.stack(ptrs_list, dim=0)
                     # a temporal positional embedding based on how far each object pointer is from
@@ -781,7 +1313,7 @@ class SAM2Base(torch.nn.Module):
         if len(current_vision_feats) > 1:
             high_res_features = [
                 x.permute(1, 2, 0).view(x.size(1), x.size(2), *s)
-                for x, s in zip(current_vision_feats[:-1], feat_sizes[:-1])
+                for x, s in zip(current_vision_feats[:-1], feat_sizes[:-1], strict=True)
             ]
         else:
             high_res_features = None
@@ -805,6 +1337,11 @@ class SAM2Base(torch.nn.Module):
                 num_frames=num_frames,
                 track_in_reverse=track_in_reverse,
             )
+            # Apply DSU perturbation before SAM head
+            if self.use_dsu:
+                pix_feat = self._dsu_perturb(pix_feat)
+                if self.dsu_apply_high_res and high_res_features is not None:
+                    high_res_features = [self._dsu_perturb(f) for f in high_res_features]
             # apply SAM-style segmentation head
             # here we might feed previously predicted low-res SAM mask logits into the SAM mask decoder,
             # e.g. in demo where such logits come from earlier interaction instead of correction sampling

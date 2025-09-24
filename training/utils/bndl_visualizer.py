@@ -4,14 +4,20 @@ BNDL可视化器模块
 """
 
 import logging
-from typing import Any, Dict, Optional, Tuple
+from typing import Any
 
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
 
-from .metric_calculator import MetricCalculator
-from .visualization_utils import VisualizationUtils
+try:
+    from .metric_calculator import MetricCalculator
+    from .visualization_utils import VisualizationUtils
+except ImportError:
+    # Fallback for when imported as standalone module
+    from metric_calculator import MetricCalculator
+    from visualization_utils import VisualizationUtils
 
 
 class BNDLVisualizer:
@@ -21,10 +27,119 @@ class BNDLVisualizer:
         self.viz_utils = VisualizationUtils()
         self.metric_calc = MetricCalculator()
 
-    def plot_parameter_and_uncertainty_overlays(self, axes, original_img: np.ndarray, lambda_img: np.ndarray, k_img: np.ndarray, bndl_outputs: Dict[str, Any], step_index: int) -> None:
+    def plot_parameter_and_uncertainty_overlays(self, axes, original_img: np.ndarray, lambda_img: np.ndarray, k_img: np.ndarray, bndl_outputs: dict[str, Any], step_index: int) -> None:
         """参数和不确定性叠加图，包含PAvPU可视化"""
         try:
-            lambda_norm, k_norm = self.viz_utils.normalize_parameters_robust(lambda_img, k_img)
+            # 优先尝试使用 hyper_in/out_w 与预测加权后的有效参数图
+            lambda_eff_np = None
+            k_eff_np = None
+
+            try:
+                wei_lambda = bndl_outputs.get("wei_lambda")
+                inv_k = bndl_outputs.get("inv_k")
+                out_w = bndl_outputs.get("out_w")
+                logits = bndl_outputs.get("masks_bndl_raw") if bndl_outputs.get("masks_bndl_raw") is not None else bndl_outputs.get("mean_pixel_logits")
+
+                if wei_lambda is not None and inv_k is not None:
+                    # 转为torch并在CPU上计算
+                    wl = wei_lambda.detach().float().cpu()  # [B,H,W,C']
+                    invk = inv_k.detach().float().cpu()
+                    k_val = 1.0 / (invk + 1e-6)            # [B,H,W,C']
+
+                    # 处理权重矩阵：优先使用 out_w；若无则尝试 hyper_in
+                    w = None
+                    if out_w is not None:
+                        if hasattr(out_w, "detach"):
+                            w = out_w.detach().float().cpu()
+                        else:
+                            # numpy -> torch
+                            w = torch.from_numpy(out_w).float().cpu()
+                    if w is None and "hyper_in" in bndl_outputs and bndl_outputs["hyper_in"] is not None:
+                        w = bndl_outputs["hyper_in"].detach().float().cpu()  # [B,K,C']
+
+                    lambda_eff = None
+                    k_eff = None
+
+                    if w is not None:
+                        # 归一化并广播到像素
+                        if w.ndim == 3:  # [B,K,C']
+                            B, H, W, C = wl.shape
+                            Bb, K, Cp = w.shape
+                            if Bb == B and Cp == C:
+                                w_sum = w.sum(dim=2, keepdim=True) + 1e-8
+                                w_norm = w / w_sum  # [B,K,C']
+
+                                # 展平像素做批矩阵乘：([B*H*W,C'] @ [B,C',K])
+                                wl_flat = wl.view(B, H * W, C)
+                                k_flat = k_val.view(B, H * W, C)
+                                w_bt = w_norm.transpose(1, 2)  # [B,C',K]
+                                lambda_w_flat = torch.bmm(wl_flat, w_bt)  # [B,HW,K]
+                                k_w_flat = torch.bmm(k_flat, w_bt)        # [B,HW,K]
+                                lambda_w = lambda_w_flat.view(B, H, W, K)
+                                k_w = k_w_flat.view(B, H, W, K)
+                            else:
+                                lambda_w = None
+                                k_w = None
+                        elif w.ndim == 2:  # [C',K] 或 [K,C']
+                            Ck0, Ck1 = w.shape
+                            # 统一为 [C',K]
+                            if Ck0 >= Ck1:
+                                w_ck = w  # 可能已是 [C',K]
+                            else:
+                                w_ck = w.transpose(0, 1)  # [C',K]
+
+                            B, H, W, C = wl.shape
+                            if w_ck.shape[0] == C:
+                                w_sum = w_ck.sum(dim=0, keepdim=True) + 1e-8  # [1,K]
+                                w_norm = w_ck / w_sum                           # [C',K]
+                                wl_flat = wl.view(B * H * W, C)
+                                k_flat = k_val.view(B * H * W, C)
+                                lambda_w_flat = torch.matmul(wl_flat, w_norm)  # [BHW,K]
+                                k_w_flat = torch.matmul(k_flat, w_norm)
+                                lambda_w = lambda_w_flat.view(B, H, W, -1)
+                                k_w = k_w_flat.view(B, H, W, -1)
+                            else:
+                                lambda_w = None
+                                k_w = None
+                        else:
+                            lambda_w = None
+                            k_w = None
+
+                        # 沿K聚合：优先使用概率加权，其次赢家法，否则均匀平均
+                        if lambda_w is not None and k_w is not None:
+                            if logits is not None:
+                                lg = logits.detach().float().cpu()  # [B,H,W,K]
+                                p = torch.sigmoid(lg)
+                                psum = p.sum(dim=-1, keepdim=True) + 1e-8
+                                p_norm = p / psum
+                                lambda_eff = (lambda_w * p_norm).sum(dim=-1)  # [B,H,W]
+                                k_eff = (k_w * p_norm).sum(dim=-1)
+                            else:
+                                # 无logits，使用均匀
+                                lambda_eff = lambda_w.mean(dim=-1)
+                                k_eff = k_w.mean(dim=-1)
+
+                    # 若无法使用权重，回退到传入的未加权图
+                    if lambda_eff is not None and k_eff is not None:
+                        lambda_eff_np = lambda_eff[0].numpy() if lambda_eff.ndim == 3 else lambda_eff.numpy()
+                        k_eff_np = k_eff[0].numpy() if k_eff.ndim == 3 else k_eff.numpy()
+            except Exception as e:
+                logging.warning(f"Weighted overlay computation failed, fallback to raw params: {e}")
+
+            # 选择用于显示的参数图
+            if lambda_eff_np is not None and k_eff_np is not None:
+                lambda_vis = lambda_eff_np
+                k_vis = k_eff_np
+            else:
+                lambda_vis = lambda_img
+                k_vis = k_img
+
+            # 尺寸对齐
+            if original_img is not None and (lambda_vis.shape != original_img.shape[:2]):
+                lambda_vis = cv2.resize(lambda_vis, (original_img.shape[1], original_img.shape[0]), interpolation=cv2.INTER_LINEAR)
+                k_vis = cv2.resize(k_vis, (original_img.shape[1], original_img.shape[0]), interpolation=cv2.INTER_LINEAR)
+
+            lambda_norm, k_norm = self.viz_utils.normalize_parameters_robust(lambda_vis, k_vis)
 
             # 提取不确定性用于叠加
             uncertainty = None
@@ -79,7 +194,7 @@ class BNDLVisualizer:
                 pavpu_text = ""
                 if "pixel_pavpu" in bndl_outputs and bndl_outputs["pixel_pavpu"] is not None:
                     pavpu_scores = bndl_outputs["pixel_pavpu"]
-                    thresholds = [0.01, 0.05, 0.1]
+                    thresholds = bndl_outputs.get("pavpu_thresholds", [0.01, 0.05, 0.1])
                     pavpu_text = "\nPAvPU: "
                     for thresh, score in zip(thresholds, pavpu_scores, strict=False):
                         pavpu_text += f"p={thresh:.2f}:{score:.1f}% "
@@ -100,11 +215,14 @@ class BNDLVisualizer:
             # 回退到常规参数叠加
             self.viz_utils.plot_parameter_overlays(axes, original_img, lambda_img, k_img, step_index)
 
-    def plot_global_parameters_in_layout(self, axes, bndl_outputs: Dict[str, Any], step_index: int) -> None:
+    def plot_global_parameters_in_layout(self, axes, bndl_outputs: dict[str, Any], step_index: int) -> None:
         """在统一布局中绘制全局权重参数"""
         try:
             lambda_w = bndl_outputs["wei_lambda_w"].detach().cpu().numpy()
             k_w = (1.0 / (bndl_outputs["inv_k_w"] + 1e-6)).detach().cpu().numpy()
+            out_w = bndl_outputs.get("out_w")
+            if out_w is not None and hasattr(out_w, "detach"):
+                out_w = out_w.detach().cpu().numpy()
 
             if len(lambda_w.shape) == 3:  # [B, K, C']
                 lambda_w_vis = lambda_w[0]  # 使用第一个批次
@@ -124,18 +242,53 @@ class BNDLVisualizer:
                 axes[1].set_ylabel("Mask Token")
                 plt.colorbar(im2, ax=axes[1], fraction=0.046, pad=0.04)
 
-                # 全局参数统计
-                axes[2].text(
-                    0.5,
-                    0.5,
-                    f"Global Parameters Summary:\n\nLambda_w:\nMean: {lambda_w_vis.mean():.4f}\nStd: {lambda_w_vis.std():.4f}\n\nK_w:\nMean: {k_w_vis.mean():.4f}\nStd: {k_w_vis.std():.4f}",
-                    ha="center",
-                    va="center",
-                    transform=axes[2].transAxes,
-                    fontsize=10,
-                )
-                axes[2].set_title(f"Global Parameters Stats (Step {step_index})")
-                axes[2].axis("off")
+                # 第三列：可视化权重矩阵（如果提供 out_w），否则显示统计
+                if out_w is not None:
+                    # 统一为 [C', K] 以便显示：若为 [B, K, C'] 取 batch 0 并转置到 [C', K]
+                    if len(out_w.shape) == 3:
+                        ow = out_w[0]  # [K, C']
+                        if ow.shape[0] != 1 and ow.shape[1] != 1:
+                            ow = ow.transpose(1, 0)  # -> [C', K]
+                    elif len(out_w.shape) == 2:
+                        # 可能是 [C', K] 或 [K, C']，尽量转为 [C', K]
+                        ow = out_w
+                        if ow.shape[0] < ow.shape[1]:
+                            # 假设 [K, C']，转置
+                            ow = ow.transpose(1, 0)
+                    else:
+                        ow = None
+
+                    if ow is not None:
+                        im3 = axes[2].imshow(ow, cmap="magma", interpolation="nearest", aspect="auto")
+                        axes[2].set_title(f"Used Weight Matrix (Step {step_index})\nShape: {ow.shape[0]}×{ow.shape[1]}")
+                        axes[2].set_xlabel("Mask Token (K)")
+                        axes[2].set_ylabel("Feature Dim (C')")
+                        plt.colorbar(im3, ax=axes[2], fraction=0.046, pad=0.04)
+                    else:
+                        axes[2].text(
+                            0.5,
+                            0.5,
+                            "Weight matrix shape\nnot supported",
+                            ha="center",
+                            va="center",
+                            transform=axes[2].transAxes,
+                            fontsize=10,
+                        )
+                        axes[2].set_title(f"Weight Matrix (Step {step_index})")
+                        axes[2].axis("off")
+                else:
+                    # 回退到全局参数统计
+                    axes[2].text(
+                        0.5,
+                        0.5,
+                        f"Global Parameters Summary:\n\nLambda_w:\nMean: {lambda_w_vis.mean():.4f}\nStd: {lambda_w_vis.std():.4f}\n\nK_w:\nMean: {k_w_vis.mean():.4f}\nStd: {k_w_vis.std():.4f}",
+                        ha="center",
+                        va="center",
+                        transform=axes[2].transAxes,
+                        fontsize=10,
+                    )
+                    axes[2].set_title(f"Global Parameters Stats (Step {step_index})")
+                    axes[2].axis("off")
 
             else:
                 # 处理其他形状
@@ -151,7 +304,7 @@ class BNDLVisualizer:
                 axes[i].set_title("Error")
                 axes[i].axis("off")
 
-    def plot_uncertainty_visualization(self, axes, bndl_outputs: Dict[str, Any], step_index: int) -> None:
+    def plot_uncertainty_visualization(self, axes, bndl_outputs: dict[str, Any], step_index: int) -> None:
         """绘制不确定性和PAvPU可视化"""
         try:
             if "pixel_uncertainty" in bndl_outputs and bndl_outputs["pixel_uncertainty"] is not None:
@@ -171,10 +324,10 @@ class BNDLVisualizer:
                 plt.colorbar(im1, ax=axes[0], fraction=0.046, pad=0.04)
 
                 # PAvPU可视化
-                if "pixel_pavpu" in bndl_outputs and bndl_outputs["pixel_pavpu"] is not None:
-                    pavpu_scores = bndl_outputs["pixel_pavpu"]
-                    thresholds = [0.01, 0.05, 0.1]
+                pavpu_scores = bndl_outputs.get("pixel_pavpu")
+                thresholds = bndl_outputs.get("pavpu_thresholds", [0.01, 0.05, 0.1]) if pavpu_scores is not None else None
 
+                if pavpu_scores is not None and thresholds is not None:
                     # PAvPU柱状图
                     bars = axes[1].bar(range(len(thresholds)), pavpu_scores, color=["lightblue", "skyblue", "deepskyblue"], alpha=0.8)
                     axes[1].set_xlabel("Uncertainty Threshold")
@@ -197,10 +350,9 @@ class BNDLVisualizer:
                 # 包含PAvPU的组合统计
                 stats_text = f"Uncertainty Summary:\nMean: {uncertainty_vis.mean():.4f}\nStd: {uncertainty_vis.std():.4f}\nMin: {uncertainty_vis.min():.4f}\nMax: {uncertainty_vis.max():.4f}"
 
-                if "pixel_pavpu" in bndl_outputs and bndl_outputs["pixel_pavpu"] is not None:
-                    pavpu_scores = bndl_outputs["pixel_pavpu"]
+                if pavpu_scores is not None and thresholds is not None:
                     stats_text += "\n\nPAvPU Scores:\n"
-                    for thresh, score in zip([0.01, 0.05, 0.1], pavpu_scores, strict=False):
+                    for thresh, score in zip(thresholds, pavpu_scores, strict=False):
                         stats_text += f"p={thresh:.2f}: {score:.1f}%\n"
 
                 axes[2].text(0.5, 0.5, stats_text, ha="center", va="center", transform=axes[2].transAxes, fontsize=9)
@@ -215,17 +367,16 @@ class BNDLVisualizer:
                     axes[i].axis("off")
 
         except Exception as e:
-            logging.warning(f"Failed to plot uncertainty visualization: {e}")
+            # logging.warning(f"Failed to plot uncertainty visualization: {e}")
             for i in range(3):
                 axes[i].text(0.5, 0.5, "Uncertainty\nVisualization\nFailed", ha="center", va="center", transform=axes[i].transAxes)
                 axes[i].set_title("Error")
                 axes[i].axis("off")
 
-    def plot_correlation_analysis(self, axes, bndl_outputs: Dict[str, Any], step_index: int, batch: Any, outputs_for_vis: Optional[Dict[str, Any]] = None) -> None:
+    def plot_correlation_analysis(self, axes, bndl_outputs: dict[str, Any], step_index: int, batch: Any, outputs_for_vis: dict[str, Any] | None = None) -> None:
         """计算IoU、DICE和掩码准确率指标，并绘制它们与不确定性值的相关性"""
         try:
             # 提取预测和目标
-            pred_masks = None
             gt_masks = None
             uncertainty = None
 
@@ -369,7 +520,7 @@ class BNDLVisualizer:
             # 图3: Mask Accuracy vs Uncertainty
             self.viz_utils.plot_metric_uncertainty_correlation(axes[2], uncertainty_valid, acc_valid, "Mask Accuracy vs Uncertainty", "Uncertainty", "Mask Accuracy", step_index)
 
-            logging.info(f"Correlation analysis completed for step {step_index}")
+            # logging.info(f"Correlation analysis completed for step {step_index}")
 
         except Exception as e:
             logging.warning(f"Failed to plot correlation analysis: {e}")

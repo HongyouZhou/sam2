@@ -4,6 +4,8 @@ Shared dataset configurations for SAM-2 zero-shot evaluation scripts.
 This ensures consistency between different evaluation approaches.
 """
 
+from __future__ import annotations
+
 # Dataset configurations for zero-shot evaluation
 DATASET_CONFIGS = {
     "TrashCan": {
@@ -168,10 +170,19 @@ DATASET_CONFIGS = {
         "has_split_subdir": True,
         "skip_first_and_last": False,
     },
+    "MOSE": {
+        "root": "/ssdArray/hongyou/dev/data/MOSE_release/",
+        "splits": ["train"],
+        "default_split": ["train"],
+        "has_split_subdir": True,  # MOSE has JPEGImages and Annotations under train/ subdirectory
+        "skip_first_and_last": False,
+        "file_list_txt": "/home/hongyou/dev/ada_samp/sam2/training/assets/MOSE_sample_train_list.txt",  # Use the specified file list
+    },
 }
 
 # Default dataset list for evaluation
 DEFAULT_DATASETS = [
+    "MOSE",
     "TrashCan",
     "GTEA",
     "PIDRay",
@@ -184,7 +195,7 @@ DEFAULT_DATASETS = [
     "WoodScape",
     "EgoHOS",
     "VISOR",
-    "OVIS", # 异常
+    "OVIS",
     "ADE20K",
     "iShape",
     "ZeroWaste-f",
@@ -196,3 +207,46 @@ DEFAULT_DATASETS = [
     "PPDLS",
     "STREETS",
 ]
+
+# -----------------------------------------------------------------------------
+# Centralized dataset type taxonomy (3 types)
+# -----------------------------------------------------------------------------
+# Category keys (stable identifiers) mapped to human-readable labels
+DATASET_TYPE_CATEGORIES: dict[str, str] = {
+    "OBJECT": "Object-centric / Instance",
+    "SCENE": "Scene-centric / Stuff",
+    "EGO_VIDEO": "Egocentric / Video",
+}
+
+# Mapping from dataset name (as used in DATASET_CONFIGS) to a category key above
+DATASET_TO_TYPE: dict[str, str] = {
+    # Object-centric / Instance
+    "TrashCan": "OBJECT",
+    "PIDRay": "OBJECT",
+    "iShape": "OBJECT",
+    "ZeroWaste-f": "OBJECT",
+    "LVIS": "OBJECT",
+    "DOORS": "OBJECT",
+    "BBBC038v1": "OBJECT",
+    "PPDLS": "OBJECT",
+    "IBD": "OBJECT",
+
+    # Scene-centric / Stuff
+    "CITYSCAPES": "SCENE",
+    "ADE20K": "SCENE",
+    "Hypersim": "SCENE",
+    "WoodScape": "SCENE",
+    "STREETS": "SCENE",
+    "NDISPark": "SCENE",
+    "plittersdorf": "SCENE",
+    "NDD20": "SCENE",
+    "TimberSeg": "SCENE",
+
+    # Egocentric / Video
+    "GTEA": "EGO_VIDEO",
+    "EgoHOS": "EGO_VIDEO",
+    "VISOR": "EGO_VIDEO",
+    "OVIS": "EGO_VIDEO",
+    "MOSE": "EGO_VIDEO",
+    "DRAM": "EGO_VIDEO",
+}

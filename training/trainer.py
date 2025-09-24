@@ -42,7 +42,7 @@ from training.utils.distributed import all_reduce_max, barrier, get_rank
 from training.utils.logger import Logger, setup_logging
 
 # Import BNDL uncertainty and PAvPU functions
-from BNDL.BNDL_upload.ViT_Sparse.utils.model_helpers import pixel_uncertain_sampling, pixel_pavpu_calculation
+from BNDL.BNDL_upload.ViT_Sparse.utils.bndl import pixel_uncertain_sampling, pixel_pavpu_calculation, pixel_entropy_uncertainty
 
 from training.utils.dataset_evaluator import DistributedDatasetEvaluator
 
@@ -148,6 +148,7 @@ class LoggingConf:
     scalar_keys_to_log: Optional[Dict[str, Any]] = None
     log_batch_stats: bool = False
     visualize_bndl: bool = False
+    uncertainty_metric: str = "entropy"
 
 
 class Trainer:
@@ -1224,15 +1225,34 @@ class Trainer:
         
         # Extract pixel features from BNDL outputs
         pixel_feat = bndl_outputs['pixel_feat']
-        hyper_in = bndl_outputs['hyper_in']
+        hyper_in = bndl_outputs.get('hyper_in', None)
         
-        # Perform pixel-level uncertainty sampling
-        pixel_uncertainty, mean_pixel_logits = pixel_uncertain_sampling(
-            pixel_bndl_model, 
-            pixel_feat, 
-            external_pre_out_w=hyper_in,
-            sample_num=50
-        )
+        # Decide which uncertainty to compute up-front and compute only that
+        mean_pixel_logits = None
+        pixel_uncertainty_p = None
+        entropy_norm = None
+        if self.logging_conf.uncertainty_metric == 'entropy':
+            entropy_map = pixel_entropy_uncertainty(
+                pixel_bndl_model,
+                pixel_feat,
+                external_pre_out_w=hyper_in,
+                sample_num=50,
+            )
+            entropy_norm = torch.clamp(entropy_map / math.log(2.0), 0.0, 1.0)
+            # Also get mean logits for downstream use via one quick sampling path
+            _, mean_pixel_logits = pixel_uncertain_sampling(
+                pixel_bndl_model,
+                pixel_feat,
+                external_pre_out_w=hyper_in,
+                sample_num=1,
+            )
+        else:
+            pixel_uncertainty_p, mean_pixel_logits = pixel_uncertain_sampling(
+                pixel_bndl_model,
+                pixel_feat,
+                external_pre_out_w=hyper_in,
+                sample_num=50,
+            )
         
         # Prepare ground truth masks for PAvPU calculation
         pixel_targets = self._prepare_targets_for_pavpu(targets, bndl_outputs)
@@ -1251,19 +1271,28 @@ class Trainer:
                 logging.info(f"Aligned spatial dimensions for PAvPU calculation")
             
 
+        # Select uncertainty metric and thresholds (default policy)
+        if self.logging_conf.uncertainty_metric == 'entropy' and entropy_norm is not None:
+            chosen_uncertainty = entropy_norm
+            thresholds = [0.2, 0.4, 0.6]
+        else:
+            chosen_uncertainty = pixel_uncertainty_p
+            thresholds = [0.01, 0.05, 0.1]
+
         pavpu_scores = pixel_pavpu_calculation(
-            pixel_uncertainty, 
-            pixel_predictions, 
+            chosen_uncertainty,
+            pixel_predictions,
             pixel_targets,
-            thresholds=[0.01, 0.05, 0.1]
+            thresholds=thresholds,
         )
         
         # Add PAvPU results to BNDL outputs
-        bndl_outputs['pixel_uncertainty'] = pixel_uncertainty.detach()
+        bndl_outputs['pixel_uncertainty'] = chosen_uncertainty.detach()
         bndl_outputs['pixel_pavpu'] = pavpu_scores
+        bndl_outputs['pavpu_thresholds'] = thresholds
         bndl_outputs['mean_pixel_logits'] = mean_pixel_logits.detach()
         
-        logging.info(f"PAvPU scores calculated: {pavpu_scores}")
+        # logging.info(f"PAvPU scores calculated: {pavpu_scores}")
                 
         
         return bndl_outputs
@@ -1438,7 +1467,7 @@ class Trainer:
         save_path = os.path.join(vis_dir, f"epoch_{self.epoch}_iter_{data_iter}_step_{step_index}_unified_{layout_type}.png")
         viz_utils.save_and_close_figure(fig, save_path, dpi=150)
         
-        logging.info(f"Unified BNDL visualization saved: {save_path}")
+        # logging.info(f"Unified BNDL visualization saved: {save_path}")
             
 
     def _plot_common_elements_refactored(self, axes, original_img, lambda_img, k_img, step_index, 

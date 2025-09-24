@@ -2,6 +2,8 @@
 # Compare SAM-2 vs SAM-2+BNDL zero-shot evaluation results
 # Runs both versions and generates comprehensive comparison plots
 
+from __future__ import annotations
+
 import argparse
 import json
 import time
@@ -18,7 +20,10 @@ matplotlib.use("Agg")  # Use non-interactive backend
 
 # Import both evaluation scripts
 # Import dataset configs
-from dataset_configs import DATASET_CONFIGS, DEFAULT_DATASETS
+from dataset_configs import DATASET_CONFIGS
+from dataset_configs import DATASET_TO_TYPE
+from dataset_configs import DATASET_TYPE_CATEGORIES
+from dataset_configs import DEFAULT_DATASETS
 from zero_shot_multi_dataset import run_single_dataset as run_sam2_dataset
 from zero_shot_multi_dataset_sam_bndl import run_single_dataset_with_bndl as run_bndl_dataset
 
@@ -160,6 +165,7 @@ def run_comparison_evaluation(
                     first_frame_only=first_frame_only,
                     max_objects=max_objects,
                     collect_statistics=True,  # Force collect statistics for comparison
+                    reuse_prompts_root=None,  # Reuse prompts saved by the first run
                 )
                 bndl_time = time.time() - bndl_start
                 bndl_per_thresh.append((th, j_f_bndl, j_bndl, f_bndl))
@@ -445,10 +451,18 @@ def create_comprehensive_comparison_plots(
 
     # Create summary table
     summary_data = []
+    # Resolve dataset types to human-readable labels
+    dataset_types = []
+    for dataset in datasets:
+        type_key = DATASET_TO_TYPE.get(dataset)
+        type_label = DATASET_TYPE_CATEGORIES.get(type_key, "Unknown") if type_key else "Unknown"
+        dataset_types.append(type_label)
+
     for i, dataset in enumerate(datasets):
         summary_data.append(
             [
                 dataset,
+                dataset_types[i],
                 f"{sam2_jf[i]:.2f}",
                 f"{bndl_jf[i]:.2f}",
                 f"{jf_improvements[i]:+.2f}",
@@ -463,7 +477,7 @@ def create_comprehensive_comparison_plots(
 
     table = ax9.table(
         cellText=summary_data, 
-        colLabels=["Dataset", "SAM-2 J&F", "BNDL J&F", "ΔJ&F", "SAM-2 J", "BNDL J", "ΔJ", "SAM-2 F", "BNDL F", "ΔF"], 
+        colLabels=["Dataset", "Type", "SAM-2 J&F", "BNDL J&F", "ΔJ&F", "SAM-2 J", "BNDL J", "ΔJ", "SAM-2 F", "BNDL F", "ΔF"], 
         cellLoc="center", 
         loc="center", 
         bbox=None
@@ -474,7 +488,7 @@ def create_comprehensive_comparison_plots(
 
     # Color code improvements
     for i in range(1, len(summary_data) + 1):
-        for j in [3, 6, 9]:  # Improvement columns
+        for j in [4, 7, 10]:  # Improvement columns after adding Type
             if j < len(summary_data[0]):
                 try:
                     val = float(summary_data[i - 1][j])
@@ -567,7 +581,7 @@ def parse_args():
     )
     p.add_argument(
         "--bndl_checkpoint",
-        default="/home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_003_07/checkpoints/checkpoint_20.pt",
+        default="/home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_007_02_adco/checkpoints/checkpoint_50.pt",
         help="SAM-2+BNDL checkpoint path",
     )
 
@@ -589,16 +603,16 @@ def parse_args():
         help="Prompting strategy: gt_box (default) or three_clicks",
     )
     p.add_argument("--num_workers", type=int, default=None, help="Number of evaluation processes")
-    p.add_argument("--output_path", default="./outputs/comparison_sam2_vs_bndl", help="Root output directory")
+    p.add_argument("--output_path", default="./outputs/comparison_sam2_vs_bndl_007_02_adco_no_reuse", help="Root output directory")
     p.add_argument("--first_frame_only", action="store_true", help="Evaluate only the first frame per video")
 
     # Subset options
     p.add_argument("--video_limit", type=int, default=None, help="Limit number of videos per dataset")
-    p.add_argument("--max_objects", type=int, default=20, help="Maximum number of objects per video")
+    p.add_argument("--max_objects", type=int, default=256, help="Maximum number of objects per video")
 
     # Visualization options
-    p.add_argument("--save_vis", action="store_true", default=False, help="Save visualizations")
-    p.add_argument("--collect_bndl_stats", action="store_true", default=False, help="Collect BNDL statistics")
+    p.add_argument("--save_vis", action="store_true", default=True, help="Save visualizations")
+    p.add_argument("--collect_bndl_stats", action="store_true", default=True, help="Collect BNDL statistics")
 
     return p.parse_args()
 
