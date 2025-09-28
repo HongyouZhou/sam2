@@ -14,6 +14,10 @@ from sam2.modeling.sam.mask_decoder import MaskDecoder
 from sam2.modeling.sam.prompt_encoder import PromptEncoder
 from sam2.modeling.sam.transformer import TwoWayTransformer
 from sam2.modeling.sam2_utils import get_1d_sine_pe, MLP, select_closest_cond_frames
+from BNDL.BNDL_upload.ViT_Sparse.utils.bndl import (
+    pixel_uncertain_sampling,
+    pixel_entropy_uncertainty,
+)
 
 # a large negative value as a placeholder score for missing objects
 NO_OBJ_SCORE = -1024.0
@@ -111,6 +115,8 @@ class SAM2Base(torch.nn.Module):
         adco_queue_size: int = 65536,
         adco_temperature: float = 0.2,
         adco_loss_weight: float = 0.1,
+        # AdCo negative image bank resolution (for memory safety)
+        adco_neg_image_size: int = 128,
         # Whether AdCo uses uncertainty for ROI weighting (can be disabled)
         adco_use_uncertainty: bool = True,
         # Uncertainty-aware controls
@@ -242,6 +248,7 @@ class SAM2Base(torch.nn.Module):
         self.adco_queue_size = int(adco_queue_size)
         self.adco_temperature = float(adco_temperature)
         self.adco_loss_weight = float(adco_loss_weight)
+        self.adco_neg_image_size = int(adco_neg_image_size)
         ############################################################
         self.adco_use_uncertainty = bool(adco_use_uncertainty)
         self.adco_gate_by_uncertainty = bool(adco_gate_by_uncertainty)
@@ -343,10 +350,17 @@ class SAM2Base(torch.nn.Module):
             torch.nn.ReLU(inplace=True),
             torch.nn.Linear(self.adco_proj_dim, self.adco_proj_dim, bias=False),
         )
-        # Learnable negatives (K x D), adversarially updated by gradient reversal
-        neg = torch.randn(self.adco_queue_size, self.adco_proj_dim) * 0.01
-        neg = F.normalize(neg, dim=1)
-        self.adco_negatives = torch.nn.Parameter(neg)
+        # Scheme A: Learnable negative image bank for AdCo (sample → encode → BNDL)
+        # Store at a reduced resolution for memory safety; upsample on use.
+        # Shape: [K_eff, 3, Hneg, Wneg]
+        Hneg = int(self.adco_neg_image_size)
+        Wneg = int(self.adco_neg_image_size)
+        # Budget ~128M elements to avoid OOM (float32 ~ 512MB). Clamp K accordingly.
+        max_elems = 128 * 1024 * 1024
+        per_item = 3 * Hneg * Wneg
+        K_eff = max(64, min(int(self.adco_queue_size), int(max_elems // max(per_item, 1))))
+        neg_images = torch.randn(K_eff, 3, Hneg, Wneg) * 0.01
+        self.adco_negatives = torch.nn.Parameter(neg_images)
         # Gradient reversal on negatives to approximate adversarial ascent
         # Use fixed gradient reversal scale (standard GRL implementation)
         self.adco_negatives.register_hook(lambda g: (-1.0 * g) if g is not None else g)
@@ -403,21 +417,53 @@ class SAM2Base(torch.nn.Module):
         batch_size = keys.shape[0]
         K = self.moco_queue_size
         ptr = int(self.moco_queue_ptr.item())
-        assert K % batch_size == 0, "Queue size must be divisible by batch size"
         # Transpose to (D x N) to fit queue layout (D x K)
-        self.moco_queue[:, ptr:ptr + batch_size] = keys.t()
+        keys_T = keys.t()  # [D, N]
+        end = ptr + batch_size
+        if end <= K:
+            self.moco_queue[:, ptr:end] = keys_T
+        else:
+            first = K - ptr
+            if first > 0:
+                self.moco_queue[:, ptr:] = keys_T[:, :first]
+            remain = batch_size - first
+            self.moco_queue[:, :remain] = keys_T[:, first:]
         ptr = (ptr + batch_size) % K
         self.moco_queue_ptr[0] = ptr
 
     @torch.no_grad()
-    def _concat_all_gather(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Gather tensors from all processes, supporting single process as fallback."""
-        if torch.distributed.is_available() and torch.distributed.is_initialized():
-            tensors_gather = [torch.zeros_like(tensor) for _ in range(torch.distributed.get_world_size())]
-            torch.distributed.all_gather(tensors_gather, tensor, async_op=False)
-            output = torch.cat(tensors_gather, dim=0)
-            return output
-        return tensor
+    def _gather_batchwise(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Safe all_gather for variable batch sizes: pad to max B, gather, then unpad.
+
+        Input:  tensor [B, D]
+        Output: concatenated across ranks [sum_B, D]
+        """
+        if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
+            return tensor
+        device = tensor.device
+        B_local = torch.tensor([tensor.shape[0]], device=device, dtype=torch.long)
+        sizes = [torch.zeros_like(B_local) for _ in range(torch.distributed.get_world_size())]
+        torch.distributed.all_gather(sizes, B_local)
+        sizes_int = [int(s.item()) for s in sizes]
+        max_B = max(sizes_int) if len(sizes_int) > 0 else 0
+        if max_B == 0:
+            return tensor.new_zeros((0, tensor.shape[1]))
+        D = tensor.shape[1]
+        if tensor.shape[0] < max_B:
+            pad = torch.zeros((max_B - tensor.shape[0], D), device=device, dtype=tensor.dtype)
+            tensor_pad = torch.cat([tensor, pad], dim=0)
+        else:
+            tensor_pad = tensor
+        gather_list = [torch.zeros((max_B, D), device=device, dtype=tensor.dtype) for _ in range(torch.distributed.get_world_size())]
+        torch.distributed.all_gather(gather_list, tensor_pad)
+        # Unpad and concat
+        parts = []
+        for t, sz in zip(gather_list, sizes_int):
+            if sz > 0:
+                parts.append(t[:sz, :])
+        if len(parts) == 0:
+            return tensor.new_zeros((0, D))
+        return torch.cat(parts, dim=0)
 
     @torch.no_grad()
     def _adco_random_crop(self, feat: torch.Tensor, min_scale: float = 0.6) -> torch.Tensor:
@@ -439,7 +485,7 @@ class SAM2Base(torch.nn.Module):
         feat: torch.Tensor,                # [B, H, W, C]
         min_scale: float = 0.6,
         boundary_ignore: int = 2,
-        uncert: torch.Tensor | None = None # [B, H, W] or None
+        uncert: torch.Tensor | None = None  # [B, H, W] or None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Masked ROI pooling to form a global vector per sample without slicing.
 
@@ -453,15 +499,15 @@ class SAM2Base(torch.nn.Module):
         for _ in range(B):
             ch = max(2, int(H * (min_scale + (1 - min_scale) * random.random())))
             cw = max(2, int(W * (min_scale + (1 - min_scale) * random.random())))
-            t = 0 if H == ch else random.randint(0, H - ch)
-            l = 0 if W == cw else random.randint(0, W - cw)
+            t = 0 if ch == H else random.randint(0, H - ch)
+            left_idx = 0 if cw == W else random.randint(0, W - cw)
             tops.append(t)
-            lefts.append(l)
+            lefts.append(left_idx)
             hs.append(ch)
             ws.append(cw)
 
         mask = torch.zeros(B, H, W, 1, device=device, dtype=feat.dtype)
-        for i, (t, left, ch, cw) in enumerate(zip(tops, lefts, hs, ws)):
+        for i, (t, left, ch, cw) in enumerate(zip(tops, lefts, hs, ws, strict=True)):
             t0 = t + boundary_ignore
             l0 = left + boundary_ignore
             t1 = t + ch - boundary_ignore
@@ -493,6 +539,108 @@ class SAM2Base(torch.nn.Module):
         return z, roi_weight
 
     def compute_adco_loss(
+        self,
+        pixel_feat: torch.Tensor,                                # [B, H, W, C']
+        pixel_uncertainty: torch.Tensor | None = None,
+        pixel_gt: torch.Tensor | None = None,
+        pixel_logits: torch.Tensor | None = None,
+        neg_sample_M: int | None = 1024,
+        roi_z1: torch.Tensor | None = None,
+        roi_z2: torch.Tensor | None = None,
+        roi_w1: torch.Tensor | None = None,
+        roi_w2: torch.Tensor | None = None,
+        pixel_bndl_model=None,
+        external_pre_out_w=None,
+        use_entropy_uq: bool | None = None,
+        uq_sample_num: int = 50,
+    ) -> torch.Tensor:
+        
+        # TODO
+        # 计算logits与uncertainty的相关性
+        
+        # 1. 损失中要最大化相关性
+        # 2. 采样neg样本
+        # 3. 从neg样本中得到不确定性以及预测
+        # 4. 最大化正/负样本的相关性 (分阶段 1. 正  2. 负 3. 正+负)
+        
+        # New AdCo implementation (independent of adco_bk):
+        # - Use BNDL t-test pixel_uncertainty p-values directly
+        # - Positive-only contribution now; negative path implemented but weight=0
+        # - No gating/curriculum/temperature scheduling; no nested helper functions
+
+        assert pixel_feat is not None and pixel_feat.ndim == 4
+        B, H, W, _ = pixel_feat.shape
+        device = pixel_feat.device
+        dtype = pixel_feat.dtype
+
+        if pixel_uncertainty is None:
+            return torch.tensor(0.0, device=device, dtype=dtype, requires_grad=True)
+
+        # Prepare uncertainty p-values in [0,1]
+        # For training we operate on ratio: uncertainty / confidence
+        uncertainty_p = torch.clamp(pixel_uncertainty, 0.0, 1.0)
+
+        # Build positive/negative pixel masks
+        pos_mask, _ = self._adco_build_pos_neg_masks(
+            pixel_gt=pixel_gt,
+            pixel_logits=pixel_logits,
+            spatial_hw=(H, W),
+            batch_size=B,
+        )
+
+        # Compute pixel-level confidence map
+        confidence = self._adco_compute_confidence(
+            pixel_logits=pixel_logits,
+        )
+        if confidence is None:
+            return torch.tensor(0.0, device=device, dtype=dtype, requires_grad=True)
+
+        # Ratio on positive pixels: mean(uncertainty / (confidence + eps))
+        ratio_pos = self._adco_mean_ratio(uncertainty_p, confidence, pos_mask)
+
+        # Negative sampling path (implemented, but weight 0 for now)
+        if neg_sample_M is not None and neg_sample_M > 0:
+            # Sample negative images from spatial bank and forward through encoder + BNDL to get neg uq/logits
+            neg_images = self._adco_sample_neg_images(neg_sample_M)  # [M, 3, Himg, Wimg]
+            if neg_images is not None and pixel_bndl_model is not None:
+                with torch.no_grad():  # TODO 考虑去掉no_grad, 使得adco_negatives能接收到梯度
+                    # Upsample negatives to encoder's expected image size
+                    if (neg_images.shape[-2] != self.image_size) or (neg_images.shape[-1] != self.image_size):
+                        neg_images = F.interpolate(
+                            neg_images,
+                            size=(self.image_size, self.image_size),
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+                    # Encode to get top-level feature map, then reshape to [M, Hf, Wf, C']
+                    enc_out = self.image_encoder(neg_images)
+                    feat = enc_out["backbone_fpn"][-1]  # [M, C, Hf, Wf]
+                    neg_feat = feat.permute(0, 2, 3, 1).contiguous()
+                # Uncertainty + logits from BNDL sampling
+                neg_uq, neg_mean_logits = pixel_uncertain_sampling(
+                    pixel_bndl_model,
+                    neg_feat,
+                    external_pre_out_w=external_pre_out_w,
+                    sample_num=uq_sample_num,
+                )  # [M, Hf, Wf], [M, Hf, Wf, K]
+                neg_conf = self._adco_compute_conf_from_logits_tensor(neg_mean_logits)
+                # Use full field as negatives (no mask), unified ratio
+                full_mask = torch.ones_like(neg_uq, dtype=torch.bool)
+                ratio_neg = self._adco_mean_ratio(neg_uq, neg_conf, full_mask)
+            else:
+                ratio_neg = confidence.new_tensor(0.0)
+        else:
+            ratio_neg = confidence.new_tensor(0.0)
+
+        # Neg off for now
+        alpha_pos = 1.0
+        alpha_neg = 0.0
+        total_ratio = alpha_pos * ratio_pos + alpha_neg * ratio_neg
+        # We want low uncertainty given high confidence => minimize the ratio
+        loss = total_ratio
+        return loss
+
+    def compute_adco_loss_bk(
         self,
         pixel_feat: torch.Tensor,                                # [B, H, W, C']
         pixel_uncertainty: torch.Tensor | None = None,
@@ -693,14 +841,135 @@ class SAM2Base(torch.nn.Module):
 
         # Update queue with keys from all GPUs if distributed
         with torch.no_grad():
-            keys_all = self._concat_all_gather(k)
-            self._moco_dequeue_and_enqueue(keys_all)
+            keys_to_enqueue = self._gather_batchwise(k)
+            self._moco_dequeue_and_enqueue(keys_to_enqueue)
 
         return loss
 
     @property
     def device(self):
         return next(self.parameters()).device
+
+    # --------------------------- AdCo (new) helpers ---------------------------
+    def _adco_build_pos_neg_masks(
+        self,
+        pixel_gt: torch.Tensor | None,
+        pixel_logits: torch.Tensor | None,
+        spatial_hw: tuple[int, int],
+        batch_size: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build boolean masks for positive and negative pixels: [B, H, W].
+
+        - If pixel_gt is provided, pos = any(gt>0) across channels.
+        - Else if logits provided, pos = any(sigmoid(logits) >= 0.5) across channels.
+        - Else fallback: all pixels as positive (negatives empty).
+        """
+        H, W = spatial_hw
+        device = self.device
+        if pixel_gt is not None:
+            gt = pixel_gt
+            if gt.ndim == 4 and gt.shape[-1] > 1:
+                pos = (gt > 0).any(dim=-1)
+            elif gt.ndim == 4 and gt.shape[1] == 1 and gt.shape[2] == H and gt.shape[3] == W:
+                pos = (gt[:, 0] > 0)
+            elif gt.ndim == 3 and gt.shape[1] == H and gt.shape[2] == W:
+                pos = (gt > 0)
+            else:
+                # Attempt to reshape/interpret to [B, H, W]
+                try:
+                    B = gt.shape[0]
+                    pos = (gt.view(B, H, W, -1) > 0).any(dim=-1)
+                except Exception:
+                    pos = torch.ones((gt.shape[0], H, W), device=gt.device, dtype=torch.bool)
+        elif pixel_logits is not None:
+            logits = pixel_logits
+            if logits.ndim == 4 and logits.shape[-1] >= 1:
+                p = torch.sigmoid(logits)
+                pos = (p >= 0.5).any(dim=-1)
+            elif logits.ndim == 3:
+                pos = (torch.sigmoid(logits) >= 0.5)
+            elif logits.ndim == 4 and logits.shape[1] == 1 and logits.shape[2] == H and logits.shape[3] == W:
+                pos = (torch.sigmoid(logits[:, 0]) >= 0.5)
+            else:
+                try:
+                    B = logits.shape[0]
+                    p = torch.sigmoid(logits.view(B, H, W, -1))
+                    pos = (p >= 0.5).any(dim=-1)
+                except Exception:
+                    pos = torch.ones((logits.shape[0], H, W), device=logits.device, dtype=torch.bool)
+        else:
+            # Fallback: consider all pixels as positive
+            # (negative path exists but will not be used initially)
+            pos = torch.ones((batch_size, H, W), device=device, dtype=torch.bool)
+
+        neg = ~pos
+        return pos.to(torch.bool), neg.to(torch.bool)
+
+    def _adco_compute_confidence(
+        self,
+        pixel_logits: torch.Tensor | None,
+        tau_conf: float = 2.0,
+    ) -> torch.Tensor | None:
+        """Compute per-pixel confidence in [0,1], [B, H, W] from logits only.
+
+        c = sigmoid(max(|logits|) / tau_conf). Returns None if logits unavailable.
+        """
+        if pixel_logits is None:
+            return None
+        logits = pixel_logits
+        if logits.ndim == 4 and logits.shape[-1] >= 1:
+            mag = torch.abs(logits)
+            mag = mag.max(dim=-1).values  # [B, H, W]
+        elif logits.ndim == 3:
+            mag = torch.abs(logits)
+        elif logits.ndim == 4 and logits.shape[1] == 1:
+            mag = torch.abs(logits[:, 0])
+        else:
+            try:
+                B2 = logits.shape[0]
+                H2, W2 = logits.shape[1], logits.shape[2]
+                mag = torch.abs(logits.view(B2, H2, W2, -1)).max(dim=-1).values
+            except Exception:
+                return None
+        return torch.sigmoid(mag / float(tau_conf)).to(mag.dtype)
+
+    def _adco_mean_ratio(
+        self,
+        uncertainty_p: torch.Tensor,  # [B, H, W]
+        confidence: torch.Tensor,     # [B, H, W]
+        mask: torch.Tensor,           # [B, H, W] bool
+        eps: float = 1e-6,
+    ) -> torch.Tensor:
+        """Compute masked mean of uncertainty/confidence ratio as scalar."""
+        m = mask.to(uncertainty_p.dtype)
+        denom = confidence * m + eps
+        ratio = (uncertainty_p * m) / denom
+        count = m.sum(dim=(1, 2)).clamp_min(1.0)
+        per_sample = ratio.sum(dim=(1, 2)) / count
+        return per_sample.mean()
+
+    def _adco_sample_neg_images(self, M: int) -> torch.Tensor | None:
+        """Sample M images from spatial negative bank as RGB tensors [M, 3, Himg, Wimg].
+
+        Here we store adco_negatives as image-aligned RGB patches: [K, 3, Himg, Wimg].
+        Returns None if the bank doesn't match this assumption.
+        """
+        neg = self.adco_negatives
+        if neg is None or neg.ndim != 4 or neg.shape[1] != 3:
+            return None
+        K = neg.shape[0]
+        device = neg.device
+        if M <= 0:
+            return None
+        idx = torch.randint(0, K, (min(M, K),), device=device)
+        return neg.index_select(0, idx)
+
+    def _adco_compute_conf_from_logits_tensor(self, logits: torch.Tensor, tau_conf: float = 2.0) -> torch.Tensor:
+        """Compute confidence from logits tensor [*, H, W, K] -> [*, H, W] via sigmoid(max(|logit|)/tau)."""
+        if logits.ndim < 3:
+            raise ValueError("logits tensor rank too low")
+        mag = logits.abs().max(dim=-1).values  # [..., H, W]
+        return torch.sigmoid(mag / float(tau_conf)).to(mag.dtype)
 
     def forward(self, *args, **kwargs):
         raise NotImplementedError(
@@ -769,6 +1038,7 @@ class SAM2Base(torch.nn.Module):
         mask_inputs=None,
         high_res_features=None,
         multimask_output=False,
+        pixel_gt_for_adco: torch.Tensor | None = None,
     ):
         """
         Forward SAM prompt encoders and mask heads.
@@ -936,13 +1206,22 @@ class SAM2Base(torch.nn.Module):
             # Optional per-frame uncertainty for AdCo
             pixel_uncertainty = bndl_outputs.get("pixel_uncertainty", None) if self.adco_use_uncertainty else None
             if self.use_adco and self.training and (pixel_feat is not None):
+                # Prefer raw mask logits if provided; fallback to mean sampled logits
+                pixel_logits_for_adco = bndl_outputs.get(
+                    "masks_bndl_raw",
+                    bndl_outputs.get("mean_pixel_logits", None),
+                )
                 adco_loss = self.compute_adco_loss(
                     pixel_feat=pixel_feat,
                     pixel_uncertainty=pixel_uncertainty,
+                    pixel_gt=pixel_gt_for_adco,
+                    pixel_logits=pixel_logits_for_adco,
                     roi_z1=shared_z1,
                     roi_z2=shared_z2,
                     roi_w1=shared_w1,
                     roi_w2=shared_w2,
+                    pixel_bndl_model=self.sam_mask_decoder.pixel_bndl if getattr(self.sam_mask_decoder, "pixel_bndl", None) is not None else None,
+                    external_pre_out_w=bndl_outputs.get("wei_lambda_w", None),
                 )
                 bndl_outputs["adco_aux_loss"] = adco_loss
             if self.use_proco and self.training and (pixel_feat is not None):
@@ -1307,6 +1586,7 @@ class SAM2Base(torch.nn.Module):
         num_frames,
         track_in_reverse,
         prev_sam_mask_logits,
+        pixel_gt_for_adco: torch.Tensor | None = None,
     ):
         current_out = {"point_inputs": point_inputs, "mask_inputs": mask_inputs}
         # High-resolution feature maps for the SAM head, reshape (HW)BC => BCHW
@@ -1356,6 +1636,7 @@ class SAM2Base(torch.nn.Module):
                 mask_inputs=mask_inputs,
                 high_res_features=high_res_features,
                 multimask_output=multimask_output,
+                pixel_gt_for_adco=pixel_gt_for_adco,
             )
 
         return current_out, sam_outputs, high_res_features, pix_feat
@@ -1405,6 +1686,7 @@ class SAM2Base(torch.nn.Module):
         run_mem_encoder=True,
         # The previously predicted SAM mask logits (which can be fed together with new clicks in demo).
         prev_sam_mask_logits=None,
+        pixel_gt_for_adco: torch.Tensor | None = None,
     ):
         current_out, sam_outputs, _, _ = self._track_step(
             frame_idx,
@@ -1418,6 +1700,7 @@ class SAM2Base(torch.nn.Module):
             num_frames,
             track_in_reverse,
             prev_sam_mask_logits,
+            pixel_gt_for_adco,
         )
 
         if self.use_bndl_for_pixels:

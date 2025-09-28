@@ -175,7 +175,7 @@ class VisualizationUtils:
                 rows = (num_metrics + cols - 1) // cols
 
             # 创建子图，确保有足够的空间
-            gs = fig.add_gridspec(rows + 1, cols, hspace=0.4, wspace=0.3, height_ratios=[1] * rows + [0.3])
+            gs = fig.add_gridspec(rows + 1, cols, hspace=0.5, wspace=0.4, height_ratios=[1] * rows + [0.35])
 
             # 设置总标题
             fig.suptitle(title, fontsize=16, fontweight="bold")
@@ -199,8 +199,30 @@ class VisualizationUtils:
                     if isinstance(metric_data, list):
                         metric_data = np.array(metric_data)
                     
-                    # 创建散点图，使用透明度避免过度重叠
-                    ax.scatter(uncertainty_data, metric_data, alpha=0.6, s=1, color='blue')
+                    # 使用hexbin替代传统散点，缓解重叠；并叠加分位均值曲线
+                    hb = ax.hexbin(uncertainty_data, metric_data, gridsize=40, cmap='viridis', mincnt=5)
+                    cb = fig.colorbar(hb, ax=ax)
+                    cb.set_label('Counts')
+
+                    # 分位分箱UA曲线
+                    try:
+                        q = np.linspace(0.0, 1.0, 21)
+                        bins = np.quantile(uncertainty_data, q)
+                        bins[0] = np.min(uncertainty_data)
+                        bins[-1] = np.max(uncertainty_data)
+                        inds = np.digitize(uncertainty_data, bins, right=True)
+                        x_centers = []
+                        y_means = []
+                        for b in range(1, len(bins)):
+                            mask = inds == b
+                            if np.sum(mask) >= 10:
+                                x_centers.append(np.median(uncertainty_data[mask]))
+                                y_means.append(np.mean(metric_data[mask]))
+                        if x_centers:
+                            ax.plot(x_centers, y_means, color='orange', linewidth=2, label='UA-curve (quantile means)')
+                            ax.legend()
+                    except Exception:
+                        pass
                     
                     # 绘制趋势线
                     if 'slope' in results and 'intercept' in results and not np.isnan(results['slope']):
@@ -212,7 +234,7 @@ class VisualizationUtils:
                         ax.legend()
                     
                     # 设置轴标签
-                    ax.set_xlabel('Uncertainty', fontsize=10)
+                    ax.set_xlabel('Uncertainty (higher = less certain)', fontsize=10)
                     ax.set_ylabel(metric_name, fontsize=10)
                     ax.set_title(f'{metric_name} vs Uncertainty', fontweight='bold', fontsize=12)
                     

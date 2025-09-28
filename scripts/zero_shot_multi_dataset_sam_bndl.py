@@ -34,7 +34,7 @@ from tools.vos_inference import (
 )
 
 # ----------  BNDL uncertainty and PAvPU functions ----------
-from BNDL.BNDL_upload.ViT_Sparse.utils.bndl import pixel_pavpu_calculation, pixel_uncertain_sampling
+from BNDL.BNDL_upload.ViT_Sparse.utils.bndl import pixel_pavpu_calculation, pixel_uncertain_sampling, pixel_entropy_uncertainty
 
 # ----------  Dataset Evaluator from SAM2 training ----------
 from training.utils.dataset_evaluator import DistributedDatasetEvaluator
@@ -297,6 +297,21 @@ def calculate_pavpu_for_bndl(bndl_outputs, batch, targets, phase, model):
             sample_num=20,  # Reduced sample number for speed during evaluation
         )
 
+        # Additionally compute entropy-based uncertainty (continuous, smooth)
+        try:
+            entropy_map = pixel_entropy_uncertainty(
+                pixel_bndl_model,
+                pixel_feat,
+                external_pre_out_w=external_pre_out_w,
+                sample_num=20,
+            )  # [B, H, W]
+            # Optionally normalize to [0,1] by log(2) for Bernoulli upper bound
+            import math
+            entropy_norm = torch.clamp(entropy_map / math.log(2.0), 0.0, 1.0)
+            bndl_outputs["pixel_entropy"] = entropy_norm.detach()
+        except Exception as e:
+            logger.warning(f"Failed to compute pixel entropy uncertainty: {e}")
+
         # Prepare ground truth masks for PAvPU calculation
         pixel_targets = prepare_targets_for_pavpu(targets, bndl_outputs)
 
@@ -406,6 +421,15 @@ def log_bndl_statistics(bndl_outputs, step, phase, dataset_name, statistics_dict
             uncertainty_mean = bndl_outputs["pixel_uncertainty"].mean().detach().cpu().item()
             statistics_dict[f"{key_prefix}_pixel_uncertainty"] = uncertainty_mean
             logger.info(f"BNDL Stats - {key_prefix}: pixel_uncertainty={uncertainty_mean:.4f}")
+
+        # Log pixel entropy if available
+        if "pixel_entropy" in bndl_outputs and bndl_outputs["pixel_entropy"] is not None:
+            try:
+                entropy_mean = bndl_outputs["pixel_entropy"].mean().detach().cpu().item()
+                statistics_dict[f"{key_prefix}_pixel_entropy"] = entropy_mean
+                logger.info(f"BNDL Stats - {key_prefix}: pixel_entropy={entropy_mean:.4f}")
+            except Exception as e:
+                logger.warning(f"Failed to log pixel_entropy: {e}")
 
         # Log PAvPU scores if available
         if "pixel_pavpu" in bndl_outputs and bndl_outputs["pixel_pavpu"] is not None:

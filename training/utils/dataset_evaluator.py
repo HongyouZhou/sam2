@@ -111,7 +111,7 @@ class DistributedDatasetEvaluator:
                 iou_scalar = self._calculate_single_image_iou_scalar(single_pred, single_gt)
                 dice_scalar = self._calculate_single_image_dice_scalar(single_pred, single_gt)
                 accuracy_scalar = self._calculate_single_image_accuracy_scalar(single_pred, single_gt)
-                uncertainty_scalar = self._calculate_single_image_uncertainty_scalar(single_uncertainty)
+                uncertainty_scalar = self._calculate_single_image_uncertainty_scalar(single_uncertainty, single_pred, single_gt)
                 
                 # 存储单张图片的标量指标（转换为CPU以节省GPU内存）
                 self.image_uncertainties.append(uncertainty_scalar.detach().cpu())
@@ -196,7 +196,7 @@ class DistributedDatasetEvaluator:
             return torch.tensor(0.0)
     
     def _calculate_single_image_accuracy_scalar(self, pred_logits: torch.Tensor, gt_masks: torch.Tensor) -> torch.Tensor:
-        """计算单张图片的平均准确率值（标量）"""
+        """计算单张图片的平均准确率值（标量）；优先在前景区域上统计，避免背景主导"""
         try:
             if pred_logits.shape != gt_masks.shape:
                 logging.warning(f"Shape mismatch in single image accuracy: pred {pred_logits.shape} vs gt {gt_masks.shape}")
@@ -207,14 +207,22 @@ class DistributedDatasetEvaluator:
             pred_binary = pred_probs > 0
             gt_binary = gt_masks > 0
             
+            # 前景掩膜（任一通道为真）
+            fg_mask = gt_binary.any(dim=-1)  # [H, W]
+
             # 计算准确率：(TP + TN) / (TP + TN + FP + FN)
             correct_predictions = (pred_binary == gt_binary).float()  # [H, W, K]
-            
-            # 对空间维度和通道维度求和，得到整张图片的准确率
-            correct_sum = correct_predictions.sum()  # 标量
-            total_pixels = correct_predictions.numel()  # 总像素数
-            
-            # 计算整张图片的准确率
+
+            if fg_mask.any():
+                # 仅在前景区域统计，避免背景像素占比过大
+                correct_sum = correct_predictions[fg_mask].sum()
+                total_pixels = correct_predictions[fg_mask].numel()
+            else:
+                # 无前景时退化为全图
+                correct_sum = correct_predictions.sum()
+                total_pixels = correct_predictions.numel()
+
+            # 计算准确率
             pixel_acc = correct_sum / (total_pixels + 1e-8)  # 标量
             
             # 确保值在[0, 1]范围内
@@ -226,13 +234,30 @@ class DistributedDatasetEvaluator:
             logging.warning(f"Failed to calculate single image accuracy scalar: {e}")
             return torch.tensor(0.0)
     
-    def _calculate_single_image_uncertainty_scalar(self, uncertainty: torch.Tensor) -> torch.Tensor:
-        """计算单张图片的平均uncertainty值（标量）"""
+    def _calculate_single_image_uncertainty_scalar(self, uncertainty: torch.Tensor, pred_logits: torch.Tensor, gt_masks: torch.Tensor) -> torch.Tensor:
+        """计算单张图片的不确定性标量（前景区域的熵中位数，越大越不确定）"""
         try:
-            # 对空间维度和通道维度求平均，得到整张图片的平均uncertainty
-            uncertainty_mean = uncertainty.mean()  # 标量
-            return uncertainty_mean
-            
+            # 使用预测logits计算每像素每通道的二元熵，作为不确定性度量
+            # 对于每通道独立二分类：p = sigmoid(logit)
+            p = torch.sigmoid(pred_logits)
+            eps = 1e-8
+            entropy_per_channel = -(p * torch.log(p + eps) + (1.0 - p) * torch.log(1.0 - p + eps))  # [H, W, K]
+            # 归一化到[0,1]，最大熵发生在p=0.5，值为ln(2)
+            entropy_per_channel = entropy_per_channel / np.log(2.0)
+            # 跨通道平均，得到每像素不确定性
+            pixel_uncertainty = entropy_per_channel.mean(dim=-1)  # [H, W]
+
+            # 使用前景掩膜（任一通道为真即视作前景）计算中位数，避免背景主导
+            fg_mask = (gt_masks > 0).any(dim=-1)  # [H, W]
+            if fg_mask.any():
+                values = pixel_uncertainty[fg_mask]
+            else:
+                values = pixel_uncertainty.view(-1)
+
+            # 使用中位数增强稳健性
+            uncertainty_scalar = values.median()
+            return uncertainty_scalar
+
         except Exception as e:
             logging.warning(f"Failed to calculate single image uncertainty scalar: {e}")
             return torch.tensor(0.0)

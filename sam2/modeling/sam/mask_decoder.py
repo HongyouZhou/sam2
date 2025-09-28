@@ -257,6 +257,7 @@ class MaskDecoder(nn.Module):
                 "wei_lambda_w": wei_lambda_w,
                 "inv_k_w": inv_k_w,
                 "masks_bndl_raw": masks_bndl_raw.detach(),      # [B, H, W, K]
+                "pixel_logits": masks_bndl_raw if self.training else masks_bndl_raw.detach(),
                 "upscaled_shape": (b, c, h, w),
                 "hyper_in": hyper_in.detach(),
                 "mask_tokens_out": mask_tokens_out.detach(),

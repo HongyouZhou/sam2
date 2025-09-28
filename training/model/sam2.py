@@ -407,6 +407,8 @@ class SAM2Train(SAM2Base):
             bndl_outputs = None
 
         if bndl_outputs is not None:
+            if gt_masks is not None:
+                bndl_outputs["pixel_gt"] = gt_masks.detach().to(dtype=torch.float32)
             current_out["multistep_bndl_outputs"] = [bndl_outputs]  # 新增：初始化为列表
         else:
             current_out["multistep_bndl_outputs"] = [None]

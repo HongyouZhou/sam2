@@ -256,13 +256,35 @@ def create_comprehensive_comparison_plots(
 
     df = pd.DataFrame(df_data)
 
+    # 计算去除 MOSE 的宏平均
+    averages_excl_mose = None
+    non_mose_idx = [i for i, d in enumerate(datasets) if d != "MOSE"]
+    if non_mose_idx:
+        avg_sam2_jf = float(np.mean([sam2_jf[i] for i in non_mose_idx]))
+        avg_bndl_jf = float(np.mean([bndl_jf[i] for i in non_mose_idx]))
+        avg_sam2_j = float(np.mean([sam2_j[i] for i in non_mose_idx]))
+        avg_bndl_j = float(np.mean([bndl_j[i] for i in non_mose_idx]))
+        avg_sam2_f = float(np.mean([sam2_f[i] for i in non_mose_idx]))
+        avg_bndl_f = float(np.mean([bndl_f[i] for i in non_mose_idx]))
+
+        averages_excl_mose = {
+            "sam2": {"jf": avg_sam2_jf, "j": avg_sam2_j, "f": avg_sam2_f},
+            "bndl": {"jf": avg_bndl_jf, "j": avg_bndl_j, "f": avg_bndl_f},
+            "improvements": {
+                "jf": avg_bndl_jf - avg_sam2_jf,
+                "j": avg_bndl_j - avg_sam2_j,
+                "f": avg_bndl_f - avg_sam2_f,
+            },
+            "datasets_count": len(non_mose_idx),
+        }
+
     # Set up plotting style
     plt.style.use("default")
     sns.set_palette("husl")
 
     # Create comprehensive figure with better spacing
-    fig = plt.figure(figsize=(24, 18))
-    gs = fig.add_gridspec(4, 4, hspace=0.4, wspace=0.4)
+    fig = plt.figure(figsize=(30, 22))
+    gs = fig.add_gridspec(4, 4, hspace=0.6, wspace=0.6)
 
     # Main title
     fig.suptitle("SAM-2 vs SAM-2+BNDL Zero-shot Evaluation Comparison", fontsize=20, fontweight="bold", y=0.95)
@@ -475,6 +497,24 @@ def create_comprehensive_comparison_plots(
             ]
         )
 
+    # 在表格中追加平均行（不含 MOSE）
+    if averages_excl_mose:
+        summary_data.append(
+            [
+                "AVG (no MOSE)",
+                "—",
+                f"{averages_excl_mose['sam2']['jf']:.2f}",
+                f"{averages_excl_mose['bndl']['jf']:.2f}",
+                f"{averages_excl_mose['improvements']['jf']:+.2f}",
+                f"{averages_excl_mose['sam2']['j']:.2f}",
+                f"{averages_excl_mose['bndl']['j']:.2f}",
+                f"{averages_excl_mose['improvements']['j']:+.2f}",
+                f"{averages_excl_mose['sam2']['f']:.2f}",
+                f"{averages_excl_mose['bndl']['f']:.2f}",
+                f"{averages_excl_mose['improvements']['f']:+.2f}",
+            ]
+        )
+
     table = ax9.table(
         cellText=summary_data, 
         colLabels=["Dataset", "Type", "SAM-2 J&F", "BNDL J&F", "ΔJ&F", "SAM-2 J", "BNDL J", "ΔJ", "SAM-2 F", "BNDL F", "ΔF"], 
@@ -517,6 +557,7 @@ def create_comprehensive_comparison_plots(
         "sam2_results": {k: {"jf": v[0], "j": v[1], "f": v[2]} for k, v in sam2_results.items()},
         "bndl_results": {k: {"jf": v[0], "j": v[1], "f": v[2]} for k, v in bndl_results.items()},
         "improvements": {k: {"jf": bndl_results[k][0] - sam2_results[k][0], "j": bndl_results[k][1] - sam2_results[k][1], "f": bndl_results[k][2] - sam2_results[k][2]} for k in datasets},
+        "averages_excl_mose": averages_excl_mose,
         "bndl_statistics": bndl_statistics,
     }
 
@@ -541,6 +582,23 @@ def create_comprehensive_comparison_plots(
                 "SAM2_F": sam2_f[i],
                 "BNDL_F": bndl_f[i],
                 "F_Improvement": f_improvements[i],
+            }
+        )
+
+    # CSV 中追加平均行（不含 MOSE）
+    if averages_excl_mose:
+        csv_data.append(
+            {
+                "Dataset": "AVG(no MOSE)",
+                "SAM2_JF": averages_excl_mose["sam2"]["jf"],
+                "BNDL_JF": averages_excl_mose["bndl"]["jf"],
+                "JF_Improvement": averages_excl_mose["improvements"]["jf"],
+                "SAM2_J": averages_excl_mose["sam2"]["j"],
+                "BNDL_J": averages_excl_mose["bndl"]["j"],
+                "J_Improvement": averages_excl_mose["improvements"]["j"],
+                "SAM2_F": averages_excl_mose["sam2"]["f"],
+                "BNDL_F": averages_excl_mose["bndl"]["f"],
+                "F_Improvement": averages_excl_mose["improvements"]["f"],
             }
         )
 
@@ -667,6 +725,15 @@ def main():
         bndl_jf = bndl_results[dataset][0]
         improvement = bndl_jf - sam2_jf
         print(f"{dataset:<12} {sam2_jf:<10.2f} {bndl_jf:<10.2f} {improvement:+12.2f}")
+
+    valid_for_avg = [k for k in sam2_results if k != "MOSE"]
+    print("-" * 80)
+    if valid_for_avg:
+        sam2_mean_jf = float(np.mean([sam2_results[k][0] for k in valid_for_avg]))
+        bndl_mean_jf = float(np.mean([bndl_results[k][0] for k in valid_for_avg]))
+        print(f"{'AVG (no MOSE)':<12} {sam2_mean_jf:<10.2f} {bndl_mean_jf:<10.2f} {bndl_mean_jf - sam2_mean_jf:+12.2f}")
+    else:
+        print("AVG (no MOSE): N/A (no eligible datasets)")
 
     print(f"\nAll comparison results saved to: {output_path}")
     print("Check the comparison_plots/ directory for detailed visualizations!")
