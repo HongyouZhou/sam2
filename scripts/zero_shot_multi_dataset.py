@@ -9,8 +9,6 @@ import torch
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 import json
-import random
-import cv2
 from tqdm import tqdm
 import matplotlib
 
@@ -32,9 +30,7 @@ from tools.vos_inference import (
 )
 
 # ----------  Click sampling ----------
-from sam2.modeling.sam2_utils import (
-    sample_one_point_from_error_center,
-)
+# (Error-click sampling is wrapped by prompt_utils.sample_error_click)
 
 # ----------  Metric ----------
 from sav_dataset.utils.sav_benchmark import benchmark
@@ -43,6 +39,9 @@ from sav_dataset.utils.sav_benchmark import benchmark
 # ---------- Dataset Configurations ----------
 from dataset_configs import DATASET_CONFIGS, DEFAULT_DATASETS
 from prompt_utils import compute_tight_box_from_bool_mask, box_center_xy, sample_pos_neg, sample_error_click
+
+# ---------- Unified click prompt generator ----------
+from prompt_generation import generate_click_prompts
 
 # Distinct colors for different objects
 OBJECT_COLORS = [
@@ -509,7 +508,7 @@ def _sample_pos_neg(gt_mask: np.ndarray, dilate_iter: int = 5, full_mask: np.nda
 
 @torch.inference_mode()
 @torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-def inference_3_clicks(
+def inference_interactive(
     predictor,
     jpeg_dir: Path,
     ann_dir: Path,
@@ -517,199 +516,95 @@ def inference_3_clicks(
     score_thresh: float = 0.0,
     video_names: list[str] | None = None,
     max_objects: int | None = None,
-    prompt_method: str = "gt_box",
+    click_protocol: str = "3click",
+    min_click_dist: float = 12.0,
+    seed: int | None = 0,
+    first_frame_only: bool = False,
 ):
-    """
-    3-click interactive inference:
-    1) Random positive point inside GT
-    2) Random negative point near GT boundary
-    3) Error-based point from prediction vs GT difference
-    """
     if video_names is None:
         video_names = sorted([d.name for d in jpeg_dir.iterdir() if d.is_dir()])
     else:
         video_names = sorted(set(video_names))
 
-    print(f"3-click inference on {len(video_names)} videos")
+    if seed is not None:
+        try:
+            np.random.seed(int(seed))
+        except Exception:
+            pass
+
+    print(f"{click_protocol} inference on {len(video_names)} videos")
     for v_idx, vid in enumerate(video_names, 1):
         print(f"[{v_idx:03}/{len(video_names)}] {vid}")
         video_dir = jpeg_dir / vid
         frame_names = sorted([p.stem for p in video_dir.iterdir() if p.suffix.lower() in [".jpg", ".jpeg"]], key=lambda x: int(x))
 
-        # Initialize predictor state
         state = predictor.init_state(str(video_dir))
         H, W = state["video_height"], state["video_width"]
 
-        # Read first frame GT to determine object IDs
         first_mask_path = ann_dir / vid / f"{frame_names[0]}.png"
         if not first_mask_path.exists():
             print(f"Warning: First frame annotation not found: {first_mask_path}")
             continue
-
         first_mask = np.array(Image.open(first_mask_path))
         all_obj_ids = [oid for oid in np.unique(first_mask) if oid > 0]
-
         if len(all_obj_ids) == 0:
             print(f"Warning: No objects found in first frame of video {vid}")
             continue
 
-        # Apply object limit if specified
         if max_objects and len(all_obj_ids) > max_objects:
-            # Select objects with largest areas for more meaningful evaluation
-            obj_areas = {}
-            for oid in all_obj_ids:
-                obj_areas[oid] = np.sum(first_mask == oid)
-
-            # Sort by area and take top N objects
-            sorted_objs = sorted(obj_areas.items(), key=lambda x: x[1], reverse=True)
-            obj_ids = [oid for oid, _ in sorted_objs[:max_objects]]
-            print(f"Limited to {max_objects} largest objects in video {vid} (from {len(all_obj_ids)} total)")
-        else:
-            obj_ids = all_obj_ids
-
-        print(f"Processing {len(obj_ids)} objects in video {vid}: {obj_ids}")
+            areas = {oid: int((first_mask == oid).sum()) for oid in all_obj_ids}
+            all_obj_ids = [oid for oid, _ in sorted(areas.items(), key=lambda x: x[1], reverse=True)[:max_objects]]
 
         obj_points: dict[int, list] = {}
-        # New: record full prompt spec per object for reuse (box or three clicks with labels)
         prompt_specs: dict[int, dict] = {}
 
-        for obj_id in obj_ids:
+        for obj_id in all_obj_ids:
             gt_bool = first_mask == obj_id
-
-            # Check if mask is empty
             if not np.any(gt_bool):
                 print(f"Warning: Empty GT mask for object {obj_id} in video {vid}")
                 continue
 
-            # Clear GPU memory before processing each object to prevent OOM
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-            if prompt_method == "gt_box":
-                # Use tight GT bounding box as prompt
-                try:
-                    x0, y0, x1, y1 = compute_tight_box_from_bool_mask(gt_bool)
-                except Exception as e:
-                    print(f"Error computing box for object {obj_id} in video {vid}: {e}")
-                    continue
+            # Always use unified click generation (no fallback)
+            used_pts, used_labels = generate_click_prompts(
+                predictor,
+                state,
+                frame_idx=0,
+                obj_id=obj_id,
+                gt_bool=gt_bool,
+                first_frame_mask_np=first_mask,
+                score_thresh=score_thresh,
+                click_protocol=click_protocol,
+                min_click_dist=min_click_dist,
+            )
 
-                _, _, _ = predictor.add_new_points_or_box(
-                    state,
-                    frame_idx=0,
-                    obj_id=obj_id,
-                    box=np.array([x0, y0, x1, y1], dtype=np.float32),
-                )
+            obj_points[obj_id] = [(int(x), int(y)) for (x, y) in used_pts]
+            clicks = [{"xy": [int(x), int(y)], "label": int(label)} for (x, y), label in zip(used_pts, used_labels, strict=True)]
+            prompt_specs[obj_id] = {"type": f"{click_protocol}", "frame_idx": 0, "clicks": clicks}
 
-                # For compatibility with existing visualization, store box center as a single point
-                cx, cy = box_center_xy((x0, y0, x1, y1))
-                obj_points[obj_id] = [
-                    (int(cx), int(cy)),
-                ]
+        print(f"Generated {click_protocol} query points for video {vid}: {obj_points}")
 
-                # Record full box prompt for reuse
-                prompt_specs[obj_id] = {
-                    "type": "box",
-                    "frame_idx": 0,
-                    "box": [int(x0), int(y0), int(x1), int(y1)],
-                }
-
-            else:
-                # three_clicks (legacy)
-                try:
-                    pos_xy, neg_xy = _sample_pos_neg(gt_bool, full_mask=first_mask, current_obj_id=obj_id)
-                except Exception as e:
-                    print(f"Error sampling points for object {obj_id} in video {vid}: {e}")
-                    continue
-
-                if neg_xy is None:
-                    print(f"Warning: Object {obj_id} in video {vid} covers entire image and no other objects available for negative sampling, using only positive point")
-                    pts = np.array([pos_xy], dtype=np.float32)
-                    lbl = np.array([1], dtype=np.int32)
-                    clicks = [{"xy": [int(pos_xy[0]), int(pos_xy[1])], "label": 1}]
-                else:
-                    pts = np.array([[pos_xy, neg_xy]], dtype=np.float32)
-                    lbl = np.array([[1, 0]], dtype=np.int32)
-                    pts = pts.reshape(-1, 2)
-                    lbl = lbl.reshape(-1)
-                    clicks = [
-                        {"xy": [int(pos_xy[0]), int(pos_xy[1])], "label": 1},
-                        {"xy": [int(neg_xy[0]), int(neg_xy[1])], "label": 0},
-                    ]
-                _, obj_ids_after, masks = predictor.add_new_points_or_box(
-                    state,
-                    frame_idx=0,
-                    obj_id=obj_id,
-                    points=pts,
-                    labels=lbl,
-                )
-
-                cur_idx = obj_ids_after.index(obj_id)
-                # Ensure masks have correct shape for indexing
-                if masks.dim() == 4:  # [B, C, H, W]
-                    mask_logits_2d = masks[cur_idx, 0]
-                elif masks.dim() == 3:  # [C, H, W]
-                    mask_logits_2d = masks[0]
-                else:
-                    print(f"Warning: Unexpected masks shape: {masks.shape}")
-                    mask_logits_2d = masks.squeeze()
-                # Align to GT resolution if needed
-                if tuple(mask_logits_2d.shape[-2:]) != gt_bool.shape:
-                    import torch.nn.functional as F
-                    h, w = gt_bool.shape
-                    mask_logits_2d = F.interpolate(
-                        mask_logits_2d.unsqueeze(0).unsqueeze(0),
-                        size=(h, w),
-                        mode="bilinear",
-                        align_corners=False,
-                    )[0, 0]
-                pred_bool = (mask_logits_2d > score_thresh).cpu().numpy().astype(bool)
-                
-                pt3_xy, lb3_i = sample_error_click(gt_bool, pred_bool)
-
-                predictor.add_new_points_or_box(
-                    state,
-                    frame_idx=0,
-                    obj_id=obj_id,
-                    points=np.array([pt3_xy], dtype=np.float32),
-                    labels=np.array([lb3_i], dtype=np.int32),
-                    clear_old_points=False,
-                )
-
-                obj_points[obj_id] = [
-                    (int(pos_xy[0]), int(pos_xy[1])),
-                    (int(neg_xy[0]), int(neg_xy[1])) if neg_xy is not None else None,
-                    (int(pt3_xy[0]), int(pt3_xy[1])),
-                ]
-
-                # Record three clicks with labels for reuse
-                clicks.append({"xy": [int(pt3_xy[0]), int(pt3_xy[1])], "label": int(lb3_i)})
-                prompt_specs[obj_id] = {"type": "three_clicks", "frame_idx": 0, "clicks": clicks}
-
-        print(f"Generated query points for video {vid}: {obj_points}")
-
-        # Propagate through entire video
+        # propagate through video
+        # When first_frame_only=True, only process the first frame (frame 0)
+        # In SAM2: end_frame_idx = start_frame_idx + max_frame_num_to_track
+        #          processing_order = range(start_frame_idx, end_frame_idx + 1)
+        # To only process frame 0: we need end_frame_idx = 0, so max_frame_num_to_track = 0
+        max_frames = 0 if first_frame_only else None
         video_segments = {}
-        for f_idx, out_obj_ids, out_logits in predictor.propagate_in_video(state, start_frame_idx=0, max_frame_num_to_track=0):
-            # Resize outputs to original image size if needed
+        for f_idx, out_obj_ids, out_logits in predictor.propagate_in_video(state, start_frame_idx=0, max_frame_num_to_track=max_frames):
             seg = {}
             for i, oid in enumerate(out_obj_ids):
                 mask_logits = out_logits[i]
-                # Ensure 2D spatial logits [H, W]
                 if mask_logits.ndim == 3:
                     mask_logits = mask_logits.squeeze(0)
-                # If logits are not at original resolution, upsample before thresholding
                 if tuple(mask_logits.shape[-2:]) != (H, W):
-                    import torch.nn.functional as F  # local import to avoid global dependency
-                    mask_logits = F.interpolate(
-                        mask_logits.unsqueeze(0).unsqueeze(0),  # [1,1,h,w]
-                        size=(H, W),
-                        mode="bilinear",
-                        align_corners=False,
-                    )[0, 0]
+                    import torch.nn.functional as F_local
+                    mask_logits = F_local.interpolate(mask_logits.unsqueeze(0).unsqueeze(0), size=(H, W), mode="bilinear", align_corners=False)[0, 0]
                 seg[oid] = (mask_logits > score_thresh).cpu().numpy()
             video_segments[f_idx] = seg
 
-        # Save PNG masks
         for f_idx, seg in video_segments.items():
             save_masks_to_dir(
                 output_mask_dir=str(out_dir),
@@ -722,12 +617,9 @@ def inference_3_clicks(
                 output_palette=DAVIS_PALETTE,
             )
 
-        # Save query points
         (out_dir / vid).mkdir(parents=True, exist_ok=True)
         with open(out_dir / vid / "query_points.json", "w") as f:
             json.dump({int(k): v for k, v in obj_points.items()}, f, indent=2)
-
-        # New: Save full prompt specs for reuse by other models
         with open(out_dir / vid / "query_prompts.json", "w") as f:
             json.dump({int(k): v for k, v in prompt_specs.items()}, f, indent=2)
 
@@ -747,6 +639,10 @@ def run_single_dataset(
     max_objects: int | None = None,
     prompt_method: str = "gt_box",
     first_frame_only: bool = False,
+    # Click protocol controls for first-frame interaction
+    click_protocol: str | None = None,
+    min_click_dist: float | None = None,
+    seed: int | None = None,
 ) -> tuple[float, float, float]:
     """Run evaluation on a single dataset and return metrics"""
 
@@ -817,7 +713,11 @@ def run_single_dataset(
     # Run inference
     start_time = time.time()
     try:
-        inference_3_clicks(
+        # Determine protocol based on explicit params or defaults
+        _click_protocol = click_protocol or "3click"
+        _min_click_dist = float(12.0 if min_click_dist is None else min_click_dist)
+        _seed = int(0 if seed is None else seed)
+        inference_interactive(
             predictor,
             jpeg_dir,
             ann_dir,
@@ -825,7 +725,10 @@ def run_single_dataset(
             score_thresh=score_thresh,
             video_names=video_subset,
             max_objects=max_objects,
-            prompt_method=prompt_method,
+            click_protocol=_click_protocol,
+            min_click_dist=_min_click_dist,
+            seed=_seed,
+            first_frame_only=first_frame_only,
         )
     except Exception as e:
         print(f"Error during inference for {dataset_name}: {e}")
@@ -1103,6 +1006,12 @@ def parse_args():
     p.add_argument("--multimask_max_pts", type=int, default=2, help="Maximum number of points to trigger multimask (box counts as 2)")
     p.add_argument("--multimask_for_tracking", action="store_true", default=False, help="Also enable multimask during tracking frames (not just the first click)")
 
+    # Click protocol
+    p.add_argument("--click_protocol", type=str, default="3click", choices=["1click", "3click", "5click"], help="Interaction protocol for first frame")
+    # point_init removed; we always use SAM's sample_pos_neg for first-click
+    p.add_argument("--min_click_dist", type=float, default=12.0, help="Minimum distance between clicks for 5-click protocol")
+    p.add_argument("--seed", type=int, default=0, help="Random seed for 'random' point initialization")
+
     # Visualization and subset options
     p.add_argument("--save_vis", action="store_true", default=True, help="Save visualizations")
     p.add_argument("--enhanced_vis", action="store_true", default=True, help="Generate enhanced multi-object visualizations")
@@ -1168,7 +1077,7 @@ def main():
                     video_subset = all_videos[: args.video_limit]
                     print(f"Limited to {len(video_subset)} videos for {dataset_name}")
 
-            # Run evaluation
+            # Run evaluation with explicit click protocol params
             j_f, j, f = run_single_dataset(
                 dataset_name=dataset_name,
                 predictor=predictor,
@@ -1181,6 +1090,9 @@ def main():
                 max_objects=args.max_objects,
                 prompt_method=args.prompt_method,
                 first_frame_only=args.first_frame_only,
+                click_protocol=args.click_protocol,
+                min_click_dist=float(args.min_click_dist),
+                seed=int(args.seed),
             )
 
             results[dataset_name] = (j_f, j, f)

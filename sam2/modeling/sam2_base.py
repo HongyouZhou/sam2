@@ -551,7 +551,6 @@ class SAM2Base(torch.nn.Module):
         roi_w2: torch.Tensor | None = None,
         pixel_bndl_model=None,
         external_pre_out_w=None,
-        use_entropy_uq: bool | None = None,
         uq_sample_num: int = 50,
     ) -> torch.Tensor:
         
@@ -573,170 +572,60 @@ class SAM2Base(torch.nn.Module):
         device = pixel_feat.device
         dtype = pixel_feat.dtype
 
-        if pixel_uncertainty is None:
-            return torch.tensor(0.0, device=device, dtype=dtype, requires_grad=True)
-
-        # Prepare uncertainty p-values in [0,1]
-        # For training we operate on ratio: uncertainty / confidence
-        uncertainty_p = torch.clamp(pixel_uncertainty, 0.0, 1.0)
-
-        # Build positive/negative pixel masks
-        pos_mask, _ = self._adco_build_pos_neg_masks(
-            pixel_gt=pixel_gt,
-            pixel_logits=pixel_logits,
-            spatial_hw=(H, W),
-            batch_size=B,
-        )
-
-        # Compute pixel-level confidence map
-        confidence = self._adco_compute_confidence(
-            pixel_logits=pixel_logits,
-        )
-        if confidence is None:
-            return torch.tensor(0.0, device=device, dtype=dtype, requires_grad=True)
-
-        # Ratio on positive pixels: mean(uncertainty / (confidence + eps))
-        ratio_pos = self._adco_mean_ratio(uncertainty_p, confidence, pos_mask)
-
-        # Negative sampling path (implemented, but weight 0 for now)
-        if neg_sample_M is not None and neg_sample_M > 0:
-            # Sample negative images from spatial bank and forward through encoder + BNDL to get neg uq/logits
-            neg_images = self._adco_sample_neg_images(neg_sample_M)  # [M, 3, Himg, Wimg]
-            if neg_images is not None and pixel_bndl_model is not None:
-                with torch.no_grad():  # TODO 考虑去掉no_grad, 使得adco_negatives能接收到梯度
-                    # Upsample negatives to encoder's expected image size
-                    if (neg_images.shape[-2] != self.image_size) or (neg_images.shape[-1] != self.image_size):
-                        neg_images = F.interpolate(
-                            neg_images,
-                            size=(self.image_size, self.image_size),
-                            mode="bilinear",
-                            align_corners=False,
-                        )
-                    # Encode to get top-level feature map, then reshape to [M, Hf, Wf, C']
-                    enc_out = self.image_encoder(neg_images)
-                    feat = enc_out["backbone_fpn"][-1]  # [M, C, Hf, Wf]
-                    neg_feat = feat.permute(0, 2, 3, 1).contiguous()
-                # Uncertainty + logits from BNDL sampling
-                neg_uq, neg_mean_logits = pixel_uncertain_sampling(
-                    pixel_bndl_model,
-                    neg_feat,
-                    external_pre_out_w=external_pre_out_w,
-                    sample_num=uq_sample_num,
-                )  # [M, Hf, Wf], [M, Hf, Wf, K]
-                neg_conf = self._adco_compute_conf_from_logits_tensor(neg_mean_logits)
-                # Use full field as negatives (no mask), unified ratio
-                full_mask = torch.ones_like(neg_uq, dtype=torch.bool)
-                ratio_neg = self._adco_mean_ratio(neg_uq, neg_conf, full_mask)
-            else:
-                ratio_neg = confidence.new_tensor(0.0)
-        else:
-            ratio_neg = confidence.new_tensor(0.0)
+        # Ratio branch: if uncertainty missing, fallback to 1 - confidence from logits
+        ratio_pos = torch.tensor(0.0, device=device, dtype=dtype)
+        if pixel_logits is not None:
+            # Build positive pixel mask
+            # remove _adco_build_pos_neg_masks, simplfy
+            pos_mask, _ = self._adco_build_pos_neg_masks(
+                pixel_gt=pixel_gt,
+                pixel_logits=pixel_logits,
+                spatial_hw=(H, W),
+                batch_size=B,
+            )
+            # Confidence from logits
+            confidence = self._adco_compute_confidence(pixel_logits=pixel_logits)
+            if confidence is not None:
+                if pixel_uncertainty is None:
+                    # Fallback uncertainty from logits: higher logit mag => lower uncertainty
+                    uncertainty_p = (1.0 - confidence).clamp(0.0, 1.0)
+                else:
+                    uncertainty_p = torch.clamp(pixel_uncertainty, 0.0, 1.0)
+                ratio_pos = self._adco_mean_ratio(uncertainty_p, confidence, pos_mask) # TODO 使用pos_mask的话，假阳性没有惩罚, 直接用gt
 
         # Neg off for now
         alpha_pos = 1.0
-        alpha_neg = 0.0
-        total_ratio = alpha_pos * ratio_pos + alpha_neg * ratio_neg
+        alpha_neg = 1.0
+        ratio_neg = torch.tensor(0.0, device=device, dtype=dtype)
+        if (alpha_neg > 0.0) and (neg_sample_M is not None) and (neg_sample_M > 0) and (pixel_bndl_model is not None):
+            neg_images = self._adco_sample_neg_images(neg_sample_M)  # [M, 3, Himg, Wimg]
+            if neg_images is not None:
+                if (neg_images.shape[-2] != self.image_size) or (neg_images.shape[-1] != self.image_size):
+                    neg_images = F.interpolate(
+                        neg_images,
+                        size=(self.image_size, self.image_size),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                enc_out = self.image_encoder(neg_images)
+                feat = enc_out["backbone_fpn"][-1]
+                neg_feat = feat.permute(0, 2, 3, 1).contiguous()
+                neg_uq, neg_mean_logits = pixel_uncertain_sampling(
+                    pixel_bndl_model,
+                    neg_feat,
+                    external_pre_out_w=external_pre_out_w, # TODO 是否是要生成对应负样本的prompt权重
+                    sample_num=uq_sample_num,
+                )
+                neg_conf = self._adco_compute_conf_from_logits_tensor(neg_mean_logits)
+                full_mask = torch.ones_like(neg_uq, dtype=torch.bool)
+                ratio_neg = self._adco_mean_ratio(neg_uq, neg_conf, full_mask) # TODO 同上
+
+        # Neg off for now
+        alpha_pos = 1.0
+        alpha_neg = 1.0
         # We want low uncertainty given high confidence => minimize the ratio
-        loss = total_ratio
-        return loss
+        loss = alpha_pos * ratio_pos + alpha_neg * ratio_neg
 
-    def compute_adco_loss_bk(
-        self,
-        pixel_feat: torch.Tensor,                                # [B, H, W, C']
-        pixel_uncertainty: torch.Tensor | None = None,
-        neg_sample_M: int | None = 1024,
-        roi_z1: torch.Tensor | None = None,
-        roi_z2: torch.Tensor | None = None,
-        roi_w1: torch.Tensor | None = None,
-        roi_w2: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """
-        ROI views + symmetric InfoNCE with normalized/subsampled negative bank.
-        """
-        assert self.use_adco and pixel_feat is not None and pixel_feat.ndim == 4
-
-        # Two ROI views (masked pooling) and their ROI weights
-        if (roi_z1 is None) or (roi_z2 is None):
-            z1, w1 = self._adco_roi_view(pixel_feat, min_scale=0.6, boundary_ignore=2, uncert=pixel_uncertainty)
-            z2, w2 = self._adco_roi_view(pixel_feat, min_scale=0.6, boundary_ignore=2, uncert=pixel_uncertainty)
-        else:
-            z1 = roi_z1
-            z2 = roi_z2
-            # If external weights are provided, use them; else default to ones
-            if (roi_w1 is None) or (roi_w2 is None):
-                B = z1.shape[0]
-                device = z1.device
-                dtype = z1.dtype
-                w1 = torch.ones(B, device=device, dtype=dtype)
-                w2 = torch.ones(B, device=device, dtype=dtype)
-            else:
-                w1 = roi_w1
-                w2 = roi_w2
-
-        # Projection + L2 normalize
-        q1 = F.normalize(self.adco_proj(z1), dim=1)
-        q2 = F.normalize(self.adco_proj(z2), dim=1)
-        k1 = F.normalize(self.adco_proj(z1).detach(), dim=1)
-        k2 = F.normalize(self.adco_proj(z2).detach(), dim=1)
-
-        # Normalize negative bank and optionally subsample
-        neg_bank = F.normalize(self.adco_negatives, dim=1)  # [K, D]
-        if (neg_sample_M is not None) and (neg_sample_M < neg_bank.size(0)):
-            idx = torch.randint(0, neg_bank.size(0), (neg_sample_M,), device=neg_bank.device)
-            neg_bank = neg_bank.index_select(dim=0, index=idx)  # [M, D]
-        # Temperature scheduling by uncertainty (per-sample)
-        # roi_conf in [0,1], approximate low-uncertainty proportion in ROI
-        roi_conf = None
-        if pixel_uncertainty is not None and self.adco_use_uncertainty:
-            roi_conf = torch.clamp((w1 + w2) * 0.5, 0.0, 1.0)  # [B]
-            # mean_u ~ (1 - roi_conf)
-            if self.adco_tau_beta > 0.0:
-                tau = self.adco_temperature * (1.0 + self.adco_tau_beta * (1.0 - roi_conf))  # [B]
-            else:
-                tau = torch.full_like(roi_conf, float(self.adco_temperature))
-        else:
-            tau = float(self.adco_temperature)
-
-        def info_nce(q: torch.Tensor, k: torch.Tensor, w: torch.Tensor | None = None) -> torch.Tensor:
-            # Support scalar or per-sample temperature
-            if isinstance(tau, torch.Tensor):
-                tau_b = tau.view(-1, 1)
-            else:
-                tau_b = tau
-            pos = (q * k).sum(dim=1, keepdim=True) / tau_b              # [B, 1]
-            neg = (q @ neg_bank.t()) / tau_b                             # [B, M or K]
-            logits = torch.cat([pos, neg], dim=1)                     # [B, 1+M]
-            labels = torch.zeros(logits.size(0), dtype=torch.long, device=logits.device)
-            loss_per = F.cross_entropy(logits, labels, reduction="none")
-            if w is not None:
-                ww = w / (w.mean().detach() + 1e-6)
-                return (loss_per * ww).mean()
-            return loss_per.mean()
-
-        roi_w = (w1 + w2) * 0.5  # [B]
-        loss = 0.5 * info_nce(q1, k2, roi_w) + 0.5 * info_nce(q2, k1, roi_w)
-
-        # Global gating by ROI confidence and curriculum
-        if self.adco_use_uncertainty and roi_conf is not None:
-            gate = torch.clamp(roi_conf, min=float(self.adco_gate_floor), max=1.0)  # [B]
-            # curriculum warmup from 0 to 1 (apply to all cases when using uncertainty)
-            if self.adco_curriculum_warmup_steps > 0:
-                progress = min(1.0, float(self._adco_step_count + 1) / float(self.adco_curriculum_warmup_steps))
-                gate = gate * progress
-            # Apply global gate
-            loss = loss * gate.mean()
-
-            # Scale GRL strength by uncertainty-aware gate (higher confidence -> stronger adversary)
-            # Only update GRL scale when gate_by_uncertainty is enabled
-            if self.adco_gate_by_uncertainty and self.adco_scale_neg_by_uq:
-                self.adco_grl_scale = float(gate.mean().detach().clamp(0.5, 1.0).item())  # min 0.5
-            else:
-                self.adco_grl_scale = 1.0
-        else:
-            self.adco_grl_scale = 1.0
-
-        # Step count for curriculum
-        self._adco_step_count += 1
         return loss
 
     def compute_proco_loss(
@@ -913,6 +802,7 @@ class SAM2Base(torch.nn.Module):
         """Compute per-pixel confidence in [0,1], [B, H, W] from logits only.
 
         c = sigmoid(max(|logits|) / tau_conf). Returns None if logits unavailable.
+        # TODO 要在gt上取logits
         """
         if pixel_logits is None:
             return None
@@ -932,6 +822,103 @@ class SAM2Base(torch.nn.Module):
             except Exception:
                 return None
         return torch.sigmoid(mag / float(tau_conf)).to(mag.dtype)
+
+    def _adco_infonce_loss(
+        self,
+        pixel_feat: torch.Tensor,                                # [B, H, W, C']
+        roi_z1: torch.Tensor | None,
+        roi_z2: torch.Tensor | None,
+        roi_w1: torch.Tensor | None,
+        roi_w2: torch.Tensor | None,
+        neg_sample_M: int | None,
+    ) -> torch.Tensor:
+        """Compute symmetric InfoNCE using two ROI queries and negatives from the image negative bank.
+
+        - Queries/keys: two ROI pooled views from pixel features (self-supervised invariance), no GT/UQ.
+        - Negatives: sample M images from `adco_negatives`, upsample to `image_size`, encode, global-pool, project.
+        """
+        assert pixel_feat is not None and pixel_feat.ndim == 4
+
+        # 1) Build or reuse ROI views
+        if (roi_z1 is None) or (roi_z2 is None):
+            with torch.no_grad():
+                z1, w1 = self._adco_roi_view(pixel_feat, min_scale=0.6, boundary_ignore=2, uncert=None)
+                z2, w2 = self._adco_roi_view(pixel_feat, min_scale=0.6, boundary_ignore=2, uncert=None)
+        else:
+            z1, z2 = roi_z1, roi_z2
+            # If external weights are provided, use them; else default to ones
+            if (roi_w1 is None) or (roi_w2 is None):
+                B = z1.shape[0]
+                device = z1.device
+                dtype = z1.dtype
+                w1 = torch.ones(B, device=device, dtype=dtype)
+                w2 = torch.ones(B, device=device, dtype=dtype)
+            else:
+                w1, w2 = roi_w1, roi_w2
+
+        # 2) Project queries/keys
+        q1 = F.normalize(self.adco_proj(z1), dim=1)
+        q2 = F.normalize(self.adco_proj(z2), dim=1)
+        k1 = F.normalize(self.adco_proj(z1).detach(), dim=1)
+        k2 = F.normalize(self.adco_proj(z2).detach(), dim=1)
+
+        # 3) Build negatives from image bank
+        tau = float(self.adco_temperature)
+        neg = None
+        if (neg_sample_M is not None) and (neg_sample_M > 0) and (self.adco_negatives is not None):
+            neg_images = self._adco_sample_neg_images(neg_sample_M)  # [M, 3, Hneg, Wneg]
+            if neg_images is not None:
+                if (neg_images.shape[-2] != self.image_size) or (neg_images.shape[-1] != self.image_size):
+                    neg_images = F.interpolate(
+                        neg_images,
+                        size=(self.image_size, self.image_size),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                with torch.no_grad():
+                    enc_out = self.image_encoder(neg_images)
+                    feat = enc_out["backbone_fpn"][-1]  # [M, C, Hf, Wf]
+                # Global average pool spatial dims -> [M, C'] via simple mean over Hf,Wf then match adco_in dim
+                m, c, hf, wf = feat.shape
+                pooled = feat.mean(dim=(2, 3))  # [M, C]
+                # Down-project to AdCo input dim if needed (use same heuristic as ROI views)
+                # Our adco_proj expects in_dim = hidden_dim//8; ROI used z already in C' domain.
+                # For negatives, approximate by a 1x linear into that domain via the first layer of adco_proj's in_features.
+                # Simpler: map via the same adco_proj by faking a z-like feature using a linear adapter if sizes mismatch.
+                # If pooled shape matches adco_proj[0].in_features we can feed directly; else use a 1x linear adapter.
+                in_features = self.adco_proj[0].in_features
+                if pooled.shape[1] != in_features:
+                    adapter = torch.nn.Linear(pooled.shape[1], in_features, bias=False).to(pooled.device, pooled.dtype)
+                    torch.nn.init.orthogonal_(adapter.weight)
+                    pooled = adapter(pooled)
+                neg = F.normalize(self.adco_proj(pooled), dim=1)  # [M, D]
+
+        # 4) InfoNCE
+        roi_w = (w1 + w2) * 0.5
+        loss_1 = self._adco_infonce_once(q1, k2, neg, tau, weights=roi_w)
+        loss_2 = self._adco_infonce_once(q2, k1, neg, tau, weights=roi_w)
+        return 0.5 * loss_1 + 0.5 * loss_2
+
+    def _adco_infonce_once(
+        self,
+        q: torch.Tensor,                # [B, D]
+        k: torch.Tensor,                # [B, D]
+        negatives: torch.Tensor | None, # [M, D] or None
+        tau: float,
+        weights: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Single-direction InfoNCE from q to k with optional negatives."""
+        pos = (q * k).sum(dim=1, keepdim=True) / tau
+        if negatives is None or negatives.numel() == 0:
+            logits = pos
+        else:
+            logits = torch.cat([pos, (q @ negatives.t()) / tau], dim=1)
+        labels = torch.zeros(logits.size(0), dtype=torch.long, device=logits.device)
+        if weights is None:
+            return F.cross_entropy(logits, labels)
+        loss_per = F.cross_entropy(logits, labels, reduction="none")
+        ww = weights / (weights.mean().detach() + 1e-6)
+        return (loss_per * ww).mean()
 
     def _adco_mean_ratio(
         self,
@@ -1193,7 +1180,7 @@ class SAM2Base(torch.nn.Module):
             obj_ptr = obj_ptr + (1 - lambda_is_obj_appearing) * self.no_obj_ptr
 
         if self.use_bndl_for_pixels:
-            pixel_feat = bndl_outputs.get("pixel_feat", None)
+            pixel_feat = bndl_outputs.get("pixel_feat_grad", bndl_outputs.get("pixel_feat", None))
             shared_z1 = None
             shared_z2 = None
             shared_w1 = None
@@ -1206,10 +1193,10 @@ class SAM2Base(torch.nn.Module):
             # Optional per-frame uncertainty for AdCo
             pixel_uncertainty = bndl_outputs.get("pixel_uncertainty", None) if self.adco_use_uncertainty else None
             if self.use_adco and self.training and (pixel_feat is not None):
-                # Prefer raw mask logits if provided; fallback to mean sampled logits
+                # Prefer gradient-carrying logits key when training
                 pixel_logits_for_adco = bndl_outputs.get(
-                    "masks_bndl_raw",
-                    bndl_outputs.get("mean_pixel_logits", None),
+                    "pixel_logits",
+                    bndl_outputs.get("masks_bndl_raw", bndl_outputs.get("mean_pixel_logits", None)),
                 )
                 adco_loss = self.compute_adco_loss(
                     pixel_feat=pixel_feat,

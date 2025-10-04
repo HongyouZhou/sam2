@@ -202,9 +202,8 @@ class DistributedDatasetEvaluator:
                 logging.warning(f"Shape mismatch in single image accuracy: pred {pred_logits.shape} vs gt {gt_masks.shape}")
                 return torch.tensor(0.0)
             
-            # 先应用sigmoid，再应用 > 0 阈值
-            pred_probs = torch.sigmoid(pred_logits)
-            pred_binary = pred_probs > 0
+            # 对logits应用 > 0 阈值，与 IoU 一致
+            pred_binary = pred_logits > 0
             gt_binary = gt_masks > 0
             
             # 前景掩膜（任一通道为真）

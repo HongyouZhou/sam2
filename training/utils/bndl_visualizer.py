@@ -88,19 +88,25 @@ class BNDLVisualizer:
                             else:
                                 w_ck = w.transpose(0, 1)  # [C',K]
 
-                            B, H, W, C = wl.shape
-                            if w_ck.shape[0] == C:
-                                w_sum = w_ck.sum(dim=0, keepdim=True) + 1e-8  # [1,K]
-                                w_norm = w_ck / w_sum                           # [C',K]
-                                wl_flat = wl.view(B * H * W, C)
-                                k_flat = k_val.view(B * H * W, C)
-                                lambda_w_flat = torch.matmul(wl_flat, w_norm)  # [BHW,K]
-                                k_w_flat = torch.matmul(k_flat, w_norm)
-                                lambda_w = lambda_w_flat.view(B, H, W, -1)
-                                k_w = k_w_flat.view(B, H, W, -1)
-                            else:
+                            # 安全检查wl的维度
+                            if wl.ndim != 4:
+                                logging.debug(f"wl has unexpected shape {wl.shape}, expected 4D [B,H,W,C], skipping weighted overlay")
                                 lambda_w = None
                                 k_w = None
+                            else:
+                                B, H, W, C = wl.shape
+                                if w_ck.shape[0] == C:
+                                    w_sum = w_ck.sum(dim=0, keepdim=True) + 1e-8  # [1,K]
+                                    w_norm = w_ck / w_sum                           # [C',K]
+                                    wl_flat = wl.view(B * H * W, C)
+                                    k_flat = k_val.view(B * H * W, C)
+                                    lambda_w_flat = torch.matmul(wl_flat, w_norm)  # [BHW,K]
+                                    k_w_flat = torch.matmul(k_flat, w_norm)
+                                    lambda_w = lambda_w_flat.view(B, H, W, -1)
+                                    k_w = k_w_flat.view(B, H, W, -1)
+                                else:
+                                    lambda_w = None
+                                    k_w = None
                         else:
                             lambda_w = None
                             k_w = None

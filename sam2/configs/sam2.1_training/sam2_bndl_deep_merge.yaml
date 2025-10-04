@@ -224,14 +224,14 @@ trainer:
     adco_curriculum_warmup_steps: 2000
 
     # ProCo options
-    use_proco: true
+    use_proco: false
     proco_proj_dim: 256
     proco_num_obj_prototypes: 128
     proco_num_bg_prototypes: 32
     proco_temperature: 0.1
     
     # MoCo options
-    use_moco: true
+    use_moco: false
     moco_proj_dim: 256
     moco_queue_size: 65536
     moco_momentum: 0.996
@@ -505,7 +505,7 @@ trainer:
 launcher:
   num_nodes: 1
   gpus_per_node: 8
-  experiment_log_dir: /home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_011_01 # Path to log directory, defaults to ./sam2_logs/${config_name}
+  experiment_log_dir: /home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_011_02 # Path to log directory, defaults to ./sam2_logs/${config_name}
 
 # SLURM args if running on a cluster
 submitit:
