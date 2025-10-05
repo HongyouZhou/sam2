@@ -11,6 +11,7 @@ from collections import defaultdict
 
 from .metric_calculator import MetricCalculator
 from .visualization_utils import VisualizationUtils
+from BNDL.BNDL_upload.ViT_Sparse.utils.bndl import calculate_nll_from_logits
 
 
 class DistributedDatasetEvaluator:
@@ -39,6 +40,7 @@ class DistributedDatasetEvaluator:
         self.image_ious = []          # 存储每张图片的平均IoU值
         self.image_dices = []         # 存储每张图片的平均DICE值
         self.image_accuracies = []    # 存储每张图片的平均accuracy值
+        self.image_nlls = []          # 存储每张图片的平均NLL值（有监督不确定性）
         
         # 存储最终结果
         self.correlation_results = {}
@@ -113,11 +115,15 @@ class DistributedDatasetEvaluator:
                 accuracy_scalar = self._calculate_single_image_accuracy_scalar(single_pred, single_gt)
                 uncertainty_scalar = self._calculate_single_image_uncertainty_scalar(single_uncertainty, single_pred, single_gt)
                 
+                # 计算NLL（复用BNDL模块的方法）
+                nll_scalar = calculate_nll_from_logits(single_pred, single_gt, foreground_only=True)
+                
                 # 存储单张图片的标量指标（转换为CPU以节省GPU内存）
                 self.image_uncertainties.append(uncertainty_scalar.detach().cpu())
                 self.image_ious.append(iou_scalar.detach().cpu())
                 self.image_dices.append(dice_scalar.detach().cpu())
                 self.image_accuracies.append(accuracy_scalar.detach().cpu())
+                self.image_nlls.append(nll_scalar.detach().cpu())
             
             if self.rank == 0:  # 只在主进程记录日志
                 logging.info(f"Added {B} images to evaluation data")
@@ -262,11 +268,11 @@ class DistributedDatasetEvaluator:
             return torch.tensor(0.0)
     
     def _gather_distributed_data(self) -> Tuple[List[torch.Tensor], List[torch.Tensor], 
-                                               List[torch.Tensor], List[torch.Tensor]]:
+                                               List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
         """收集所有GPU进程的数据（使用NCCL-safe all_gather + padding）"""
         if not self.distributed or not dist.is_initialized():
             return (self.image_uncertainties, self.image_ious, 
-                    self.image_dices, self.image_accuracies)
+                    self.image_dices, self.image_accuracies, self.image_nlls)
 
         def gather_scalar_list(values: List[torch.Tensor]) -> List[torch.Tensor]:
             # 将标量列表打包为CUDA张量，使用padding后all_gather
@@ -300,11 +306,12 @@ class DistributedDatasetEvaluator:
             all_ious = gather_scalar_list(self.image_ious)
             all_dices = gather_scalar_list(self.image_dices)
             all_accuracies = gather_scalar_list(self.image_accuracies)
-            return all_uncertainties, all_ious, all_dices, all_accuracies
+            all_nlls = gather_scalar_list(self.image_nlls)
+            return all_uncertainties, all_ious, all_dices, all_accuracies, all_nlls
         except Exception as e:
             logging.warning(f"Failed to gather distributed data: {e}")
             return (self.image_uncertainties, self.image_ious, 
-                    self.image_dices, self.image_accuracies)
+                    self.image_dices, self.image_accuracies, self.image_nlls)
     
     def evaluate_dataset_correlation(self) -> Dict[str, Dict[str, float]]:
         """评估整个数据集的指标与不确定性相关性"""
@@ -317,7 +324,7 @@ class DistributedDatasetEvaluator:
                 logging.info(f"Evaluating correlation for {len(self.image_uncertainties)} images")
             
             # 收集分布式数据
-            all_uncertainties, all_ious, all_dices, all_accuracies = self._gather_distributed_data()
+            all_uncertainties, all_ious, all_dices, all_accuracies, all_nlls = self._gather_distributed_data()
             
             # 只在主进程上进行评估
             if not self.is_main_process:
@@ -367,6 +374,20 @@ class DistributedDatasetEvaluator:
                     logging.info(f"Accuracy correlation calculated: {acc_corr['Accuracy'].get('correlation', 'N/A')}")
                 else:
                     logging.warning("Accuracy correlation calculation failed")
+            
+            # NLL相关性（NLL本身就是不确定性度量，与uncertainty的相关性）
+            if all_nlls:
+                logging.info(f"Calculating NLL correlation with {len(all_nlls)} images")
+                nll_corr = self.metric_calculator.calculate_image_metric_uncertainty_correlation(
+                    uncertainties=all_uncertainties,
+                    metrics=all_nlls,
+                    metric_names=['NLL'] * len(all_nlls)
+                )
+                if 'NLL' in nll_corr:
+                    correlation_results['NLL'] = nll_corr['NLL']
+                    logging.info(f"NLL correlation calculated: {nll_corr['NLL'].get('correlation', 'N/A')}")
+                else:
+                    logging.warning("NLL correlation calculation failed")
             
             # 保存结果
             self.correlation_results = correlation_results
@@ -542,6 +563,7 @@ class DistributedDatasetEvaluator:
         self.image_ious.clear()
         self.image_dices.clear()
         self.image_accuracies.clear()
+        self.image_nlls.clear()
         self.correlation_results.clear()
         
         if self.is_main_process:

@@ -8,6 +8,8 @@ import shutil
 from pathlib import Path
 from typing import Any, Optional
 from collections import defaultdict
+import os
+import sys
 
 import numpy as np
 import torch
@@ -35,6 +37,37 @@ from training.utils.dataset_evaluator import DistributedDatasetEvaluator
 
 # ----------  Unified click prompt generator ----------
 from prompt_generation import generate_click_prompts
+
+# Add path for visualization utils
+sys.path.append(os.path.join(os.path.dirname(__file__), "..", "training", "utils"))
+
+
+def create_uctta_ua_ratio_visualization(
+    out_logits, uncertainty_map, original_img, vid, frame_name, vis_dir
+):
+    """Create U/A ratio visualization for UCTTA"""
+    from visualization_utils import VisualizationUtils
+    from bndl_visualizer import BNDLVisualizer
+    
+    viz_utils = VisualizationUtils()
+    bndl_viz = BNDLVisualizer()
+    
+    # Prepare data in format expected by visualizer
+    uctta_outputs = {
+        "pixel_uncertainty": uncertainty_map,
+        "mean_pixel_logits": out_logits,
+    }
+    
+    # Create figure with U/A ratio visualization
+    fig, axes = viz_utils.create_figure_layout(1, 3, (18, 6))
+    bndl_viz.plot_uncertainty_accuracy_ratio_visualization(
+        axes[0, :], uctta_outputs, original_img, step_index=0, ratio_type="U/A"
+    )
+    
+    # Save visualization
+    save_path = vis_dir / vid / f"{frame_name}_uctta_ua_ratio.png"
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    viz_utils.save_and_close_figure(fig, str(save_path), dpi=150)
 
 
 def _load_first_frame_mask(ann_dir: Path, vid: str, frame_names: list[str]) -> Optional[np.ndarray]:
@@ -547,23 +580,49 @@ def inference_with_uctta(
                         gt_tensor = None
 
                     max_obj_stats = 3
+                    # Build per-frame stacked logits [K,H,W] for visualization/accuracy proxy
+                    stacked_logits = []
+                    # Also prepare a list of per-object uncertainty maps for aggregation
+                    per_object_uncertainties = []
                     for i, oid in enumerate(out_obj_ids[:max_obj_stats]):
                         logits_i = out_logits[i]
-                        # Unwrap inference tensor first
                         logits_clean = logits_i.detach().clone()
-                        if logits_clean.ndim == 3:
-                            logits_2d = logits_clean.squeeze(0)
-                        else:
-                            logits_2d = logits_clean
+                        logits_2d = logits_clean.squeeze(0) if logits_clean.ndim == 3 else logits_clean
                         if tuple(logits_2d.shape[-2:]) != (H, W):
                             logits_2d = F.interpolate(
                                 logits_2d.unsqueeze(0).unsqueeze(0), size=(H, W), mode="bilinear", align_corners=False
                             )[0, 0]
-                        # Uncertainty map from normal tensor
-                        u_map = _entropy_map_from_logits_scaled(logits_2d, logT).unsqueeze(0)  # [1,H,W]
-                        # Add batch to evaluator
+                        # Uncertainty per object
+                        u_map = _entropy_map_from_logits_scaled(logits_2d, logT)  # [H,W]
+                        per_object_uncertainties.append(u_map.unsqueeze(0))  # [1,H,W]
+                        stacked_logits.append(logits_2d.unsqueeze(0))  # [1,H,W]
+                        # Add to evaluator if GT available
                         if gt_tensor is not None:
-                            dataset_eval.add_batch_data(uncertainty=u_map, pred_logits=logits_2d.unsqueeze(0), gt_masks=gt_tensor)
+                            dataset_eval.add_batch_data(uncertainty=u_map.unsqueeze(0), pred_logits=logits_2d.unsqueeze(0), gt_masks=gt_tensor)
+
+                    # Once per frame: create UA ratio visualization using all available objects
+                    if stacked_logits and f_idx < 5 and collect_statistics:
+                        # Shape to [1,H,W,K]
+                        logits_hwk = torch.cat(stacked_logits, dim=0).permute(1, 2, 0).unsqueeze(0)
+                        # Aggregate uncertainty across objects: use max for conservative view → [1,H,W]
+                        u_agg = torch.max(torch.cat(per_object_uncertainties, dim=0), dim=0, keepdim=True).values  # [1,H,W]
+                        # Load original image with .jpg/.jpeg fallback
+                        img_path = jpeg_dir / vid / f"{frame_names[f_idx]}.jpg"
+                        if not img_path.exists():
+                            alt = jpeg_dir / vid / f"{frame_names[f_idx]}.jpeg"
+                            if alt.exists():
+                                img_path = alt
+                        if img_path.exists():
+                            img = Image.open(img_path).convert("RGB")
+                            img_np = np.array(img).astype(np.float32) / 255.0
+                            create_uctta_ua_ratio_visualization(
+                                logits_hwk,
+                                u_agg,
+                                img_np,
+                                vid,
+                                frame_names[f_idx],
+                                out_dir.parent / "uctta_visualizations",
+                            )
                 except Exception as e:
                     print(f"Warning: UCTTA evaluator add_batch_data failed: {e}")
 

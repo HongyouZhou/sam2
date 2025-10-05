@@ -378,11 +378,16 @@ def calculate_pavpu_for_bndl(bndl_outputs, batch, targets, phase, model):
                         logger.warning("Cannot fix dimension mismatch, skipping PAvPU calculation")
                         return bndl_outputs
 
-                pavpu_scores = pixel_pavpu_calculation(pixel_uncertainty, pixel_predictions, pixel_targets, thresholds=[0.01, 0.05, 0.1])
+                # Determine thresholds with wider scan. Match to the uncertainty used here (pixel_uncertainty)
+                # pixel_uncertainty here is p-value style from pixel_uncertain_sampling
+                thresholds = [0.005, 0.010, 0.020, 0.050, 0.100, 0.200, 0.300]
+
+                pavpu_scores = pixel_pavpu_calculation(pixel_uncertainty, pixel_predictions, pixel_targets, thresholds=thresholds)
 
                 # Add PAvPU results to BNDL outputs
                 bndl_outputs["pixel_uncertainty"] = pixel_uncertainty.detach()
                 bndl_outputs["pixel_pavpu"] = pavpu_scores
+                bndl_outputs["pavpu_thresholds"] = thresholds
                 bndl_outputs["mean_pixel_logits"] = mean_pixel_logits.detach()
 
                 logger.info(f"PAvPU scores calculated: {pavpu_scores}")
@@ -437,7 +442,8 @@ def log_bndl_statistics(bndl_outputs, step, phase, dataset_name, statistics_dict
         # Log PAvPU scores if available
         if "pixel_pavpu" in bndl_outputs and bndl_outputs["pixel_pavpu"] is not None:
             pavpu_scores = bndl_outputs["pixel_pavpu"]
-            for i, threshold in enumerate([0.01, 0.05, 0.1]):
+            thresholds = bndl_outputs.get("pavpu_thresholds", [0.01, 0.05, 0.1])
+            for i, threshold in enumerate(thresholds):
                 if i < len(pavpu_scores):
                     score = pavpu_scores[i].item() if hasattr(pavpu_scores[i], "item") else pavpu_scores[i]
                     statistics_dict[f"{key_prefix}_pavpu_{threshold}"] = score
@@ -595,10 +601,13 @@ def create_bndl_visualization_refactored(bndl_outputs, batch, outputs_for_vis, v
             lambda_img, k_img = upsample_params_to_image_size(lambda_img, k_img, original_img.shape)
 
         has_uncertainty = "pixel_uncertainty" in bndl_outputs and bndl_outputs["pixel_uncertainty"] is not None
+        has_ratio_data = (has_uncertainty and 
+                         "mean_pixel_logits" in bndl_outputs and 
+                         bndl_outputs["mean_pixel_logits"] is not None)
 
-        # Determine number of rows based on layout type and uncertainty availability
+        # Determine number of rows based on layout type and data availability
         if layout_type == "full" and has_uncertainty:
-            rows = 4
+            rows = 5 if has_ratio_data else 4
         else:
             rows = 3
 
@@ -607,6 +616,10 @@ def create_bndl_visualization_refactored(bndl_outputs, batch, outputs_for_vis, v
 
         # Plot common elements using refactored functions
         plot_common_elements_refactored(axes, original_img, lambda_img, k_img, step_index, bndl_outputs, has_uncertainty, batch, outputs_for_vis, bndl_viz, viz_utils)
+        
+        # Add U/A ratio visualization if data is available
+        if has_ratio_data and rows >= 5:
+            bndl_viz.plot_uncertainty_accuracy_ratio_visualization(axes[4, :], bndl_outputs, original_img, step_index, ratio_type="U/A")
 
         # Use refactored tools to save and close figure
         save_path = os.path.join(vis_dir, f"iter_{data_iter}_step_{step_index}_bndl_{layout_type}.png")

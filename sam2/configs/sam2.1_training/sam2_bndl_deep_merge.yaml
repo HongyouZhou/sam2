@@ -77,7 +77,7 @@ vos:
 
 trainer:
   _target_: training.trainer.Trainer
-  mode: train
+  mode: train 
   max_epochs: ${times:${scratch.num_epochs},${scratch.phases_per_epoch}}
   accelerator: cuda
   seed_value: 123
@@ -481,7 +481,9 @@ trainer:
     log_freq: 10
     log_scalar_frequency: 100
     visualize_bndl: true
-    # uncertainty_metric: entropy
+    uncertainty_metric: ["entropy", "nll"] 
+    visualize_pavpu_overlay: true
+    uncertainty_sample_num: 50
 
   # initialize from a SAM 2 checkpoint
   checkpoint:
@@ -505,7 +507,7 @@ trainer:
 launcher:
   num_nodes: 1
   gpus_per_node: 8
-  experiment_log_dir: /home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_011_02 # Path to log directory, defaults to ./sam2_logs/${config_name}
+  experiment_log_dir: /home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_012_01 # Path to log directory, defaults to ./sam2_logs/${config_name}
 
 # SLURM args if running on a cluster
 submitit:

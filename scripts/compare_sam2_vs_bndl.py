@@ -9,6 +9,7 @@ import json
 import time
 from pathlib import Path
 from typing import Any
+from collections import defaultdict
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -1136,7 +1137,7 @@ def parse_args():
     )
     p.add_argument(
         "--bndl_checkpoint",
-        default="/home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_011_02/checkpoints/checkpoint.pt",
+        default="/home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_012_01/checkpoints/checkpoint.pt",
         help="SAM-2+BNDL checkpoint path",
     )
 

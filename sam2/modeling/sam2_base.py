@@ -544,14 +544,13 @@ class SAM2Base(torch.nn.Module):
         pixel_uncertainty: torch.Tensor | None = None,
         pixel_gt: torch.Tensor | None = None,
         pixel_logits: torch.Tensor | None = None,
-        neg_sample_M: int | None = 1024,
+        neg_sample_M: int | None = 2,
         roi_z1: torch.Tensor | None = None,
         roi_z2: torch.Tensor | None = None,
         roi_w1: torch.Tensor | None = None,
         roi_w2: torch.Tensor | None = None,
         pixel_bndl_model=None,
-        external_pre_out_w=None,
-        uq_sample_num: int = 50,
+        uq_sample_num: int = 4,  # Reduced from 50 to save ~2GB GPU memory
     ) -> torch.Tensor:
         
         # TODO
@@ -572,34 +571,26 @@ class SAM2Base(torch.nn.Module):
         device = pixel_feat.device
         dtype = pixel_feat.dtype
 
-        # Ratio branch: if uncertainty missing, fallback to 1 - confidence from logits
-        ratio_pos = torch.tensor(0.0, device=device, dtype=dtype)
-        if pixel_logits is not None:
-            # Build positive pixel mask
-            # remove _adco_build_pos_neg_masks, simplfy
-            pos_mask, _ = self._adco_build_pos_neg_masks(
-                pixel_gt=pixel_gt,
-                pixel_logits=pixel_logits,
-                spatial_hw=(H, W),
-                batch_size=B,
-            )
-            # Confidence from logits
-            confidence = self._adco_compute_confidence(pixel_logits=pixel_logits)
-            if confidence is not None:
-                if pixel_uncertainty is None:
-                    # Fallback uncertainty from logits: higher logit mag => lower uncertainty
-                    uncertainty_p = (1.0 - confidence).clamp(0.0, 1.0)
-                else:
-                    uncertainty_p = torch.clamp(pixel_uncertainty, 0.0, 1.0)
-                ratio_pos = self._adco_mean_ratio(uncertainty_p, confidence, pos_mask) # TODO 使用pos_mask的话，假阳性没有惩罚, 直接用gt
+        # Positive samples: compute global uncertainty/confidence ratio
+        ratio_pos = self._compute_pos_ratios(
+            pixel_logits=pixel_logits,
+            pixel_uncertainty=pixel_uncertainty,
+            pixel_gt=pixel_gt,
+            spatial_hw=(H, W),
+            batch_size=B,
+            device=device,
+            dtype=dtype,
+        )
 
-        # Neg off for now
         alpha_pos = 1.0
         alpha_neg = 1.0
+
         ratio_neg = torch.tensor(0.0, device=device, dtype=dtype)
-        if (alpha_neg > 0.0) and (neg_sample_M is not None) and (neg_sample_M > 0) and (pixel_bndl_model is not None):
-            neg_images = self._adco_sample_neg_images(neg_sample_M)  # [M, 3, Himg, Wimg]
-            if neg_images is not None:
+        # Negative samples
+        neg_images = self._adco_sample_neg_images(neg_sample_M)  # [M, 3, Himg, Wimg]
+        if neg_images is not None:
+            # SAM组件不需要梯度以节省内存
+            with torch.no_grad():
                 if (neg_images.shape[-2] != self.image_size) or (neg_images.shape[-1] != self.image_size):
                     neg_images = F.interpolate(
                         neg_images,
@@ -608,22 +599,38 @@ class SAM2Base(torch.nn.Module):
                         align_corners=False,
                     )
                 enc_out = self.image_encoder(neg_images)
-                feat = enc_out["backbone_fpn"][-1]
-                neg_feat = feat.permute(0, 2, 3, 1).contiguous()
-                neg_uq, neg_mean_logits = pixel_uncertain_sampling(
-                    pixel_bndl_model,
-                    neg_feat,
-                    external_pre_out_w=external_pre_out_w, # TODO 是否是要生成对应负样本的prompt权重
-                    sample_num=uq_sample_num,
-                )
-                neg_conf = self._adco_compute_conf_from_logits_tensor(neg_mean_logits)
-                full_mask = torch.ones_like(neg_uq, dtype=torch.bool)
-                ratio_neg = self._adco_mean_ratio(neg_uq, neg_conf, full_mask) # TODO 同上
+                feat = enc_out["backbone_fpn"][-1]  # [M, C, H, W], C=256
+                
+                # Apply upscaling to match the feature dimension expected by pixel_bndl
+                if self.use_high_res_features_in_sam:
+                    dc1, ln1, act1, dc2, act2 = self.sam_mask_decoder.output_upscaling
+                    neg_feat_upscaled = act2(dc2(act1(ln1(dc1(feat)))))
+                else:
+                    neg_feat_upscaled = self.sam_mask_decoder.output_upscaling(feat)
+                
+                neg_feat = neg_feat_upscaled.permute(0, 2, 3, 1).contiguous()  # [M, H', W', C']
+            
+            # BNDL部分保留梯度用于权重学习
+            # 为负样本生成external_pre_out_w：使用pixel_bndl的全局权重矩阵
+            M = neg_feat.shape[0]
+            if pixel_bndl_model.enable_global_sparse:
+                neg_external_w = None
+            else:
+                # 使用linear.weight作为负样本的基础权重 [K, C'] -> [M, K, C']
+                linear_weight = pixel_bndl_model.linear.weight  # [K, C']
+                neg_external_w = linear_weight.unsqueeze(0).expand(M, -1, -1)
+            
+            neg_uq, neg_mean_logits = pixel_uncertain_sampling(
+                pixel_bndl_model,
+                neg_feat,
+                external_pre_out_w=neg_external_w,
+                sample_num=uq_sample_num,
+            )
+            neg_conf = self._adco_compute_conf_from_logits_tensor(neg_mean_logits)
+            # Simplified: no need for mask, just compute global mean
+            eps = 1e-6
+            ratio_neg = (neg_uq / (neg_conf + eps)).mean()
 
-        # Neg off for now
-        alpha_pos = 1.0
-        alpha_neg = 1.0
-        # We want low uncertainty given high confidence => minimize the ratio
         loss = alpha_pos * ratio_pos + alpha_neg * ratio_neg
 
         return loss
@@ -740,88 +747,121 @@ class SAM2Base(torch.nn.Module):
         return next(self.parameters()).device
 
     # --------------------------- AdCo (new) helpers ---------------------------
-    def _adco_build_pos_neg_masks(
+    def _compute_pos_ratios(
         self,
-        pixel_gt: torch.Tensor | None,
         pixel_logits: torch.Tensor | None,
+        pixel_uncertainty: torch.Tensor | None,
+        pixel_gt: torch.Tensor | None,
         spatial_hw: tuple[int, int],
         batch_size: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Build boolean masks for positive and negative pixels: [B, H, W].
-
-        - If pixel_gt is provided, pos = any(gt>0) across channels.
-        - Else if logits provided, pos = any(sigmoid(logits) >= 0.5) across channels.
-        - Else fallback: all pixels as positive (negatives empty).
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Compute global uncertainty-confidence ratio.
+        
+        With GT-aligned confidence, we no longer need separate TP/FP masks:
+        - TP regions: confidence naturally high → ratio low
+        - FP regions: confidence naturally low → ratio high
+        
+        Simply minimize global uncertainty/confidence ratio = maximize confidence globally.
+        
+        Returns:
+            global_ratio: mean(uncertainty/confidence) over all pixels
         """
+        if pixel_logits is None:
+            return torch.tensor(0.0, device=device, dtype=dtype)
+        
+        # Compute GT-aligned confidence (automatically handles TP/FP/TN/FN)
+        confidence = self._adco_compute_confidence(
+            pixel_logits=pixel_logits,
+            pixel_gt=pixel_gt,
+        )
+        
+        uncertainty_p = pixel_uncertainty if pixel_uncertainty is not None else (1.0 - confidence)
+        uncertainty_p = uncertainty_p.clamp(0.0, 1.0)
+        
+        # Global optimization: minimize uncertainty/confidence
+        # - TP regions (high conf) → small ratio → small loss ✓
+        # - FP regions (low conf) → large ratio → large loss (automatic penalty) ✓
+        # - No need for separate masks!
+        eps = 1e-6
+        ratio = uncertainty_p / (confidence + eps)  # [B, H, W]
+        return ratio.mean()  # Simple global mean
+    
+    def _extract_mask_from_gt(
+        self,
+        pixel_gt: torch.Tensor | None,
+        spatial_hw: tuple[int, int],
+        batch_size: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Extract positive mask from GT tensor [B, H, W]."""
         H, W = spatial_hw
-        device = self.device
-        if pixel_gt is not None:
-            gt = pixel_gt
-            if gt.ndim == 4 and gt.shape[-1] > 1:
-                pos = (gt > 0).any(dim=-1)
-            elif gt.ndim == 4 and gt.shape[1] == 1 and gt.shape[2] == H and gt.shape[3] == W:
-                pos = (gt[:, 0] > 0)
-            elif gt.ndim == 3 and gt.shape[1] == H and gt.shape[2] == W:
-                pos = (gt > 0)
-            else:
-                # Attempt to reshape/interpret to [B, H, W]
-                try:
-                    B = gt.shape[0]
-                    pos = (gt.view(B, H, W, -1) > 0).any(dim=-1)
-                except Exception:
-                    pos = torch.ones((gt.shape[0], H, W), device=gt.device, dtype=torch.bool)
-        elif pixel_logits is not None:
-            logits = pixel_logits
-            if logits.ndim == 4 and logits.shape[-1] >= 1:
-                p = torch.sigmoid(logits)
-                pos = (p >= 0.5).any(dim=-1)
-            elif logits.ndim == 3:
-                pos = (torch.sigmoid(logits) >= 0.5)
-            elif logits.ndim == 4 and logits.shape[1] == 1 and logits.shape[2] == H and logits.shape[3] == W:
-                pos = (torch.sigmoid(logits[:, 0]) >= 0.5)
-            else:
-                try:
-                    B = logits.shape[0]
-                    p = torch.sigmoid(logits.view(B, H, W, -1))
-                    pos = (p >= 0.5).any(dim=-1)
-                except Exception:
-                    pos = torch.ones((logits.shape[0], H, W), device=logits.device, dtype=torch.bool)
+        
+        if pixel_gt is None:
+            return torch.ones((batch_size, H, W), device=device, dtype=torch.bool)
+        
+        gt = pixel_gt
+        if gt.ndim == 4 and gt.shape[-1] > 1:
+            pos = (gt > 0).any(dim=-1)
+        elif gt.ndim == 4 and gt.shape[1] == 1 and gt.shape[2] == H and gt.shape[3] == W:
+            pos = (gt[:, 0] > 0)
+        elif gt.ndim == 3 and gt.shape[1] == H and gt.shape[2] == W:
+            pos = (gt > 0)
         else:
-            # Fallback: consider all pixels as positive
-            # (negative path exists but will not be used initially)
-            pos = torch.ones((batch_size, H, W), device=device, dtype=torch.bool)
-
-        neg = ~pos
-        return pos.to(torch.bool), neg.to(torch.bool)
+            try:
+                B = gt.shape[0]
+                pos = (gt.view(B, H, W, -1) > 0).any(dim=-1)
+            except Exception:
+                pos = torch.ones((gt.shape[0], H, W), device=gt.device, dtype=torch.bool)
+        
+        return pos.to(torch.bool)
 
     def _adco_compute_confidence(
         self,
-        pixel_logits: torch.Tensor | None,
+        pixel_logits: torch.Tensor,
+        pixel_gt: torch.Tensor,
         tau_conf: float = 2.0,
-    ) -> torch.Tensor | None:
-        """Compute per-pixel confidence in [0,1], [B, H, W] from logits only.
+    ) -> torch.Tensor:
+        """Compute GT-aligned per-pixel confidence in [0,1], [B, H, W].
 
-        c = sigmoid(max(|logits|) / tau_conf). Returns None if logits unavailable.
-        # TODO 要在gt上取logits
+        Confidence reflects prediction correctness:
+        - GT=1, logits=+5 → high confidence (correct foreground)
+        - GT=0, logits=-5 → high confidence (correct background)
+        - GT=1, logits=-5 → low confidence (wrong prediction)
+        
+        Formula: c = sigmoid((logits * (2*gt - 1)) / tau_conf)
         """
-        if pixel_logits is None:
-            return None
-        logits = pixel_logits
-        if logits.ndim == 4 and logits.shape[-1] >= 1:
-            mag = torch.abs(logits)
-            mag = mag.max(dim=-1).values  # [B, H, W]
-        elif logits.ndim == 3:
-            mag = torch.abs(logits)
-        elif logits.ndim == 4 and logits.shape[1] == 1:
-            mag = torch.abs(logits[:, 0])
+        # Extract logits value based on shape
+        if pixel_logits.ndim == 4 and pixel_logits.shape[-1] >= 1:
+            logits_val = pixel_logits.max(dim=-1).values  # [B, H, W, C] -> [B, H, W]
+        elif pixel_logits.ndim == 3:
+            logits_val = pixel_logits  # [B, H, W]
+        elif pixel_logits.ndim == 4 and pixel_logits.shape[1] == 1:
+            logits_val = pixel_logits[:, 0]  # [B, 1, H, W] -> [B, H, W]
         else:
-            try:
-                B2 = logits.shape[0]
-                H2, W2 = logits.shape[1], logits.shape[2]
-                mag = torch.abs(logits.view(B2, H2, W2, -1)).max(dim=-1).values
-            except Exception:
-                return None
-        return torch.sigmoid(mag / float(tau_conf)).to(mag.dtype)
+            B, H, W = pixel_logits.shape[0], pixel_logits.shape[1], pixel_logits.shape[2]
+            logits_val = pixel_logits.view(B, H, W, -1).mean(dim=-1).values
+        
+        # Extract GT mask [B, H, W] as boolean
+        H, W = logits_val.shape[1], logits_val.shape[2]
+        B = logits_val.shape[0]
+        gt_mask = self._extract_mask_from_gt(
+            pixel_gt=pixel_gt,
+            spatial_hw=(H, W),
+            batch_size=B,
+            device=logits_val.device,
+        )
+        
+        # Convert GT boolean mask to sign: [0,1] -> [-1,+1]
+        # GT=1 (foreground) → +1, GT=0 (background) → -1
+        gt_sign = 2.0 * gt_mask.float() - 1.0  # [B, H, W]
+        
+        # Align logits with GT direction
+        aligned_logits = logits_val * gt_sign
+        
+        # Compute confidence from aligned logits
+        return torch.sigmoid(aligned_logits / float(tau_conf))
 
     def _adco_infonce_loss(
         self,
@@ -919,21 +959,6 @@ class SAM2Base(torch.nn.Module):
         loss_per = F.cross_entropy(logits, labels, reduction="none")
         ww = weights / (weights.mean().detach() + 1e-6)
         return (loss_per * ww).mean()
-
-    def _adco_mean_ratio(
-        self,
-        uncertainty_p: torch.Tensor,  # [B, H, W]
-        confidence: torch.Tensor,     # [B, H, W]
-        mask: torch.Tensor,           # [B, H, W] bool
-        eps: float = 1e-6,
-    ) -> torch.Tensor:
-        """Compute masked mean of uncertainty/confidence ratio as scalar."""
-        m = mask.to(uncertainty_p.dtype)
-        denom = confidence * m + eps
-        ratio = (uncertainty_p * m) / denom
-        count = m.sum(dim=(1, 2)).clamp_min(1.0)
-        per_sample = ratio.sum(dim=(1, 2)) / count
-        return per_sample.mean()
 
     def _adco_sample_neg_images(self, M: int) -> torch.Tensor | None:
         """Sample M images from spatial negative bank as RGB tensors [M, 3, Himg, Wimg].
@@ -1208,7 +1233,6 @@ class SAM2Base(torch.nn.Module):
                     roi_w1=shared_w1,
                     roi_w2=shared_w2,
                     pixel_bndl_model=self.sam_mask_decoder.pixel_bndl if getattr(self.sam_mask_decoder, "pixel_bndl", None) is not None else None,
-                    external_pre_out_w=bndl_outputs.get("wei_lambda_w", None),
                 )
                 bndl_outputs["adco_aux_loss"] = adco_loss
             if self.use_proco and self.training and (pixel_feat is not None):

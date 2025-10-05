@@ -42,7 +42,7 @@ from training.utils.distributed import all_reduce_max, barrier, get_rank
 from training.utils.logger import Logger, setup_logging
 
 # Import BNDL uncertainty and PAvPU functions
-from BNDL.BNDL_upload.ViT_Sparse.utils.bndl import pixel_uncertain_sampling, pixel_pavpu_calculation, pixel_entropy_uncertainty
+from BNDL.BNDL_upload.ViT_Sparse.utils.bndl import pixel_uncertain_sampling, pixel_pavpu_calculation, pixel_entropy_uncertainty, pixel_nll_uncertainty
 
 from training.utils.dataset_evaluator import DistributedDatasetEvaluator
 
@@ -148,8 +148,9 @@ class LoggingConf:
     scalar_keys_to_log: Optional[Dict[str, Any]] = None
     log_batch_stats: bool = False
     visualize_bndl: bool = False
-    uncertainty_metric: str = "entropy"
-
+    uncertainty_metric: set = field(default_factory=lambda: {"entropy"})  # Options: {"entropy"}, {"nll"}, {"sampling"}, {"entropy", "nll"}, {"entropy", "nll", "sampling"}, etc.
+    visualize_pavpu_overlay: bool = True  # Enable PAvPU overlay visualization on original images
+    uncertainty_sample_num: int = 50
 
 class Trainer:
     """
@@ -694,6 +695,8 @@ class Trainer:
                         makedir(vis_dir)
                         # Ensure PAvPU is calculated for visualization
                         self._create_unified_visualization(bndl_outputs, batch, outputs, vis_dir, data_iter, step_index, frame_index, 'full')
+                        # After BNDL visualization, also visualize AdCo negatives (bank + sampled)
+                        self._visualize_adco_negatives(phase=phase, data_iter=data_iter)
                     
                     # Dataset evaluation using BNDL outputs (use postprocessed masks)
                     pixel_predictions = bndl_outputs.get('masks_bndl_postprocessed', bndl_outputs.get('masks_bndl_raw'))
@@ -906,6 +909,8 @@ class Trainer:
                             progress_meter.val,
                             self.steps[phase],
                         )
+
+                # (train) We keep AdCo negatives visualization off to avoid overhead
 
             # Catching NaN/Inf errors in the loss
             except FloatingPointError as e:
@@ -1161,9 +1166,11 @@ class Trainer:
             # Log PAvsPU scores if available
             if 'pixel_pavpu' in bndl_outputs and bndl_outputs['pixel_pavpu'] is not None:
                 pavpu_scores = bndl_outputs['pixel_pavpu']
-                for i, threshold in enumerate([0.01, 0.05, 0.1]):
+                thresholds = bndl_outputs.get('pavpu_thresholds', [0.01, 0.05, 0.1])
+                for i, threshold in enumerate(thresholds):
                     if i < len(pavpu_scores):
-                        self.logger.log(f"Stats/{phase}_pavpu_{threshold}", pavpu_scores[i], step)
+                        score_val = pavpu_scores[i].item() if hasattr(pavpu_scores[i], 'item') else pavpu_scores[i]
+                        self.logger.log(f"Stats/{phase}_pavpu_{threshold}", score_val, step)
         
         # Global w statistics (original BNDL)
         if ('wei_lambda_w' in bndl_outputs and 
@@ -1217,85 +1224,157 @@ class Trainer:
 
     def _calculate_pavpu_for_bndl(self, bndl_outputs, batch, targets):
         """Calculate PAvPU metric for BNDL outputs during validation"""
-        # Extract pixel BNDL model for uncertainty sampling
-        pixel_bndl_model = self._extract_pixel_bndl_model(self.model)
-        if pixel_bndl_model is None:
-            logging.warning("Could not extract pixel_bndl model for PAvPU calculation")
-            return bndl_outputs
-        
-        # Extract pixel features from BNDL outputs
-        pixel_feat = bndl_outputs['pixel_feat']
-        hyper_in = bndl_outputs.get('hyper_in', None)
-        
-        # Decide which uncertainty to compute up-front and compute only that
-        mean_pixel_logits = None
-        pixel_uncertainty_p = None
-        entropy_norm = None
-        if self.logging_conf.uncertainty_metric == 'entropy':
-            entropy_map = pixel_entropy_uncertainty(
-                pixel_bndl_model,
-                pixel_feat,
-                external_pre_out_w=hyper_in,
-                sample_num=50,
-            )
-            entropy_norm = torch.clamp(entropy_map / math.log(2.0), 0.0, 1.0)
-            # Also get mean logits for downstream use via one quick sampling path
+        # Use no_grad to avoid gradient accumulation during uncertainty sampling
+        with torch.no_grad():
+            # Clear cache before uncertainty calculation to free up memory
+            torch.cuda.empty_cache()
+            # Extract pixel BNDL model for uncertainty sampling
+            pixel_bndl_model = self._extract_pixel_bndl_model(self.model)
+            if pixel_bndl_model is None:
+                logging.warning("Could not extract pixel_bndl model for PAvPU calculation")
+                return bndl_outputs
+            
+            # Extract pixel features from BNDL outputs
+            pixel_feat = bndl_outputs['pixel_feat']
+            hyper_in = bndl_outputs.get('hyper_in', None)
+            
+            # Decide which uncertainty to compute based on set configuration
+            mean_pixel_logits = None
+            pixel_uncertainty_p = None
+            entropy_norm = None
+            nll_map = None
+            nll_norm = None
+            uncertainty_data = {}
+            
+            # Compute requested uncertainty metrics
+            if "entropy" in self.logging_conf.uncertainty_metric:
+                entropy_map = pixel_entropy_uncertainty(
+                    pixel_bndl_model,
+                    pixel_feat,
+                    external_pre_out_w=hyper_in,
+                    sample_num=self.logging_conf.uncertainty_sample_num,
+                )
+                entropy_norm = torch.clamp(entropy_map / math.log(2.0), 0.0, 1.0)
+                uncertainty_data['entropy'] = entropy_norm
+            
+            if "sampling" in self.logging_conf.uncertainty_metric:
+                pixel_uncertainty_p, mean_pixel_logits = pixel_uncertain_sampling(
+                    pixel_bndl_model,
+                    pixel_feat,
+                    external_pre_out_w=hyper_in,
+                    sample_num=self.logging_conf.uncertainty_sample_num,
+                )
+                uncertainty_data['sampling'] = pixel_uncertainty_p
+            
+            if "nll" in self.logging_conf.uncertainty_metric:
+                # Prepare targets: resize to match pixel_feat spatial dims and add channel dim
+                B, H_feat, W_feat, C = pixel_feat.shape
+                
+                # Ensure targets is 3D [B, H, W]
+                if len(targets.shape) == 4:
+                    targets = targets.squeeze(-1)  # [B, H, W, 1] -> [B, H, W]
+                
+                # Resize if needed
+                if targets.shape[-2:] != (H_feat, W_feat):
+                    targets_resized = F.interpolate(
+                        targets.unsqueeze(1).float(),  # [B, H, W] -> [B, 1, H, W]
+                        size=(H_feat, W_feat),
+                        mode='bilinear',
+                        align_corners=False
+                    ).squeeze(1)  # [B, 1, H_feat, W_feat] -> [B, H_feat, W_feat]
+                else:
+                    targets_resized = targets
+                
+                # Add channel dimension: [B, H, W] -> [B, H, W, 1]
+                targets_4d = targets_resized.unsqueeze(-1)
+                
+                nll_map, mean_pixel_logits = pixel_nll_uncertainty(
+                    pixel_bndl_model,
+                    pixel_feat,
+                    gt_masks=targets_4d,
+                    external_pre_out_w=hyper_in,
+                    sample_num=self.logging_conf.uncertainty_sample_num,
+                )
+                nll_norm = torch.clamp(nll_map / 10.0, 0.0, 1.0)
+                uncertainty_data['nll'] = nll_norm
+            
+            # If no specific metrics requested, default to entropy
+            if not uncertainty_data:
+                entropy_map = pixel_entropy_uncertainty(
+                    pixel_bndl_model,
+                    pixel_feat,
+                    external_pre_out_w=hyper_in,
+                    sample_num=self.logging_conf.uncertainty_sample_num,
+                )
+                entropy_norm = torch.clamp(entropy_map / math.log(2.0), 0.0, 1.0)
+                uncertainty_data['entropy'] = entropy_norm
+            # Also get mean logits for downstream use
             _, mean_pixel_logits = pixel_uncertain_sampling(
                 pixel_bndl_model,
                 pixel_feat,
                 external_pre_out_w=hyper_in,
                 sample_num=1,
             )
-        else:
-            pixel_uncertainty_p, mean_pixel_logits = pixel_uncertain_sampling(
-                pixel_bndl_model,
-                pixel_feat,
-                external_pre_out_w=hyper_in,
-                sample_num=50,
-            )
-        
-        # Prepare ground truth masks for PAvPU calculation
-        pixel_targets = self._prepare_targets_for_pavpu(targets, bndl_outputs)
-        
-        # Calculate PAvPU scores
-        pixel_predictions = bndl_outputs.get('masks_bndl_raw', mean_pixel_logits)
-
-        if pixel_predictions.shape != pixel_targets.shape:
-            if (pixel_predictions.shape[1:3] != pixel_targets.shape[1:3]):
-                pixel_targets = F.interpolate(
-                    pixel_targets.permute(0, 3, 1, 2),
-                    size=pixel_predictions.shape[1:3],
-                    mode='bilinear',
-                    align_corners=False
-                ).permute(0, 2, 3, 1)
-                logging.info(f"Aligned spatial dimensions for PAvPU calculation")
             
+            # Prepare ground truth masks for PAvPU calculation
+            pixel_targets = self._prepare_targets_for_pavpu(targets, bndl_outputs)
+            
+            # Calculate PAvPU scores
+            pixel_predictions = bndl_outputs.get('masks_bndl_raw', mean_pixel_logits)
 
-        # Select uncertainty metric and thresholds (default policy)
-        if self.logging_conf.uncertainty_metric == 'entropy' and entropy_norm is not None:
-            chosen_uncertainty = entropy_norm
-            thresholds = [0.2, 0.4, 0.6]
-        else:
-            chosen_uncertainty = pixel_uncertainty_p
-            thresholds = [0.01, 0.05, 0.1]
+            if pixel_predictions.shape != pixel_targets.shape:
+                if (pixel_predictions.shape[1:3] != pixel_targets.shape[1:3]):
+                    pixel_targets = F.interpolate(
+                        pixel_targets.permute(0, 3, 1, 2),
+                        size=pixel_predictions.shape[1:3],
+                        mode='bilinear',
+                        align_corners=False
+                    ).permute(0, 2, 3, 1)
+                    logging.info("Aligned spatial dimensions for PAvPU calculation")
+            
+            # Select primary uncertainty metric for PAvPU calculation (prefer entropy)
+            if entropy_norm is not None:
+                chosen_uncertainty = entropy_norm
+                thresholds = [0.10, 0.20, 0.30, 0.40, 0.60, 0.80]
+            elif nll_norm is not None:
+                chosen_uncertainty = nll_norm
+                thresholds = [0.10, 0.20, 0.30, 0.40, 0.60, 0.80]
+            else:
+                chosen_uncertainty = pixel_uncertainty_p
+                thresholds = [0.005, 0.010, 0.020, 0.050, 0.100, 0.200, 0.300]
 
-        pavpu_scores = pixel_pavpu_calculation(
-            chosen_uncertainty,
-            pixel_predictions,
-            pixel_targets,
-            thresholds=thresholds,
-        )
-        
-        # Add PAvPU results to BNDL outputs
-        bndl_outputs['pixel_uncertainty'] = chosen_uncertainty.detach()
-        bndl_outputs['pixel_pavpu'] = pavpu_scores
-        bndl_outputs['pavpu_thresholds'] = thresholds
-        bndl_outputs['mean_pixel_logits'] = mean_pixel_logits.detach()
-        
-        # logging.info(f"PAvPU scores calculated: {pavpu_scores}")
-                
-        
-        return bndl_outputs
+            pavpu_scores = pixel_pavpu_calculation(
+                chosen_uncertainty,
+                pixel_predictions,
+                pixel_targets,
+                thresholds=thresholds,
+            )
+            
+            # Add PAvPU results to BNDL outputs
+            bndl_outputs['pixel_uncertainty'] = chosen_uncertainty.detach()
+            bndl_outputs['pixel_pavpu'] = pavpu_scores
+            bndl_outputs['pavpu_thresholds'] = thresholds
+            bndl_outputs['mean_pixel_logits'] = mean_pixel_logits.detach()
+            
+            # Add uncertainty-specific data
+            if len(uncertainty_data) > 1:
+                bndl_outputs['multi_uncertainty'] = {k: v.detach() for k, v in uncertainty_data.items()}
+                bndl_outputs['uncertainty_type'] = 'multi'
+            elif 'nll' in uncertainty_data:
+                bndl_outputs['pixel_nll_raw'] = nll_map.detach()
+                bndl_outputs['pixel_nll_normalized'] = nll_norm.detach()
+                bndl_outputs['uncertainty_type'] = 'nll'
+            elif 'entropy' in uncertainty_data:
+                bndl_outputs['uncertainty_type'] = 'entropy'
+            else:
+                bndl_outputs['uncertainty_type'] = 'sampling'
+            
+            # logging.info(f"PAvPU scores calculated: {pavpu_scores}")
+            
+            # Clear cache after uncertainty calculation to free up memory
+            torch.cuda.empty_cache()
+            
+            return bndl_outputs
  
     def _prepare_targets_for_pavpu(self, targets, bndl_outputs):
         """Prepare ground truth targets in the correct format for PAvPU calculation"""
@@ -1342,7 +1421,6 @@ class Trainer:
         except Exception as e:
             logging.warning(f"Failed to prepare targets for PAvPU: {e}")
             return None
-            
 
     def _has_global_params(self, bndl_outputs):
         """检查是否有全局权重参数"""
@@ -1449,27 +1527,49 @@ class Trainer:
         
         has_uncertainty = ('pixel_uncertainty' in bndl_outputs and 
                           bndl_outputs['pixel_uncertainty'] is not None)
+        has_pavpu = (self.logging_conf.visualize_pavpu_overlay and 
+                    'pixel_pavpu' in bndl_outputs and 
+                    bndl_outputs['pixel_pavpu'] is not None)
         
-        # 根据布局类型和是否有不确定性决定行数
+        # 检查是否有数据支持比值可视化
+        has_ratio_data = ('pixel_uncertainty' in bndl_outputs and 
+                         'mean_pixel_logits' in bndl_outputs and
+                         bndl_outputs['pixel_uncertainty'] is not None and
+                         bndl_outputs['mean_pixel_logits'] is not None)
+        
+        # 根据布局类型决定行数
         if layout_type == 'full' and has_uncertainty:
-            rows = 4
+            if has_pavpu and has_ratio_data:
+                rows = 6  # 添加PAvPU overlay行和比值可视化行
+            elif has_pavpu or has_ratio_data:
+                rows = 5  # 添加其中一种可视化
+            else:
+                rows = 4
         else:
             rows = 3
             
         # 使用重构后的工具创建图表布局
-        fig, axes = viz_utils.create_figure_layout(rows, 3, (18, 6*rows))
+        fig, axes = viz_utils.create_figure_layout(rows, 3, (18, 6 * rows))
         
         # 绘制通用元素
         self._plot_common_elements_refactored(axes, original_img, lambda_img, k_img, step_index, 
                                             bndl_outputs, has_uncertainty, batch, outputs_for_vis, bndl_viz, viz_utils)
         
-        # 使用重构后的工具保存和关闭图表
+        # 添加PAvPU overlay可视化
+        current_row = 4
+        if has_pavpu and rows >= 5:
+            bndl_viz.plot_pavpu_overlay_visualization(axes[current_row, :], bndl_outputs, original_img, step_index)
+            current_row += 1
+        
+        # 添加U/A比值可视化
+        if has_ratio_data and rows >= current_row + 1:
+            bndl_viz.plot_uncertainty_accuracy_ratio_visualization(axes[current_row, :], bndl_outputs, original_img, step_index, ratio_type="U/A")
+        
         save_path = os.path.join(vis_dir, f"epoch_{self.epoch}_iter_{data_iter}_step_{step_index}_unified_{layout_type}.png")
         viz_utils.save_and_close_figure(fig, save_path, dpi=150)
         
         # logging.info(f"Unified BNDL visualization saved: {save_path}")
             
-
     def _plot_common_elements_refactored(self, axes, original_img, lambda_img, k_img, step_index, 
                                         bndl_outputs, has_uncertainty=False, batch=None, outputs_for_vis=None, 
                                         bndl_viz=None, viz_utils=None):
@@ -1487,7 +1587,93 @@ class Trainer:
         
         bndl_viz.plot_global_parameters_in_layout(axes[2, :], bndl_outputs, step_index)
         if has_uncertainty:
-            bndl_viz.plot_uncertainty_visualization(axes[3, :], bndl_outputs, step_index)
+            # Use multi-uncertainty visualization if multiple metrics are requested
+            if len(self.logging_conf.uncertainty_metric) > 1:
+                bndl_viz.plot_multi_uncertainty_visualization(axes[3, :], bndl_outputs, step_index)
+            else:
+                bndl_viz.plot_uncertainty_visualization(axes[3, :], bndl_outputs, step_index)
+
+    def _visualize_adco_negatives(self, phase: str, data_iter: int):
+        """Minimal visualization for AdCo negative bank and sampled negatives.
+
+        Saves two optional grids under log_dir/bndl_visualizations/{phase}/adco_negatives/:
+        - epoch_{e}_iter_{i}_adco_bank.png (learnable bank snapshot)
+        - epoch_{e}_iter_{i}_adco_sampled.png (on-the-fly sampled negatives)
+        """
+        # Locate underlying model (unwrap DDP)
+        model = self.model
+        if isinstance(model, torch.nn.parallel.DistributedDataParallel):
+            model = model.module
+
+        # Build output directory
+        vis_dir = os.path.join(self.logging_conf.log_dir, "bndl_visualizations", phase, "adco_negatives")
+        makedir(vis_dir)
+
+        def _to_numpy_grid(img_tensor: torch.Tensor, max_items: int = 16) -> np.ndarray:
+            """Convert a [N, 3, H, W] tensor to a grid numpy image [Hgrid, Wgrid, 3] in [0,1]."""
+            n = min(int(max_items), int(img_tensor.shape[0]))
+            sel = img_tensor[:n].detach().to("cpu")
+            # Per-image min-max normalize to [0,1]
+            imgs = []
+            for t in sel:
+                c, h, w = t.shape
+                t_flat = t.view(c, -1)
+                t_min = t_flat.min(dim=1, keepdim=True).values
+                t_max = t_flat.max(dim=1, keepdim=True).values
+                denom = torch.clamp(t_max - t_min, min=1e-6)
+                t_norm = ((t - t_min.view(c, 1, 1)) / denom.view(c, 1, 1)).clamp(0.0, 1.0)
+                imgs.append(t_norm.permute(1, 2, 0).numpy())  # H W C
+            # Arrange into a square-ish grid
+            cols = int(math.ceil(math.sqrt(n)))
+            rows = int(math.ceil(n / cols))
+            h, w, _ = imgs[0].shape
+            grid = np.ones((rows * h, cols * w, 3), dtype=np.float32)
+            idx = 0
+            for r in range(rows):
+                for cidx in range(cols):
+                    if idx >= n:
+                        break
+                    grid[r * h:(r + 1) * h, cidx * w:(cidx + 1) * w, :] = imgs[idx]
+                    idx += 1
+            return grid
+
+        # 1) Visualize the learnable negative bank if present
+        try:
+            neg_bank = getattr(model, "adco_negatives", None)
+            if isinstance(neg_bank, torch.Tensor) and neg_bank.ndim == 4 and neg_bank.shape[1] == 3:
+                bank_grid = _to_numpy_grid(neg_bank)
+                plt.figure(figsize=(12, 12))
+                plt.imshow(bank_grid)
+                plt.axis("off")
+                save_path = os.path.join(
+                    vis_dir,
+                    f"epoch_{self.epoch}_iter_{data_iter}_adco_bank.png",
+                )
+                plt.tight_layout()
+                plt.savefig(save_path, dpi=150)
+                plt.close()
+        except Exception as e:
+            logging.warning(f"AdCo bank visualization failed: {e}")
+
+        # 2) Visualize a fresh sample via model._adco_sample_neg_images if available
+        try:
+            sample_fn = getattr(model, "_adco_sample_neg_images", None)
+            if callable(sample_fn):
+                sampled = sample_fn(16)
+                if isinstance(sampled, torch.Tensor) and sampled.ndim == 4 and sampled.shape[1] == 3:
+                    sampled_grid = _to_numpy_grid(sampled)
+                    plt.figure(figsize=(12, 12))
+                    plt.imshow(sampled_grid)
+                    plt.axis("off")
+                    save_path = os.path.join(
+                        vis_dir,
+                        f"epoch_{self.epoch}_iter_{data_iter}_adco_sampled.png",
+                    )
+                    plt.tight_layout()
+                    plt.savefig(save_path, dpi=150)
+                    plt.close()
+        except Exception as e:
+            logging.warning(f"AdCo sampled visualization failed: {e}")
 
 
 def print_model_summary(model: torch.nn.Module, log_dir: str = ""):
