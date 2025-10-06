@@ -240,32 +240,21 @@ class DistributedDatasetEvaluator:
             return torch.tensor(0.0)
     
     def _calculate_single_image_uncertainty_scalar(self, uncertainty: torch.Tensor, pred_logits: torch.Tensor, gt_masks: torch.Tensor) -> torch.Tensor:
-        """计算单张图片的不确定性标量（前景区域的熵中位数，越大越不确定）"""
-        try:
-            # 使用预测logits计算每像素每通道的二元熵，作为不确定性度量
-            # 对于每通道独立二分类：p = sigmoid(logit)
-            p = torch.sigmoid(pred_logits)
-            eps = 1e-8
-            entropy_per_channel = -(p * torch.log(p + eps) + (1.0 - p) * torch.log(1.0 - p + eps))  # [H, W, K]
-            # 归一化到[0,1]，最大熵发生在p=0.5，值为ln(2)
-            entropy_per_channel = entropy_per_channel / np.log(2.0)
-            # 跨通道平均，得到每像素不确定性
-            pixel_uncertainty = entropy_per_channel.mean(dim=-1)  # [H, W]
+        """计算单张图片的不确定性标量，直接使用传入的不确定性并在前景区域取中位数。"""
+        # 统一到 [H, W]
+        if uncertainty.ndim == 3:
+            pixel_uncertainty = uncertainty.mean(dim=-1)
+        else:
+            pixel_uncertainty = uncertainty
+        pixel_uncertainty = pixel_uncertainty.float()
 
-            # 使用前景掩膜（任一通道为真即视作前景）计算中位数，避免背景主导
-            fg_mask = (gt_masks > 0).any(dim=-1)  # [H, W]
-            if fg_mask.any():
-                values = pixel_uncertainty[fg_mask]
-            else:
-                values = pixel_uncertainty.view(-1)
+        # 前景掩膜 [H, W]
+        fg_mask = (gt_masks > 0)
+        if fg_mask.ndim == 3:
+            fg_mask = fg_mask.any(dim=-1)
 
-            # 使用中位数增强稳健性
-            uncertainty_scalar = values.median()
-            return uncertainty_scalar
-
-        except Exception as e:
-            logging.warning(f"Failed to calculate single image uncertainty scalar: {e}")
-            return torch.tensor(0.0)
+        values = pixel_uncertainty[fg_mask] if fg_mask.any() else pixel_uncertainty.reshape(-1)
+        return values.median()
     
     def _gather_distributed_data(self) -> Tuple[List[torch.Tensor], List[torch.Tensor], 
                                                List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
@@ -298,7 +287,7 @@ class DistributedDatasetEvaluator:
                 n = int(len_list[r].item())
                 if n > 0:
                     vals = tensor_r[:n].detach().cpu().tolist()
-                    out.extend([torch.tensor(v) for v in vals if np.isfinite(v)])
+                    out.extend([torch.tensor(v) for v in vals])  # 移除isfinite过滤，保持长度一致性
             return out
 
         try:
@@ -329,6 +318,11 @@ class DistributedDatasetEvaluator:
             # 只在主进程上进行评估
             if not self.is_main_process:
                 return {}
+            
+            # 记录各指标列表长度用于调试
+            logging.info(f"Gathered data lengths - Uncertainties: {len(all_uncertainties)}, "
+                        f"IoU: {len(all_ious)}, DICE: {len(all_dices)}, "
+                        f"Accuracy: {len(all_accuracies)}, NLL: {len(all_nlls)}")
             
             # 分别计算每个指标的相关性
             correlation_results = {}

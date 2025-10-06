@@ -469,7 +469,7 @@ class BNDLVisualizer:
             cmap = "viridis"
             overlay_color = np.array([0.0, 1.0, 0.0])  # 绿色表示高确定性
         
-        # 创建三种不同的可视化
+        # 创建三种不同的可视化：全部用 heatmap 形式
         ratio_methods = [
             ("Linear", "linear"),
             ("Log", "log"),
@@ -483,53 +483,32 @@ class BNDLVisualizer:
             # 根据方法类型处理比值
             if method_type == "linear":
                 display_ratio = ratio_vis
-                vmin, vmax = np.percentile(ratio_vis, [5, 95])  # 使用5%-95%分位数避免极值
+                vmin, vmax = np.percentile(ratio_vis, [1, 99])  # 使用1%-99%分位数避免极值
             elif method_type == "log":
                 display_ratio = np.log(ratio_vis + 1)  # log(ratio + 1)避免log(0)
-                vmin, vmax = np.percentile(display_ratio, [5, 95])
+                vmin, vmax = np.percentile(display_ratio, [1, 99])
             else:  # normalized
                 display_ratio = (ratio_vis - ratio_vis.min()) / (ratio_vis.max() - ratio_vis.min() + eps)
                 vmin, vmax = 0, 1
             
-            # 创建overlay图像
-            if original_img is not None:
-                overlay_img = original_img.copy()
-                
-                # 根据比值创建颜色overlay
-                if method_type == "linear":
-                    # 使用分位数阈值创建overlay
-                    high_ratio_mask = display_ratio > np.percentile(display_ratio, 80)
-                elif method_type == "log":
-                    high_ratio_mask = display_ratio > np.percentile(display_ratio, 80)
-                else:  # normalized
-                    high_ratio_mask = display_ratio > 0.8
-                
-                # 应用颜色overlay
-                overlay_img[high_ratio_mask] = overlay_img[high_ratio_mask] * 0.6 + overlay_color * 0.4
-                
-                # 显示图像
-                axes[i].imshow(overlay_img)
-            else:
-                # 如果没有原图，直接显示比值热图
-                im = axes[i].imshow(display_ratio, cmap=cmap, vmin=vmin, vmax=vmax)
-                # 添加颜色条
-                plt.colorbar(im, ax=axes[i], fraction=0.046, pad=0.04)
+            # 直接显示比值热图
+            im = axes[i].imshow(display_ratio, cmap=cmap, vmin=vmin, vmax=vmax, interpolation='nearest')
+            plt.colorbar(im, ax=axes[i], fraction=0.046, pad=0.04)
             
             # 设置标题和统计信息
             mean_ratio = np.mean(ratio_vis)
             std_ratio = np.std(ratio_vis)
-            axes[i].set_title(f"{title_prefix} Ratio ({method_name})\nMean: {mean_ratio:.3f}, Std: {std_ratio:.3f} (Step {step_index})")
+            median_ratio = np.median(ratio_vis)
+            axes[i].set_title(f"{title_prefix} ({method_name})\nMean: {mean_ratio:.3f}, Median: {median_ratio:.3f}, Std: {std_ratio:.3f}")
             axes[i].axis("off")
             
-            # 添加统计信息文本
-            high_ratio_percent = np.mean(high_ratio_mask) * 100 if 'high_ratio_mask' in locals() else 0
-            if ratio_type == "U/A":
-                info_text = f"High Uncertainty: {high_ratio_percent:.1f}%"
-            else:
-                info_text = f"High Confidence: {high_ratio_percent:.1f}%"
+            # 添加更详细的统计信息文本
+            percentile_90 = np.percentile(ratio_vis, 90)
+            percentile_10 = np.percentile(ratio_vis, 10)
+            info_text = f"P10: {percentile_10:.3f}\nP90: {percentile_90:.3f}\nRange: [{ratio_vis.min():.3f}, {ratio_vis.max():.3f}]"
             
             axes[i].text(0.02, 0.98, info_text, 
-                       transform=axes[i].transAxes, fontsize=9, 
+                       transform=axes[i].transAxes, fontsize=8, 
                        bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8),
                        verticalalignment="top")
         

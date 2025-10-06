@@ -700,18 +700,12 @@ class Trainer:
                     
                     # Dataset evaluation using BNDL outputs (use postprocessed masks)
                     pixel_predictions = bndl_outputs.get('masks_bndl_postprocessed', bndl_outputs.get('masks_bndl_raw'))
-                    if pixel_predictions is not None and 'pixel_uncertainty' in bndl_outputs:
-                        try:
-                            self.dataset_evaluator.add_batch_data(
-                                uncertainty=bndl_outputs['pixel_uncertainty'],
-                                pred_logits=pixel_predictions,
-                                gt_masks=current_frame_masks
-                            )
-                            logging.info(f"Added batch {data_iter} to dataset evaluator (batch size: {pixel_predictions.shape[0]})")
-                        except Exception as e:
-                            logging.warning(f"Failed to add batch {data_iter} to dataset evaluator: {e}")
-                    else:
-                        logging.warning(f"Skipping batch {data_iter}: missing BNDL outputs or uncertainty data")
+                    self.dataset_evaluator.add_batch_data(
+                        uncertainty=bndl_outputs['pixel_uncertainty'],
+                        pred_logits=pixel_predictions,
+                        gt_masks=current_frame_masks
+                    )
+                    logging.info(f"Added batch {data_iter} to dataset evaluator (batch size: {pixel_predictions.shape[0]})")
                                                 
             # measure elapsed time
             batch_time.update(time.time() - end)
@@ -739,38 +733,25 @@ class Trainer:
             if data_iter % 10 == 0:
                 dist.barrier()
 
-        # 记录数据集评估器的状态
-        try:
-            total_images = self.dataset_evaluator.get_total_images_across_all_processes()
-            logging.info(f"Dataset evaluator status: {len(self.dataset_evaluator)} images on rank {self.rank}, {total_images} total across all processes")
-        except Exception as e:
-            logging.warning(f"Failed to get total images across processes: {e}")
-            logging.info(f"Dataset evaluator status: {len(self.dataset_evaluator)} images on rank {self.rank}")
+        total_images = self.dataset_evaluator.get_total_images_across_all_processes()
+        logging.info(f"Dataset evaluator status: {len(self.dataset_evaluator)} images on rank {self.rank}, {total_images} total across all processes")
         
-        if len(self.dataset_evaluator) > 0:
-            try:
-                # 评估相关性
-                correlation_results = self.dataset_evaluator.evaluate_dataset_correlation()
-                logging.info(f"Correlation evaluation completed with {len(correlation_results)} metrics")
-                
-                # 生成可视化
-                self.dataset_evaluator.create_dataset_correlation_visualization(
-                    title=f"Epoch {self.epoch} - Dataset Analysis",
-                    save_name=f"epoch_{self.epoch}_dataset_analysis.png"
-                )
-                # 保存结果
-                self.dataset_evaluator.save_correlation_results(
-                    save_name=f"epoch_{self.epoch}_results.json"
-                )
-                logging.info(f"Dataset evaluation completed for epoch {self.epoch}")
-                # 重置evaluator
-                self.dataset_evaluator.reset()
-            except Exception as e:
-                logging.warning(f"Dataset evaluation failed: {e}")
-                import traceback
-                logging.warning(f"Traceback: {traceback.format_exc()}")
-        else:
-            logging.warning(f"No data collected for dataset evaluation in epoch {self.epoch}")
+        # 评估相关性
+        correlation_results = self.dataset_evaluator.evaluate_dataset_correlation()
+        logging.info(f"Correlation evaluation completed with {len(correlation_results)} metrics")
+        
+        # 生成可视化
+        self.dataset_evaluator.create_dataset_correlation_visualization(
+            title=f"Epoch {self.epoch} - Dataset Analysis",
+            save_name=f"epoch_{self.epoch}_dataset_analysis.png"
+        )
+        # 保存结果
+        self.dataset_evaluator.save_correlation_results(
+            save_name=f"epoch_{self.epoch}_results.json"
+        )
+        logging.info(f"Dataset evaluation completed for epoch {self.epoch}")
+        # 重置evaluator
+        self.dataset_evaluator.reset()
 
         self.est_epoch_time[phase] = batch_time.avg * iters_per_epoch
         self._log_timers(phase)

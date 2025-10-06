@@ -268,26 +268,33 @@ class MetricCalculator:
             相关性结果字典
         """
         try:
-            if len(uncertainties) != len(metrics) or len(uncertainties) != len(metric_names):
-                logging.warning("Input lists have different lengths")
-                return {}
-            
-            if not uncertainties:
+            if not uncertainties or not metrics:
                 logging.warning("No data provided for correlation calculation")
                 return {}
             
-            # 将所有图片的标量数据合并
+            # 使用最短长度确保配对一致性，并在配对时进行有效性检查
+            min_length = min(len(uncertainties), len(metrics))
+            if min_length == 0:
+                logging.warning("Empty input lists")
+                return {}
+            
+            # 将所有图片的标量数据合并，只保留配对的有效数据
             all_uncertainties = []
             all_metrics = []
             
-            for uncertainty, metric in zip(uncertainties, metrics):
+            for i in range(min_length):
+                uncertainty = uncertainties[i]
+                metric = metrics[i]
+                
                 if uncertainty.numel() > 0 and metric.numel() > 0:
                     # 将标量张量转换为numpy标量
                     uncertainty_scalar = uncertainty.detach().cpu().item()
                     metric_scalar = metric.detach().cpu().item()
                     
-                    all_uncertainties.append(uncertainty_scalar)
-                    all_metrics.append(metric_scalar)
+                    # 检查数值有效性，只保留配对的有效数据
+                    if np.isfinite(uncertainty_scalar) and np.isfinite(metric_scalar):
+                        all_uncertainties.append(uncertainty_scalar)
+                        all_metrics.append(metric_scalar)
             
             if not all_uncertainties:
                 logging.warning("No valid data after processing")

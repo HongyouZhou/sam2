@@ -544,7 +544,7 @@ class SAM2Base(torch.nn.Module):
         pixel_uncertainty: torch.Tensor | None = None,
         pixel_gt: torch.Tensor | None = None,
         pixel_logits: torch.Tensor | None = None,
-        neg_sample_M: int | None = 2,
+        neg_sample_M: int | None = 4,
         roi_z1: torch.Tensor | None = None,
         roi_z2: torch.Tensor | None = None,
         roi_w1: torch.Tensor | None = None,
@@ -563,8 +563,6 @@ class SAM2Base(torch.nn.Module):
         
         # New AdCo implementation (independent of adco_bk):
         # - Use BNDL t-test pixel_uncertainty p-values directly
-        # - Positive-only contribution now; negative path implemented but weight=0
-        # - No gating/curriculum/temperature scheduling; no nested helper functions
 
         assert pixel_feat is not None and pixel_feat.ndim == 4
         B, H, W, _ = pixel_feat.shape
@@ -589,26 +587,17 @@ class SAM2Base(torch.nn.Module):
         # Negative samples
         neg_images = self._adco_sample_neg_images(neg_sample_M)  # [M, 3, Himg, Wimg]
         if neg_images is not None:
-            # SAM组件不需要梯度以节省内存
-            with torch.no_grad():
-                if (neg_images.shape[-2] != self.image_size) or (neg_images.shape[-1] != self.image_size):
-                    neg_images = F.interpolate(
-                        neg_images,
-                        size=(self.image_size, self.image_size),
-                        mode="bilinear",
-                        align_corners=False,
-                    )
-                enc_out = self.image_encoder(neg_images)
-                feat = enc_out["backbone_fpn"][-1]  # [M, C, H, W], C=256
-                
-                # Apply upscaling to match the feature dimension expected by pixel_bndl
-                if self.use_high_res_features_in_sam:
-                    dc1, ln1, act1, dc2, act2 = self.sam_mask_decoder.output_upscaling
-                    neg_feat_upscaled = act2(dc2(act1(ln1(dc1(feat)))))
-                else:
-                    neg_feat_upscaled = self.sam_mask_decoder.output_upscaling(feat)
-                
-                neg_feat = neg_feat_upscaled.permute(0, 2, 3, 1).contiguous()  # [M, H', W', C']
+            enc_out = self.image_encoder(neg_images)
+            feat = enc_out["backbone_fpn"][-1]  # [M, C, H, W], C=256
+            
+            # Apply upscaling to match the feature dimension expected by pixel_bndl
+            if self.use_high_res_features_in_sam:
+                dc1, ln1, act1, dc2, act2 = self.sam_mask_decoder.output_upscaling
+                neg_feat_upscaled = act2(dc2(act1(ln1(dc1(feat)))))
+            else:
+                neg_feat_upscaled = self.sam_mask_decoder.output_upscaling(feat)
+            
+            neg_feat = neg_feat_upscaled.permute(0, 2, 3, 1).contiguous()  # [M, H', W', C']
             
             # BNDL部分保留梯度用于权重学习
             # 为负样本生成external_pre_out_w：使用pixel_bndl的全局权重矩阵

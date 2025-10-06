@@ -604,10 +604,16 @@ def create_bndl_visualization_refactored(bndl_outputs, batch, outputs_for_vis, v
         has_ratio_data = (has_uncertainty and 
                          "mean_pixel_logits" in bndl_outputs and 
                          bndl_outputs["mean_pixel_logits"] is not None)
+        has_pavpu = ("pixel_pavpu" in bndl_outputs and bndl_outputs["pixel_pavpu"] is not None)
 
         # Determine number of rows based on layout type and data availability
         if layout_type == "full" and has_uncertainty:
-            rows = 5 if has_ratio_data else 4
+            if has_pavpu and has_ratio_data:
+                rows = 6  # add both PAvPU overlay and ratio row
+            elif has_pavpu or has_ratio_data:
+                rows = 5  # add one of them
+            else:
+                rows = 4
         else:
             rows = 3
 
@@ -617,9 +623,13 @@ def create_bndl_visualization_refactored(bndl_outputs, batch, outputs_for_vis, v
         # Plot common elements using refactored functions
         plot_common_elements_refactored(axes, original_img, lambda_img, k_img, step_index, bndl_outputs, has_uncertainty, batch, outputs_for_vis, bndl_viz, viz_utils)
         
-        # Add U/A ratio visualization if data is available
-        if has_ratio_data and rows >= 5:
-            bndl_viz.plot_uncertainty_accuracy_ratio_visualization(axes[4, :], bndl_outputs, original_img, step_index, ratio_type="U/A")
+        # Add PAvPU thresholded overlay and U/A ratio continuous overlay (order: PAvPU first, then ratio)
+        current_row = 4
+        if has_pavpu and rows >= 5:
+            bndl_viz.plot_pavpu_overlay_visualization(axes[current_row, :], bndl_outputs, original_img, step_index)
+            current_row += 1
+        if has_ratio_data and rows >= current_row + 1:
+            bndl_viz.plot_uncertainty_accuracy_ratio_visualization(axes[current_row, :], bndl_outputs, original_img, step_index, ratio_type="U/A")
 
         # Use refactored tools to save and close figure
         save_path = os.path.join(vis_dir, f"iter_{data_iter}_step_{step_index}_bndl_{layout_type}.png")

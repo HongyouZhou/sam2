@@ -9,7 +9,6 @@ import json
 import time
 from pathlib import Path
 from typing import Any
-from collections import defaultdict
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -84,8 +83,10 @@ def run_comparison_evaluation(
     sam2_output = output_path / "sam2_results"
     bndl_output = output_path / "bndl_results"
     uctta_output = output_path / "sam2_uctta_results"
-    sam2_output.mkdir(parents=True, exist_ok=True)
-    bndl_output.mkdir(parents=True, exist_ok=True)
+    if run_sam:
+        sam2_output.mkdir(parents=True, exist_ok=True)
+    if run_bndl:
+        bndl_output.mkdir(parents=True, exist_ok=True)
     if run_uctta:
         uctta_output.mkdir(parents=True, exist_ok=True)
 
@@ -915,37 +916,97 @@ def create_ua_shift_analysis_plots(
     
     ax2.grid(True, alpha=0.3, axis='x')
     
-    # 3. UA Shift from source domain (BNDL)
-    if source_domain in bndl_uncertainty_data and source_domain in bndl_performance_data:
+    # 3. UA Shift from source domain using Pearson CC (Uncertainty vs Accuracy)
+    #    For each dataset, load per-image correlation (PCC) between uncertainty and accuracy,
+    #    then compute ΔPCC relative to the source domain. Do this for BNDL and (if available) UCTTA
+    accuracy_pcc_map: dict[str, float] = {}
+    for dataset_name in bndl_datasets_list:
+        # evaluator results are saved by run_single_dataset_with_bndl at:
+        #   bndl_results/<dataset>_bndl_vis/dataset_evaluation/<dataset>_zeroshot_results.json
+        eval_json = (output_path
+                     / "bndl_results"
+                     / f"{dataset_name.lower()}_bndl_vis"
+                     / "dataset_evaluation"
+                     / f"{dataset_name.lower()}_zeroshot_results.json")
+        if not eval_json.exists():
+            continue
+        with open(eval_json) as f:
+            eval_data = json.load(f)
+        if isinstance(eval_data, dict) and "Accuracy" in eval_data:
+            acc_info = eval_data["Accuracy"]
+            if isinstance(acc_info, dict) and "correlation" in acc_info:
+                accuracy_pcc_map[dataset_name] = float(acc_info["correlation"])  # Pearson CC
+
+    # UCTTA per-dataset PCC (optional)
+    uctta_accuracy_pcc_map: dict[str, float] = {}
+    uctta_root = output_path / "sam2_uctta_results"
+    for dataset_name in bndl_datasets_list:
+        eval_json = (uctta_root
+                     / f"{dataset_name.lower()}_uctta_eval"
+                     / f"{dataset_name.lower()}_uctta_results.json")
+        if not eval_json.exists():
+            continue
+        with open(eval_json) as f:
+            eval_data = json.load(f)
+        if isinstance(eval_data, dict) and "Accuracy" in eval_data:
+            acc_info = eval_data["Accuracy"]
+            if isinstance(acc_info, dict) and "correlation" in acc_info:
+                uctta_accuracy_pcc_map[dataset_name] = float(acc_info["correlation"])  # Pearson CC
+
+    if source_domain in accuracy_pcc_map:
         ax3 = fig.add_subplot(gs[0, 2])
-        
-        source_unc = bndl_uncertainty_data[source_domain]
-        source_jf = bndl_performance_data[source_domain]["jf"]
-        
-        target_datasets = [d for d in bndl_datasets_list if d != source_domain]
-        ua_shifts_unc = [bndl_uncertainty_data[d] - source_unc for d in target_datasets]
-        ua_shifts_perf = [bndl_performance_data[d]["jf"] - source_jf for d in target_datasets]
-        
-        ax3.scatter(ua_shifts_unc, ua_shifts_perf, s=100, alpha=0.6, 
-                   c='green', edgecolors='black')
-        
-        for i, dataset in enumerate(target_datasets):
-            ax3.annotate(dataset, (ua_shifts_unc[i], ua_shifts_perf[i]),
-                        xytext=(5, 5), textcoords='offset points', fontsize=9)
-        
-        ax3.axhline(y=0, color='red', linestyle='--', alpha=0.5, linewidth=1)
-        ax3.axvline(x=0, color='red', linestyle='--', alpha=0.5, linewidth=1)
-        ax3.set_xlabel(f'Δ Uncertainty (vs {source_domain})', fontsize=11)
-        ax3.set_ylabel(f'Δ J&F Score (vs {source_domain})', fontsize=11)
-        ax3.set_title(f'UA Shift from Source Domain ({source_domain})', 
-                     fontweight='bold', fontsize=12)
-        ax3.grid(True, alpha=0.3)
-        
-        # Add quadrant labels
-        ax3.text(0.95, 0.95, 'Higher Unc\nBetter Perf', transform=ax3.transAxes,
-                ha='right', va='top', fontsize=8, style='italic', alpha=0.5)
-        ax3.text(0.05, 0.05, 'Lower Unc\nWorse Perf', transform=ax3.transAxes,
-                ha='left', va='bottom', fontsize=8, style='italic', alpha=0.5)
+
+        source_pcc = accuracy_pcc_map[source_domain]
+        target_datasets = [d for d in bndl_datasets_list if d in accuracy_pcc_map and d != source_domain]
+        # Compute ΔPCC for each target dataset
+        delta_pcc = {d: (accuracy_pcc_map[d] - source_pcc) for d in target_datasets}
+
+        # Sort by ΔPCC magnitude for readability
+        sorted_items = sorted(delta_pcc.items(), key=lambda x: x[1])
+        labels = [k for k, _ in sorted_items]
+        values = [v for _, v in sorted_items]
+        y_pos = np.arange(len(labels))
+
+        bars = ax3.barh(y_pos, values, color=['red' if v < 0 else 'green' for v in values], alpha=0.7, edgecolor='black')
+        ax3.set_yticks(y_pos)
+        ax3.set_yticklabels(labels, fontsize=9)
+        ax3.set_xlabel(f"ΔPCC (U vs Acc) relative to {source_domain}", fontsize=11)
+        ax3.set_title(f"UA Shift: ΔPCC from {source_domain}", fontweight='bold', fontsize=12)
+        ax3.axvline(x=0.0, color='black', linestyle='--', alpha=0.4)
+        ax3.grid(True, alpha=0.3, axis='x')
+
+        # Annotate values
+        for bar in bars:
+            width = bar.get_width()
+            ax3.text(width + (0.01 if width >= 0 else -0.01), bar.get_y() + bar.get_height() / 2,
+                     f"{width:+.3f}", va='center', ha='left' if width >= 0 else 'right', fontsize=8)
+    else:
+        if not accuracy_pcc_map:
+            print("No per-dataset Accuracy PCC available for UA shift; skipping ΔPCC panel")
+        else:
+            print(f"Source domain '{source_domain}' PCC not found; skipping ΔPCC panel")
+
+    # Optional: UCTTA ΔPCC panel
+    if uctta_accuracy_pcc_map and source_domain in uctta_accuracy_pcc_map and has_uctta:
+        ax3b = fig.add_subplot(gs[0, 3])
+        source_pcc_u = uctta_accuracy_pcc_map[source_domain]
+        target_datasets_u = [d for d in bndl_datasets_list if d in uctta_accuracy_pcc_map and d != source_domain]
+        delta_pcc_u = {d: (uctta_accuracy_pcc_map[d] - source_pcc_u) for d in target_datasets_u}
+        sorted_items_u = sorted(delta_pcc_u.items(), key=lambda x: x[1])
+        labels_u = [k for k, _ in sorted_items_u]
+        values_u = [v for _, v in sorted_items_u]
+        y_pos_u = np.arange(len(labels_u))
+        bars_u = ax3b.barh(y_pos_u, values_u, color=['red' if v < 0 else 'green' for v in values_u], alpha=0.7, edgecolor='black')
+        ax3b.set_yticks(y_pos_u)
+        ax3b.set_yticklabels(labels_u, fontsize=9)
+        ax3b.set_xlabel(f"ΔPCC (U vs Acc) relative to {source_domain}", fontsize=11)
+        ax3b.set_title("UA Shift (UCTTA): ΔPCC", fontweight='bold', fontsize=12)
+        ax3b.axvline(x=0.0, color='black', linestyle='--', alpha=0.4)
+        ax3b.grid(True, alpha=0.3, axis='x')
+        for bar in bars_u:
+            width = bar.get_width()
+            ax3b.text(width + (0.01 if width >= 0 else -0.01), bar.get_y() + bar.get_height() / 2,
+                      f"{width:+.3f}", va='center', ha='left' if width >= 0 else 'right', fontsize=8)
     
     # 4. Improvement vs Uncertainty (BNDL vs SAM-2)
     ax4 = fig.add_subplot(gs[1, 0])
@@ -1052,6 +1113,28 @@ def create_ua_shift_analysis_plots(
     plt.close()
     
     print(f"UA shift analysis plots saved to: {ua_plot_path}")
+
+    # Save UA PCC summary to CSV for downstream analysis
+    if accuracy_pcc_map or uctta_accuracy_pcc_map:
+        import csv
+        csv_path = plots_dir / "ua_pcc_summary.csv"
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Dataset", "PCC_U_vs_Acc_BNDL", f"Delta_vs_{source_domain}_BNDL", "PCC_U_vs_Acc_UCTTA", f"Delta_vs_{source_domain}_UCTTA"])
+            src_val = accuracy_pcc_map.get(source_domain)
+            src_val_u = uctta_accuracy_pcc_map.get(source_domain)
+            all_ds = sorted(set(list(accuracy_pcc_map.keys()) + list(uctta_accuracy_pcc_map.keys())))
+            for d in all_ds:
+                pcc_b = accuracy_pcc_map.get(d)
+                pcc_u = uctta_accuracy_pcc_map.get(d)
+                delta_b = (pcc_b - src_val) if (pcc_b is not None and src_val is not None and d != source_domain) else (0.0 if d == source_domain and pcc_b is not None else "")
+                delta_u = (pcc_u - src_val_u) if (pcc_u is not None and src_val_u is not None and d != source_domain) else (0.0 if d == source_domain and pcc_u is not None else "")
+                writer.writerow([d,
+                                 (f"{pcc_b:.6f}" if pcc_b is not None else ""),
+                                 (f"{delta_b:+.6f}" if isinstance(delta_b, float) else delta_b),
+                                 (f"{pcc_u:.6f}" if pcc_u is not None else ""),
+                                 (f"{delta_u:+.6f}" if isinstance(delta_u, float) else delta_u)])
+        print(f"UA PCC summary CSV saved to: {csv_path}")
 
 
 def load_results_from_detailed_json(
