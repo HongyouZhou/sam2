@@ -481,20 +481,23 @@ class Trainer:
         # loss contains multiple sub-components we wish to log
         step_losses = {}
         
-        # Log BNDL statistics from model outputs if available
-        bndl_outputs, step_index, frame_index = self._extract_bndl_outputs(outputs)
-        if bndl_outputs is not None:
-            # Calculate PAvPU if in validation phase and targets are available
-            if phase == "val" and targets is not None:
-                # Use frame_index to get the corresponding mask for the current frame
-                # targets shape: [4, 2, 1024, 1024] -> [frames, batch_size, height, width]
-                # We need to extract the specific frame and transpose to [batch_size, height, width]
-                if frame_index is not None and targets.shape[0] > frame_index:
-                    current_frame_targets = targets[frame_index]  # Shape: [2, 1024, 1024]
-                else:
-                    current_frame_targets = targets[0] if targets.shape[0] > 0 else targets  # Fallback to first frame
-                bndl_outputs = self._calculate_pavpu_for_bndl(bndl_outputs, batch, current_frame_targets)
-            self._log_bndl_statistics(bndl_outputs, self.steps[phase], phase)
+        # Log BNDL statistics from model outputs if available (only if BNDL is enabled)
+        _model = unwrap_ddp_if_wrapped(self.model)
+        if getattr(_model, 'use_bndl_for_pixels', False):
+            bndl_outputs, step_index, frame_index = self._extract_bndl_outputs(outputs)
+            if bndl_outputs is not None:
+                # Calculate PAvPU if in validation phase and targets are available
+                if phase == "val" and targets is not None:
+                    # Use frame_index to get the corresponding mask for the current frame
+                    # targets shape: [4, 2, 1024, 1024] -> [frames, batch_size, height, width]
+                    # We need to extract the specific frame and transpose to [batch_size, height, width]
+                    if frame_index is not None and targets.shape[0] > frame_index:
+                        current_frame_targets = targets[frame_index]  # Shape: [2, 1024, 1024]
+                    else:
+                        current_frame_targets = targets[0] if targets.shape[0] > 0 else targets  # Fallback to first frame
+                    bndl_outputs = self._calculate_pavpu_for_bndl(bndl_outputs, batch, current_frame_targets)
+                self._log_bndl_statistics(bndl_outputs, self.steps[phase], phase)
+
         if isinstance(loss, dict):
             step_losses.update(
                 {f"Losses/{phase}_{key}_{k}": v for k, v in loss.items()}
@@ -678,34 +681,38 @@ class Trainer:
                     
                     outputs = self.model(batch)
 
-                    bndl_outputs, step_index, frame_index = self._extract_bndl_outputs(outputs)
-                    # Use frame_index to get the corresponding mask for the current frame
-                    # batch.masks shape: [4, 2, 1024, 1024] -> [frames, batch_size, height, width]
-                    # We need to extract the specific frame and transpose to [batch_size, height, width]
-                    if frame_index is not None and batch.masks.shape[0] > frame_index:
-                        current_frame_masks = batch.masks[frame_index]  # Shape: [2, 1024, 1024]
-                    else:
-                        current_frame_masks = batch.masks[0] if batch.masks.shape[0] > 0 else batch.masks  # Fallback to first frame
-                    bndl_outputs = self._calculate_pavpu_for_bndl(bndl_outputs, batch, current_frame_masks)
-                    # BNDL visualization and evaluation (moved inside the for loop)
-                    if (random.random() < 0.15 and self.logging_conf.visualize_bndl) and get_rank() == 0:
-                        logging.info(f"Starting BNDL visualization for iter {data_iter}")
-                        # Use bndl_outputs already returned from _step instead of re-extracting
-                        vis_dir = os.path.join(self.logging_conf.log_dir, "bndl_visualizations", phase)
-                        makedir(vis_dir)
-                        # Ensure PAvPU is calculated for visualization
-                        self._create_unified_visualization(bndl_outputs, batch, outputs, vis_dir, data_iter, step_index, frame_index, 'full')
-                        # After BNDL visualization, also visualize AdCo negatives (bank + sampled)
-                        self._visualize_adco_negatives(phase=phase, data_iter=data_iter)
-                    
-                    # Dataset evaluation using BNDL outputs (use postprocessed masks)
-                    pixel_predictions = bndl_outputs.get('masks_bndl_postprocessed', bndl_outputs.get('masks_bndl_raw'))
-                    self.dataset_evaluator.add_batch_data(
-                        uncertainty=bndl_outputs['pixel_uncertainty'],
-                        pred_logits=pixel_predictions,
-                        gt_masks=current_frame_masks
-                    )
-                    logging.info(f"Added batch {data_iter} to dataset evaluator (batch size: {pixel_predictions.shape[0]})")
+                    # Only process BNDL outputs if BNDL is enabled
+                    _model = unwrap_ddp_if_wrapped(self.model)
+                    if getattr(_model, 'use_bndl_for_pixels', False):
+                        bndl_outputs, step_index, frame_index = self._extract_bndl_outputs(outputs)
+                        if bndl_outputs is not None:
+                            # Use frame_index to get the corresponding mask for the current frame
+                            # batch.masks shape: [4, 2, 1024, 1024] -> [frames, batch_size, height, width]
+                            # We need to extract the specific frame and transpose to [batch_size, height, width]
+                            if frame_index is not None and batch.masks.shape[0] > frame_index:
+                                current_frame_masks = batch.masks[frame_index]  # Shape: [2, 1024, 1024]
+                            else:
+                                current_frame_masks = batch.masks[0] if batch.masks.shape[0] > 0 else batch.masks  # Fallback to first frame
+                            bndl_outputs = self._calculate_pavpu_for_bndl(bndl_outputs, batch, current_frame_masks)
+                            # BNDL visualization and evaluation (moved inside the for loop)
+                            if (random.random() < 0.15 and self.logging_conf.visualize_bndl) and get_rank() == 0:
+                                logging.info(f"Starting BNDL visualization for iter {data_iter}")
+                                # Use bndl_outputs already returned from _step instead of re-extracting
+                                vis_dir = os.path.join(self.logging_conf.log_dir, "bndl_visualizations", phase)
+                                makedir(vis_dir)
+                                # Ensure PAvPU is calculated for visualization
+                                self._create_unified_visualization(bndl_outputs, batch, outputs, vis_dir, data_iter, step_index, frame_index, 'full')
+                                # After BNDL visualization, also visualize AdCo negatives (bank + sampled)
+                                self._visualize_adco_negatives(phase=phase, data_iter=data_iter)
+                            
+                            # Dataset evaluation using BNDL outputs (use postprocessed masks)
+                            pixel_predictions = bndl_outputs.get('masks_bndl_postprocessed', bndl_outputs.get('masks_bndl_raw'))
+                            self.dataset_evaluator.add_batch_data(
+                                uncertainty=bndl_outputs['pixel_uncertainty'],
+                                pred_logits=pixel_predictions,
+                                gt_masks=current_frame_masks
+                            )
+                            logging.info(f"Added batch {data_iter} to dataset evaluator (batch size: {pixel_predictions.shape[0]})")
                                                 
             # measure elapsed time
             batch_time.update(time.time() - end)
@@ -943,7 +950,7 @@ class Trainer:
             enabled=self.optim_conf.amp.enabled,
             dtype=get_amp_type(self.optim_conf.amp.amp_dtype),
         ):
-            loss_dict, batch_size, extra_losses= self._step(
+            loss_dict, batch_size, extra_losses = self._step(
                 batch,
                 self.model,
                 phase,
@@ -1192,15 +1199,22 @@ class Trainer:
 
 
     def _extract_bndl_outputs(self, outputs):
-        """提取BNDL输出"""
-        for frame_idx, outs in enumerate(outputs):
-            if "multistep_bndl_outputs" in outs:
-                bndl_outputs_list = outs["multistep_bndl_outputs"]
-                
+        """提取BNDL输出（从统一的 aux_outputs）"""
+        # Normalize outputs to an iterable of per-frame dicts
+        if isinstance(outputs, dict):
+            outputs_iter = [outputs]
+        else:
+            outputs_iter = outputs
+
+        for frame_idx, outs in enumerate(outputs_iter):
+            if "multistep_aux_outputs" in outs:
+                aux_list = outs["multistep_aux_outputs"]
                 # Use the last valid BNDL output (highest resolution)
-                for i in reversed(range(len(bndl_outputs_list))):
-                    if bndl_outputs_list[i] is not None:
-                        return bndl_outputs_list[i], i, frame_idx 
+                for i in reversed(range(len(aux_list))):
+                    if aux_list[i] is not None and isinstance(aux_list[i], dict):
+                        bndl_outputs = aux_list[i].get("bndl", None)
+                        if bndl_outputs is not None:
+                            return bndl_outputs, i, frame_idx
         return None, None, None
 
     def _calculate_pavpu_for_bndl(self, bndl_outputs, batch, targets):

@@ -800,35 +800,68 @@ class SAM2VideoPredictor(SAM2Base):
             "obj_ptr": obj_ptr,
             "object_score_logits": object_score_logits,
         }
-        # Preserve BNDL outputs for downstream visualization if available
-        if "bndl_outputs" in current_out and current_out["bndl_outputs"] is not None:
-            compact_current_out["bndl_outputs"] = current_out["bndl_outputs"]
+        # Preserve generic aux_outputs (e.g., UR-ERN) if available
+        if "aux_outputs" in current_out and current_out["aux_outputs"] is not None:
+            compact_current_out["aux_outputs"] = current_out["aux_outputs"]
         return compact_current_out, pred_masks_gpu
 
     @torch.inference_mode()
     def get_bndl_outputs(self, inference_state, frame_idx, obj_idx=0):
-        """Return BNDL outputs stored for a given frame/object, if available.
-
-        This enables visualization scripts to fetch BNDL statistics produced during inference.
-        """
+        """Return BNDL outputs (aux_outputs['bndl']) for a given frame/object, if available."""
+        import logging
+        logger = logging.getLogger(__name__)
         try:
             obj_output_dict = inference_state["output_dict_per_obj"].get(obj_idx, None)
             if obj_output_dict is None:
+                logger.warning(f"get_bndl_outputs: obj_idx={obj_idx} not found in output_dict_per_obj (available: {list(inference_state['output_dict_per_obj'].keys())})")
                 return None
             # Prefer conditioning outputs if present, otherwise fall back to non-conditioning
             out = obj_output_dict["cond_frame_outputs"].get(frame_idx)
             if out is None:
                 out = obj_output_dict["non_cond_frame_outputs"].get(frame_idx)
             if out is None:
+                logger.warning(f"get_bndl_outputs: frame_idx={frame_idx} not found in cond/non_cond outputs for obj={obj_idx}")
                 return None
-            # New inference path stores under 'bndl_outputs'; training path may use 'multistep_bndl_outputs'
-            if "bndl_outputs" in out and out["bndl_outputs"] is not None:
-                return out["bndl_outputs"]
-            if "multistep_bndl_outputs" in out and out["multistep_bndl_outputs"]:
-                # take the last valid step
-                for bndl_out in reversed(out["multistep_bndl_outputs"]):
-                    if bndl_out is not None:
-                        return bndl_out
+            # New unified storage: aux_outputs['bndl'] or last valid in multistep_aux_outputs
+            aux = out.get("aux_outputs") if isinstance(out, dict) else None
+            if isinstance(aux, dict) and "bndl" in aux:
+                return aux["bndl"]
+            ms = out.get("multistep_aux_outputs") if isinstance(out, dict) else None
+            if isinstance(ms, list):
+                for a in reversed(ms):
+                    if isinstance(a, dict) and "bndl" in a:
+                        return a["bndl"]
+            logger.warning(f"get_bndl_outputs: no 'bndl' data found in aux_outputs or multistep_aux_outputs for frame={frame_idx}, obj={obj_idx}")
+            return None
+        except Exception as e:
+            logger.error(f"get_bndl_outputs: exception for frame={frame_idx}, obj={obj_idx}: {e}")
+            return None
+
+    @torch.inference_mode()
+    def get_ur_ern_outputs(self, inference_state, frame_idx, obj_idx=0):
+        """Return UR-ERN outputs stored for a given frame/object, if available.
+
+        Looks for aux_outputs['ur_ern'] in the compact per-frame outputs saved during inference.
+        """
+        try:
+            obj_output_dict = inference_state["output_dict_per_obj"].get(obj_idx, None)
+            if obj_output_dict is None:
+                return None
+            out = obj_output_dict["cond_frame_outputs"].get(frame_idx)
+            if out is None:
+                out = obj_output_dict["non_cond_frame_outputs"].get(frame_idx)
+            if out is None:
+                return None
+            # Direct aux_outputs
+            aux = out.get("aux_outputs") if isinstance(out, dict) else None
+            if isinstance(aux, dict) and "ur_ern" in aux:
+                return aux["ur_ern"]
+            # Fallback: multistep_aux_outputs list
+            ms = out.get("multistep_aux_outputs") if isinstance(out, dict) else None
+            if isinstance(ms, list):
+                for a in reversed(ms):
+                    if isinstance(a, dict) and "ur_ern" in a:
+                        return a["ur_ern"]
             return None
         except Exception:
             return None
@@ -1127,6 +1160,7 @@ class SAM2VideoPredictorVOS(SAM2VideoPredictor):
             ious,
             sam_output_tokens,
             object_score_logits,
+            aux_outputs,
         ) = self.sam_mask_decoder(
             image_embeddings=backbone_features,
             image_pe=image_pe,
@@ -1197,6 +1231,7 @@ class SAM2VideoPredictorVOS(SAM2VideoPredictor):
             high_res_masks,
             obj_ptr,
             object_score_logits,
+            aux_outputs,
         )
 
     def _encode_new_memory(

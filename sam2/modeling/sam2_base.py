@@ -97,6 +97,8 @@ class SAM2Base(torch.nn.Module):
         bndl_fuse_type: str = 'sum',
         bndl_replace_global_with_hyper: bool = False,
         bndl_hyper_in_sparse: bool = False,
+        # Whether to use UR-ERN for pixels (mutually exclusive with BNDL)
+        use_ur_ern_for_pixels: bool = False,
         # add no obj embedding to spatial frames
         no_obj_embed_spatial: bool = False,
         # DSU options
@@ -217,6 +219,7 @@ class SAM2Base(torch.nn.Module):
         self.bndl_fuse_type = bndl_fuse_type
         self.bndl_replace_global_with_hyper = bndl_replace_global_with_hyper
         self.bndl_hyper_in_sparse = bndl_hyper_in_sparse
+        self.use_ur_ern_for_pixels = use_ur_ern_for_pixels
         self.fixed_no_obj_ptr = fixed_no_obj_ptr
         self.soft_no_obj_ptr = soft_no_obj_ptr
         if self.fixed_no_obj_ptr:
@@ -1013,6 +1016,7 @@ class SAM2Base(torch.nn.Module):
             bndl_fuse_type=self.bndl_fuse_type,
             bndl_replace_global_with_hyper=self.bndl_replace_global_with_hyper,
             bndl_hyper_in_sparse=self.bndl_hyper_in_sparse,
+            use_ur_ern_for_pixels=self.use_ur_ern_for_pixels,
             use_multimask_token_for_obj_ptr=self.use_multimask_token_for_obj_ptr,
             **(self.sam_mask_decoder_extra_args or {}),
         )
@@ -1131,13 +1135,13 @@ class SAM2Base(torch.nn.Module):
             high_res_features=high_res_features,
         )
         
-        if len(mask_decoder_outputs) == 5:  # 包含BNDL输出
+        if len(mask_decoder_outputs) == 5:  # 包含辅助输出（BNDL/UR-ERN 等）
             (
                 low_res_multimasks,
                 ious,
                 sam_output_tokens,
                 object_score_logits,
-                bndl_outputs,
+                aux_outputs,
             ) = mask_decoder_outputs
         else:  # 标准输出
             (
@@ -1194,6 +1198,9 @@ class SAM2Base(torch.nn.Module):
             obj_ptr = obj_ptr + (1 - lambda_is_obj_appearing) * self.no_obj_ptr
 
         if self.use_bndl_for_pixels:
+            # Read and update BNDL namespace inside aux_outputs, then pass aux_outputs through unchanged
+            aux_outputs = aux_outputs or {}
+            bndl_outputs = aux_outputs.get("bndl", {})
             pixel_feat = bndl_outputs.get("pixel_feat_grad", bndl_outputs.get("pixel_feat", None))
             shared_z1 = None
             shared_z2 = None
@@ -1239,6 +1246,8 @@ class SAM2Base(torch.nn.Module):
                     roi_z2=shared_z2,
                 )
                 bndl_outputs["moco_aux_loss"] = moco_loss
+            # Write back updated BNDL namespace
+            aux_outputs["bndl"] = bndl_outputs
             return (
                 low_res_multimasks,
                 high_res_multimasks,
@@ -1247,7 +1256,7 @@ class SAM2Base(torch.nn.Module):
                 high_res_masks,
                 obj_ptr,
                 object_score_logits,
-                bndl_outputs,
+                aux_outputs,
             )
         else:
             return (
@@ -1258,6 +1267,7 @@ class SAM2Base(torch.nn.Module):
                 high_res_masks,
                 obj_ptr,
                 object_score_logits,
+                aux_outputs,
             )
 
     def _use_mask_as_output(self, backbone_features, high_res_features, mask_inputs):
@@ -1703,7 +1713,8 @@ class SAM2Base(torch.nn.Module):
             pixel_gt_for_adco,
         )
 
-        if self.use_bndl_for_pixels:
+        # If SAM head returned auxiliary outputs (BNDL/UR-ERN), sam_outputs will have 8 elements
+        if isinstance(sam_outputs, tuple) and len(sam_outputs) == 8:
             (
                 _,
                 _,
@@ -1712,10 +1723,10 @@ class SAM2Base(torch.nn.Module):
                 high_res_masks,
                 obj_ptr,
                 object_score_logits,
-                bndl_outputs,
+                aux_outputs,
             ) = sam_outputs
-            # Optionally expose BNDL outputs for downstream consumers
-            current_out["bndl_outputs"] = bndl_outputs
+            # Optionally expose aux outputs for downstream consumers
+            current_out["aux_outputs"] = aux_outputs
         else:
             (
                 _,

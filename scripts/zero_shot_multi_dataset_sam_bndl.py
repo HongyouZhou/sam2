@@ -55,10 +55,10 @@ logger = logging.getLogger(__name__)
 
 # ---------- Dataset Configurations ----------
 from dataset_configs import DATASET_CONFIGS, DEFAULT_DATASETS
-from prompt_utils import compute_tight_box_from_bool_mask, box_center_xy, sample_pos_neg, sample_error_click
 
 # ---------- Unified click prompt generator ----------
 from prompt_generation import generate_click_prompts
+from prompt_loader import load_reused_prompts, apply_reused_prompts, save_prompts_to_json
 
 # Distinct colors for different objects
 OBJECT_COLORS = [
@@ -692,6 +692,7 @@ def inference_with_bndl(
     vis_dir: Path | None = None,
     dataset_name: str = "unknown",
     collect_statistics: bool = True,
+    eval_dir: Path | None = None,
     max_objects: int | None = None,
     prompt_method: str = "gt_box",
     first_frame_only: bool = False,
@@ -716,10 +717,7 @@ def inference_with_bndl(
 
     # Optional seeding
     if seed is not None:
-        try:
-            np.random.seed(int(seed))
-        except Exception:
-            pass
+        np.random.seed(int(seed))
 
     # Create BNDL visualization directory
     if save_bndl_vis and vis_dir is not None:
@@ -730,16 +728,29 @@ def inference_with_bndl(
     total_frames_processed = 0
 
     # Initialize dataset evaluator for correlation analysis like in SAM trainer
-    dataset_evaluator = (
-        DistributedDatasetEvaluator(
-            save_dir=str(vis_dir / "dataset_evaluation") if vis_dir else str(Path("./dataset_evaluation")),
-            distributed=False,  # Single process for zero-shot evaluation
-            rank=0,
-            world_size=1,
-        )
-        if collect_statistics
-        else None
-    )
+    # Use consistent path format: <output_root>/<dataset>_bndl_eval
+    dataset_evaluator = None
+    if collect_statistics:
+        try:
+            # Prioritize eval_dir if provided, otherwise use consistent naming pattern
+            if eval_dir is not None:
+                eval_save_dir = eval_dir
+            else:
+                # Use consistent format: out_dir.parent / f"{dataset_name}_bndl_eval"
+                eval_save_dir = out_dir.parent / f"{dataset_name.lower()}_bndl_eval" if dataset_name else (out_dir.parent / "bndl_eval")
+            
+            dataset_evaluator = DistributedDatasetEvaluator(
+                save_dir=str(eval_save_dir),
+                distributed=False,  # Single process for zero-shot evaluation
+                rank=0,
+                world_size=1,
+            )
+            logger.info(f"Dataset evaluator initialized with save_dir: {dataset_evaluator.save_dir}")
+        except Exception as e:
+            logger.error(f"Failed to initialize dataset evaluator: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            dataset_evaluator = None
 
     for v_idx, vid in enumerate(video_names, 1):
         print(f"[{v_idx:03}/{len(video_names)}] {vid}")
@@ -778,74 +789,42 @@ def inference_with_bndl(
         else:
             obj_ids = all_obj_ids
 
-        # Try to load reused prompts (from first model outputs)
-        prompts_json = None
-        if reuse_prompts_root is not None:
-            candidate = reuse_prompts_root / f"{dataset_name.lower()}_pred" / vid / "query_prompts.json"
-            if candidate.exists():
-                try:
-                    with open(candidate) as f:
-                        prompts_json = {int(k): v for k, v in json.load(f).items()}
-                    print(f"Loaded reused prompts for video {vid} from {candidate}")
-                except Exception as e:
-                    print(f"Warning: Failed to load reused prompts {candidate}: {e}")
-            else:
-                print(f"Reused prompts not found for {vid}: {candidate}")
+        # Load reused prompts if available
+        prompts_json = load_reused_prompts(reuse_prompts_root, dataset_name, vid)
+        if prompts_json:
+            print(f"Loaded reused prompts for video {vid}")
 
         print(f"Processing {len(obj_ids)} objects in video {vid}: {obj_ids}")
 
-        obj_points: dict[int, list] = {}
+        # Set random seed for reproducibility
+        if seed is not None:
+            np.random.seed(int(seed))
+
+        obj_points: dict[int, list[tuple[int, int, int]]] = {}  # Now stores (x, y, label)
 
         for obj_id in obj_ids:
             gt_bool = first_mask == obj_id
-
-            # Check if mask is empty
             if not np.any(gt_bool):
-                print(f"Warning: Empty GT mask for object {obj_id} in video {vid}")
                 continue
 
             # Clear GPU memory before processing each object to prevent OOM
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-            # Use reused prompts if present; otherwise always generate clicks per protocol (no GT box fallback)
-            reused = False
+            # Try reused prompts first, fall back to generation
+            prompt_applied = False
             if prompts_json and obj_id in prompts_json:
-                spec = prompts_json[obj_id]
-                if spec.get("type") in {"1click", "3click", "5click"} and "clicks" in spec:
-                    clicks = spec["clicks"]
-                    init_pts: list[list[int]] = []
-                    init_lbl: list[int] = []
-                    for c in clicks:
-                        if "xy" in c and "label" in c:
-                            init_pts.append(c["xy"])
-                            init_lbl.append(int(c["label"]))
-                    if init_pts:
-                        pts = np.array(init_pts, dtype=np.float32)
-                        lbl = np.array(init_lbl, dtype=np.int32)
-                        # First point
-                        _, _, _ = predictor.add_new_points_or_box(
-                            state,
-                            frame_idx=0,
-                            obj_id=obj_id,
-                            points=pts[:1],
-                            labels=lbl[:1],
-                        )
-                        # Subsequent points
-                        for k in range(1, len(init_pts)):
-                            predictor.add_new_points_or_box(
-                                state,
-                                frame_idx=0,
-                                obj_id=obj_id,
-                                points=np.array([init_pts[k]], dtype=np.float32),
-                                labels=np.array([init_lbl[k]], dtype=np.int32),
-                                clear_old_points=False,
-                            )
-                    obj_points[obj_id] = [tuple(map(int, c["xy"])) for c in clicks if "xy" in c]
-                    reused = True
-
-            if not reused:
-                # Always generate clicks per protocol (no fallback to GT box)
+                prompt_applied = apply_reused_prompts(predictor, state, obj_id, prompts_json[obj_id])
+                if prompt_applied:
+                    # Extract points AND labels from prompt spec for saving
+                    clicks = prompts_json[obj_id].get("clicks", [])
+                    obj_points[obj_id] = [
+                        (int(c["xy"][0]), int(c["xy"][1]), int(c.get("label", 1)))
+                        for c in clicks if "xy" in c
+                    ]
+            
+            if not prompt_applied:
+                # Generate new prompts using click protocol
                 used_pts, used_labels = generate_click_prompts(
                     predictor,
                     state,
@@ -855,11 +834,11 @@ def inference_with_bndl(
                     first_frame_mask_np=first_mask,
                     score_thresh=score_thresh,
                     click_protocol=click_protocol,
-                    min_click_dist=float(min_click_dist),
+                    min_click_dist=float(min_click_dist or 12.0),
                 )
-                obj_points[obj_id] = [(int(x), int(y)) for (x, y) in used_pts]
+                obj_points[obj_id] = [(int(x), int(y), int(label)) for (x, y), label in zip(used_pts, used_labels, strict=True)]
 
-        print(f"Generated query points for video {vid}: {obj_points}")
+        print(f"Query points for video {vid}: {obj_points}")
 
         # Propagate through entire video with BNDL UQ analysis
         # When first_frame_only=True, only process the first frame (frame 0)
@@ -890,64 +869,65 @@ def inference_with_bndl(
 
             # Collect BNDL statistics if enabled (with memory optimization)
             if collect_statistics:
+                # Map object IDs to their index in out_logits to fetch per-object logits reliably
+                id_to_idx = {oid: i for i, oid in enumerate(out_obj_ids)}
                 max_obj_stats = 2 if dataset_name == "Hypersim" else 3
-                for obj_idx, obj_id in enumerate(out_obj_ids[:max_obj_stats]):
-                    try:
-                        bndl_outputs = predictor.get_bndl_outputs(state, f_idx, obj_idx)
-                        if bndl_outputs is not None:
-                            # Calculate PAvPU if we have ground truth
-                            first_mask_path = ann_dir / vid / f"{frame_names[f_idx]}.png"
-                            if first_mask_path.exists():
-                                gt_mask = np.array(Image.open(first_mask_path))
-                                # Convert to tensor format for PAvPU calculation and move to same device as BNDL outputs
-                                gt_tensor = torch.from_numpy(gt_mask).float().unsqueeze(0)  # [1, H, W]
-                                # Move to the same device as BNDL outputs
-                                if "pixel_logits_raw" in bndl_outputs:
-                                    gt_tensor = gt_tensor.to(bndl_outputs["pixel_logits_raw"].device)
-                                elif "wei_lambda" in bndl_outputs:
-                                    gt_tensor = gt_tensor.to(bndl_outputs["wei_lambda"].device)
-                                bndl_outputs = calculate_pavpu_for_bndl(bndl_outputs, None, gt_tensor, "eval", predictor)
+                logger.info(f"Processing {len(out_obj_ids[:max_obj_stats])} objects for stats collection")
+                for obj_id in out_obj_ids[:max_obj_stats]:
+                    # Convert obj_id to internal obj_idx using predictor's mapping
+                    obj_idx = predictor._obj_id_to_idx(state, obj_id)
+                    logger.info(f"Object ID {obj_id} -> internal index {obj_idx}")
+                    bndl_outputs = predictor.get_bndl_outputs(state, f_idx, obj_idx)
+                    logger.info(f"get_bndl_outputs(frame={f_idx}, obj_idx={obj_idx}): returned {'data' if bndl_outputs is not None else 'None'}")
+                    
+                    if bndl_outputs is not None:
+                        # Calculate PAvPU if we have ground truth
+                        first_mask_path = ann_dir / vid / f"{frame_names[f_idx]}.png"
+                        if first_mask_path.exists():
+                            gt_mask = np.array(Image.open(first_mask_path))
+                            # Convert to tensor format for PAvPU calculation
+                            gt_tensor = torch.from_numpy(gt_mask).float().unsqueeze(0)  # [1, H, W]
+                            # Move to the same device as BNDL outputs
+                            if "pixel_logits_raw" in bndl_outputs:
+                                gt_tensor = gt_tensor.to(bndl_outputs["pixel_logits_raw"].device)
+                            elif "wei_lambda" in bndl_outputs:
+                                gt_tensor = gt_tensor.to(bndl_outputs["wei_lambda"].device)
+                            bndl_outputs = calculate_pavpu_for_bndl(bndl_outputs, None, gt_tensor, "eval", predictor)
+                            del gt_tensor, gt_mask
 
-                                # Clean up ground truth tensor immediately
-                                del gt_tensor, gt_mask
+                        # Log statistics
+                        video_statistics = log_bndl_statistics(bndl_outputs, f_idx, "eval", f"{dataset_name}_{vid}_obj{obj_id}", video_statistics)
+                        total_frames_processed += 1
 
-                            # Log statistics
-                            video_statistics = log_bndl_statistics(bndl_outputs, f_idx, "eval", f"{dataset_name}_{vid}_obj{obj_id}", video_statistics)
-                            total_frames_processed += 1
+                        # Add to dataset evaluator (skip Hypersim to save memory)
+                        if dataset_evaluator is not None and dataset_name != "Hypersim":
+                            _idx = id_to_idx.get(obj_id)
+                            if _idx is not None and _idx < len(out_logits):
+                                pred_logits = out_logits[_idx]
+                                current_mask_path = ann_dir / vid / f"{frame_names[f_idx]}.png"
+                                
+                                if current_mask_path.exists() and "pixel_uncertainty" in bndl_outputs:
+                                    # Extract binary mask for current object only
+                                    current_gt_mask_full = np.array(Image.open(current_mask_path))
+                                    current_gt_mask = (current_gt_mask_full == obj_id).astype(np.float32)
+                                    current_gt_tensor = torch.from_numpy(current_gt_mask).unsqueeze(0)
+                                    
+                                    # Move to same device
+                                    if "pixel_logits_raw" in bndl_outputs:
+                                        current_gt_tensor = current_gt_tensor.to(bndl_outputs["pixel_logits_raw"].device)
+                                    elif "wei_lambda" in bndl_outputs:
+                                        current_gt_tensor = current_gt_tensor.to(bndl_outputs["wei_lambda"].device)
 
-                            # Skip dataset evaluator for Hypersim to save memory
-                            if dataset_evaluator and "pixel_uncertainty" in bndl_outputs and dataset_name != "Hypersim":
-                                try:
-                                    # Get predictions from current frame
-                                    pred_logits = out_logits[obj_idx] if obj_idx < len(out_logits) else None
-                                    # Get current frame mask path (not just first frame)
-                                    current_mask_path = ann_dir / vid / f"{frame_names[f_idx]}.png"
-                                    if pred_logits is not None and current_mask_path.exists():
-                                        # Load current frame ground truth
-                                        current_gt_mask = np.array(Image.open(current_mask_path))
-                                        current_gt_tensor = torch.from_numpy(current_gt_mask).float().unsqueeze(0)
-                                        if "pixel_logits_raw" in bndl_outputs:
-                                            current_gt_tensor = current_gt_tensor.to(bndl_outputs["pixel_logits_raw"].device)
-                                        elif "wei_lambda" in bndl_outputs:
-                                            current_gt_tensor = current_gt_tensor.to(bndl_outputs["wei_lambda"].device)
+                                    dataset_evaluator.add_batch_data(
+                                        uncertainty=bndl_outputs["pixel_uncertainty"],
+                                        pred_logits=pred_logits.unsqueeze(0),
+                                        gt_masks=current_gt_tensor,
+                                    )
+                                    logger.info(f"Added frame {f_idx} obj {obj_id} to dataset evaluator")
+                                    del current_gt_mask, current_gt_tensor
 
-                                        dataset_evaluator.add_batch_data(
-                                            uncertainty=bndl_outputs["pixel_uncertainty"],
-                                            pred_logits=pred_logits.unsqueeze(0),  # Add batch dimension
-                                            gt_masks=current_gt_tensor,
-                                        )
-                                        logger.info(f"Added frame {f_idx} obj {obj_id} to dataset evaluator")
-
-                                        # Clean up immediately after adding to evaluator
-                                        del current_gt_mask, current_gt_tensor
-                                except Exception as e:
-                                    logger.warning(f"Failed to add frame {f_idx} obj {obj_id} to dataset evaluator: {e}")
-
-                            # Clean up bndl_outputs after processing
-                            del bndl_outputs
-
-                    except Exception as e:
-                        logger.warning(f"Failed to process BNDL outputs for obj {obj_idx}: {e}")
+                        # Clean up bndl_outputs after processing
+                        del bndl_outputs
 
 
             # Generate BNDL visualizations for selected frames (reduced for memory)
@@ -957,16 +937,19 @@ def inference_with_bndl(
                     # This requires accessing the internal state or outputs
                     # For now, we'll create a mock batch for visualization
                     if hasattr(predictor, "get_bndl_outputs") and out_obj_ids:
-                        # Use the first object for visualization
-
-                        bndl_outputs = predictor.get_bndl_outputs(state, f_idx, 0)
+                        # Use the first object's ID for visualization
+                        first_obj_id = out_obj_ids[0]
+                        first_obj_idx = predictor._obj_id_to_idx(state, first_obj_id)
+                        bndl_outputs = predictor.get_bndl_outputs(state, f_idx, first_obj_idx)
                         if bndl_outputs is not None:
                             # Calculate PAvPU for visualization (same as in statistics collection)
                             current_mask_path = ann_dir / vid / f"{frame_names[f_idx]}.png"
                             if current_mask_path.exists():
-                                gt_mask = np.array(Image.open(current_mask_path))
+                                gt_mask_full = np.array(Image.open(current_mask_path))
+                                # Extract binary mask for the first object (consistent with evaluation)
+                                gt_mask = (gt_mask_full == first_obj_id).astype(np.float32)
                                 # Convert to tensor format for PAvPU calculation and move to same device as BNDL outputs
-                                gt_tensor = torch.from_numpy(gt_mask).float().unsqueeze(0)  # [1, H, W]
+                                gt_tensor = torch.from_numpy(gt_mask).unsqueeze(0)  # [1, H, W]
                                 # Move to the same device as BNDL outputs
                                 if "pixel_logits_raw" in bndl_outputs:
                                     gt_tensor = gt_tensor.to(bndl_outputs["pixel_logits_raw"].device)
@@ -1045,16 +1028,17 @@ def inference_with_bndl(
         # Clear any remaining frames
         video_segments.clear()
 
-        # Save query points
-        (out_dir / vid).mkdir(parents=True, exist_ok=True)
-        with open(out_dir / vid / "query_points.json", "w") as f:
-            json.dump({int(k): v for k, v in obj_points.items()}, f, indent=2)
+        # Save query prompts in standard format
+        save_prompts_to_json(out_dir, vid, obj_points, click_protocol)
 
         # Merge video statistics into dataset statistics
         if collect_statistics and video_statistics and dataset_statistics is not None:
             dataset_statistics.update(video_statistics)
             print(f"Collected BNDL statistics for video {vid}: {len(video_statistics)} metrics")
 
+        # Critical: Reset predictor state to free memory for this video
+        predictor.reset_state(state)
+        
         # Final cleanup after each video (keep consistent with original)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -1214,6 +1198,7 @@ def run_single_dataset_with_bndl(
             vis_dir=bndl_vis_dir,
             dataset_name=dataset_name,
             collect_statistics=collect_statistics,
+            eval_dir=(output_path / f"{dataset_name.lower()}_bndl_eval") if collect_statistics else None,
             prompt_method=prompt_method,
             first_frame_only=first_frame_only,
             max_objects=max_objects,

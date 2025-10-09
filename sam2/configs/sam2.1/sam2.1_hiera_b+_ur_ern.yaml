@@ -1,0 +1,164 @@
+# @package _global_
+
+
+model:
+  _target_: sam2.modeling.sam2_base.SAM2Base
+  image_encoder:
+    _target_: sam2.modeling.backbones.image_encoder.ImageEncoder
+    scalp: 1
+    trunk:
+      _target_: sam2.modeling.backbones.hieradet.Hiera
+      embed_dim: 112
+      num_heads: 2
+    neck:
+      _target_: sam2.modeling.backbones.image_encoder.FpnNeck
+      position_encoding:
+        _target_: sam2.modeling.position_encoding.PositionEmbeddingSine
+        num_pos_feats: 256
+        normalize: true
+        scale: null
+        temperature: 10000
+      d_model: 256
+      backbone_channel_list: [896, 448, 224, 112]
+      fpn_top_down_levels: [2, 3]  # output level 0 and 1 directly use the backbone features
+      fpn_interp_model: nearest
+
+  memory_attention:
+    _target_: sam2.modeling.memory_attention.MemoryAttention
+    d_model: 256
+    pos_enc_at_input: true
+    layer:
+      _target_: sam2.modeling.memory_attention.MemoryAttentionLayer
+      activation: relu
+      dim_feedforward: 2048
+      dropout: 0.1
+      pos_enc_at_attn: false
+      self_attention:
+        _target_: sam2.modeling.sam.transformer.RoPEAttention
+        rope_theta: 10000.0
+        feat_sizes: [64, 64]
+        embedding_dim: 256
+        num_heads: 1
+        downsample_rate: 1
+        dropout: 0.1
+      d_model: 256
+      pos_enc_at_cross_attn_keys: true
+      pos_enc_at_cross_attn_queries: false
+      cross_attention:
+        _target_: sam2.modeling.sam.transformer.RoPEAttention
+        rope_theta: 10000.0
+        feat_sizes: [64, 64]
+        rope_k_repeat: True
+        embedding_dim: 256
+        num_heads: 1
+        downsample_rate: 1
+        dropout: 0.1
+        kv_in_dim: 64
+    num_layers: 4
+
+  memory_encoder:
+      _target_: sam2.modeling.memory_encoder.MemoryEncoder
+      out_dim: 64
+      position_encoding:
+        _target_: sam2.modeling.position_encoding.PositionEmbeddingSine
+        num_pos_feats: 64
+        normalize: true
+        scale: null
+        temperature: 10000
+      mask_downsampler:
+        _target_: sam2.modeling.memory_encoder.MaskDownSampler
+        kernel_size: 3
+        stride: 2
+        padding: 1
+      fuser:
+        _target_: sam2.modeling.memory_encoder.Fuser
+        layer:
+          _target_: sam2.modeling.memory_encoder.CXBlock
+          dim: 256
+          kernel_size: 7
+          padding: 3
+          layer_scale_init_value: 1e-6
+          use_dwconv: True  # depth-wise convs
+        num_layers: 2
+
+  num_maskmem: 7
+  image_size: 1024
+  # apply scaled sigmoid on mask logits for memory encoder, and directly feed input mask as output mask
+  sigmoid_scale_for_mem_enc: 20.0
+  sigmoid_bias_for_mem_enc: -10.0
+  use_mask_input_as_output_without_sam: true
+  # Memory
+  directly_add_no_mem_embed: true
+  no_obj_embed_spatial: true
+  # use high-resolution feature map in the SAM mask decoder
+  use_high_res_features_in_sam: true
+  # output 3 masks on the first click on initial conditioning frames
+  multimask_output_in_sam: true
+  # SAM heads
+  iou_prediction_use_sigmoid: True
+  # cross-attend to object pointers from other frames (based on SAM output tokens) in the encoder
+  use_obj_ptrs_in_encoder: true
+  add_tpos_enc_to_obj_ptrs: true
+  proj_tpos_enc_in_obj_ptrs: true
+  use_signed_tpos_enc_to_obj_ptrs: true
+  only_obj_ptrs_in_the_past_for_eval: true
+  # object occlusion prediction
+  pred_obj_scores: true
+  pred_obj_scores_mlp: true
+  fixed_no_obj_ptr: true
+  # multimask tracking settings
+  multimask_output_for_tracking: true
+  use_multimask_token_for_obj_ptr: true
+  multimask_min_pt_num: 0
+  multimask_max_pt_num: 1
+  use_mlp_for_obj_ptr_proj: true
+  # Compilation flag
+  compile_image_encoder: False
+
+  # BNDL (关闭，与 UR-ERN 互斥)
+  use_bndl_for_pixels: false
+  bndl_fuse_type: none
+  bndl_replace_global_with_hyper: false
+  bndl_hyper_in_sparse: false
+  # UR-ERN (开启)
+  use_ur_ern_for_pixels: true
+  # DSU options
+  use_dsu: false
+  dsu_strength_mu: 0.1
+  dsu_strength_sigma: 0.1
+  dsu_prob: 1.0
+  dsu_apply_high_res: true
+  dsu_stats_eps: 1e-6
+  # Compilation flag
+  # compile_image_encoder: False
+
+  # AdCo options (关闭，UR-ERN 不依赖 BNDL 采样)
+  use_adco: false
+  adco_proj_dim: 256
+  adco_queue_size: 65536
+  adco_temperature: 0.2
+  adco_use_uncertainty: false
+  # UQ-aware AdCo controls
+  adco_gate_by_uncertainty: false
+  adco_gate_floor: 0.2
+  adco_tau_beta: 0.7
+  adco_uncertainty_mask_threshold: 0.4
+  adco_scale_neg_by_uq: true
+  adco_curriculum_warmup_steps: 2000
+
+  # ProCo options (关闭)
+  use_proco: false
+  proco_proj_dim: 256
+  proco_num_obj_prototypes: 128
+  proco_num_bg_prototypes: 32
+  proco_temperature: 0.1
+  
+  # MoCo options (关闭)
+  use_moco: false
+  moco_proj_dim: 256
+  moco_queue_size: 65536
+  moco_momentum: 0.996
+  moco_temperature: 0.2
+
+  # ROI sharing
+  share_roi_views: true

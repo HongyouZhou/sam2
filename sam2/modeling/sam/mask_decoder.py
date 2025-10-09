@@ -36,6 +36,8 @@ class MaskDecoder(nn.Module):
         bndl_fuse_type: str = "sum",
         bndl_hyper_in_sparse: bool = False,
         use_multimask_token_for_obj_ptr: bool = False,
+        # UR-ERN related (mutually exclusive with BNDL)
+        use_ur_ern_for_pixels: bool = False,
     ) -> None:
         """
         Predicts masks given an image and prompt embeddings, using a
@@ -96,6 +98,18 @@ class MaskDecoder(nn.Module):
             if self.bndl_fuse_type == "conv":
                 self.fuse_conv = nn.Conv2d(2 * num_multimask_outputs, num_multimask_outputs, 1, bias=False)
         #########################################################
+
+        # UR-ERN (NIG evidential regression) head - mutually exclusive with BNDL
+        self.use_ur_ern_for_pixels = bool(use_ur_ern_for_pixels)
+        if self.use_bndl_for_pixels and self.use_ur_ern_for_pixels:
+            raise ValueError("use_bndl_for_pixels and use_ur_ern_for_pixels cannot be both True.")
+
+        if self.use_ur_ern_for_pixels:
+            # Use C' = transformer_dim // 8 features from output_upscaling; predict 4 channels: (mu, v, alpha, beta)
+            pixel_feat_dim = transformer_dim // 8
+            self.ur_ern_head = nn.Conv2d(pixel_feat_dim, 4, kernel_size=1, stride=1, bias=True)
+            # Small epsilon to stabilize parameter transforms at inference/training time
+            self.register_buffer("_ur_eps", torch.tensor(1e-6), persistent=False)
 
         self.output_hypernetworks_mlps = nn.ModuleList([MLP(transformer_dim, transformer_dim, transformer_dim // 8, 3) for i in range(self.num_mask_tokens)])
 
@@ -235,7 +249,7 @@ class MaskDecoder(nn.Module):
         hyper_in = torch.stack(hyper_in_list, dim=1)
         b, c, h, w = upscaled_embedding.shape
 
-        bndl_outputs = None
+        aux_outputs = None
         masks_sam = (hyper_in @ upscaled_embedding.view(b, c, h * w)).view(b, -1, h, w)
         masks = masks_sam
 
@@ -250,29 +264,62 @@ class MaskDecoder(nn.Module):
             # 重塑BNDL输出：从[B, H, W, K]到[B, K, H, W]
             masks_bndl = masks_bndl_raw.permute(0, 3, 1, 2)
 
-            bndl_outputs = {
-                "z_out": z_out,
-                "wei_lambda": wei_lambda,
-                "inv_k": inv_k,
-                "wei_lambda_w": wei_lambda_w,
-                "inv_k_w": inv_k_w,
-                "masks_bndl_raw": masks_bndl_raw.detach(),      # [B, H, W, K]
-                "pixel_logits": masks_bndl_raw if self.training else masks_bndl_raw.detach(),
-                "upscaled_shape": (b, c, h, w),
-                "hyper_in": hyper_in.detach(),
-                "mask_tokens_out": mask_tokens_out.detach(),
-                "pixel_feat": pixel_feat.detach(),
-                # Provide gradient-carrying pixel features for auxiliary losses during training
-                "pixel_feat_grad": pixel_feat if self.training else None,
-                "masks_bndl": masks_bndl.detach(),
-                "masks_hyper": masks_sam.detach(),
-                "out_w": out_w.detach(),
+            aux_outputs = {
+                "bndl": {
+                    "z_out": z_out,
+                    "wei_lambda": wei_lambda,
+                    "inv_k": inv_k,
+                    "wei_lambda_w": wei_lambda_w,
+                    "inv_k_w": inv_k_w,
+                    "masks_bndl_raw": masks_bndl_raw.detach(),      # [B, H, W, K]
+                    "pixel_logits": masks_bndl_raw if self.training else masks_bndl_raw.detach(),
+                    "upscaled_shape": (b, c, h, w),
+                    "hyper_in": hyper_in.detach(),
+                    "mask_tokens_out": mask_tokens_out.detach(),
+                    "pixel_feat": pixel_feat.detach(),
+                    # Provide gradient-carrying pixel features for auxiliary losses during training
+                    "pixel_feat_grad": pixel_feat if self.training else None,
+                    "masks_bndl": masks_bndl.detach(),
+                    "masks_hyper": masks_sam.detach(),
+                    "out_w": out_w.detach(),
+                }
             }
 
             if self.bndl_fuse_type in ("sum", "conv"):
                 masks = self._fuse_masks(masks_sam, masks_bndl)
             else:
                 masks = masks_bndl
+
+        # UR-ERN evidential outputs (NIG) using upscaled feature map; independent of BNDL branch
+        if self.use_ur_ern_for_pixels:
+            # Input features to UR-ERN head must match transformer_dim//8 channels
+            # If high-res path was used above, upscaled_embedding already fused; reuse it here.
+            nig_params = self.ur_ern_head(upscaled_embedding)  # [B, 4, H, W]
+            mu, v_raw, alpha_raw, beta_raw = torch.chunk(nig_params, 4, dim=1)
+            # Constrain parameters to valid domains
+            v = torch.nn.functional.softplus(v_raw) + self._ur_eps  # v > 0
+            alpha = torch.nn.functional.softplus(alpha_raw) + 1.0 + self._ur_eps  # alpha > 1
+            beta = torch.nn.functional.softplus(beta_raw) + self._ur_eps  # beta > 0
+
+            # Student-t predictive variance decomposition
+            # var = beta * (1 + v) / (v * (alpha - 1))
+            # aleatoric = beta / (alpha - 1)
+            # epistemic = beta / (v * (alpha - 1))
+            denom = (alpha - 1.0)
+            aleatoric = beta / denom
+            epistemic = beta / (v * denom)
+            var = (beta * (1.0 + v)) / (v * denom)
+
+            # Pack into aux dict (fixed top-level key with method namespace)
+            aux_outputs = {"ur_ern": {
+                "nig_mu": mu,
+                "nig_v": v,
+                "nig_alpha": alpha,
+                "nig_beta": beta,
+                "nig_var": var,
+                "nig_aleatoric": aleatoric,
+                "nig_epistemic": epistemic,
+            }}
 
         # Generate mask quality predictions
         iou_pred = self.iou_prediction_head(iou_token_out)
@@ -283,7 +330,7 @@ class MaskDecoder(nn.Module):
             # Obj scores logits - default to 10.0, i.e. assuming the object is present, sigmoid(10)=1
             object_score_logits = 10.0 * iou_pred.new_ones(iou_pred.shape[0], 1)
 
-        return masks, iou_pred, mask_tokens_out, object_score_logits, bndl_outputs
+        return masks, iou_pred, mask_tokens_out, object_score_logits, aux_outputs
 
     def _fuse_masks(self, masks_hyper, masks_bndl):
         """Fuse hypernetwork and BNDL masks."""

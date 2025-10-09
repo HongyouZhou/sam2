@@ -383,7 +383,7 @@ class SAM2Train(SAM2Base):
             prev_sam_mask_logits,
         )
 
-        if len(sam_outputs) == 8:  # 包含BNDL输出
+        if len(sam_outputs) == 8:  # 包含辅助输出（BNDL/UR-ERN等）
             (
                 low_res_multimasks,
                 high_res_multimasks,
@@ -392,7 +392,7 @@ class SAM2Train(SAM2Base):
                 high_res_masks,
                 obj_ptr,
                 object_score_logits,
-                bndl_outputs,
+                aux_outputs,
             ) = sam_outputs
         else:
             (
@@ -404,14 +404,17 @@ class SAM2Train(SAM2Base):
                 obj_ptr,
                 object_score_logits,
             ) = sam_outputs
-            bndl_outputs = None
+            aux_outputs = None
 
-        if bndl_outputs is not None:
-            if gt_masks is not None:
-                bndl_outputs["pixel_gt"] = gt_masks.detach().to(dtype=torch.float32)
-            current_out["multistep_bndl_outputs"] = [bndl_outputs]  # 新增：初始化为列表
+        # 初始化多步辅助输出列表（统一为 aux_outputs）
+        if aux_outputs is not None:
+            # 将 GT 添加到 BNDL 命名空间（如果存在）
+            bndl_ns = aux_outputs.get("bndl", None)
+            if bndl_ns is not None and gt_masks is not None:
+                bndl_ns["pixel_gt"] = gt_masks.detach().to(dtype=torch.float32)
+            current_out["multistep_aux_outputs"] = [aux_outputs]
         else:
-            current_out["multistep_bndl_outputs"] = [None]
+            current_out["multistep_aux_outputs"] = [None]
 
         current_out["multistep_pred_masks"] = low_res_masks
         current_out["multistep_pred_masks_high_res"] = high_res_masks
@@ -490,8 +493,8 @@ class SAM2Train(SAM2Base):
         all_pred_ious = [ious]
         all_point_inputs = [point_inputs]
         all_object_score_logits = [object_score_logits]
-        if self.use_bndl_for_pixels:
-            all_bndl_outputs = current_out.get("multistep_bndl_outputs", [None])
+        # Collect aux outputs (BNDL/UR-ERN) if present
+        all_aux_outputs = current_out.get("multistep_aux_outputs", [None])
 
         for _ in range(self.num_correction_pt_per_frame):
             # sample a new point from the error between prediction and ground-truth
@@ -534,7 +537,8 @@ class SAM2Train(SAM2Base):
                     multimask_output=multimask_output,
                 )
 
-            if self.use_bndl_for_pixels:
+            # Unpack sam_outputs: check if aux_outputs is present (8 elements) or not (7 elements)
+            if isinstance(sam_outputs, tuple) and len(sam_outputs) == 8:
                 (
                     low_res_multimasks,
                     high_res_multimasks,
@@ -543,8 +547,9 @@ class SAM2Train(SAM2Base):
                     high_res_masks,
                     _,
                     object_score_logits,
-                    bndl_outputs,
+                    aux_outputs,
                 ) = sam_outputs
+                all_aux_outputs.append(aux_outputs)
             else:
                 (
                     low_res_multimasks,
@@ -555,9 +560,7 @@ class SAM2Train(SAM2Base):
                     _,
                     object_score_logits,
                 ) = sam_outputs
-
-            if self.use_bndl_for_pixels:
-                all_bndl_outputs.append(bndl_outputs)
+                all_aux_outputs.append(None)
             all_pred_masks.append(low_res_masks)
             all_pred_high_res_masks.append(high_res_masks)
             all_pred_multimasks.append(low_res_multimasks)
@@ -577,7 +580,8 @@ class SAM2Train(SAM2Base):
         current_out["multistep_pred_ious"] = all_pred_ious
         current_out["multistep_point_inputs"] = all_point_inputs
         current_out["multistep_object_score_logits"] = all_object_score_logits
-        if self.use_bndl_for_pixels:
-            current_out["multistep_bndl_outputs"] = all_bndl_outputs
+        
+        # 统一保存 aux_outputs（包含 BNDL/UR-ERN 等）
+        current_out["multistep_aux_outputs"] = all_aux_outputs
 
         return point_inputs, sam_outputs

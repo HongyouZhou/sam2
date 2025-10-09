@@ -30,8 +30,15 @@ class BNDLLoss(nn.Module):
         total_part3_w = 0.0
 
         for outs in outs_batch:
-            if "multistep_bndl_outputs" in outs:
+            # 从统一的 aux_outputs 中提取 BNDL 命名空间
+            if "multistep_aux_outputs" in outs:
+                aux_list = outs["multistep_aux_outputs"]
+                bndl_outputs_list = [aux.get("bndl") if isinstance(aux, dict) else None for aux in aux_list]
+            elif "multistep_bndl_outputs" in outs:
+                # 向后兼容旧键名
                 bndl_outputs_list = outs["multistep_bndl_outputs"]
+            else:
+                continue
                 step_loss = 0.0
                 valid_steps = 0
                 

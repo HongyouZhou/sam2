@@ -1,0 +1,511 @@
+# @package _global_
+
+scratch:
+  resolution: 1024
+  train_batch_size: 1
+  num_train_workers: 16
+  num_frames: 4
+  max_num_objects: 3
+  base_lr: 5.0e-6
+  vision_lr: 3.0e-06
+  phases_per_epoch: 1
+  num_epochs: 50
+
+dataset:
+  # PATHS to Dataset
+  img_folder: /home/hongyou/dev/data/MOSE_release/train/JPEGImages # PATH to MOSE JPEGImages folder
+  gt_folder: /home/hongyou/dev/data/MOSE_release/train/Annotations # PATH to MOSE Annotations folder
+  file_list_txt: /home/hongyou/dev/ada_samp/sam2/training/assets/MOSE_sample_train_list.txt # Optional PATH to filelist containing a subset of videos to be used for training
+  multiplier: 4
+  # PATHS to MOSE-val dataset
+  val_img_folder: /home/hongyou/dev/data/MOSE_release/train/JPEGImages
+  val_gt_folder: /home/hongyou/dev/data/MOSE_release/train/Annotations
+  val_file_list_txt: /home/hongyou/dev/ada_samp/sam2/training/assets/MOSE_sample_val_list.txt
+  val_multiplier: 4
+
+
+# Video transforms
+vos:
+  train_transforms:
+    - _target_: training.dataset.transforms.ComposeAPI
+      transforms:
+        - _target_: training.dataset.transforms.RandomHorizontalFlip
+          consistent_transform: True
+        - _target_: training.dataset.transforms.RandomAffine
+          degrees: 25
+          shear: 20
+          # scale: [0.9, 1.1]
+          # translate: [0.05, 0.05]
+          image_interpolation: bilinear
+          consistent_transform: True
+          # num_tentatives: 3
+        - _target_: training.dataset.transforms.RandomResizeAPI
+          sizes: ${scratch.resolution}
+          square: true
+          consistent_transform: True
+        - _target_: training.dataset.transforms.ColorJitter
+          consistent_transform: True
+          brightness: 0.1
+          contrast: 0.03
+          saturation: 0.03
+          hue: null
+        - _target_: training.dataset.transforms.RandomGrayscale
+          p: 0.05
+          consistent_transform: True
+        - _target_: training.dataset.transforms.ColorJitter
+          consistent_transform: False
+          brightness: 0.1
+          contrast: 0.05
+          saturation: 0.05
+          hue: null
+        - _target_: training.dataset.transforms.ToTensorAPI
+        - _target_: training.dataset.transforms.NormalizeAPI
+          mean: [0.485, 0.456, 0.406]
+          std: [0.229, 0.224, 0.225]
+
+  val_transforms:
+    - _target_: training.dataset.transforms.ComposeAPI
+      transforms:
+        - _target_: training.dataset.transforms.RandomResizeAPI   # same resize as train
+          sizes: ${scratch.resolution}
+          square: true
+          consistent_transform: True          # single deterministic resize
+        - _target_: training.dataset.transforms.ToTensorAPI
+        - _target_: training.dataset.transforms.NormalizeAPI
+          mean: [0.485, 0.456, 0.406]
+          std:  [0.229, 0.224, 0.225] 
+
+trainer:
+  _target_: training.trainer.Trainer
+  mode: train 
+  max_epochs: ${times:${scratch.num_epochs},${scratch.phases_per_epoch}}
+  accelerator: cuda
+  seed_value: 123
+
+  model:
+    _target_: training.model.sam2.SAM2Train
+    image_encoder:
+      _target_: sam2.modeling.backbones.image_encoder.ImageEncoder
+      scalp: 1
+      trunk:
+        _target_: sam2.modeling.backbones.hieradet.Hiera
+        embed_dim: 112
+        num_heads: 2
+        drop_path_rate: 0.1
+      neck:
+        _target_: sam2.modeling.backbones.image_encoder.FpnNeck
+        position_encoding:
+          _target_: sam2.modeling.position_encoding.PositionEmbeddingSine
+          num_pos_feats: 256
+          normalize: true
+          scale: null
+          temperature: 10000
+        d_model: 256
+        backbone_channel_list: [896, 448, 224, 112]
+        fpn_top_down_levels: [2, 3]  # output level 0 and 1 directly use the backbone features
+        fpn_interp_model: nearest
+
+    memory_attention:
+      _target_: sam2.modeling.memory_attention.MemoryAttention
+      d_model: 256
+      pos_enc_at_input: true
+      layer:
+        _target_: sam2.modeling.memory_attention.MemoryAttentionLayer
+        activation: relu
+        dim_feedforward: 2048
+        dropout: 0.1
+        pos_enc_at_attn: false
+        self_attention:
+          _target_: sam2.modeling.sam.transformer.RoPEAttention
+          rope_theta: 10000.0
+          feat_sizes: [64, 64]
+          embedding_dim: 256
+          num_heads: 1
+          downsample_rate: 1
+          dropout: 0.1
+        d_model: 256
+        pos_enc_at_cross_attn_keys: true
+        pos_enc_at_cross_attn_queries: false
+        cross_attention:
+          _target_: sam2.modeling.sam.transformer.RoPEAttention
+          rope_theta: 10000.0
+          feat_sizes: [64, 64]
+          rope_k_repeat: True
+          embedding_dim: 256
+          num_heads: 1
+          downsample_rate: 1
+          dropout: 0.1
+          kv_in_dim: 64
+      num_layers: 4
+
+    memory_encoder:
+        _target_: sam2.modeling.memory_encoder.MemoryEncoder
+        out_dim: 64
+        position_encoding:
+          _target_: sam2.modeling.position_encoding.PositionEmbeddingSine
+          num_pos_feats: 64
+          normalize: true
+          scale: null
+          temperature: 10000
+        mask_downsampler:
+          _target_: sam2.modeling.memory_encoder.MaskDownSampler
+          kernel_size: 3
+          stride: 2
+          padding: 1
+        fuser:
+          _target_: sam2.modeling.memory_encoder.Fuser
+          layer:
+            _target_: sam2.modeling.memory_encoder.CXBlock
+            dim: 256
+            kernel_size: 7
+            padding: 3
+            layer_scale_init_value: 1e-6
+            use_dwconv: True  # depth-wise convs
+          num_layers: 2
+
+    num_maskmem: 7
+    image_size: ${scratch.resolution}
+    # apply scaled sigmoid on mask logits for memory encoder, and directly feed input mask as output mask
+    sigmoid_scale_for_mem_enc: 20.0
+    sigmoid_bias_for_mem_enc: -10.0
+    use_mask_input_as_output_without_sam: true
+    # Memory
+    directly_add_no_mem_embed: true
+    no_obj_embed_spatial: true
+    # use high-resolution feature map in the SAM mask decoder
+    use_high_res_features_in_sam: true
+    # output 3 masks on the first click on initial conditioning frames
+    multimask_output_in_sam: true
+    # SAM heads
+    iou_prediction_use_sigmoid: True
+    # cross-attend to object pointers from other frames (based on SAM output tokens) in the encoder
+    use_obj_ptrs_in_encoder: true
+    add_tpos_enc_to_obj_ptrs: true
+    proj_tpos_enc_in_obj_ptrs: true
+    use_signed_tpos_enc_to_obj_ptrs: true
+    only_obj_ptrs_in_the_past_for_eval: true
+    # object occlusion prediction
+    pred_obj_scores: true
+    pred_obj_scores_mlp: true
+    fixed_no_obj_ptr: true
+    # multimask tracking settings
+    multimask_output_for_tracking: true
+    use_multimask_token_for_obj_ptr: true
+    multimask_min_pt_num: 0
+    multimask_max_pt_num: 1
+    use_mlp_for_obj_ptr_proj: true
+    # BNDL (关闭，与 UR-ERN 互斥)
+    use_bndl_for_pixels: false
+    bndl_fuse_type: none
+    bndl_replace_global_with_hyper: false
+    bndl_hyper_in_sparse: false
+    # UR-ERN (开启)
+    use_ur_ern_for_pixels: true
+    # DSU options
+    use_dsu: false
+    dsu_strength_mu: 0.1
+    dsu_strength_sigma: 0.1
+    dsu_prob: 1.0
+    dsu_apply_high_res: true
+    dsu_stats_eps: 1e-6
+    # Compilation flag
+    # compile_image_encoder: False
+
+    # AdCo options (关闭，UR-ERN 不依赖 BNDL 采样)
+    use_adco: false
+    adco_proj_dim: 256
+    adco_queue_size: 65536
+    adco_temperature: 0.2
+    adco_use_uncertainty: false
+    # UQ-aware AdCo controls
+    adco_gate_by_uncertainty: false
+    adco_gate_floor: 0.2
+    adco_tau_beta: 0.7
+    adco_uncertainty_mask_threshold: 0.4
+    adco_scale_neg_by_uq: true
+    adco_curriculum_warmup_steps: 2000
+
+    # ProCo options (关闭)
+    use_proco: false
+    proco_proj_dim: 256
+    proco_num_obj_prototypes: 128
+    proco_num_bg_prototypes: 32
+    proco_temperature: 0.1
+    
+    # MoCo options (关闭)
+    use_moco: false
+    moco_proj_dim: 256
+    moco_queue_size: 65536
+    moco_momentum: 0.996
+    moco_temperature: 0.2
+
+    # ROI sharing
+    share_roi_views: true
+
+    ####### Training specific params #######
+    # box/point input and corrections
+    prob_to_use_pt_input_for_train: 0.5
+    prob_to_use_pt_input_for_eval: 0.0
+    prob_to_use_box_input_for_train: 0.5  # 0.5*0.5 = 0.25 prob to use box instead of points
+    prob_to_use_box_input_for_eval: 0.0
+    prob_to_sample_from_gt_for_train: 0.1  # with a small prob, sampling correction points from GT mask instead of prediction errors
+    num_frames_to_correct_for_train: 2  # iteratively sample on random 1~2 frames (always include the first frame)
+    num_frames_to_correct_for_eval: 1  # only iteratively sample on first frame
+    rand_frames_to_correct_for_train: True  # random #init-cond-frame ~ 2
+    add_all_frames_to_correct_as_cond: True  # when a frame receives a correction click, it becomes a conditioning frame (even if it's not initially a conditioning frame)
+    # maximum 2 initial conditioning frames
+    num_init_cond_frames_for_train: 2
+    rand_init_cond_frames_for_train: True  # random 1~2
+    num_correction_pt_per_frame: 7
+    use_act_ckpt_iterative_pt_sampling: false
+    
+
+    
+    num_init_cond_frames_for_eval: 1  # only mask on the first frame
+    forward_backbone_per_frame_for_eval: True
+    
+
+  data:
+    train:
+      _target_: training.dataset.sam2_datasets.TorchTrainMixedDataset
+      phases_per_epoch: ${scratch.phases_per_epoch}
+      batch_sizes:
+        - ${scratch.train_batch_size}
+
+      datasets:
+        - _target_: training.dataset.utils.RepeatFactorWrapper
+          dataset:
+            _target_: training.dataset.utils.ConcatDataset
+            datasets:
+            - _target_: training.dataset.vos_dataset.VOSDataset
+              transforms: ${vos.train_transforms}
+              training: true
+              video_dataset:
+                _target_: training.dataset.vos_raw_dataset.PNGRawDataset
+                img_folder: ${dataset.img_folder}
+                gt_folder: ${dataset.gt_folder}
+                file_list_txt: ${dataset.file_list_txt}
+              sampler:
+                _target_: training.dataset.vos_sampler.RandomUniformSampler
+                num_frames: ${scratch.num_frames}
+                max_num_objects: ${scratch.max_num_objects}
+              multiplier: ${dataset.multiplier}
+      shuffle: True
+      num_workers: ${scratch.num_train_workers}
+      pin_memory: True
+      drop_last: True
+      collate_fn:
+        _target_: training.utils.data_utils.collate_fn
+        _partial_: true
+        dict_key: all
+
+    # MOSE-val dataset
+    val:
+      _target_: training.dataset.sam2_datasets.TorchTrainMixedDataset
+      phases_per_epoch: 1
+      batch_sizes:
+        - 1
+
+      datasets:                                        # single MOSE-val dataset
+        - _target_: training.dataset.vos_dataset.VOSDataset
+          transforms: ${vos.val_transforms}
+          training: false                              # <-- IMPORTANT
+          video_dataset:
+            _target_: training.dataset.vos_raw_dataset.PNGRawDataset
+            img_folder: ${dataset.val_img_folder}
+            gt_folder:  ${dataset.val_gt_folder}
+            file_list_txt: ${dataset.val_file_list_txt}
+          # sampler:
+          #   _target_: training.dataset.vos_sampler.EvalSampler  # sample all frames/objects
+          sampler:
+            _target_: training.dataset.vos_sampler.RandomUniformSampler
+            num_frames: ${scratch.num_frames}
+            max_num_objects: ${scratch.max_num_objects}
+          multiplier: ${dataset.val_multiplier}
+
+      shuffle: False
+      num_workers: ${scratch.num_train_workers}
+      pin_memory: True
+      drop_last: False
+      collate_fn:
+        _target_: training.utils.data_utils.collate_fn
+        _partial_: true
+        dict_key: val   
+
+  optim:
+    amp:
+      enabled: True
+      amp_dtype: bfloat16
+
+    optimizer:
+      _target_: torch.optim.AdamW
+
+    gradient_clip:
+      _target_: training.optimizer.GradientClipper
+      max_norm: 0.1
+      norm_type: 2
+
+    param_group_modifiers:
+      - _target_: training.optimizer.layer_decay_param_modifier
+        _partial_: True
+        layer_decay_value: 0.9
+        apply_to: 'image_encoder.trunk'
+        overrides:
+          - pattern: '*pos_embed*'
+            value: 1.0
+
+    # options:
+    #   lr:
+    #     - scheduler:
+    #         _target_: fvcore.common.param_scheduler.CosineParamScheduler
+    #         start_value: ${scratch.base_lr}
+    #         end_value: ${divide:${scratch.base_lr},10}
+    #     - scheduler:
+    #         _target_: fvcore.common.param_scheduler.CosineParamScheduler
+    #         start_value: ${scratch.vision_lr}
+    #         end_value: ${divide:${scratch.vision_lr},10}
+    #       param_names:
+    #         - 'image_encoder.*'
+    #   weight_decay:
+    #     - scheduler:
+    #         _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+    #         value: 0.1
+    #     - scheduler:
+    #         _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+    #         value: 0.0
+    #       param_names:
+    #         - '*bias*'
+    #       module_cls_names: ['torch.nn.LayerNorm']
+    options:
+      lr:
+        - scheduler:
+            _target_: fvcore.common.param_scheduler.CosineParamScheduler
+            start_value: 1.0e-6          # 通用/其余模块很小的LR
+            end_value: 1.0e-7
+        - scheduler:
+            _target_: fvcore.common.param_scheduler.CosineParamScheduler
+            start_value: 1.0e-7          # 骨干极小LR（基本冻结）
+            end_value: 1.0e-7
+          param_names:
+            - 'image_encoder.*'
+        - scheduler:
+            _target_: fvcore.common.param_scheduler.CosineParamScheduler
+            start_value: 5.0e-4          # UR-ERN 头的学习率
+            end_value: 1.0e-4
+          param_names:
+            - 'sam_mask_decoder.ur_ern_head.*'
+      weight_decay:
+        - scheduler:
+            _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+            value: 0.01
+
+  loss:
+    all:
+      # _target_: training.loss_fns.MultiStepMultiMasksAndIous
+      # weight_dict:
+      #   loss_mask: 20
+      #   loss_dice: 1
+      #   loss_iou: 1
+      #   loss_class: 1
+      # supervise_all_iou: true
+      # iou_use_l1_loss: true
+      # pred_obj_scores: true
+      # focal_gamma_obj_score: 0.0
+      # focal_alpha_obj_score: -1.0
+      _target_: training.loss_combined.CombinedSAMBNDLLoss
+      sam_loss:
+        _target_: training.loss_fns.MultiStepMultiMasksAndIous
+        weight_dict:
+          loss_mask: 20.0
+          loss_dice: 1.0
+          loss_iou: 1.0
+          loss_class: 1.0
+        supervise_all_iou: true
+        iou_use_l1_loss: true
+        pred_obj_scores: true
+        focal_gamma_obj_score: 0.0
+        focal_alpha_obj_score: -1.0
+      bndl_loss:
+        _target_: training.loss_bndl.BNDLLoss
+        kl_weight: 0.0  # BNDL 关闭，权重设为 0
+      ur_ern_loss:
+        _target_: training.loss_ur_ern.URERNLoss
+        lambda_ur: 0.005  # UR 正则权重，起步值
+        label_smoothing: 0.02  # 二值标签平滑
+      sam_weight: 1.0
+      bndl_weight: 0.0  # BNDL 关闭
+      ur_ern_weight: 1.0  # UR-ERN 主要监督信号
+      adco_loss: null  # 不使用 AdCo
+      adco_weight: 0.0
+      proco_loss: null  # 不使用 ProCo
+      proco_weight: 0.0
+      moco_loss: null  # 不使用 MoCo
+      moco_weight: 0.0
+    # val:
+    #   _target_: training.loss_combined.CombinedSAMBNDLLoss
+    #   sam_loss: ${trainer.loss.all.sam_loss}
+    #   bndl_loss: ${trainer.loss.all.bndl_loss}
+    #   sam_weight: ${trainer.loss.all.sam_weight}
+    #   bndl_weight: ${trainer.loss.all.bndl_weight}
+    val:                                                # NEW – identical settings
+      _target_: training.loss_fns.MultiStepMultiMasksAndIous
+      weight_dict: ${trainer.loss.all.sam_loss.weight_dict}
+      supervise_all_iou: ${trainer.loss.all.sam_loss.supervise_all_iou}
+      iou_use_l1_loss: ${trainer.loss.all.sam_loss.iou_use_l1_loss}
+      pred_obj_scores: ${trainer.loss.all.sam_loss.pred_obj_scores}
+      focal_gamma_obj_score: ${trainer.loss.all.sam_loss.focal_gamma_obj_score}
+      focal_alpha_obj_score: ${trainer.loss.all.sam_loss.focal_alpha_obj_score}
+
+  distributed:
+    backend: nccl
+    find_unused_parameters: True
+
+  logging:
+    tensorboard_writer:
+      _target_: training.utils.logger.make_tensorboard_logger
+      log_dir:  ${launcher.experiment_log_dir}/tensorboard
+      flush_secs: 120
+      should_log: True
+    log_dir: ${launcher.experiment_log_dir}/logs
+    log_freq: 10
+    log_scalar_frequency: 100
+    visualize_bndl: true
+    uncertainty_metric: ["entropy", "nll"] 
+    visualize_pavpu_overlay: true
+    uncertainty_sample_num: 50
+
+  # initialize from a SAM 2 checkpoint
+  checkpoint:
+    save_dir: ${launcher.experiment_log_dir}/checkpoints
+    save_freq: 10 # 0 only last checkpoint is saved.
+    model_weight_initializer:
+      _partial_: True
+      _target_: training.utils.checkpoint_utils.load_state_dict_into_model
+      strict: False
+      ignore_missing_keys: [
+          "sam_mask_decoder.ur_ern_head.*",  # UR-ERN 头从头训练，不在预训练权重中
+      ]
+      ignore_unexpected_keys: [
+          # "sam_mask_decoder.pixel_bndl.*",
+      ]
+      state_dict:
+        _target_: training.utils.checkpoint_utils.load_checkpoint_and_apply_kernels
+        checkpoint_path: /home/hongyou/dev/ada_samp/sam2/checkpoints/sam2.1_hiera_base_plus.pt # PATH to SAM 2.1 checkpoint
+        ckpt_state_dict_keys: ['model']
+
+launcher:
+  num_nodes: 1
+  gpus_per_node: 8
+  experiment_log_dir: /home/hongyou/dev/ada_samp/logs/sam2/sam2_ur_ern_001_01 # Path to log directory, defaults to ./sam2_logs/${config_name}
+
+# SLURM args if running on a cluster
+submitit:
+  partition: null
+  account: null
+  qos: null
+  cpus_per_task: 10
+  use_cluster: false
+  timeout_hour: 24
+  name: null
+  port_range: [10000, 65000]
+

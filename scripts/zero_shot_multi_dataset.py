@@ -623,6 +623,8 @@ def inference_interactive(
         with open(out_dir / vid / "query_prompts.json", "w") as f:
             json.dump({int(k): v for k, v in prompt_specs.items()}, f, indent=2)
 
+        # Critical: Reset predictor state to free memory for this video
+        predictor.reset_state(state)
         torch.cuda.empty_cache()
 
 

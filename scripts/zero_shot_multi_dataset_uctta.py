@@ -2,12 +2,9 @@
 # Multi-dataset Zero-shot evaluation of SAM-2 with UCTTA (Uncertainty-Calibrated Test-Time Adaptation)
 # Based on "Uncertainty-Calibrated Test-Time Model Adaptation without Forgetting" (TPAMI 2025)
 
-import argparse
-import json
 import shutil
 from pathlib import Path
 from typing import Any, Optional
-from collections import defaultdict
 import os
 import sys
 
@@ -37,6 +34,7 @@ from training.utils.dataset_evaluator import DistributedDatasetEvaluator
 
 # ----------  Unified click prompt generator ----------
 from prompt_generation import generate_click_prompts
+from prompt_loader import load_reused_prompts, apply_reused_prompts
 
 # Add path for visualization utils
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "training", "utils"))
@@ -371,7 +369,8 @@ def inference_with_uctta(
     # Prepare dataset evaluator (optional)
     dataset_eval = None
     if collect_statistics:
-        eval_dir = out_dir.parent / (f"{dataset_name.lower()}_uctta_eval" if dataset_name else "uctta_eval")
+        # Use consistent path format: <output_root>/<dataset>_uctta_eval
+        eval_dir = out_dir.parent / f"{dataset_name.lower()}_uctta_eval" if dataset_name else (out_dir.parent / "uctta_eval")
         eval_dir.mkdir(parents=True, exist_ok=True)
         dataset_eval = DistributedDatasetEvaluator(save_dir=str(eval_dir), distributed=False, rank=0, world_size=1)
 
@@ -397,74 +396,29 @@ def inference_with_uctta(
             continue
         print(f"Processing {len(obj_ids)} objects in video {vid}: {obj_ids}")
 
-        # Reuse prompts if provided (ensures consistent clicks across methods)
-        prompts_json = None
-        if reuse_prompts_root is not None and dataset_name is not None:
-            candidate = reuse_prompts_root / f"{dataset_name.lower()}_pred" / vid / "query_prompts.json"
-            if candidate.exists():
-                try:
-                    with open(candidate) as f:
-                        prompts_json = {int(k): v for k, v in json.load(f).items()}
-                    print(f"Loaded reused prompts for video {vid} from {candidate}")
-                except Exception as e:
-                    print(f"Warning: Failed to load reused prompts {candidate}: {e}")
+        # Load reused prompts if available
+        prompts_json = load_reused_prompts(reuse_prompts_root, dataset_name, vid)
+        if prompts_json:
+            print(f"Loaded reused prompts for video {vid}")
 
-        # Resolve protocol knobs
-        _click_protocol = (click_protocol or "").strip() or "3click"
-        _min_click_dist = float(12.0 if min_click_dist is None else min_click_dist)
+        # Set random seed for reproducibility
         if seed is not None:
-            try:
-                np.random.seed(int(seed))
-            except Exception:
-                pass
+            np.random.seed(int(seed))
 
+        # Apply prompts for each object
         for obj_id in obj_ids:
             gt_bool = first_mask_np == obj_id
             if not np.any(gt_bool):
-                print(f"Warning: Empty GT for obj {obj_id} in {vid}")
                 continue
             
-            # If reused prompts exist, apply them; otherwise always use click protocol generation
+            # Try reused prompts first, fall back to generation
+            prompt_applied = False
             if prompts_json and obj_id in prompts_json:
-                spec = prompts_json[obj_id]
-                if spec.get("type") in {"1click", "3click", "5click"} and "clicks" in spec:
-                    clicks = spec["clicks"]
-                    # first click
-                    if len(clicks) >= 1:
-                        c0 = clicks[0]
-                        predictor.add_new_points_or_box(
-                            state,
-                            frame_idx=0,
-                            obj_id=obj_id,
-                            points=np.array([[int(c0["xy"][0]), int(c0["xy"][1])]], dtype=np.float32),
-                            labels=np.array([int(c0["label"])], dtype=np.int32),
-                        )
-                    # subsequent clicks
-                    for c in clicks[1:]:
-                        predictor.add_new_points_or_box(
-                            state,
-                            frame_idx=0,
-                            obj_id=obj_id,
-                            points=np.array([[int(c["xy"][0]), int(c["xy"][1])]], dtype=np.float32),
-                            labels=np.array([int(c["label"])], dtype=np.int32),
-                            clear_old_points=False,
-                        )
-                else:
-                    # Unknown prompt type, use protocol generation (no GT box fallback)
-                    used_pts, used_labels = generate_click_prompts(
-                        predictor,
-                        state,
-                        frame_idx=0,
-                        obj_id=obj_id,
-                        gt_bool=gt_bool,
-                        first_frame_mask_np=first_mask_np,
-                        score_thresh=score_thresh,
-                        click_protocol=_click_protocol,
-                        min_click_dist=_min_click_dist,
-                    )
-            else:
-                # No reused prompts; always use click protocol generation (no GT box fallback)
-                used_pts, used_labels = generate_click_prompts(
+                prompt_applied = apply_reused_prompts(predictor, state, obj_id, prompts_json[obj_id])
+            
+            if not prompt_applied:
+                # Generate new prompts using click protocol
+                generate_click_prompts(
                     predictor,
                     state,
                     frame_idx=0,
@@ -472,8 +426,8 @@ def inference_with_uctta(
                     gt_bool=gt_bool,
                     first_frame_mask_np=first_mask_np,
                     score_thresh=score_thresh,
-                    click_protocol=_click_protocol,
-                    min_click_dist=_min_click_dist,
+                    click_protocol=click_protocol or "3click",
+                    min_click_dist=float(min_click_dist or 12.0),
                 )
 
         # Per-video temperature parameter + adaptable model params
@@ -571,13 +525,11 @@ def inference_with_uctta(
             # Add to dataset evaluator (sample a few objects to limit memory)
             if dataset_eval is not None and len(out_obj_ids) > 0:
                 try:
-                    # Load GT for current frame
+                    # Load GT for current frame (full multi-object mask)
                     gt_path = ann_dir / vid / f"{frame_names[f_idx]}.png"
+                    gt_full_np = None
                     if gt_path.exists():
-                        gt_np = np.array(Image.open(gt_path))
-                        gt_tensor = torch.from_numpy(gt_np).float().unsqueeze(0).to(predictor.device)  # [1,H,W]
-                    else:
-                        gt_tensor = None
+                        gt_full_np = np.array(Image.open(gt_path))
 
                     max_obj_stats = 3
                     # Build per-frame stacked logits [K,H,W] for visualization/accuracy proxy
@@ -596,8 +548,10 @@ def inference_with_uctta(
                         u_map = _entropy_map_from_logits_scaled(logits_2d, logT)  # [H,W]
                         per_object_uncertainties.append(u_map.unsqueeze(0))  # [1,H,W]
                         stacked_logits.append(logits_2d.unsqueeze(0))  # [1,H,W]
-                        # Add to evaluator if GT available
-                        if gt_tensor is not None:
+                        # Add to evaluator if GT available - extract binary mask for THIS object only
+                        if gt_full_np is not None:
+                            gt_binary = (gt_full_np == oid).astype(np.float32)  # Extract this object's mask
+                            gt_tensor = torch.from_numpy(gt_binary).unsqueeze(0).to(predictor.device)  # [1,H,W]
                             dataset_eval.add_batch_data(uncertainty=u_map.unsqueeze(0), pred_logits=logits_2d.unsqueeze(0), gt_masks=gt_tensor)
 
                     # Once per frame: create UA ratio visualization using all available objects
@@ -641,6 +595,11 @@ def inference_with_uctta(
                 per_obj_png_file=False,
                 output_palette=DAVIS_PALETTE,
             )
+        
+        # Critical: Reset predictor state to free memory for this video
+        predictor.reset_state(state)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     # Finalize dataset correlation visualization/results
     if dataset_eval is not None and len(dataset_eval) > 0:

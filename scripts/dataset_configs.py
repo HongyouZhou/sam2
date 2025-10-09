@@ -170,19 +170,32 @@ DATASET_CONFIGS = {
         "has_split_subdir": True,
         "skip_first_and_last": False,
     },
-    "MOSE": {
+    # MOSE split for domain shift analysis
+    # Both use MOSE official train set (val set has no GT), split via different file lists
+    "MOSE_train": {
         "root": "/ssdArray/hongyou/dev/data/MOSE_release/",
         "splits": ["train"],
         "default_split": ["train"],
-        "has_split_subdir": True,  # MOSE has JPEGImages and Annotations under train/ subdirectory
+        "has_split_subdir": True,
         "skip_first_and_last": False,
-        "file_list_txt": "/home/hongyou/dev/ada_samp/sam2/training/assets/MOSE_sample_train_list.txt",  # Use the specified file list
+        "file_list_txt": "/home/hongyou/dev/ada_samp/sam2/training/assets/MOSE_sample_train_list.txt",  # 1246 videos (86%)
+        "note": "Source domain for BNDL/UR-ERN fine-tuning",
+    },
+    "MOSE_val": {
+        "root": "/ssdArray/hongyou/dev/data/MOSE_release/",
+        "splits": ["train"],  # Note: still uses 'train' directory (official val has no GT)
+        "default_split": ["train"],
+        "has_split_subdir": True,
+        "skip_first_and_last": False,
+        "file_list_txt": "/home/hongyou/dev/ada_samp/sam2/training/assets/MOSE_sample_val_list.txt",  # 200 videos (14%)
+        "note": "Within-domain baseline for domain shift analysis",
     },
 }
 
 # Default dataset list for evaluation
 DEFAULT_DATASETS = [
-    "MOSE",
+    "MOSE_train",  # Source domain (fine-tune domain for BNDL/UR-ERN, 1246 videos)
+    "MOSE_val",    # Within-domain baseline (200 videos)
     "TrashCan",
     "GTEA",
     "PIDRay",
@@ -247,6 +260,7 @@ DATASET_TO_TYPE: dict[str, str] = {
     "EgoHOS": "EGO_VIDEO",
     "VISOR": "EGO_VIDEO",
     "OVIS": "EGO_VIDEO",
-    "MOSE": "EGO_VIDEO",
+    "MOSE_train": "EGO_VIDEO",  # MOSE train split (1246 videos) - fine-tune domain
+    "MOSE_val": "EGO_VIDEO",    # MOSE val split (200 videos) - within-domain test
     "DRAM": "EGO_VIDEO",
 }

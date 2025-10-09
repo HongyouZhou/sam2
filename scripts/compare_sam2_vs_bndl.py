@@ -29,6 +29,9 @@ from zero_shot_multi_dataset_sam_bndl import (
 from zero_shot_multi_dataset_uctta import (
     run_single_dataset_with_uctta as run_uctta_dataset,
 )
+from zero_shot_multi_dataset_ur_ern import (
+    run_single_dataset_with_ur_ern as run_ur_ern_dataset,
+)
 
 matplotlib.use("Agg")  # Use non-interactive backend
 
@@ -40,6 +43,8 @@ def run_comparison_evaluation(
     bndl_cfg: str,
     bndl_checkpoint: str,
     output_path: Path,
+    ur_ern_cfg: str | None = None,
+    ur_ern_checkpoint: str | None = None,
     device: str = "cuda",
     score_thresh: float = 0.0,
     thresh_grid: list[float] | None = None,
@@ -55,6 +60,7 @@ def run_comparison_evaluation(
     run_sam: bool = True,
     run_uctta: bool = False,
     run_bndl: bool = True,
+    run_ur_ern: bool = False,
     # click protocol passed to baseline SAM run so prompts are saved
     click_protocol: str = "3click",
     min_click_dist: float = 12.0,
@@ -70,8 +76,10 @@ def run_comparison_evaluation(
     dict[str, tuple[float, float, float]],  # bndl_results
     dict[str, Any],                          # bndl_statistics
     dict[str, tuple[float, float, float]] | None,  # uctta_results
+    dict[str, tuple[float, float, float]] | None,  # ur_ern_results
     dict[str, dict[str, Any]],              # ua_data_per_dataset
     dict[str, Any],                          # uctta_statistics
+    dict[str, Any],                          # ur_ern_statistics
 ]:
     """Run both SAM-2 and SAM-2+BNDL evaluations and return results"""
 
@@ -83,12 +91,15 @@ def run_comparison_evaluation(
     sam2_output = output_path / "sam2_results"
     bndl_output = output_path / "bndl_results"
     uctta_output = output_path / "sam2_uctta_results"
+    ur_ern_output = output_path / "sam2_ur_ern_results"
     if run_sam:
         sam2_output.mkdir(parents=True, exist_ok=True)
     if run_bndl:
         bndl_output.mkdir(parents=True, exist_ok=True)
     if run_uctta:
         uctta_output.mkdir(parents=True, exist_ok=True)
+    if run_ur_ern:
+        ur_ern_output.mkdir(parents=True, exist_ok=True)
 
     # Build both predictors with identical Hydra overrides to ensure strict consistency
     hydra_overrides_extra = [
@@ -117,12 +128,28 @@ def run_comparison_evaluation(
     )
     print("SAM-2+BNDL loaded successfully!")
 
+    # Load SAM-2+UR-ERN predictor with the same overrides (if needed)
+    ur_ern_predictor = None
+    if run_ur_ern:
+        if ur_ern_cfg is None or ur_ern_checkpoint is None:
+            raise ValueError("UR-ERN requires both ur_ern_cfg and ur_ern_checkpoint to be specified")
+        print("\nLoading SAM-2+UR-ERN checkpoint...")
+        ur_ern_predictor = build_sam2_video_predictor(
+            config_file=ur_ern_cfg,
+            ckpt_path=ur_ern_checkpoint,
+            device=device,
+            hydra_overrides_extra=hydra_overrides_extra,
+        )
+        print("SAM-2+UR-ERN loaded successfully!")
+
     # Run evaluations
     sam2_results = {}
     bndl_results = {}
     uctta_results: dict[str, tuple[float, float, float]] | dict[str, list[tuple[float, float, float, float]]] | None = {} if run_uctta else None
+    ur_ern_results: dict[str, tuple[float, float, float]] | None = {} if run_ur_ern else None
     bndl_statistics = {}
     uctta_statistics = {}  # Store UCTTA statistics per dataset
+    ur_ern_statistics = {}  # Store UR-ERN statistics per dataset
     ua_data_per_dataset = {}  # Store UA data for each dataset
 
     total_start_time = time.time()
@@ -242,7 +269,7 @@ def run_comparison_evaluation(
                         first_frame_only=first_frame_only,
                         max_objects=max_objects,
                         collect_statistics=True,  # Force collect statistics for comparison
-                        reuse_prompts_root=sam2_output,  # Reuse prompts saved by the SAM run
+                        reuse_prompts_root=sam2_output if run_sam else None,  # Only reuse prompts if SAM ran
                         click_protocol=click_protocol,
                         min_click_dist=min_click_dist,
                         seed=seed,
@@ -252,6 +279,35 @@ def run_comparison_evaluation(
                     if dataset_stats:
                         bndl_statistics[dataset_name] = dataset_stats
                     print(f"BNDL  @ {th:.2f} - J&F: {j_f_bndl:.2f}, J: {j_bndl:.2f}, F: {f_bndl:.2f} (Time: {bndl_time:.2f}s)")
+
+                # Run SAM-2+UR-ERN evaluation
+                if run_ur_ern and ur_ern_predictor is not None:
+                    print(f"--- Running SAM-2+UR-ERN evaluation for {dataset_name} @ thresh={th} ---")
+                    ur_ern_start = time.time()
+                    j_f_ur_ern, j_ur_ern, f_ur_ern, dataset_stats = run_ur_ern_dataset(
+                        dataset_name=dataset_name,
+                        predictor=ur_ern_predictor,
+                        output_path=ur_ern_output,
+                        score_thresh=th,
+                        num_workers=num_workers,
+                        video_subset=video_subset,
+                        save_ur_ern_vis=save_vis,
+                        prompt_method=prompt_method,
+                        first_frame_only=first_frame_only,
+                        max_objects=max_objects,
+                        collect_statistics=True,  # Force collect statistics for comparison
+                        reuse_prompts_root=sam2_output if run_sam else None,  # Only reuse prompts if SAM ran
+                        click_protocol=click_protocol,
+                        min_click_dist=min_click_dist,
+                        seed=seed,
+                    )
+                    ur_ern_time = time.time() - ur_ern_start
+                    if dataset_name not in ur_ern_results:
+                        ur_ern_results[dataset_name] = []
+                    ur_ern_results[dataset_name].append((th, j_f_ur_ern, j_ur_ern, f_ur_ern))
+                    if dataset_stats:
+                        ur_ern_statistics[dataset_name] = dataset_stats
+                    print(f"UR-ERN @ {th:.2f} - J&F: {j_f_ur_ern:.2f}, J: {j_ur_ern:.2f}, F: {f_ur_ern:.2f} (Time: {ur_ern_time:.2f}s)")
 
             # Print per-threshold summary for this dataset
             if run_sam:
@@ -266,6 +322,10 @@ def run_comparison_evaluation(
                 print("Per-threshold summary (BNDL):")
                 for th, jf, j, f in bndl_per_thresh:
                     print(f"  th={th:.2f}: J&F={jf:.2f}, J={j:.2f}, F={f:.2f}")
+            if run_ur_ern and isinstance(ur_ern_results, dict) and dataset_name in ur_ern_results:
+                print("Per-threshold summary (UR-ERN):")
+                for th, jf, j, f in ur_ern_results[dataset_name]:
+                    print(f"  th={th:.2f}: J&F={jf:.2f}, J={j:.2f}, F={f:.2f}")
 
             # Select best-threshold result per method by J&F
             if run_sam and sam2_per_thresh:
@@ -278,6 +338,10 @@ def run_comparison_evaluation(
                 best_uctta = max((uctta_results[dataset_name]), key=lambda x: x[1])  # type: ignore[index]
                 # Replace list with best tuple
                 uctta_results[dataset_name] = (best_uctta[1], best_uctta[2], best_uctta[3])  # type: ignore[index]
+            if run_ur_ern and isinstance(ur_ern_results, dict) and dataset_name in ur_ern_results and len(ur_ern_results[dataset_name]) > 0:
+                best_ur_ern = max(ur_ern_results[dataset_name], key=lambda x: x[1])
+                # Replace list with best tuple
+                ur_ern_results[dataset_name] = (best_ur_ern[1], best_ur_ern[2], best_ur_ern[3])
 
             if run_sam and sam2_per_thresh:
                 print(f"\nBest (SAM-2) th={best_sam2[0]:.2f} -> J&F: {best_sam2[1]:.2f}, J: {best_sam2[2]:.2f}, F: {best_sam2[3]:.2f}")
@@ -285,6 +349,8 @@ def run_comparison_evaluation(
                 print(f"Best (BNDL ) th={best_bndl[0]:.2f} -> J&F: {best_bndl[1]:.2f}, J: {best_bndl[2]:.2f}, F: {best_bndl[3]:.2f}")
             if run_uctta and isinstance(uctta_results, dict) and dataset_name in uctta_results and isinstance(uctta_results[dataset_name], tuple):
                 print(f"Best (UCTTA) -> J&F: {uctta_results[dataset_name][0]:.2f}, J: {uctta_results[dataset_name][1]:.2f}, F: {uctta_results[dataset_name][2]:.2f}")
+            if run_ur_ern and isinstance(ur_ern_results, dict) and dataset_name in ur_ern_results and isinstance(ur_ern_results[dataset_name], tuple):
+                print(f"Best (UR-ERN) -> J&F: {ur_ern_results[dataset_name][0]:.2f}, J: {ur_ern_results[dataset_name][1]:.2f}, F: {ur_ern_results[dataset_name][2]:.2f}")
 
             # Improvement at respective best thresholds
             if run_sam and run_bndl and sam2_per_thresh and bndl_per_thresh:
@@ -300,7 +366,10 @@ def run_comparison_evaluation(
     total_time = time.time() - total_start_time
     print(f"\nTotal evaluation time: {total_time:.2f}s")
 
-    return sam2_results, bndl_results, bndl_statistics, (uctta_results if isinstance(uctta_results, dict) else None), ua_data_per_dataset, uctta_statistics
+    return (sam2_results, bndl_results, bndl_statistics, 
+            (uctta_results if isinstance(uctta_results, dict) else None), 
+            (ur_ern_results if isinstance(ur_ern_results, dict) else None), 
+            ua_data_per_dataset, uctta_statistics, ur_ern_statistics)
 
 
 def save_detailed_results(
@@ -309,7 +378,9 @@ def save_detailed_results(
     bndl_results: dict[str, tuple[float, float, float]] | None = None,
     bndl_statistics: dict[str, Any] | None = None,
     uctta_results: dict[str, tuple[float, float, float]] | None = None,
+    ur_ern_results: dict[str, tuple[float, float, float]] | None = None,
     uctta_statistics: dict[str, Any] | None = None,
+    ur_ern_statistics: dict[str, Any] | None = None,
     ua_data: dict[str, dict[str, Any]] | None = None,
 ) -> Path:
     """Save detailed results to JSON file
@@ -335,9 +406,11 @@ def save_detailed_results(
     detailed_results = {
         "sam2_results": {k: {"jf": v[0], "j": v[1], "f": v[2]} for k, v in sam2_results.items()} if sam2_results else {},
         "uctta_results": {k: {"jf": v[0], "j": v[1], "f": v[2]} for k, v in uctta_results.items()} if uctta_results else {},
+        "ur_ern_results": {k: {"jf": v[0], "j": v[1], "f": v[2]} for k, v in ur_ern_results.items()} if ur_ern_results else {},
         "bndl_results": {k: {"jf": v[0], "j": v[1], "f": v[2]} for k, v in bndl_results.items()} if bndl_results else {},
         "bndl_statistics": bndl_statistics if bndl_statistics else {},
         "uctta_statistics": uctta_statistics if uctta_statistics else {},
+        "ur_ern_statistics": ur_ern_statistics if ur_ern_statistics else {},
         "ua_data": ua_data if ua_data else {},
     }
     
@@ -353,8 +426,8 @@ def save_detailed_results(
             for k in common_datasets
         }
         
-        # Calculate averages excluding MOSE
-        non_mose_datasets = [d for d in common_datasets if d != "MOSE"]
+        # Calculate averages excluding MOSE (both train and val)
+        non_mose_datasets = [d for d in common_datasets if not d.startswith("MOSE")]
         if non_mose_datasets:
             import numpy as np
             avg_sam2_jf = float(np.mean([sam2_results[d][0] for d in non_mose_datasets]))
@@ -429,9 +502,9 @@ def create_comprehensive_comparison_plots(
 
     df = pd.DataFrame(df_data)
 
-    # 计算去除 MOSE 的宏平均
+    # 计算去除 MOSE 的宏平均 (排除 MOSE_train 和 MOSE_val)
     averages_excl_mose = None
-    non_mose_idx = [i for i, d in enumerate(datasets) if d != "MOSE"]
+    non_mose_idx = [i for i, d in enumerate(datasets) if not d.startswith("MOSE")]
     if non_mose_idx:
         avg_sam2_jf = float(np.mean([sam2_jf[i] for i in non_mose_idx]))
         avg_bndl_jf = float(np.mean([bndl_jf[i] for i in non_mose_idx]))
@@ -668,10 +741,10 @@ def create_comprehensive_comparison_plots(
             f"{f_improvements[i]:+.2f}",
         ])
 
-    # 在表格中追加平均行（不含 MOSE）
+    # 在表格中追加平均行（不含 MOSE_train/val）
     if averages_excl_mose:
         summary_data.append([
-            "AVG (no MOSE)",
+            "AVG (excl MOSE)",
             "—",
             f"{averages_excl_mose['sam2']['jf']:.2f}",
             f"{averages_excl_mose['bndl']['jf']:.2f}",
@@ -733,10 +806,10 @@ def create_comprehensive_comparison_plots(
             "F_Improvement": f_improvements[i],
         })
 
-    # CSV 中追加平均行（不含 MOSE）
+    # CSV 中追加平均行（不含 MOSE_train/val）
     if averages_excl_mose:
         csv_data.append({
-            "Dataset": "AVG(no MOSE)",
+            "Dataset": "AVG(excl MOSE)",
             "SAM2_JF": averages_excl_mose["sam2"]["jf"],
             "BNDL_JF": averages_excl_mose["bndl"]["jf"],
             "JF_Improvement": averages_excl_mose["improvements"]["jf"],
@@ -760,7 +833,12 @@ def create_ua_shift_analysis_plots(
     output_path: Path,
     uctta_statistics: dict[str, Any] | None = None,
     uctta_results: dict[str, tuple[float, float, float]] | None = None,
-    source_domain: str = "MOSE",
+    ur_ern_results: dict[str, tuple[float, float, float]] | None = None,
+    source_domain: str = "MOSE_train",
+    sam2_root_override: Path | None = None,
+    bndl_root_override: Path | None = None,
+    uctta_root_override: Path | None = None,
+    ur_ern_root_override: Path | None = None,
 ) -> None:
     """Create UA (Uncertainty-Accuracy) shift analysis plots
     
@@ -771,9 +849,18 @@ def create_ua_shift_analysis_plots(
         output_path: Output directory for plots
         uctta_statistics: Optional UCTTA statistics per dataset
         uctta_results: Optional UCTTA performance results
-        source_domain: Source domain for shift comparison (default: MOSE)
+        ur_ern_results: Optional UR-ERN performance results
+        source_domain: Source domain for shift comparison (default: MOSE_train - fine-tune domain)
     """
     print("\nGenerating UA shift analysis plots...")
+    
+    # Define unified color scheme for all methods
+    METHOD_COLORS = {
+        'SAM-2': '#95A5A6',   # Gray - baseline
+        'UCTTA': '#FF6B6B',   # Red/Pink - adaptation method
+        'BNDL': '#4ECDC4',    # Teal/Cyan - our method
+        'UR-ERN': '#95E1D3',  # Light teal/mint - alternative method
+    }
     
     # Extract datasets
     datasets = list(bndl_statistics.keys())
@@ -803,6 +890,11 @@ def create_ua_shift_analysis_plots(
                 if stats and 'pixel_uncertainty_mean' in stats:
                     uctta_uncertainty_data[dataset_name] = float(stats['pixel_uncertainty_mean'])
     
+    # Extract uncertainty metrics from UR-ERN statistics (if available, passed as function parameter)
+    # Note: UR-ERN statistics need to be passed via function call or loaded from ur_ern_root
+    ur_ern_uncertainty_data = {}
+    # Will be populated after loading UR-ERN PCC data below
+    
     if not bndl_uncertainty_data:
         print("No uncertainty data found in BNDL statistics!")
         return
@@ -830,15 +922,13 @@ def create_ua_shift_analysis_plots(
         print("Not enough data points for UA shift analysis!")
         return
     
-    # Determine figure layout based on whether UCTTA data is available
-    if has_uctta:
-        fig = plt.figure(figsize=(24, 16))
-        gs = fig.add_gridspec(3, 4, hspace=0.4, wspace=0.4)
-        title = "UA Consistency Analysis: BNDL vs UCTTA"
-    else:
-        fig = plt.figure(figsize=(20, 12))
-        gs = fig.add_gridspec(2, 3, hspace=0.4, wspace=0.4)
-        title = "UA Consistency Analysis: BNDL across Domains"
+    # Determine figure layout: put all ΔPCC plots together
+    # Row 0: Basic UA analysis (U vs Perf, U comparison, Improvement vs U, U distribution)
+    # Row 1: All ΔPCC plots side by side (BNDL, UCTTA, UR-ERN)
+    # Row 2: Summary table and additional analysis
+    fig = plt.figure(figsize=(24, 18))
+    gs = fig.add_gridspec(3, 4, hspace=0.5, wspace=0.4)
+    title = "UA Consistency Analysis"
     
     fig.suptitle(title, fontsize=16, fontweight="bold", y=0.98)
     
@@ -878,55 +968,87 @@ def create_ua_shift_analysis_plots(
     ax1.grid(True, alpha=0.3)
     ax1.legend()
     
-    # 2. Uncertainty comparison: BNDL (and optionally UCTTA)
-    ax2 = fig.add_subplot(gs[0, 1])
+    # NOTE: ax2 will be created after loading all PCC/uncertainty data to include UR-ERN
     
-    if has_uctta:
-        # Side-by-side comparison of BNDL and UCTTA uncertainty
-        common_datasets = sorted([d for d in bndl_uncertainty_data if d in uctta_uncertainty_data])
-        x_pos = np.arange(len(common_datasets))
-        width = 0.35
-        
-        bndl_unc_vals = [bndl_uncertainty_data[d] for d in common_datasets]
-        uctta_unc_vals = [uctta_uncertainty_data[d] for d in common_datasets]
-        
-        ax2.barh(x_pos - width / 2, bndl_unc_vals, width, label='BNDL', color='#4ECDC4', alpha=0.8)
-        ax2.barh(x_pos + width / 2, uctta_unc_vals, width, label='UCTTA', color='#FF6B6B', alpha=0.8)
-        
-        ax2.set_yticks(x_pos)
-        ax2.set_yticklabels(common_datasets, fontsize=9)
-        ax2.set_xlabel('Mean Pixel Uncertainty', fontsize=11)
-        ax2.set_title('Uncertainty Comparison: BNDL vs UCTTA', fontweight='bold', fontsize=12)
-        ax2.legend()
-    else:
-        # Just BNDL uncertainty ranking
-        sorted_datasets = sorted(bndl_uncertainty_data.keys(), key=lambda x: bndl_uncertainty_data[x])
-        sorted_unc = [bndl_uncertainty_data[d] for d in sorted_datasets]
-        bar_colors = ['red' if d == source_domain else 'steelblue' for d in sorted_datasets]
-        
-        bars = ax2.barh(range(len(sorted_datasets)), sorted_unc, color=bar_colors, alpha=0.7)
-        ax2.set_yticks(range(len(sorted_datasets)))
-        ax2.set_yticklabels(sorted_datasets, fontsize=9)
-        ax2.set_xlabel('Mean Pixel Uncertainty (BNDL)', fontsize=11)
-        ax2.set_title('BNDL Uncertainty Ranking by Dataset', fontweight='bold', fontsize=12)
-        
-        # Add value labels
-        for i, (_bar, val) in enumerate(zip(bars, sorted_unc, strict=True)):
-            ax2.text(val, i, f' {val:.4f}', va='center', fontsize=8)
+    # 3. Improvement vs Uncertainty (BNDL vs SAM-2) - MOVED to gs[0, 2]
+    ax3 = fig.add_subplot(gs[0, 2])
+    common_datasets = [d for d in bndl_datasets_list if d in sam2_results and d in bndl_results]
+    improvements = [bndl_results[d][0] - sam2_results[d][0] for d in common_datasets]
+    uncertainties = [bndl_uncertainty_data[d] for d in common_datasets]
     
-    ax2.grid(True, alpha=0.3, axis='x')
+    colors_imp = ['red' if d == source_domain else 'purple' for d in common_datasets]
+    ax3.scatter(uncertainties, improvements, s=100, alpha=0.6, 
+               c=colors_imp, edgecolors='black')
     
-    # 3. UA Shift from source domain using Pearson CC (Uncertainty vs Accuracy)
-    #    For each dataset, load per-image correlation (PCC) between uncertainty and accuracy,
-    #    then compute ΔPCC relative to the source domain. Do this for BNDL and (if available) UCTTA
+    for i, dataset in enumerate(common_datasets):
+        ax3.annotate(dataset, (uncertainties[i], improvements[i]),
+                    xytext=(5, 5), textcoords='offset points', fontsize=9)
+    
+    if len(uncertainties) > 1:
+        z_imp = np.polyfit(uncertainties, improvements, 1)
+        p_imp = np.poly1d(z_imp)
+        x_line_imp = np.linspace(min(uncertainties), max(uncertainties), 100)
+        ax3.plot(x_line_imp, p_imp(x_line_imp), "g--", alpha=0.5, linewidth=2)
+        
+        corr_imp = np.corrcoef(uncertainties, improvements)[0, 1]
+        ax3.text(0.05, 0.95, f'Correlation: {corr_imp:.3f}', 
+                transform=ax3.transAxes, fontsize=10,
+                bbox=dict(boxstyle="round", facecolor="lightgreen", alpha=0.5),
+                verticalalignment='top')
+    
+    ax3.axhline(y=0, color='black', linestyle='-', alpha=0.3, linewidth=1)
+    ax3.set_xlabel('Pixel Uncertainty', fontsize=11)
+    ax3.set_ylabel('BNDL Improvement (ΔJ&F)', fontsize=11)
+    ax3.set_title('BNDL Improvement vs Uncertainty', fontweight='bold', fontsize=12)
+    ax3.grid(True, alpha=0.3)
+    
+    # 4. Uncertainty distribution across datasets (BNDL) - MOVED to gs[0, 3]
+    ax4 = fig.add_subplot(gs[0, 3])
+    dataset_names_short = [d[:8] for d in bndl_datasets_list]  # Shorten names for readability
+    x_pos = np.arange(len(bndl_datasets_list))
+    
+    bars4 = ax4.bar(x_pos, bndl_x_unc, color=bndl_colors, alpha=0.7, edgecolor='black')
+    ax4.set_xticks(x_pos)
+    ax4.set_xticklabels(dataset_names_short, rotation=45, ha='right', fontsize=9)
+    ax4.set_ylabel('Mean Pixel Uncertainty (BNDL)', fontsize=11)
+    ax4.set_title('BNDL Uncertainty Distribution Across Datasets', fontweight='bold', fontsize=12)
+    ax4.grid(True, alpha=0.3, axis='y')
+    
+    # Add value labels on bars
+    for bar in bars4:
+        height = bar.get_height()
+        ax4.text(bar.get_x() + bar.get_width() / 2., height,
+                f'{height:.3f}', ha='center', va='bottom', fontsize=8)
+    
+    # === ROW 1: ALL ΔPCC PLOTS TOGETHER ===
+    # Load per-dataset PCC and NLL data for SAM-2, BNDL, UCTTA, UR-ERN
+    
+    # SAM-2 per-dataset NLL (baseline)
+    sam2_nll_data: dict[str, float] = {}
+    sam2_root = sam2_root_override if sam2_root_override is not None else (output_path / "sam2_results")
+    for dataset_name in bndl_datasets_list:
+        eval_json = (sam2_root
+                     / f"{dataset_name.lower()}_sam2_eval"
+                     / f"{dataset_name.lower()}_zeroshot_results.json")
+        if not eval_json.exists():
+            continue
+        with open(eval_json) as f:
+            eval_data = json.load(f)
+        # Extract NLL mean value
+        if isinstance(eval_data, dict) and "NLL" in eval_data:
+            nll_info = eval_data["NLL"]
+            if isinstance(nll_info, dict) and "metric_mean" in nll_info:
+                sam2_nll_data[dataset_name] = float(nll_info["metric_mean"])
+    
+    # BNDL per-dataset PCC and NLL
+    bndl_root = bndl_root_override if bndl_root_override is not None else (output_path / "bndl_results")
     accuracy_pcc_map: dict[str, float] = {}
+    bndl_nll_data: dict[str, float] = {}
     for dataset_name in bndl_datasets_list:
         # evaluator results are saved by run_single_dataset_with_bndl at:
-        #   bndl_results/<dataset>_bndl_vis/dataset_evaluation/<dataset>_zeroshot_results.json
-        eval_json = (output_path
-                     / "bndl_results"
-                     / f"{dataset_name.lower()}_bndl_vis"
-                     / "dataset_evaluation"
+        #   <bndl_root>/<dataset>_bndl_eval/<dataset>_zeroshot_results.json
+        eval_json = (bndl_root
+                     / f"{dataset_name.lower()}_bndl_eval"
                      / f"{dataset_name.lower()}_zeroshot_results.json")
         if not eval_json.exists():
             continue
@@ -935,11 +1057,23 @@ def create_ua_shift_analysis_plots(
         if isinstance(eval_data, dict) and "Accuracy" in eval_data:
             acc_info = eval_data["Accuracy"]
             if isinstance(acc_info, dict) and "correlation" in acc_info:
-                accuracy_pcc_map[dataset_name] = float(acc_info["correlation"])  # Pearson CC
+                corr_val = acc_info["correlation"]
+                # Skip NaN correlations
+                if corr_val == "NaN" or (isinstance(corr_val, float) and np.isnan(corr_val)):
+                    print(f"Warning: BNDL {dataset_name} has NaN correlation")
+                else:
+                    accuracy_pcc_map[dataset_name] = float(corr_val)
+        
+        # Extract NLL mean value
+        if isinstance(eval_data, dict) and "NLL" in eval_data:
+            nll_info = eval_data["NLL"]
+            if isinstance(nll_info, dict) and "metric_mean" in nll_info:
+                bndl_nll_data[dataset_name] = float(nll_info["metric_mean"])
 
-    # UCTTA per-dataset PCC (optional)
+    # UCTTA per-dataset PCC and NLL (optional)
     uctta_accuracy_pcc_map: dict[str, float] = {}
-    uctta_root = output_path / "sam2_uctta_results"
+    uctta_nll_data: dict[str, float] = {}
+    uctta_root = uctta_root_override if uctta_root_override is not None else (output_path / "sam2_uctta_results")
     for dataset_name in bndl_datasets_list:
         eval_json = (uctta_root
                      / f"{dataset_name.lower()}_uctta_eval"
@@ -951,116 +1085,283 @@ def create_ua_shift_analysis_plots(
         if isinstance(eval_data, dict) and "Accuracy" in eval_data:
             acc_info = eval_data["Accuracy"]
             if isinstance(acc_info, dict) and "correlation" in acc_info:
-                uctta_accuracy_pcc_map[dataset_name] = float(acc_info["correlation"])  # Pearson CC
+                corr_val = acc_info["correlation"]
+                # Skip NaN correlations
+                if corr_val == "NaN" or (isinstance(corr_val, float) and np.isnan(corr_val)):
+                    print(f"Warning: UCTTA {dataset_name} has NaN correlation")
+                else:
+                    uctta_accuracy_pcc_map[dataset_name] = float(corr_val)
+        
+        # Extract NLL mean value
+        if isinstance(eval_data, dict) and "NLL" in eval_data:
+            nll_info = eval_data["NLL"]
+            if isinstance(nll_info, dict) and "metric_mean" in nll_info:
+                uctta_nll_data[dataset_name] = float(nll_info["metric_mean"])
 
+    # UR-ERN per-dataset PCC, uncertainty, and NLL (optional)
+    ur_ern_accuracy_pcc_map: dict[str, float] = {}
+    ur_ern_nll_data: dict[str, float] = {}
+    ur_ern_root = ur_ern_root_override if ur_ern_root_override is not None else (output_path / "sam2_ur_ern_results")
+    for dataset_name in bndl_datasets_list:
+        eval_json = (ur_ern_root
+                     / f"{dataset_name.lower()}_ur_ern_eval"
+                     / f"{dataset_name.lower()}_ur_ern_results.json")
+        if not eval_json.exists():
+            continue
+        with open(eval_json) as f:
+            eval_data = json.load(f)
+        if isinstance(eval_data, dict) and "Accuracy" in eval_data:
+            acc_info = eval_data["Accuracy"]
+            if isinstance(acc_info, dict) and "correlation" in acc_info:
+                corr_val = acc_info["correlation"]
+                # Skip NaN correlations (happens when uncertainty_std == 0)
+                if corr_val == "NaN" or (isinstance(corr_val, float) and np.isnan(corr_val)):
+                    print(f"Warning: UR-ERN {dataset_name} has NaN correlation (likely constant uncertainty)")
+                else:
+                    ur_ern_accuracy_pcc_map[dataset_name] = float(corr_val)
+            # Also extract UR-ERN uncertainty mean
+            if "uncertainty_mean" in acc_info:
+                ur_ern_uncertainty_data[dataset_name] = float(acc_info["uncertainty_mean"])
+        
+        # Extract NLL mean value
+        if isinstance(eval_data, dict) and "NLL" in eval_data:
+            nll_info = eval_data["NLL"]
+            if isinstance(nll_info, dict) and "metric_mean" in nll_info:
+                ur_ern_nll_data[dataset_name] = float(nll_info["metric_mean"])
+
+    has_ur_ern = len(ur_ern_accuracy_pcc_map) > 0
+    if has_ur_ern:
+        print(f"Including UR-ERN data for {len(ur_ern_accuracy_pcc_map)} datasets in UA analysis")
+
+    # Update title now that we know which methods are available
+    title_parts = ["UA Consistency Analysis: BNDL"]
+    if has_uctta:
+        title_parts.append(" vs UCTTA")
+    if has_ur_ern:
+        title_parts.append(" vs UR-ERN")
+    fig.suptitle("".join(title_parts), fontsize=16, fontweight="bold", y=0.98)
+    
+    # === NOW CREATE ax2: NLL comparison with all methods ===
+    ax2 = fig.add_subplot(gs[0, 1])
+    common_datasets = sorted(set(sam2_nll_data.keys()) | set(bndl_nll_data.keys()) | set(uctta_nll_data.keys()) | set(ur_ern_nll_data.keys()))
+    
+    if common_datasets:
+        # Multi-method NLL comparison
+        x_pos = np.arange(len(common_datasets))
+        
+        # Determine number of methods and bar width
+        num_methods = 0
+        if sam2_nll_data:
+            num_methods += 1
+        if bndl_nll_data:
+            num_methods += 1
+        if has_uctta and uctta_nll_data:
+            num_methods += 1
+        if has_ur_ern and ur_ern_nll_data:
+            num_methods += 1
+        
+        width = 0.22 if num_methods <= 3 else 0.18
+        offset = 0
+        
+        # Plot SAM-2 baseline first
+        if sam2_nll_data:
+            sam2_nll_vals = [sam2_nll_data.get(d, np.nan) for d in common_datasets]
+            ax2.barh(x_pos + offset, sam2_nll_vals, width, label='SAM-2', color=METHOD_COLORS['SAM-2'], alpha=0.8)
+            offset += width
+        
+        # Plot UCTTA if available
+        if has_uctta and uctta_nll_data:
+            uctta_nll_vals = [uctta_nll_data.get(d, np.nan) for d in common_datasets]
+            ax2.barh(x_pos + offset, uctta_nll_vals, width, label='UCTTA', color=METHOD_COLORS['UCTTA'], alpha=0.8)
+            offset += width
+        
+        # Plot BNDL
+        if bndl_nll_data:
+            bndl_nll_vals = [bndl_nll_data.get(d, np.nan) for d in common_datasets]
+            ax2.barh(x_pos + offset, bndl_nll_vals, width, label='BNDL', color=METHOD_COLORS['BNDL'], alpha=0.8)
+            offset += width
+        
+        # Plot UR-ERN if available
+        if has_ur_ern and ur_ern_nll_data:
+            ur_ern_nll_vals = [ur_ern_nll_data.get(d, np.nan) for d in common_datasets]
+            ax2.barh(x_pos + offset, ur_ern_nll_vals, width, label='UR-ERN', color=METHOD_COLORS['UR-ERN'], alpha=0.8)
+            offset += width
+        
+        # Center the y-tick labels
+        center_offset = (num_methods - 1) * width / 2
+        ax2.set_yticks(x_pos + center_offset)
+        ax2.set_yticklabels(common_datasets, fontsize=9)
+        ax2.set_xlabel('Mean NLL (Negative Log-Likelihood)', fontsize=11)
+        
+        # Update title based on available methods
+        title_methods = []
+        if sam2_nll_data:
+            title_methods.append('SAM-2')
+        if has_uctta and uctta_nll_data:
+            title_methods.append('UCTTA')
+        if bndl_nll_data:
+            title_methods.append('BNDL')
+        if has_ur_ern and ur_ern_nll_data:
+            title_methods.append('UR-ERN')
+        ax2.set_title(f'NLL: {" vs ".join(title_methods)}', fontweight='bold', fontsize=12)
+        
+        ax2.legend(fontsize=9)
+        ax2.invert_xaxis()  # Lower NLL is better, so invert for better visualization
+    else:
+        # Just BNDL NLL ranking
+        sorted_datasets = sorted(bndl_nll_data.keys(), key=lambda x: bndl_nll_data[x])
+        sorted_nll = [bndl_nll_data[d] for d in sorted_datasets]
+        bar_colors = ['red' if d == source_domain else 'steelblue' for d in sorted_datasets]
+        
+        bars = ax2.barh(range(len(sorted_datasets)), sorted_nll, color=bar_colors, alpha=0.7)
+        ax2.set_yticks(range(len(sorted_datasets)))
+        ax2.set_yticklabels(sorted_datasets, fontsize=9)
+        ax2.set_xlabel('Mean NLL (lower is better)', fontsize=11)
+        ax2.set_title('BNDL NLL Ranking by Dataset', fontweight='bold', fontsize=12)
+        ax2.invert_xaxis()  # Lower NLL is better
+        
+        # Add value labels
+        for i, (_bar, val) in enumerate(zip(bars, sorted_nll, strict=True)):
+            ax2.text(val, i, f' {val:.4f}', va='center', fontsize=8)
+    
+    ax2.grid(True, alpha=0.3, axis='x')
+    
+    # === ROW 1: ALL ΔPCC PLOTS TOGETHER ===
+    # 5. BNDL ΔPCC (gs[1, 0]) - sorted by absolute value
     if source_domain in accuracy_pcc_map:
-        ax3 = fig.add_subplot(gs[0, 2])
-
+        ax5 = fig.add_subplot(gs[1, 0])
         source_pcc = accuracy_pcc_map[source_domain]
         target_datasets = [d for d in bndl_datasets_list if d in accuracy_pcc_map and d != source_domain]
-        # Compute ΔPCC for each target dataset
         delta_pcc = {d: (accuracy_pcc_map[d] - source_pcc) for d in target_datasets}
-
-        # Sort by ΔPCC magnitude for readability
-        sorted_items = sorted(delta_pcc.items(), key=lambda x: x[1])
+        
+        sorted_items = sorted(delta_pcc.items(), key=lambda x: abs(x[1]))
         labels = [k for k, _ in sorted_items]
         values = [v for _, v in sorted_items]
         y_pos = np.arange(len(labels))
-
-        bars = ax3.barh(y_pos, values, color=['red' if v < 0 else 'green' for v in values], alpha=0.7, edgecolor='black')
-        ax3.set_yticks(y_pos)
-        ax3.set_yticklabels(labels, fontsize=9)
-        ax3.set_xlabel(f"ΔPCC (U vs Acc) relative to {source_domain}", fontsize=11)
-        ax3.set_title(f"UA Shift: ΔPCC from {source_domain}", fontweight='bold', fontsize=12)
-        ax3.axvline(x=0.0, color='black', linestyle='--', alpha=0.4)
-        ax3.grid(True, alpha=0.3, axis='x')
-
-        # Annotate values
+        
+        bars = ax5.barh(y_pos, values, color=['red' if v < 0 else 'green' for v in values], alpha=0.7, edgecolor='black')
+        ax5.set_yticks(y_pos)
+        ax5.set_yticklabels(labels, fontsize=9)
+        ax5.set_xlabel(f"ΔPCC relative to {source_domain}", fontsize=11)
+        ax5.set_title("BNDL: UA Shift (ΔPCC)", fontweight='bold', fontsize=12)
+        ax5.axvline(x=0.0, color='black', linestyle='--', alpha=0.4)
+        ax5.grid(True, alpha=0.3, axis='x')
+        
         for bar in bars:
             width = bar.get_width()
-            ax3.text(width + (0.01 if width >= 0 else -0.01), bar.get_y() + bar.get_height() / 2,
+            ax5.text(width + (0.01 if width >= 0 else -0.01), bar.get_y() + bar.get_height() / 2,
                      f"{width:+.3f}", va='center', ha='left' if width >= 0 else 'right', fontsize=8)
-    else:
-        if not accuracy_pcc_map:
-            print("No per-dataset Accuracy PCC available for UA shift; skipping ΔPCC panel")
-        else:
-            print(f"Source domain '{source_domain}' PCC not found; skipping ΔPCC panel")
-
-    # Optional: UCTTA ΔPCC panel
+    
+    # 6. UCTTA ΔPCC (gs[1, 1]) - sorted by absolute value
     if uctta_accuracy_pcc_map and source_domain in uctta_accuracy_pcc_map and has_uctta:
-        ax3b = fig.add_subplot(gs[0, 3])
+        ax6 = fig.add_subplot(gs[1, 1])
         source_pcc_u = uctta_accuracy_pcc_map[source_domain]
         target_datasets_u = [d for d in bndl_datasets_list if d in uctta_accuracy_pcc_map and d != source_domain]
         delta_pcc_u = {d: (uctta_accuracy_pcc_map[d] - source_pcc_u) for d in target_datasets_u}
-        sorted_items_u = sorted(delta_pcc_u.items(), key=lambda x: x[1])
+        sorted_items_u = sorted(delta_pcc_u.items(), key=lambda x: abs(x[1]))
         labels_u = [k for k, _ in sorted_items_u]
         values_u = [v for _, v in sorted_items_u]
         y_pos_u = np.arange(len(labels_u))
-        bars_u = ax3b.barh(y_pos_u, values_u, color=['red' if v < 0 else 'green' for v in values_u], alpha=0.7, edgecolor='black')
-        ax3b.set_yticks(y_pos_u)
-        ax3b.set_yticklabels(labels_u, fontsize=9)
-        ax3b.set_xlabel(f"ΔPCC (U vs Acc) relative to {source_domain}", fontsize=11)
-        ax3b.set_title("UA Shift (UCTTA): ΔPCC", fontweight='bold', fontsize=12)
-        ax3b.axvline(x=0.0, color='black', linestyle='--', alpha=0.4)
-        ax3b.grid(True, alpha=0.3, axis='x')
+        bars_u = ax6.barh(y_pos_u, values_u, color=['red' if v < 0 else 'green' for v in values_u], alpha=0.7, edgecolor='black')
+        ax6.set_yticks(y_pos_u)
+        ax6.set_yticklabels(labels_u, fontsize=9)
+        ax6.set_xlabel(f"ΔPCC relative to {source_domain}", fontsize=11)
+        ax6.set_title("UCTTA: UA Shift (ΔPCC)", fontweight='bold', fontsize=12)
+        ax6.axvline(x=0.0, color='black', linestyle='--', alpha=0.4)
+        ax6.grid(True, alpha=0.3, axis='x')
         for bar in bars_u:
             width = bar.get_width()
-            ax3b.text(width + (0.01 if width >= 0 else -0.01), bar.get_y() + bar.get_height() / 2,
+            ax6.text(width + (0.01 if width >= 0 else -0.01), bar.get_y() + bar.get_height() / 2,
+                      f"{width:+.3f}", va='center', ha='left' if width >= 0 else 'right', fontsize=8)
+
+    # 7. UR-ERN ΔPCC (gs[1, 2]) - sorted by absolute value
+    if ur_ern_accuracy_pcc_map and source_domain in ur_ern_accuracy_pcc_map and has_ur_ern:
+        ax7 = fig.add_subplot(gs[1, 2])
+        source_pcc_r = ur_ern_accuracy_pcc_map[source_domain]
+        target_datasets_r = [d for d in bndl_datasets_list if d in ur_ern_accuracy_pcc_map and d != source_domain]
+        delta_pcc_r = {d: (ur_ern_accuracy_pcc_map[d] - source_pcc_r) for d in target_datasets_r}
+        sorted_items_r = sorted(delta_pcc_r.items(), key=lambda x: abs(x[1]))
+        labels_r = [k for k, _ in sorted_items_r]
+        values_r = [v for _, v in sorted_items_r]
+        y_pos_r = np.arange(len(labels_r))
+        bars_r = ax7.barh(y_pos_r, values_r, color=['red' if v < 0 else 'green' for v in values_r], alpha=0.7, edgecolor='black')
+        ax7.set_yticks(y_pos_r)
+        ax7.set_yticklabels(labels_r, fontsize=9)
+        ax7.set_xlabel(f"ΔPCC relative to {source_domain}", fontsize=11)
+        ax7.set_title("UR-ERN: UA Shift (ΔPCC)", fontweight='bold', fontsize=12)
+        ax7.axvline(x=0.0, color='black', linestyle='--', alpha=0.4)
+        ax7.grid(True, alpha=0.3, axis='x')
+        for bar in bars_r:
+            width = bar.get_width()
+            ax7.text(width + (0.01 if width >= 0 else -0.01), bar.get_y() + bar.get_height() / 2,
                       f"{width:+.3f}", va='center', ha='left' if width >= 0 else 'right', fontsize=8)
     
-    # 4. Improvement vs Uncertainty (BNDL vs SAM-2)
-    ax4 = fig.add_subplot(gs[1, 0])
-    common_datasets = [d for d in bndl_datasets_list if d in sam2_results and d in bndl_results]
-    improvements = [bndl_results[d][0] - sam2_results[d][0] for d in common_datasets]
-    uncertainties = [bndl_uncertainty_data[d] for d in common_datasets]
+    # 8. J&F Performance Comparison (gs[1, 3]) - Similar to NLL plot
+    ax8 = fig.add_subplot(gs[1, 3])
     
-    colors_imp = ['red' if d == source_domain else 'purple' for d in common_datasets]
-    ax4.scatter(uncertainties, improvements, s=100, alpha=0.6, 
-               c=colors_imp, edgecolors='black')
+    # Get all datasets that have results from at least one method
+    all_datasets_for_jf = sorted(set(sam2_results.keys()) | set(bndl_results.keys()) | 
+                                  (set(uctta_results.keys()) if uctta_results else set()) |
+                                  (set(ur_ern_results.keys()) if ur_ern_results else set()))
     
-    for i, dataset in enumerate(common_datasets):
-        ax4.annotate(dataset, (uncertainties[i], improvements[i]),
-                    xytext=(5, 5), textcoords='offset points', fontsize=9)
+    # Prepare data for J&F comparison
+    sam_jf_vals = [sam2_results[d][0] if d in sam2_results else np.nan for d in all_datasets_for_jf]
+    bndl_jf_vals = [bndl_results[d][0] if d in bndl_results else np.nan for d in all_datasets_for_jf]
     
-    if len(uncertainties) > 1:
-        z_imp = np.polyfit(uncertainties, improvements, 1)
-        p_imp = np.poly1d(z_imp)
-        x_line_imp = np.linspace(min(uncertainties), max(uncertainties), 100)
-        ax4.plot(x_line_imp, p_imp(x_line_imp), "g--", alpha=0.5, linewidth=2)
-        
-        corr_imp = np.corrcoef(uncertainties, improvements)[0, 1]
-        ax4.text(0.05, 0.95, f'Correlation: {corr_imp:.3f}', 
-                transform=ax4.transAxes, fontsize=10,
-                bbox=dict(boxstyle="round", facecolor="lightgreen", alpha=0.5),
-                verticalalignment='top')
+    x_pos = np.arange(len(all_datasets_for_jf))
     
-    ax4.axhline(y=0, color='black', linestyle='-', alpha=0.3, linewidth=1)
-    ax4.set_xlabel('Pixel Uncertainty', fontsize=11)
-    ax4.set_ylabel('BNDL Improvement (ΔJ&F)', fontsize=11)
-    ax4.set_title('BNDL Improvement vs Uncertainty', fontweight='bold', fontsize=12)
-    ax4.grid(True, alpha=0.3)
+    # Determine number of methods and bar width
+    num_methods = 2  # SAM-2 and BNDL are always present
+    if has_uctta and uctta_results:
+        num_methods += 1
+    if has_ur_ern and ur_ern_results:
+        num_methods += 1
     
-    # 5. Uncertainty distribution across datasets (BNDL)
-    ax5 = fig.add_subplot(gs[1, 1])
-    dataset_names_short = [d[:8] for d in bndl_datasets_list]  # Shorten names for readability
-    x_pos = np.arange(len(bndl_datasets_list))
+    width = 0.22 if num_methods <= 3 else 0.18
+    offset = 0
     
-    bars5 = ax5.bar(x_pos, bndl_x_unc, color=bndl_colors, alpha=0.7, edgecolor='black')
-    ax5.set_xticks(x_pos)
-    ax5.set_xticklabels(dataset_names_short, rotation=45, ha='right', fontsize=9)
-    ax5.set_ylabel('Mean Pixel Uncertainty (BNDL)', fontsize=11)
-    ax5.set_title('BNDL Uncertainty Distribution Across Datasets', fontweight='bold', fontsize=12)
-    ax5.grid(True, alpha=0.3, axis='y')
+    # Plot SAM-2 baseline
+    ax8.barh(x_pos + offset, sam_jf_vals, width, label='SAM-2', color=METHOD_COLORS['SAM-2'], alpha=0.8)
+    offset += width
     
-    # Add value labels on bars
-    for bar in bars5:
-        height = bar.get_height()
-        ax5.text(bar.get_x() + bar.get_width() / 2., height,
-                f'{height:.3f}', ha='center', va='bottom', fontsize=8)
+    # Plot UCTTA if available
+    if has_uctta and uctta_results:
+        uctta_jf_vals = [uctta_results[d][0] if d in uctta_results else np.nan for d in all_datasets_for_jf]
+        ax8.barh(x_pos + offset, uctta_jf_vals, width, label='UCTTA', color=METHOD_COLORS['UCTTA'], alpha=0.8)
+        offset += width
     
-    # 6. Summary statistics table
-    ax6 = fig.add_subplot(gs[1, 2])
-    ax6.axis('off')
+    # Plot BNDL
+    ax8.barh(x_pos + offset, bndl_jf_vals, width, label='BNDL', color=METHOD_COLORS['BNDL'], alpha=0.8)
+    offset += width
+    
+    # Plot UR-ERN if available  
+    if has_ur_ern and ur_ern_results:
+        ur_ern_jf_vals = [ur_ern_results[d][0] if d in ur_ern_results else np.nan for d in all_datasets_for_jf]
+        ax8.barh(x_pos + offset, ur_ern_jf_vals, width, label='UR-ERN', color=METHOD_COLORS['UR-ERN'], alpha=0.8)
+        offset += width
+    
+    # Center the y-tick labels
+    center_offset = (num_methods - 1) * width / 2
+    ax8.set_yticks(x_pos + center_offset)
+    ax8.set_yticklabels(all_datasets_for_jf, fontsize=9)
+    ax8.set_xlabel('J&F Score', fontsize=11)
+    
+    # Update title based on available methods
+    title_methods = ['SAM-2']
+    if has_uctta and uctta_results:
+        title_methods.append('UCTTA')
+    title_methods.append('BNDL')
+    if has_ur_ern and ur_ern_results:
+        title_methods.append('UR-ERN')
+    ax8.set_title(f'J&F Performance: {" vs ".join(title_methods)}', fontweight='bold', fontsize=12)
+    
+    ax8.legend(fontsize=9, loc='lower right')
+    ax8.grid(True, alpha=0.3, axis='x')
+    ax8.set_xlim(0, 100)
+    
+    # 9. Summary statistics table (gs[2, 0:2]) - moved to row 2
+    ax9 = fig.add_subplot(gs[2, 0:2])
+    ax9.axis('off')
     
     # Create summary table
     table_data = []
@@ -1079,7 +1380,7 @@ def create_ua_shift_analysis_plots(
             f"{improvement:+.2f}"
         ])
     
-    table = ax6.table(
+    table = ax9.table(
         cellText=table_data,
         colLabels=["Dataset", "Uncertainty", "BNDL J&F", "Δ vs SAM-2"],
         cellLoc="center",
@@ -1101,7 +1402,7 @@ def create_ua_shift_analysis_plots(
         except (ValueError, IndexError):
             pass
     
-    ax6.set_title('UA Summary Statistics', fontweight='bold', fontsize=12, pad=20)
+    ax9.set_title('UA Summary Statistics', fontweight='bold', fontsize=12, pad=20)
     
     # Save plots
     plots_dir = output_path / "comparison_plots"
@@ -1115,25 +1416,36 @@ def create_ua_shift_analysis_plots(
     print(f"UA shift analysis plots saved to: {ua_plot_path}")
 
     # Save UA PCC summary to CSV for downstream analysis
-    if accuracy_pcc_map or uctta_accuracy_pcc_map:
+    if accuracy_pcc_map or uctta_accuracy_pcc_map or ur_ern_accuracy_pcc_map:
         import csv
         csv_path = plots_dir / "ua_pcc_summary.csv"
         with open(csv_path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["Dataset", "PCC_U_vs_Acc_BNDL", f"Delta_vs_{source_domain}_BNDL", "PCC_U_vs_Acc_UCTTA", f"Delta_vs_{source_domain}_UCTTA"])
+            writer.writerow([
+                "Dataset",
+                "PCC_U_vs_Acc_BNDL", f"Delta_vs_{source_domain}_BNDL",
+                "PCC_U_vs_Acc_UCTTA", f"Delta_vs_{source_domain}_UCTTA",
+                "PCC_U_vs_Acc_UR_ERN", f"Delta_vs_{source_domain}_UR_ERN",
+            ])
             src_val = accuracy_pcc_map.get(source_domain)
             src_val_u = uctta_accuracy_pcc_map.get(source_domain)
-            all_ds = sorted(set(list(accuracy_pcc_map.keys()) + list(uctta_accuracy_pcc_map.keys())))
+            src_val_r = ur_ern_accuracy_pcc_map.get(source_domain)
+            all_ds = sorted(set(list(accuracy_pcc_map.keys()) + list(uctta_accuracy_pcc_map.keys()) + list(ur_ern_accuracy_pcc_map.keys())))
             for d in all_ds:
                 pcc_b = accuracy_pcc_map.get(d)
                 pcc_u = uctta_accuracy_pcc_map.get(d)
+                pcc_r = ur_ern_accuracy_pcc_map.get(d)
                 delta_b = (pcc_b - src_val) if (pcc_b is not None and src_val is not None and d != source_domain) else (0.0 if d == source_domain and pcc_b is not None else "")
                 delta_u = (pcc_u - src_val_u) if (pcc_u is not None and src_val_u is not None and d != source_domain) else (0.0 if d == source_domain and pcc_u is not None else "")
+                delta_r = (pcc_r - src_val_r) if (pcc_r is not None and src_val_r is not None and d != source_domain) else (0.0 if d == source_domain and pcc_r is not None else "")
                 writer.writerow([d,
                                  (f"{pcc_b:.6f}" if pcc_b is not None else ""),
                                  (f"{delta_b:+.6f}" if isinstance(delta_b, float) else delta_b),
                                  (f"{pcc_u:.6f}" if pcc_u is not None else ""),
-                                 (f"{delta_u:+.6f}" if isinstance(delta_u, float) else delta_u)])
+                                 (f"{delta_u:+.6f}" if isinstance(delta_u, float) else delta_u),
+                                 (f"{pcc_r:.6f}" if pcc_r is not None else ""),
+                                 (f"{delta_r:+.6f}" if isinstance(delta_r, float) else delta_r),
+                                 ])
         print(f"UA PCC summary CSV saved to: {csv_path}")
 
 
@@ -1144,8 +1456,10 @@ def load_results_from_detailed_json(
     dict[str, tuple[float, float, float]],  # bndl_results
     dict[str, Any],                          # bndl_statistics
     dict[str, tuple[float, float, float]] | None,  # uctta_results
+    dict[str, tuple[float, float, float]] | None,  # ur_ern_results
     dict[str, dict[str, Any]],              # ua_data_per_dataset
     dict[str, Any],                          # uctta_statistics
+    dict[str, Any],                          # ur_ern_statistics
 ]:
     """Load previously saved results to avoid re-running experiments.
 
@@ -1160,8 +1474,10 @@ def load_results_from_detailed_json(
     bndl_map = {}
     stats_map = data.get("bndl_statistics", {})
     uctta_map = None
+    ur_ern_map = None
     ua_data_map = data.get("ua_data", {})
     uctta_stats_map = data.get("uctta_statistics", {})
+    ur_ern_stats_map = data.get("ur_ern_statistics", {})
 
     # Convert nested dicts to expected tuple format
     for k, v in data.get("sam2_results", {}).items():
@@ -1185,7 +1501,16 @@ def load_results_from_detailed_json(
             f = float(v.get("f", 0.0))
             uctta_map[k] = (jf, j, f)
 
-    return sam2_map, bndl_map, stats_map, uctta_map, ua_data_map, uctta_stats_map
+    # UR-ERN (optional)
+    if "ur_ern_results" in data:
+        ur_ern_map = {}
+        for k, v in data.get("ur_ern_results", {}).items():
+            jf = float(v.get("jf", 0.0))
+            j = float(v.get("j", 0.0))
+            f = float(v.get("f", 0.0))
+            ur_ern_map[k] = (jf, j, f)
+
+    return sam2_map, bndl_map, stats_map, uctta_map, ur_ern_map, ua_data_map, uctta_stats_map, ur_ern_stats_map
 
 
 def parse_args():
@@ -1197,7 +1522,7 @@ def parse_args():
         nargs="+",
         default=DEFAULT_DATASETS,
         choices=list(DATASET_CONFIGS.keys()),
-        help="Datasets to evaluate (default: all)",
+        help="Datasets to evaluate (default: all including MOSE_train/val)",
     )
 
     # SAM-2 configuration
@@ -1222,6 +1547,18 @@ def parse_args():
         "--bndl_checkpoint",
         default="/home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_012_01/checkpoints/checkpoint.pt",
         help="SAM-2+BNDL checkpoint path",
+    )
+
+    # SAM-2+UR-ERN configuration
+    p.add_argument(
+        "--ur_ern_cfg",
+        default="configs/sam2.1/sam2.1_hiera_b+_ur_ern.yaml",
+        help="SAM-2+UR-ERN config file",
+    )
+    p.add_argument(
+        "--ur_ern_checkpoint",
+        default="/home/hongyou/dev/ada_samp/logs/sam2/sam2_ur_ern_001_01/checkpoints/checkpoint.pt",
+        help="SAM-2+UR-ERN checkpoint path",
     )
 
     # Evaluation parameters
@@ -1250,7 +1587,7 @@ def parse_args():
     p.add_argument("--max_objects", type=int, default=256, help="Maximum number of objects per video")
 
     # Visualization options
-    p.add_argument("--save_vis", action="store_true", default=True, help="Save visualizations")
+    p.add_argument("--save_vis", action="store_true", default=False, help="Save visualizations")
     p.add_argument("--collect_bndl_stats", action="store_true", default=True, help="Collect BNDL statistics")
     # Click protocol options
     p.add_argument("--click_protocol", type=str, default="3click", choices=["1click", "3click", "5click"], help="Interaction protocol for first frame")
@@ -1263,6 +1600,7 @@ def parse_args():
     p.add_argument("--run_sam", action="store_true", default=False, help="Run baseline SAM-2 branch")
     p.add_argument("--run_uctta", action="store_true", default=False, help="Run SAM-2 + UCTTA branch")
     p.add_argument("--run_bndl", action="store_true", default=False, help="Run SAM-2 + BNDL branch")
+    p.add_argument("--run_ur_ern", action="store_true", default=False, help="Run SAM-2 + UR-ERN branch")
     # UCTTA options
     p.add_argument("--uctta_steps", type=int, default=2, help="UCTTA adaptation steps per frame/batch")
     p.add_argument("--uctta_lr", type=float, default=3e-4, help="UCTTA learning rate")
@@ -1294,16 +1632,18 @@ def main():
     if args.load_detailed_json is not None:
         detailed_path = Path(args.load_detailed_json)
         print(f"Loading cached results from: {detailed_path}")
-        sam2_results, bndl_results, bndl_statistics, uctta_results, ua_data, uctta_statistics = load_results_from_detailed_json(detailed_path)
+        sam2_results, bndl_results, bndl_statistics, uctta_results, ur_ern_results, ua_data, uctta_statistics, ur_ern_statistics = load_results_from_detailed_json(detailed_path)
     else:
         # Run comparison evaluation
-        sam2_results, bndl_results, bndl_statistics, uctta_results, ua_data, uctta_statistics = run_comparison_evaluation(
+        sam2_results, bndl_results, bndl_statistics, uctta_results, ur_ern_results, ua_data, uctta_statistics, ur_ern_statistics = run_comparison_evaluation(
             datasets=args.datasets,
             sam2_cfg=args.sam2_cfg,
             sam2_checkpoint=args.sam2_checkpoint,
             bndl_cfg=args.bndl_cfg,
             bndl_checkpoint=args.bndl_checkpoint,
             output_path=output_path,
+            ur_ern_cfg=args.ur_ern_cfg,
+            ur_ern_checkpoint=args.ur_ern_checkpoint,
             device=args.device,
             score_thresh=args.score_thresh,
             thresh_grid=args.thresh_grid,
@@ -1319,6 +1659,7 @@ def main():
             run_sam=args.run_sam,
             run_uctta=args.run_uctta,
             run_bndl=args.run_bndl,
+            run_ur_ern=args.run_ur_ern,
             click_protocol=args.click_protocol,
             min_click_dist=args.min_click_dist,
             seed=args.seed,
@@ -1337,7 +1678,9 @@ def main():
         bndl_results=bndl_results,
         bndl_statistics=bndl_statistics,
         uctta_results=uctta_results,
+        ur_ern_results=ur_ern_results,
         uctta_statistics=uctta_statistics,
+        ur_ern_statistics=ur_ern_statistics,
         ua_data=ua_data,
     )
     
