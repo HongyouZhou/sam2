@@ -18,18 +18,15 @@ import os
 from pathlib import Path
 from typing import Dict, Tuple, List, Any
 import pandas as pd
-import numpy as np
 
 from dataset_configs import (
     DATASET_CONFIGS,
-    DATASET_TO_TYPE,
-    DATASET_TYPE_CATEGORIES,
     DEFAULT_DATASETS,
 )
 
 # 导入 compare_sam2_vs_bndl 中的可视化函数
 sys.path.insert(0, str(Path(__file__).parent))
-from zs import create_comprehensive_comparison_plots, create_ua_shift_analysis_plots
+from zs import create_comprehensive_comparison_plots, create_ua_shift_analysis_plots, create_pavpu_comparison_plots
 
 
 # 方法配置
@@ -62,7 +59,13 @@ METHOD_CONFIGS = {
 }
 
 # 所有方法的列表（按执行顺序）
-ALL_METHODS = ["SAM", "UCTTA", "BNDL_AUE", "BNDL", "UR-ERN"]
+ALL_METHODS = [
+    "SAM",
+    "UCTTA",
+    "BNDL_AUE",
+    "BNDL",
+    "UR-ERN",
+]
 
 RESET_COLOR = "\033[0m"
 
@@ -267,6 +270,41 @@ def parse_statistics_from_output(output_dir: Path, method: str) -> Dict[str, Any
     return statistics
 
 
+def load_all_cached_results(
+    method_to_output: Dict[str, Path],
+    methods: List[str],
+) -> tuple[Dict[str, Dict], Dict[str, Dict]]:
+    """
+    从所有方法的输出目录加载缓存的结果和统计数据
+    
+    Returns:
+        (all_results, all_statistics): 所有方法的结果和统计数据
+    """
+    all_results = {}
+    all_statistics = {}
+    
+    for method in methods:
+        output_dir = method_to_output.get(method)
+        if not output_dir:
+            continue
+        
+        # 加载结果
+        method_results = parse_results_from_output(output_dir, method)
+        if method_results:
+            all_results[method] = method_results
+            print(f"✓ {method:10s}: 加载了 {len(method_results)} 个数据集的结果")
+        else:
+            print(f"⚠ {method:10s}: 未找到结果")
+        
+        # 加载统计数据
+        method_statistics = parse_statistics_from_output(output_dir, method)
+        if method_statistics:
+            all_statistics[method] = method_statistics
+            print(f"  {method:10s}: 加载了 {len(method_statistics)} 条统计数据")
+    
+    return all_results, all_statistics
+
+
 def create_parallel_comparison_wrapper(
     all_results: Dict[str, Dict],
     all_statistics: Dict[str, Dict],
@@ -283,15 +321,12 @@ def create_parallel_comparison_wrapper(
     def convert_results(method: str) -> dict:
         if method not in all_results:
             return {}
-        return {
-            dataset: (metrics["J&F"], metrics["J"], metrics["F"])
-            for dataset, metrics in all_results[method].items()
-        }
+        return {dataset: (metrics["J&F"], metrics["J"], metrics["F"]) for dataset, metrics in all_results[method].items()}
 
     sam_results = convert_results("SAM")
     uctta_results = convert_results("UCTTA")
     bndl_aue_results = convert_results("BNDL_AUE")
-    bndl_results = convert_results("BNDL")
+    _bndl_results = convert_results("BNDL")  # Reserved for future use
     ur_ern_results = convert_results("UR-ERN")
 
     # 获取统计数据
@@ -300,70 +335,58 @@ def create_parallel_comparison_wrapper(
     bndl_statistics = all_statistics.get("BNDL", {})
     ur_ern_statistics = all_statistics.get("UR-ERN", {})
 
-    # 创建comprehensive对比图（复用原有函数）
-    # 注意：原函数需要至少有SAM和BNDL的结果
-    if sam_results and bndl_results:
-        try:
-            create_comprehensive_comparison_plots(
-                sam2_results=sam_results,
-                bndl_results=bndl_results,
-                bndl_statistics=bndl_statistics,
-                output_path=output_path,
-                uctta_results=uctta_results if uctta_results else None,
-                uctta_statistics=uctta_statistics if uctta_statistics else None,
-            )
-            print("✓ 综合对比图已生成 (包含SAM+BNDL+UCTTA)")
-        except Exception as e:
-            print(f"警告: 无法生成综合对比图: {e}")
-            import traceback
-
-            traceback.print_exc()
-    elif sam_results or bndl_results or uctta_results:
-        print(f"⚠ 跳过综合对比图: 需要至少有SAM和BNDL的结果")
-        print(f"  当前有: SAM={'✓' if sam_results else '✗'}, UCTTA={'✓' if uctta_results else '✗'}, BNDL={'✓' if bndl_results else '✗'}")
-
-    # 创建UA shift分析图（复用原有函数）
-    print(f"\n检查 UA shift 分析条件:")
-    print(f"  bndl_statistics: {bool(bndl_statistics)} ({len(bndl_statistics) if bndl_statistics else 0} datasets)")
-    print(f"  bndl_results: {bool(bndl_results)} ({len(bndl_results) if bndl_results else 0} datasets)")
-    print(f"  sam_results: {bool(sam_results)} ({len(sam_results) if sam_results else 0} datasets)")
-    
-    if bndl_statistics and bndl_results and sam_results:
-        try:
-            # 智能选择源域：优先使用 MOSE_train（fine-tune域），如果不存在则使用第一个数据集
-            available_datasets = list(bndl_results.keys())
-            source_domain = "MOSE_train" if "MOSE_train" in available_datasets else (available_datasets[0] if available_datasets else "MOSE_train")
-            print(f"✓ 开始生成 UA shift 分析，使用源域: {source_domain}")
-            
-            create_ua_shift_analysis_plots(
-                bndl_statistics=bndl_statistics,
-                sam2_results=sam_results,
-                bndl_results=bndl_results,
-                output_path=output_path,
-                uctta_statistics=uctta_statistics if uctta_statistics else None,
-                uctta_results=uctta_results if uctta_results else None,
-                ur_ern_results=ur_ern_results if ur_ern_results else None,
-                source_domain=source_domain,
-                # Ensure PCC JSON lookup uses nested zs_parallel roots
-                sam2_root_override=(method_to_output["SAM"] / "sam2_results") if method_to_output and "SAM" in method_to_output else None,
-                bndl_root_override=(method_to_output["BNDL"] / "bndl_results") if method_to_output and "BNDL" in method_to_output else None,
-                uctta_root_override=(method_to_output["UCTTA"] / "sam2_uctta_results") if method_to_output and "UCTTA" in method_to_output else None,
-                ur_ern_root_override=(method_to_output["UR-ERN"] / "sam2_ur_ern_results") if method_to_output and "UR-ERN" in method_to_output else None,
-            )
-            print("✓ UA shift分析图已生成")
-        except Exception as e:
-            print(f"警告: 无法生成UA shift分析图: {e}")
-            import traceback
-
-            traceback.print_exc()
+    # 创建comprehensive对比图
+    if sam_results and bndl_aue_results:
+        create_comprehensive_comparison_plots(
+            sam2_results=sam_results,
+            bndl_results=bndl_aue_results,
+            bndl_statistics=bndl_aue_statistics,
+            output_path=output_path,
+            uctta_results=uctta_results or None,
+            uctta_statistics=uctta_statistics or None,
+        )
+        print("✓ 综合对比图已生成 (SAM vs BNDL_AUE)")
     else:
-        print(f"⚠ 跳过 UA shift 分析:")
-        if not bndl_statistics:
-            print(f"  - BNDL statistics 缺失")
-        if not bndl_results:
-            print(f"  - BNDL results 缺失")
-        if not sam_results:
-            print(f"  - SAM results 缺失")
+        print("⚠ 跳过综合对比图: 需要SAM和BNDL_AUE的结果")
+
+    # 创建UA shift分析图
+    if bndl_aue_statistics and bndl_aue_results and sam_results:
+        # 智能选择源域：优先使用 MOSE_train（fine-tune域），如果不存在则使用第一个数据集
+        available_datasets = list(bndl_aue_results.keys())
+        source_domain = "MOSE_train" if "MOSE_train" in available_datasets else (available_datasets[0] if available_datasets else "MOSE_train")
+        
+        create_ua_shift_analysis_plots(
+            bndl_statistics=bndl_aue_statistics,
+            sam2_results=sam_results,
+            bndl_results=bndl_aue_results,
+            output_path=output_path,
+            uctta_statistics=uctta_statistics or None,
+            uctta_results=uctta_results or None,
+            ur_ern_results=ur_ern_results or None,
+            source_domain=source_domain,
+            # Ensure PCC JSON lookup uses nested zs_parallel roots
+            sam2_root_override=(method_to_output["SAM"] / "sam2_results") if method_to_output and "SAM" in method_to_output else None,
+            bndl_root_override=(method_to_output["BNDL_AUE"] / "bndl_aue_results") if method_to_output and "BNDL_AUE" in method_to_output else None,
+            uctta_root_override=(method_to_output["UCTTA"] / "sam2_uctta_results") if method_to_output and "UCTTA" in method_to_output else None,
+            ur_ern_root_override=(method_to_output["UR-ERN"] / "sam2_ur_ern_results") if method_to_output and "UR-ERN" in method_to_output else None,
+        )
+        print("✓ UA shift分析图已生成")
+    else:
+        print("⚠ 跳过 UA shift 分析: 需要BNDL_AUE统计数据、BNDL_AUE结果和SAM结果")
+
+    # 创建PAvPU对比图（仅对有BNDL的方法）
+    if bndl_aue_statistics or bndl_statistics or ur_ern_statistics:
+        create_pavpu_comparison_plots(
+            output_path=output_path,
+            bndl_aue_statistics=bndl_aue_statistics or None,
+            bndl_statistics=bndl_statistics or None,
+            uctta_statistics=uctta_statistics or None,
+            ur_ern_statistics=ur_ern_statistics or None,
+            datasets=datasets,
+        )
+        print("✓ PAvPU对比图已生成")
+    else:
+        print("⚠ 跳过 PAvPU 对比: 无可用的统计数据")
 
 
 def create_merged_comparison(
@@ -525,12 +548,12 @@ def main():
     parser.add_argument("--sam2_checkpoint", default="/home/hongyou/dev/ada_samp/sam2/checkpoints/sam2.1_hiera_base_plus.pt")
 
     # BNDL+AUE配置
-    parser.add_argument("--bndl_aue_cfg", default="configs/sam2.1_training/sam2_bndl_aue.yaml")
-    parser.add_argument("--bndl_aue_checkpoint", default="/home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_012_02/checkpoints/checkpoint.pt")
+    parser.add_argument("--bndl_aue_cfg", default="configs/sam2.1/sam2.1_hiera_b+_bndl_aue.yaml")
+    parser.add_argument("--bndl_aue_checkpoint", default="/home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_aue_013_01/checkpoints/checkpoint.pt")
 
     # BNDL (pure)配置
-    parser.add_argument("--bndl_cfg", default="configs/sam2.1_training/sam2_bndl.yaml")
-    parser.add_argument("--bndl_checkpoint", default="/home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_012_02/checkpoints/checkpoint.pt")
+    parser.add_argument("--bndl_cfg", default="configs/sam2.1/sam2.1_hiera_b+_bndl.yaml")
+    parser.add_argument("--bndl_checkpoint", default="/home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_013_01/checkpoints/checkpoint.pt")
 
     # UR-ERN配置
     parser.add_argument("--ur_ern_cfg", default="configs/sam2.1/sam2.1_hiera_b+_ur_ern.yaml")
@@ -556,16 +579,19 @@ def main():
 
     # 输出
     parser.add_argument("--output_path", type=Path, default=Path("./outputs/parallel_compare"))
-    
+
     # 版本号配置（每个方法独立版本，格式：xxx_xx，前三位代码版本，后两位参数版本）
     parser.add_argument("--sam_version", type=str, default="001_01", help="SAM方法版本号 (格式: xxx_xx)")
     parser.add_argument("--uctta_version", type=str, default="001_01", help="UCTTA方法版本号 (格式: xxx_xx)")
-    parser.add_argument("--bndl_aue_version", type=str, default="012_02", help="BNDL+AUE方法版本号 (格式: xxx_xx)")
-    parser.add_argument("--bndl_version", type=str, default="012_02", help="BNDL (pure)方法版本号 (格式: xxx_xx)")
+    parser.add_argument("--bndl_aue_version", type=str, default="013_01", help="BNDL+AUE方法版本号 (格式: xxx_xx)")
+    parser.add_argument("--bndl_version", type=str, default="013_01", help="BNDL (pure)方法版本号 (格式: xxx_xx)")
     parser.add_argument("--ur_ern_version", type=str, default="001_01", help="UR-ERN方法版本号 (格式: xxx_xx)")
-    
+
     # 复用缓存结果（若存在 detailed_results.json 则跳过对应方法的重新运行）
     parser.add_argument("--reuse_cached", action="store_true", default=False, help="若存在已缓存结果则跳过该方法的重新运行")
+    
+    # 仅生成图表模式（跳过所有评估，只从已有结果生成可视化）
+    parser.add_argument("--plot_only", action="store_true", default=False, help="仅从已有结果生成图表，不运行评估")
 
     args = parser.parse_args()
 
@@ -578,14 +604,18 @@ def main():
 
     # 打印配置
     print("=" * 80)
-    print("并行对比评估")
+    if args.plot_only:
+        print("仅生成图表模式（不运行评估）")
+    else:
+        print("并行对比评估")
     print("=" * 80)
     print(f"数据集: {', '.join(args.datasets)}")
     print(f"方法版本: SAM={args.sam_version}, UCTTA={args.uctta_version}, BNDL_AUE={args.bndl_aue_version}, BNDL={args.bndl_version}, UR-ERN={args.ur_ern_version}")
-    gpu_assignment = ", ".join([f"{method}→GPU{gpu_id}" for method, gpu_id in zip(ALL_METHODS, args.gpu_ids, strict=False)])
-    print(f"GPU分配: {gpu_assignment}")
+    if not args.plot_only:
+        gpu_assignment = ", ".join([f"{method}→GPU{gpu_id}" for method, gpu_id in zip(ALL_METHODS, args.gpu_ids, strict=False)])
+        print(f"GPU分配: {gpu_assignment}")
+        print(f"模式: {'仅第一帧' if args.first_frame_only else '完整视频'}")
     print(f"输出目录: {args.output_path}")
-    print(f"模式: {'仅第一帧' if args.first_frame_only else '完整视频'}")
     print("=" * 80 + "\n")
 
     # 创建输出目录
@@ -605,75 +635,89 @@ def main():
         "UR-ERN": args.ur_ern_version,
     }
 
-    method_to_output = {
-        method: args.output_path / f"output_{METHOD_CONFIGS[method]['output_suffix']}_{method_versions[method]}"
-        for method in ALL_METHODS
-    }
-
-    tasks = []
-    skipped_methods = []
-    for method, gpu_id in zip(ALL_METHODS, args.gpu_ids, strict=False):
-        out_dir = method_to_output[method]
-        if args.reuse_cached and _has_cached_results(out_dir):
-            print(f"检测到已存在缓存结果，跳过运行: {method} v{method_versions[method]} -> {out_dir}")
-            skipped_methods.append(method)
-            continue
-        tasks.append((method, gpu_id, args.output_path, args, method_versions[method]))
-
-    # 并行运行
-    print("启动并行执行...\n")
-    start_time = time.time()
-
-    results = []
-    if tasks:
-        with multiprocessing.Pool(processes=4) as pool:
-            results = pool.starmap(run_method, tasks)
-
-    total_time = time.time() - start_time
-
-    # 处理结果
-    print("\n" + "=" * 80)
-    print("并行执行完成")
-    print("=" * 80 + "\n")
+    method_to_output = {method: args.output_path / f"output_{METHOD_CONFIGS[method]['output_suffix']}_{method_versions[method]}" for method in ALL_METHODS}
 
     times = {}
     all_results = {}
     all_statistics = {}
 
-    for method, return_code, elapsed, output_dir in results:
-        times[method] = elapsed
+    # ========== 仅生成图表模式：跳过评估，直接加载缓存结果 ==========
+    if args.plot_only:
+        print("📊 从缓存结果加载数据...\n")
+        all_results, all_statistics = load_all_cached_results(method_to_output, ALL_METHODS)
+        
+        if not all_results:
+            print("\n❌ 错误: 未找到任何缓存结果！")
+            print("请先运行评估生成数据，或检查输出目录和方法版本号是否正确。")
+            return
+        
+        print(f"\n✓ 成功加载 {len(all_results)} 个方法的结果")
+    
+    # ========== 正常模式：运行评估 ==========
+    else:
+        tasks = []
+        skipped_methods = []
+        for method, gpu_id in zip(ALL_METHODS, args.gpu_ids, strict=False):
+            out_dir = method_to_output[method]
+            if args.reuse_cached and _has_cached_results(out_dir):
+                print(f"检测到已存在缓存结果，跳过运行: {method} v{method_versions[method]} -> {out_dir}")
+                skipped_methods.append(method)
+                continue
+            tasks.append((method, gpu_id, args.output_path, args, method_versions[method]))
 
-        if return_code == 0:
-            # 解析结果
-            method_results = parse_results_from_output(output_dir, method)
-            if method_results:
-                all_results[method] = method_results
+        # 并行运行
+        print("启动并行执行...\n")
+        start_time = time.time()
 
-            # 解析统计数据（用于UA分析）
-            method_statistics = parse_statistics_from_output(output_dir, method)
-            if method_statistics:
-                all_statistics[method] = method_statistics
+        results = []
+        if tasks:
+            # 根据实际任务数量确定进程数
+            num_processes = len(tasks)
+            print(f"创建 {num_processes} 个并行进程...\n")
+            with multiprocessing.Pool(processes=num_processes) as pool:
+                results = pool.starmap(run_method, tasks)
 
-            print(f"✓ {method:10s}: 成功 ({elapsed:.1f}s)")
-        else:
-            print(f"✗ {method:10s}: 失败 (代码 {return_code}, {elapsed:.1f}s)")
+        total_time = time.time() - start_time
 
-    print(f"\n总并行时间: {total_time:.1f}s")
-    if times:
-        est_seq = sum(times.values())
-        print(f"预估顺序时间: {est_seq:.1f}s")
-        print(f"加速比: {est_seq / total_time:.2f}x\n")
+        # 处理结果
+        print("\n" + "=" * 80)
+        print("并行执行完成")
+        print("=" * 80 + "\n")
 
-    # 解析被跳过的方法（直接读取缓存）
-    for method in skipped_methods:
-        out_dir = method_to_output[method]
-        cached_results = parse_results_from_output(out_dir, method)
-        if cached_results:
-            all_results[method] = cached_results
-        cached_stats = parse_statistics_from_output(out_dir, method)
-        if cached_stats:
-            all_statistics[method] = cached_stats
-        print(f"✓ {method:10s}: 复用缓存结果 (v{method_versions[method]})")
+        for method, return_code, elapsed, output_dir in results:
+            times[method] = elapsed
+
+            if return_code == 0:
+                # 解析结果
+                method_results = parse_results_from_output(output_dir, method)
+                if method_results:
+                    all_results[method] = method_results
+
+                # 解析统计数据（用于UA分析）
+                method_statistics = parse_statistics_from_output(output_dir, method)
+                if method_statistics:
+                    all_statistics[method] = method_statistics
+
+                print(f"✓ {method:10s}: 成功 ({elapsed:.1f}s)")
+            else:
+                print(f"✗ {method:10s}: 失败 (代码 {return_code}, {elapsed:.1f}s)")
+
+        print(f"\n总并行时间: {total_time:.1f}s")
+        if times:
+            est_seq = sum(times.values())
+            print(f"预估顺序时间: {est_seq:.1f}s")
+            print(f"加速比: {est_seq / total_time:.2f}x\n")
+
+        # 解析被跳过的方法（直接读取缓存）
+        for method in skipped_methods:
+            out_dir = method_to_output[method]
+            cached_results = parse_results_from_output(out_dir, method)
+            if cached_results:
+                all_results[method] = cached_results
+            cached_stats = parse_statistics_from_output(out_dir, method)
+            if cached_stats:
+                all_statistics[method] = cached_stats
+            print(f"✓ {method:10s}: 复用缓存结果 (v{method_versions[method]})")
 
     # 创建合并的对比表格（只要有任何成功的结果）
     if all_results:

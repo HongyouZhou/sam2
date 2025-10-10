@@ -352,28 +352,6 @@ trainer:
           - pattern: '*pos_embed*'
             value: 1.0
 
-    # options:
-    #   lr:
-    #     - scheduler:
-    #         _target_: fvcore.common.param_scheduler.CosineParamScheduler
-    #         start_value: ${scratch.base_lr}
-    #         end_value: ${divide:${scratch.base_lr},10}
-    #     - scheduler:
-    #         _target_: fvcore.common.param_scheduler.CosineParamScheduler
-    #         start_value: ${scratch.vision_lr}
-    #         end_value: ${divide:${scratch.vision_lr},10}
-    #       param_names:
-    #         - 'image_encoder.*'
-    #   weight_decay:
-    #     - scheduler:
-    #         _target_: fvcore.common.param_scheduler.ConstantParamScheduler
-    #         value: 0.1
-    #     - scheduler:
-    #         _target_: fvcore.common.param_scheduler.ConstantParamScheduler
-    #         value: 0.0
-    #       param_names:
-    #         - '*bias*'
-    #       module_cls_names: ['torch.nn.LayerNorm']
     options:
       lr:
         - scheduler:
@@ -496,7 +474,7 @@ trainer:
 launcher:
   num_nodes: 1
   gpus_per_node: 8
-  experiment_log_dir: /home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_012_02 # Path to log directory, defaults to ./sam2_logs/${config_name}
+  experiment_log_dir: /home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_013_01 # Path to log directory, defaults to ./sam2_logs/${config_name}
 
 # SLURM args if running on a cluster
 submitit:

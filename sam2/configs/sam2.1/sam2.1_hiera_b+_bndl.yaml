@@ -131,7 +131,7 @@ model:
   # compile_image_encoder: False
 
   # AdCo options
-  use_adco: true
+  use_adco: false
   adco_proj_dim: 256
   adco_queue_size: 65536
   adco_temperature: 0.2

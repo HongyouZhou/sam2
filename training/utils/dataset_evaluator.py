@@ -24,10 +24,13 @@ def _dilate_mask(mask: torch.Tensor, kernel_size: int = 10) -> torch.Tensor:
         kernel_size: 膨胀核大小（像素），推荐5-15
 
     Returns:
-        dilated_mask: [H, W] 膨胀后的二值mask
+        dilated_mask: [H, W] 膨胀后的二值mask（与输入尺寸完全一致）
     """
     if kernel_size <= 0:
         return mask
+
+    # 保存原始尺寸
+    orig_h, orig_w = mask.shape
 
     # 使用max_pool2d实现膨胀：将mask reshape为[1, 1, H, W]
     mask_4d = mask.unsqueeze(0).unsqueeze(0).float()  # [1, 1, H, W]
@@ -39,6 +42,16 @@ def _dilate_mask(mask: torch.Tensor, kernel_size: int = 10) -> torch.Tensor:
 
     # 转回[H, W]并转为bool
     dilated_mask = dilated.squeeze(0).squeeze(0) > 0.5
+
+    # 确保输出尺寸与输入完全一致（修复由于padding/kernel_size组合导致的尺寸差异）
+    if dilated_mask.shape != (orig_h, orig_w):
+        # 如果尺寸不一致，使用插值调整回原始尺寸
+        dilated_mask = F.interpolate(
+            dilated_mask.unsqueeze(0).unsqueeze(0).float(),
+            size=(orig_h, orig_w),
+            mode='nearest'  # 使用nearest保持二值性质
+        ).squeeze(0).squeeze(0) > 0.5
+        logging.debug(f"Adjusted dilated mask size from {dilated.shape[2:]} to {(orig_h, orig_w)}")
 
     return dilated_mask
 
@@ -361,13 +374,15 @@ class DistributedDatasetEvaluator:
             pixel_uncertainty = pixel_uncertainty.float()
 
             # 3. 计算像素级accuracy（二值正确性）
-            pred_binary = (pred_logits > 0).float()  # [H, W, K]
-            gt_binary = (gt_masks > 0).float()       # [H, W, K]
+            pred_binary_bool = (pred_logits > 0)  # [H, W, K] - keep as bool
+            gt_binary_bool = (gt_masks > 0)       # [H, W, K] - keep as bool
+            pred_binary = pred_binary_bool.float()  # [H, W, K] - convert to float for comparison
+            gt_binary = gt_binary_bool.float()       # [H, W, K]
             pixel_correct = (pred_binary == gt_binary).all(dim=-1).float()  # [H, W] 所有通道都正确
 
             # 4. 计算像素级IoU贡献（intersection / union per pixel across channels）
-            intersection = (pred_binary & gt_binary.bool()).float().sum(dim=-1)  # [H, W]
-            union = (pred_binary.bool() | gt_binary.bool()).float().sum(dim=-1)  # [H, W]
+            intersection = (pred_binary_bool & gt_binary_bool).float().sum(dim=-1)  # [H, W]
+            union = (pred_binary_bool | gt_binary_bool).float().sum(dim=-1)  # [H, W]
             pixel_iou = intersection / (union + 1e-8)  # [H, W]
             pixel_iou = torch.clamp(pixel_iou, 0.0, 1.0)
 
@@ -740,8 +755,11 @@ class DistributedDatasetEvaluator:
             if not self.correlation_results:
                 return {}
             
+            # Use the correct data source based on mode
+            data_source = self.pixel_uncertainties if self.per_pixel_statistics else self.image_uncertainties
+            
             summary = {
-                'total_batches': len(self.image_uncertainties),
+                'total_batches': len(data_source),
                 'metrics_evaluated': list(self.correlation_results.keys()),
                 'correlation_summary': {},
                 'overall_statistics': {},

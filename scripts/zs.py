@@ -1,6 +1,6 @@
 #!/usr/bin/env python
-# Compare SAM-2 vs SAM-2+BNDL zero-shot evaluation results
-# Runs both versions and generates comprehensive comparison plots
+# Compare SAM-2 vs BNDL vs BNDL_AUE zero-shot evaluation results
+# Runs multiple versions and generates comprehensive comparison plots
 
 from __future__ import annotations
 
@@ -42,8 +42,8 @@ def run_comparison_evaluation(
     sam2_checkpoint: str,
     bndl_aue_cfg: str,
     bndl_aue_checkpoint: str,
-    bndl_cfg: str,
-    bndl_checkpoint: str,
+    bndl_cfg: str | None,
+    bndl_checkpoint: str | None,
     output_path: Path,
     ur_ern_cfg: str | None = None,
     ur_ern_checkpoint: str | None = None,
@@ -86,10 +86,10 @@ def run_comparison_evaluation(
     dict[str, Any],                          # uctta_statistics
     dict[str, Any],                          # ur_ern_statistics
 ]:
-    """Run both SAM-2 and SAM-2+BNDL evaluations and return results"""
+    """Run SAM-2, BNDL, and BNDL_AUE evaluations and return results"""
 
     print("=" * 80)
-    print("COMPARISON EVALUATION: SAM-2 vs SAM-2+BNDL")
+    print("COMPARISON EVALUATION: SAM-2 vs BNDL vs BNDL_AUE")
     print("=" * 80)
 
     # Create output directories
@@ -116,35 +116,43 @@ def run_comparison_evaluation(
         "++model.multimask_max_pt_num=2",
     ]
 
-    # Load SAM-2 predictor (original) with the same overrides
-    print("\nLoading SAM-2 checkpoint...")
-    sam2_predictor = build_sam2_video_predictor(
-        config_file=sam2_cfg,
-        ckpt_path=sam2_checkpoint,
-        device=device,
-        hydra_overrides_extra=hydra_overrides_extra,
-    )
-    print("SAM-2 loaded successfully!")
+    # Load SAM-2 predictor (original) with the same overrides (optional)
+    sam2_predictor = None
+    if run_sam or run_uctta:  # UCTTA needs SAM-2 predictor
+        print("\nLoading SAM-2 checkpoint...")
+        sam2_predictor = build_sam2_video_predictor(
+            config_file=sam2_cfg,
+            ckpt_path=sam2_checkpoint,
+            device=device,
+            hydra_overrides_extra=hydra_overrides_extra,
+        )
+        print("SAM-2 loaded successfully!")
 
-    # Load SAM-2+BNDL+AUE predictor with the same overrides
-    print("\nLoading SAM-2+BNDL+AUE checkpoint...")
-    bndl_aue_predictor = build_sam2_video_predictor(
-        config_file=bndl_aue_cfg,
-        ckpt_path=bndl_aue_checkpoint,
-        device=device,
-        hydra_overrides_extra=hydra_overrides_extra,
-    )
-    print("SAM-2+BNDL+AUE loaded successfully!")
+    # Load BNDL predictor with the same overrides (optional)
+    bndl_predictor = None
+    if run_bndl:
+        if bndl_cfg is None or bndl_checkpoint is None:
+            raise ValueError("BNDL requires both bndl_cfg and bndl_checkpoint to be specified")
+        print("\nLoading BNDL checkpoint...")
+        bndl_predictor = build_sam2_video_predictor(
+            config_file=bndl_cfg,
+            ckpt_path=bndl_checkpoint,
+            device=device,
+            hydra_overrides_extra=hydra_overrides_extra,
+        )
+        print("BNDL loaded successfully!")
 
-    # Load SAM-2+BNDL (pure) predictor with the same overrides
-    print("\nLoading SAM-2+BNDL (pure) checkpoint...")
-    bndl_predictor = build_sam2_video_predictor(
-        config_file=bndl_cfg,
-        ckpt_path=bndl_checkpoint,
-        device=device,
-        hydra_overrides_extra=hydra_overrides_extra,
-    )
-    print("SAM-2+BNDL (pure) loaded successfully!")
+    # Load BNDL_AUE predictor with the same overrides (optional)
+    bndl_aue_predictor = None
+    if run_bndl_aue:
+        print("\nLoading BNDL_AUE checkpoint...")
+        bndl_aue_predictor = build_sam2_video_predictor(
+            config_file=bndl_aue_cfg,
+            ckpt_path=bndl_aue_checkpoint,
+            device=device,
+            hydra_overrides_extra=hydra_overrides_extra,
+        )
+        print("BNDL_AUE loaded successfully!")
 
     # Load SAM-2+UR-ERN predictor with the same overrides (if needed)
     ur_ern_predictor = None
@@ -274,36 +282,9 @@ def run_comparison_evaluation(
                         uctta_results[dataset_name] = []  # type: ignore[assignment]
                     (uctta_results[dataset_name]).append((th, j_f_uctta, j_uctta, f_uctta))  # type: ignore[index]
 
-                # Run SAM-2+BNDL+AUE evaluation
-                if run_bndl_aue:
-                    print(f"--- Running SAM-2+BNDL+AUE evaluation for {dataset_name} @ thresh={th} ---")
-                    bndl_aue_start = time.time()
-                    j_f_bndl_aue, j_bndl_aue, f_bndl_aue, dataset_stats_aue = run_bndl_dataset(
-                        dataset_name=dataset_name,
-                        predictor=bndl_aue_predictor,
-                        output_path=bndl_aue_output,
-                        score_thresh=th,
-                        num_workers=num_workers,
-                        video_subset=video_subset,
-                        save_bndl_vis=save_vis,
-                        prompt_method=prompt_method,
-                        first_frame_only=first_frame_only,
-                        max_objects=max_objects,
-                        collect_statistics=True,  # Force collect statistics for comparison
-                        reuse_prompts_root=sam2_output if run_sam else None,  # Only reuse prompts if SAM ran
-                        click_protocol=click_protocol,
-                        min_click_dist=min_click_dist,
-                        seed=seed,
-                    )
-                    bndl_aue_time = time.time() - bndl_aue_start
-                    bndl_aue_per_thresh.append((th, j_f_bndl_aue, j_bndl_aue, f_bndl_aue))
-                    if dataset_stats_aue:
-                        bndl_aue_statistics[dataset_name] = dataset_stats_aue
-                    print(f"BNDL+AUE @ {th:.2f} - J&F: {j_f_bndl_aue:.2f}, J: {j_bndl_aue:.2f}, F: {f_bndl_aue:.2f} (Time: {bndl_aue_time:.2f}s)")
-
-                # Run SAM-2+BNDL (pure) evaluation
+                # Run BNDL evaluation
                 if run_bndl:
-                    print(f"--- Running SAM-2+BNDL (pure) evaluation for {dataset_name} @ thresh={th} ---")
+                    print(f"--- Running BNDL evaluation for {dataset_name} @ thresh={th} ---")
                     bndl_start = time.time()
                     j_f_bndl, j_bndl, f_bndl, dataset_stats = run_bndl_dataset(
                         dataset_name=dataset_name,
@@ -326,7 +307,34 @@ def run_comparison_evaluation(
                     bndl_per_thresh.append((th, j_f_bndl, j_bndl, f_bndl))
                     if dataset_stats:
                         bndl_statistics[dataset_name] = dataset_stats
-                    print(f"BNDL (pure) @ {th:.2f} - J&F: {j_f_bndl:.2f}, J: {j_bndl:.2f}, F: {f_bndl:.2f} (Time: {bndl_time:.2f}s)")
+                    print(f"BNDL @ {th:.2f} - J&F: {j_f_bndl:.2f}, J: {j_bndl:.2f}, F: {f_bndl:.2f} (Time: {bndl_time:.2f}s)")
+
+                # Run BNDL_AUE evaluation
+                if run_bndl_aue:
+                    print(f"--- Running BNDL_AUE evaluation for {dataset_name} @ thresh={th} ---")
+                    bndl_aue_start = time.time()
+                    j_f_bndl_aue, j_bndl_aue, f_bndl_aue, dataset_stats_aue = run_bndl_dataset(
+                        dataset_name=dataset_name,
+                        predictor=bndl_aue_predictor,
+                        output_path=bndl_aue_output,
+                        score_thresh=th,
+                        num_workers=num_workers,
+                        video_subset=video_subset,
+                        save_bndl_vis=save_vis,
+                        prompt_method=prompt_method,
+                        first_frame_only=first_frame_only,
+                        max_objects=max_objects,
+                        collect_statistics=True,  # Force collect statistics for comparison
+                        reuse_prompts_root=sam2_output if run_sam else None,  # Only reuse prompts if SAM ran
+                        click_protocol=click_protocol,
+                        min_click_dist=min_click_dist,
+                        seed=seed,
+                    )
+                    bndl_aue_time = time.time() - bndl_aue_start
+                    bndl_aue_per_thresh.append((th, j_f_bndl_aue, j_bndl_aue, f_bndl_aue))
+                    if dataset_stats_aue:
+                        bndl_aue_statistics[dataset_name] = dataset_stats_aue
+                    print(f"BNDL_AUE @ {th:.2f} - J&F: {j_f_bndl_aue:.2f}, J: {j_bndl_aue:.2f}, F: {f_bndl_aue:.2f} (Time: {bndl_aue_time:.2f}s)")
 
                 # Run SAM-2+UR-ERN evaluation
                 if run_ur_ern and ur_ern_predictor is not None:
@@ -366,13 +374,13 @@ def run_comparison_evaluation(
                 print("Per-threshold summary (SAM-2+UCTTA):")
                 for th, jf, j, f in uctta_results[dataset_name]:  # type: ignore[index]
                     print(f"  th={th:.2f}: J&F={jf:.2f}, J={j:.2f}, F={f:.2f}")
-            if run_bndl_aue:
-                print("Per-threshold summary (BNDL+AUE):")
-                for th, jf, j, f in bndl_aue_per_thresh:
-                    print(f"  th={th:.2f}: J&F={jf:.2f}, J={j:.2f}, F={f:.2f}")
             if run_bndl:
-                print("Per-threshold summary (BNDL pure):")
+                print("Per-threshold summary (BNDL):")
                 for th, jf, j, f in bndl_per_thresh:
+                    print(f"  th={th:.2f}: J&F={jf:.2f}, J={j:.2f}, F={f:.2f}")
+            if run_bndl_aue:
+                print("Per-threshold summary (BNDL_AUE):")
+                for th, jf, j, f in bndl_aue_per_thresh:
                     print(f"  th={th:.2f}: J&F={jf:.2f}, J={j:.2f}, F={f:.2f}")
             if run_ur_ern and isinstance(ur_ern_results, dict) and dataset_name in ur_ern_results:
                 print("Per-threshold summary (UR-ERN):")
@@ -400,10 +408,10 @@ def run_comparison_evaluation(
 
             if run_sam and sam2_per_thresh:
                 print(f"\nBest (SAM-2) th={best_sam2[0]:.2f} -> J&F: {best_sam2[1]:.2f}, J: {best_sam2[2]:.2f}, F: {best_sam2[3]:.2f}")
-            if run_bndl_aue and bndl_aue_per_thresh:
-                print(f"Best (BNDL+AUE) th={best_bndl_aue[0]:.2f} -> J&F: {best_bndl_aue[1]:.2f}, J: {best_bndl_aue[2]:.2f}, F: {best_bndl_aue[3]:.2f}")
             if run_bndl and bndl_per_thresh:
-                print(f"Best (BNDL pure) th={best_bndl[0]:.2f} -> J&F: {best_bndl[1]:.2f}, J: {best_bndl[2]:.2f}, F: {best_bndl[3]:.2f}")
+                print(f"Best (BNDL) th={best_bndl[0]:.2f} -> J&F: {best_bndl[1]:.2f}, J: {best_bndl[2]:.2f}, F: {best_bndl[3]:.2f}")
+            if run_bndl_aue and bndl_aue_per_thresh:
+                print(f"Best (BNDL_AUE) th={best_bndl_aue[0]:.2f} -> J&F: {best_bndl_aue[1]:.2f}, J: {best_bndl_aue[2]:.2f}, F: {best_bndl_aue[3]:.2f}")
             if run_uctta and isinstance(uctta_results, dict) and dataset_name in uctta_results and isinstance(uctta_results[dataset_name], tuple):
                 print(f"Best (UCTTA) -> J&F: {uctta_results[dataset_name][0]:.2f}, J: {uctta_results[dataset_name][1]:.2f}, F: {uctta_results[dataset_name][2]:.2f}")
             if run_ur_ern and isinstance(ur_ern_results, dict) and dataset_name in ur_ern_results and isinstance(ur_ern_results[dataset_name], tuple):
@@ -447,10 +455,10 @@ def save_detailed_results(
     Args:
         output_path: Root output directory
         sam2_results: SAM-2 results {dataset: (J&F, J, F)}
-        bndl_aue_results: BNDL+AUE results {dataset: (J&F, J, F)}
-        bndl_aue_statistics: BNDL+AUE statistics per dataset
-        bndl_results: BNDL (pure) results {dataset: (J&F, J, F)}
-        bndl_statistics: BNDL (pure) statistics per dataset
+        bndl_results: BNDL results {dataset: (J&F, J, F)}
+        bndl_statistics: BNDL statistics per dataset
+        bndl_aue_results: BNDL_AUE results {dataset: (J&F, J, F)}
+        bndl_aue_statistics: BNDL_AUE statistics per dataset
         uctta_results: UCTTA results {dataset: (J&F, J, F)}
         uctta_statistics: UCTTA statistics per dataset
         ua_data: UA analysis data per dataset
@@ -527,7 +535,7 @@ def create_comprehensive_comparison_plots(
     uctta_results: dict[str, tuple[float, float, float]] | None = None,
     uctta_statistics: dict[str, Any] | None = None,
 ) -> None:
-    """Create comprehensive comparison plots between SAM-2 and SAM-2+BNDL"""
+    """Create comprehensive comparison plots between SAM-2 and BNDL"""
 
     print("\nGenerating comprehensive comparison plots...")
 
@@ -556,11 +564,11 @@ def create_comprehensive_comparison_plots(
     for i, dataset in enumerate(datasets):
         df_data.extend([
             {"Dataset": dataset, "Method": "SAM-2", "Metric": "J&F", "Score": sam2_jf[i]},
-            {"Dataset": dataset, "Method": "SAM-2+BNDL", "Metric": "J&F", "Score": bndl_jf[i]},
+            {"Dataset": dataset, "Method": "BNDL_AUE", "Metric": "J&F", "Score": bndl_jf[i]},
             {"Dataset": dataset, "Method": "SAM-2", "Metric": "J (IoU)", "Score": sam2_j[i]},
-            {"Dataset": dataset, "Method": "SAM-2+BNDL", "Metric": "J (IoU)", "Score": bndl_j[i]},
+            {"Dataset": dataset, "Method": "BNDL_AUE", "Metric": "J (IoU)", "Score": bndl_j[i]},
             {"Dataset": dataset, "Method": "SAM-2", "Metric": "F (Boundary)", "Score": sam2_f[i]},
-            {"Dataset": dataset, "Method": "SAM-2+BNDL", "Metric": "F (Boundary)", "Score": bndl_f[i]},
+            {"Dataset": dataset, "Method": "BNDL_AUE", "Metric": "F (Boundary)", "Score": bndl_f[i]},
         ])
 
     df = pd.DataFrame(df_data)
@@ -596,7 +604,7 @@ def create_comprehensive_comparison_plots(
     gs = fig.add_gridspec(4, 4, hspace=0.6, wspace=0.6)
 
     # Main title
-    fig.suptitle("SAM-2 vs SAM-2+BNDL Zero-shot Evaluation Comparison", fontsize=20, fontweight="bold", y=0.95)
+    fig.suptitle("SAM-2 vs BNDL_AUE Zero-shot Evaluation Comparison", fontsize=20, fontweight="bold", y=0.95)
 
     # 1. J&F Scores Comparison (top left)
     ax1 = fig.add_subplot(gs[0, 0])
@@ -604,7 +612,7 @@ def create_comprehensive_comparison_plots(
     width = 0.35
 
     bars1 = ax1.bar(x - width / 2, sam2_jf, width, label="SAM-2", color="#FF6B6B", alpha=0.8)
-    bars2 = ax1.bar(x + width / 2, bndl_jf, width, label="SAM-2+BNDL", color="#4ECDC4", alpha=0.8)
+    bars2 = ax1.bar(x + width / 2, bndl_jf, width, label="BNDL_AUE", color="#4ECDC4", alpha=0.8)
 
     ax1.set_title("J&F Scores Comparison", fontweight="bold", fontsize=12)
     ax1.set_ylabel("J&F Score", fontsize=10)
@@ -623,7 +631,7 @@ def create_comprehensive_comparison_plots(
     # 2. J (IoU) Scores Comparison (top center)
     ax2 = fig.add_subplot(gs[0, 1])
     bars1 = ax2.bar(x - width / 2, sam2_j, width, label="SAM-2", color="#FF6B6B", alpha=0.8)
-    bars2 = ax2.bar(x + width / 2, bndl_j, width, label="SAM-2+BNDL", color="#4ECDC4", alpha=0.8)
+    bars2 = ax2.bar(x + width / 2, bndl_j, width, label="BNDL_AUE", color="#4ECDC4", alpha=0.8)
 
     ax2.set_title("J (IoU) Scores Comparison", fontweight="bold", fontsize=12)
     ax2.set_ylabel("J (IoU) Score", fontsize=10)
@@ -642,7 +650,7 @@ def create_comprehensive_comparison_plots(
     # 3. F (Boundary) Scores Comparison (top right)
     ax3 = fig.add_subplot(gs[0, 2])
     bars1 = ax3.bar(x - width / 2, sam2_f, width, label="SAM-2", color="#FF6B6B", alpha=0.8)
-    bars2 = ax3.bar(x + width / 2, bndl_f, width, label="SAM-2+BNDL", color="#4ECDC4", alpha=0.8)
+    bars2 = ax3.bar(x + width / 2, bndl_f, width, label="BNDL_AUE", color="#4ECDC4", alpha=0.8)
 
     ax3.set_title("F (Boundary) Scores Comparison", fontweight="bold", fontsize=12)
     ax3.set_ylabel("F (Boundary) Score", fontsize=10)
@@ -671,7 +679,7 @@ def create_comprehensive_comparison_plots(
         ax4.bar(x_imp + i * width_imp, data, width_imp, label=label, alpha=0.8)
 
     ax4.set_title("Improvement Summary", fontweight="bold", fontsize=12)
-    ax4.set_ylabel("Improvement (BNDL - SAM-2)", fontsize=10)
+    ax4.set_ylabel("Improvement (BNDL_AUE - SAM-2)", fontsize=10)
     ax4.set_xticks(x_imp + width_imp)
     ax4.set_xticklabels(datasets, rotation=45, ha="right", fontsize=9)
     ax4.legend(fontsize=9)
@@ -687,7 +695,7 @@ def create_comprehensive_comparison_plots(
     ax5.set_xticks(range(len(datasets)))
     ax5.set_xticklabels(datasets, rotation=45, ha="right", fontsize=9)
     ax5.set_yticks(range(6))
-    ax5.set_yticklabels(["SAM-2 J&F", "BNDL J&F", "SAM-2 J", "BNDL J", "SAM-2 F", "BNDL F"], fontsize=9)
+    ax5.set_yticklabels(["SAM-2 J&F", "BNDL_AUE J&F", "SAM-2 J", "BNDL_AUE J", "SAM-2 F", "BNDL_AUE F"], fontsize=9)
     ax5.set_title("Performance Heatmap Comparison", fontweight="bold", fontsize=12)
 
     # Add text annotations
@@ -714,11 +722,11 @@ def create_comprehensive_comparison_plots(
     # Adjust legend
     ax6.legend(fontsize=9, loc="upper right")
 
-    # 7. BNDL Lambda Statistics (bottom left)
+    # 7. BNDL_AUE Lambda Statistics (bottom left)
     if bndl_statistics:
         ax7 = fig.add_subplot(gs[2, 0])
 
-        # Extract BNDL statistics for plotting
+        # Extract BNDL_AUE statistics for plotting
         lambda_data = []
 
         for dataset, stats in bndl_statistics.items():
@@ -734,7 +742,7 @@ def create_comprehensive_comparison_plots(
             lambda_df = pd.DataFrame(lambda_data)
             lambda_df.columns = ["Dataset", "Lambda"]
             sns.boxplot(data=lambda_df, x="Dataset", y="Lambda", ax=ax7)
-            ax7.set_title("BNDL Lambda (λ) Distribution", fontweight="bold", fontsize=10)
+            ax7.set_title("BNDL_AUE Lambda (λ) Distribution", fontweight="bold", fontsize=10)
             ax7.set_ylabel("Lambda Value", fontsize=9)
             for label in ax7.get_xticklabels():
                 label.set_rotation(45)
@@ -743,13 +751,13 @@ def create_comprehensive_comparison_plots(
             ax7.grid(True, alpha=0.3)
         else:
             ax7.text(0.5, 0.5, "No Lambda Data", ha="center", va="center", transform=ax7.transAxes, fontsize=9)
-            ax7.set_title("BNDL Lambda (λ)", fontweight="bold", fontsize=10)
+            ax7.set_title("BNDL_AUE Lambda (λ)", fontweight="bold", fontsize=10)
 
-    # 8. BNDL K Statistics (bottom center-left)
+    # 8. BNDL_AUE K Statistics (bottom center-left)
     if bndl_statistics:
         ax8 = fig.add_subplot(gs[2, 1])
 
-        # Extract BNDL statistics for plotting
+        # Extract BNDL_AUE statistics for plotting
         k_data = []
 
         for dataset, stats in bndl_statistics.items():
@@ -765,7 +773,7 @@ def create_comprehensive_comparison_plots(
             k_df = pd.DataFrame(k_data)
             k_df.columns = ["Dataset", "K"]
             sns.boxplot(data=k_df, x="Dataset", y="K", ax=ax8)
-            ax8.set_title("BNDL K Distribution", fontweight="bold", fontsize=10)
+            ax8.set_title("BNDL_AUE K Distribution", fontweight="bold", fontsize=10)
             ax8.set_ylabel("K Value", fontsize=9)
             for label in ax8.get_xticklabels():
                 label.set_rotation(45)
@@ -774,7 +782,7 @@ def create_comprehensive_comparison_plots(
             ax8.grid(True, alpha=0.3)
         else:
             ax8.text(0.5, 0.5, "No K Data", ha="center", va="center", transform=ax8.transAxes, fontsize=9)
-            ax8.set_title("BNDL K", fontweight="bold", fontsize=10)
+            ax8.set_title("BNDL_AUE K", fontweight="bold", fontsize=10)
 
     # 9. Summary Statistics Table (bottom right)
     ax9 = fig.add_subplot(gs[2, 2:])
@@ -821,7 +829,7 @@ def create_comprehensive_comparison_plots(
         ])
 
     table = ax9.table(
-        cellText=summary_data, colLabels=["Dataset", "Type", "SAM-2 J&F", "BNDL J&F", "ΔJ&F", "SAM-2 J", "BNDL J", "ΔJ", "SAM-2 F", "BNDL F", "ΔF"], cellLoc="center", loc="center", bbox=None
+        cellText=summary_data, colLabels=["Dataset", "Type", "SAM-2 J&F", "BNDL_AUE J&F", "ΔJ&F", "SAM-2 J", "BNDL_AUE J", "ΔJ", "SAM-2 F", "BNDL_AUE F", "ΔF"], cellLoc="center", loc="center", bbox=None
     )
     table.auto_set_font_size(False)
     table.set_fontsize(8)
@@ -906,22 +914,22 @@ def create_ua_shift_analysis_plots(
     """Create UA (Uncertainty-Accuracy) shift analysis plots
     
     Args:
-        bndl_statistics: Dictionary containing BNDL statistics per dataset
+        bndl_statistics: Dictionary containing BNDL_AUE statistics per dataset
         sam2_results: SAM-2 performance results  
-        bndl_results: BNDL performance results
+        bndl_results: BNDL_AUE performance results
         output_path: Output directory for plots
         uctta_statistics: Optional UCTTA statistics per dataset
         uctta_results: Optional UCTTA performance results
         ur_ern_results: Optional UR-ERN performance results
         source_domain: Source domain for shift comparison (default: MOSE_train - fine-tune domain)
     """
-    print("\nGenerating UA shift analysis plots...")
+    print("\nGenerating UA shift analysis plots using BNDL_AUE...")
     
     # Define unified color scheme for all methods
     METHOD_COLORS = {
         'SAM-2': '#95A5A6',   # Gray - baseline
         'UCTTA': '#FF6B6B',   # Red/Pink - adaptation method
-        'BNDL': '#4ECDC4',    # Teal/Cyan - our method
+        'BNDL_AUE': '#4ECDC4',  # Teal/Cyan - our method (default)
         'UR-ERN': '#95E1D3',  # Light teal/mint - alternative method
     }
     
@@ -1003,7 +1011,7 @@ def create_ua_shift_analysis_plots(
     
     # Color source domain differently
     bndl_colors = ['red' if d == source_domain else 'blue' for d in bndl_datasets_list]
-    ax1.scatter(bndl_x_unc, bndl_y_jf, c=bndl_colors, s=100, alpha=0.6, edgecolors='black', label='BNDL')
+    ax1.scatter(bndl_x_unc, bndl_y_jf, c=bndl_colors, s=100, alpha=0.6, edgecolors='black', label='BNDL_AUE')
     
     # Add dataset labels
     for i, dataset in enumerate(bndl_datasets_list):
@@ -1016,18 +1024,18 @@ def create_ua_shift_analysis_plots(
         p = np.poly1d(z)
         x_line = np.linspace(min(bndl_x_unc), max(bndl_x_unc), 100)
         ax1.plot(x_line, p(x_line), "b--", alpha=0.5, linewidth=2, 
-                label=f'BNDL Trend: y={z[0]:.2f}x+{z[1]:.2f}')
+                label=f'BNDL_AUE Trend: y={z[0]:.2f}x+{z[1]:.2f}')
         
         # Calculate correlation
         corr = np.corrcoef(bndl_x_unc, bndl_y_jf)[0, 1]
-        ax1.text(0.05, 0.95, f'BNDL Correlation: {corr:.3f}', 
+        ax1.text(0.05, 0.95, f'BNDL_AUE Correlation: {corr:.3f}', 
                 transform=ax1.transAxes, fontsize=9,
                 bbox=dict(boxstyle="round", facecolor="lightblue", alpha=0.5),
                 verticalalignment='top')
     
     ax1.set_xlabel('Pixel Uncertainty (mean)', fontsize=11)
     ax1.set_ylabel('J&F Score', fontsize=11)
-    ax1.set_title('BNDL: Uncertainty vs Performance', fontweight='bold', fontsize=12)
+    ax1.set_title('BNDL_AUE: Uncertainty vs Performance', fontweight='bold', fontsize=12)
     ax1.grid(True, alpha=0.3)
     ax1.legend()
     
@@ -1061,8 +1069,8 @@ def create_ua_shift_analysis_plots(
     
     ax3.axhline(y=0, color='black', linestyle='-', alpha=0.3, linewidth=1)
     ax3.set_xlabel('Pixel Uncertainty', fontsize=11)
-    ax3.set_ylabel('BNDL Improvement (ΔJ&F)', fontsize=11)
-    ax3.set_title('BNDL Improvement vs Uncertainty', fontweight='bold', fontsize=12)
+    ax3.set_ylabel('BNDL_AUE Improvement (ΔJ&F)', fontsize=11)
+    ax3.set_title('BNDL_AUE Improvement vs Uncertainty', fontweight='bold', fontsize=12)
     ax3.grid(True, alpha=0.3)
     
     # 4. Uncertainty distribution across datasets (BNDL) - MOVED to gs[0, 3]
@@ -1073,8 +1081,8 @@ def create_ua_shift_analysis_plots(
     bars4 = ax4.bar(x_pos, bndl_x_unc, color=bndl_colors, alpha=0.7, edgecolor='black')
     ax4.set_xticks(x_pos)
     ax4.set_xticklabels(dataset_names_short, rotation=45, ha='right', fontsize=9)
-    ax4.set_ylabel('Mean Pixel Uncertainty (BNDL)', fontsize=11)
-    ax4.set_title('BNDL Uncertainty Distribution Across Datasets', fontweight='bold', fontsize=12)
+    ax4.set_ylabel('Mean Pixel Uncertainty (BNDL_AUE)', fontsize=11)
+    ax4.set_title('BNDL_AUE Uncertainty Distribution Across Datasets', fontweight='bold', fontsize=12)
     ax4.grid(True, alpha=0.3, axis='y')
     
     # Add value labels on bars
@@ -1197,7 +1205,7 @@ def create_ua_shift_analysis_plots(
         print(f"Including UR-ERN data for {len(ur_ern_accuracy_pcc_map)} datasets in UA analysis")
 
     # Update title now that we know which methods are available
-    title_parts = ["UA Consistency Analysis: BNDL"]
+    title_parts = ["UA Consistency Analysis: BNDL_AUE"]
     if has_uctta:
         title_parts.append(" vs UCTTA")
     if has_ur_ern:
@@ -1238,10 +1246,11 @@ def create_ua_shift_analysis_plots(
             ax2.barh(x_pos + offset, uctta_nll_vals, width, label='UCTTA', color=METHOD_COLORS['UCTTA'], alpha=0.8)
             offset += width
         
-        # Plot BNDL
+        # Plot BNDL_AUE
         if bndl_nll_data:
             bndl_nll_vals = [bndl_nll_data.get(d, np.nan) for d in common_datasets]
-            ax2.barh(x_pos + offset, bndl_nll_vals, width, label='BNDL', color=METHOD_COLORS['BNDL'], alpha=0.8)
+            ax2.barh(x_pos + offset, bndl_nll_vals, width, label='BNDL_AUE', 
+                    color=METHOD_COLORS['BNDL_AUE'], alpha=0.8)
             offset += width
         
         # Plot UR-ERN if available
@@ -1280,7 +1289,7 @@ def create_ua_shift_analysis_plots(
         ax2.set_yticks(range(len(sorted_datasets)))
         ax2.set_yticklabels(sorted_datasets, fontsize=9)
         ax2.set_xlabel('Mean NLL (lower is better)', fontsize=11)
-        ax2.set_title('BNDL NLL Ranking by Dataset', fontweight='bold', fontsize=12)
+        ax2.set_title('BNDL_AUE NLL Ranking by Dataset', fontweight='bold', fontsize=12)
         ax2.invert_xaxis()  # Lower NLL is better
         
         # Add value labels
@@ -1306,7 +1315,7 @@ def create_ua_shift_analysis_plots(
         ax5.set_yticks(y_pos)
         ax5.set_yticklabels(labels, fontsize=9)
         ax5.set_xlabel(f"ΔPCC relative to {source_domain}", fontsize=11)
-        ax5.set_title("BNDL: UA Shift (ΔPCC)", fontweight='bold', fontsize=12)
+        ax5.set_title("BNDL_AUE: UA Shift (ΔPCC)", fontweight='bold', fontsize=12)
         ax5.axvline(x=0.0, color='black', linestyle='--', alpha=0.4)
         ax5.grid(True, alpha=0.3, axis='x')
         
@@ -1393,8 +1402,9 @@ def create_ua_shift_analysis_plots(
         ax8.barh(x_pos + offset, uctta_jf_vals, width, label='UCTTA', color=METHOD_COLORS['UCTTA'], alpha=0.8)
         offset += width
     
-    # Plot BNDL
-    ax8.barh(x_pos + offset, bndl_jf_vals, width, label='BNDL', color=METHOD_COLORS['BNDL'], alpha=0.8)
+    # Plot BNDL_AUE
+    ax8.barh(x_pos + offset, bndl_jf_vals, width, label='BNDL_AUE', 
+            color=METHOD_COLORS['BNDL_AUE'], alpha=0.8)
     offset += width
     
     # Plot UR-ERN if available  
@@ -1413,7 +1423,7 @@ def create_ua_shift_analysis_plots(
     title_methods = ['SAM-2']
     if has_uctta and uctta_results:
         title_methods.append('UCTTA')
-    title_methods.append('BNDL')
+    title_methods.append('BNDL_AUE')
     if has_ur_ern and ur_ern_results:
         title_methods.append('UR-ERN')
     ax8.set_title(f'J&F Performance: {" vs ".join(title_methods)}', fontweight='bold', fontsize=12)
@@ -1445,7 +1455,7 @@ def create_ua_shift_analysis_plots(
     
     table = ax9.table(
         cellText=table_data,
-        colLabels=["Dataset", "Uncertainty", "BNDL J&F", "Δ vs SAM-2"],
+        colLabels=["Dataset", "Uncertainty", "BNDL_AUE J&F", "Δ vs SAM-2"],
         cellLoc="center",
         loc="center",
         bbox=[0, 0, 1, 1]
@@ -1510,6 +1520,307 @@ def create_ua_shift_analysis_plots(
                                  (f"{delta_r:+.6f}" if isinstance(delta_r, float) else delta_r),
                                  ])
         print(f"UA PCC summary CSV saved to: {csv_path}")
+
+
+def create_pavpu_comparison_plots(
+    output_path: Path,
+    bndl_aue_statistics: dict[str, Any] | None = None,
+    bndl_statistics: dict[str, Any] | None = None,
+    uctta_statistics: dict[str, Any] | None = None,
+    ur_ern_statistics: dict[str, Any] | None = None,
+    datasets: list[str] | None = None,
+):
+    """
+    Create TRUE PAvPU scatter plots (Uncertainty vs Accuracy, NO thresholds)
+    PAvPU (Pseudo-mask Accuracy vs Prediction Uncertainty) shows calibration quality
+    
+    Args:
+        output_path: Output directory for plots
+        bndl_aue_statistics: BNDL+AUE statistics containing raw pixel samples
+        bndl_statistics: BNDL statistics containing raw pixel samples
+        uctta_statistics: UCTTA statistics containing raw pixel samples
+        ur_ern_statistics: UR-ERN statistics containing raw pixel samples
+        datasets: List of datasets to include in comparison
+    """
+    print("\n" + "=" * 80)
+    print("Creating TRUE PAvPU Scatter Plots (Uncertainty vs Accuracy, NO thresholds)")
+    print("=" * 80)
+    
+    # Collect raw PAvPU samples from all methods
+    methods_with_pavpu = {}
+    
+    # Parse BNDL+AUE statistics (get raw samples)
+    if bndl_aue_statistics:
+        pavpu_data = _extract_pavpu_samples_from_statistics(bndl_aue_statistics, datasets)
+        if pavpu_data:
+            methods_with_pavpu["BNDL+AUE"] = pavpu_data
+    
+    # Parse BNDL statistics
+    if bndl_statistics:
+        pavpu_data = _extract_pavpu_samples_from_statistics(bndl_statistics, datasets)
+        if pavpu_data:
+            methods_with_pavpu["BNDL"] = pavpu_data
+    
+    # Parse UCTTA statistics
+    if uctta_statistics:
+        pavpu_data = _extract_pavpu_samples_from_statistics(uctta_statistics, datasets)
+        if pavpu_data:
+            methods_with_pavpu["UCTTA"] = pavpu_data
+    
+    # Parse UR-ERN statistics
+    if ur_ern_statistics:
+        pavpu_data = _extract_pavpu_samples_from_statistics(ur_ern_statistics, datasets)
+        if pavpu_data:
+            methods_with_pavpu["UR-ERN"] = pavpu_data
+    
+    # Check if we have any methods with PAvPU data
+    if not methods_with_pavpu:
+        print("⚠ No PAvPU data found for any method. Skipping PAvPU comparison plots.")
+        print("   Make sure to run evaluation with --collect_statistics to gather PAvPU data.")
+        return
+    
+    print(f"Found PAvPU raw samples for methods: {list(methods_with_pavpu.keys())}")
+    for method, data in methods_with_pavpu.items():
+        total_samples = sum(len(samples['uncertainty']) for samples in data.values())
+        print(f"  {method}: {len(data)} datasets, {total_samples} total pixel samples")
+    
+    # Create TRUE PAvPU scatter/density plots (uncertainty vs accuracy)
+    _plot_pavpu_scatter(methods_with_pavpu, output_path)
+    _plot_pavpu_hexbin(methods_with_pavpu, output_path)
+    
+    print(f"✓ TRUE PAvPU scatter plots saved to: {output_path / 'comparison_plots'}")
+
+
+def _extract_pavpu_samples_from_statistics(statistics: dict[str, Any], datasets: list[str] | None = None) -> dict:
+    """
+    Extract raw PAvPU samples (uncertainty and accuracy) from statistics dictionary
+    
+    Args:
+        statistics: Statistics dictionary containing raw pixel samples
+        datasets: Optional list of datasets to filter
+    
+    Returns:
+        dict with structure {dataset: {'uncertainty': [...], 'accuracy': [...]}}
+    """
+    pavpu_data = {}
+    
+    for key, value in statistics.items():
+        # Parse keys like "GTEA_eval_pavpu_uncertainty_samples" or "GTEA_eval_pavpu_accuracy_samples"
+        if "_pavpu_uncertainty_samples" in key:
+            parts = key.split("_pavpu_uncertainty_samples")
+            if len(parts) == 2:
+                dataset_prefix = parts[0]
+                # Extract dataset name (remove trailing _eval if present)
+                dataset_name = dataset_prefix.replace("_eval", "")
+                
+                # Filter by dataset list if provided
+                if datasets is not None and dataset_name not in datasets:
+                    continue
+                
+                # Initialize dataset dict if needed
+                if dataset_name not in pavpu_data:
+                    pavpu_data[dataset_name] = {'uncertainty': [], 'accuracy': []}
+                
+                # Store uncertainty samples
+                if isinstance(value, list):
+                    pavpu_data[dataset_name]['uncertainty'] = value
+                
+        elif "_pavpu_accuracy_samples" in key:
+            parts = key.split("_pavpu_accuracy_samples")
+            if len(parts) == 2:
+                dataset_prefix = parts[0]
+                dataset_name = dataset_prefix.replace("_eval", "")
+                
+                # Filter by dataset list if provided
+                if datasets is not None and dataset_name not in datasets:
+                    continue
+                
+                # Initialize dataset dict if needed
+                if dataset_name not in pavpu_data:
+                    pavpu_data[dataset_name] = {'uncertainty': [], 'accuracy': []}
+                
+                # Store accuracy samples
+                if isinstance(value, list):
+                    pavpu_data[dataset_name]['accuracy'] = value
+    
+    # Filter out datasets with missing or empty data
+    pavpu_data = {
+        dataset: samples 
+        for dataset, samples in pavpu_data.items() 
+        if samples['uncertainty'] and samples['accuracy'] and 
+           len(samples['uncertainty']) == len(samples['accuracy'])
+    }
+    
+    return pavpu_data
+
+
+def _plot_pavpu_scatter(methods_with_pavpu: dict, output_path: Path):
+    """
+    Plot TRUE PAvPU scatter plots: Uncertainty (X) vs Accuracy (Y)
+    Each point represents a pixel. Shows calibration quality directly.
+    """
+    print("\n  Creating PAvPU scatter plots...")
+    
+    # Get all datasets
+    all_datasets = set()
+    for method_data in methods_with_pavpu.values():
+        all_datasets.update(method_data.keys())
+    all_datasets = sorted(all_datasets)
+    
+    if not all_datasets:
+        print("⚠ No datasets found in PAvPU data")
+        return
+    
+    # Create subplots: one per dataset
+    n_datasets = len(all_datasets)
+    n_cols = min(3, n_datasets)
+    n_rows = (n_datasets + n_cols - 1) // n_cols
+    
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 5 * n_rows))
+    if n_datasets == 1:
+        axes = np.array([axes])
+    axes = axes.flatten()
+    
+    # Color scheme for methods
+    method_colors = {
+        "BNDL+AUE": "#1f77b4",  # Blue
+        "BNDL": "#ff7f0e",      # Orange
+        "UR-ERN": "#2ca02c",    # Green
+        "UCTTA": "#d62728",     # Red
+    }
+    
+    for idx, dataset in enumerate(all_datasets):
+        ax = axes[idx]
+        
+        for method, method_data in methods_with_pavpu.items():
+            if dataset not in method_data:
+                continue
+            
+            # Get raw uncertainty and accuracy samples
+            samples = method_data[dataset]
+            uncertainty = np.array(samples['uncertainty'])
+            accuracy = np.array(samples['accuracy'])
+            
+            # Plot scatter (with alpha for overlapping points)
+            color = method_colors.get(method, "#333333")
+            ax.scatter(uncertainty, accuracy, alpha=0.3, s=1, 
+                      color=color, label=method, rasterized=True)
+        
+        # Ideal calibration line (diagonal)
+        ax.plot([0, 1], [0, 1], 'k--', alpha=0.3, linewidth=1, label='Perfect calibration')
+        
+        # Formatting
+        ax.set_xlabel("Pixel Uncertainty", fontsize=10)
+        ax.set_ylabel("Pixel Accuracy (0=wrong, 1=correct)", fontsize=10)
+        ax.set_title(f"{dataset}", fontweight='bold', fontsize=11)
+        ax.grid(True, alpha=0.2)
+        ax.legend(fontsize=8, loc='best', markerscale=5)
+        ax.set_xlim([0, 1])
+        ax.set_ylim([-0.05, 1.05])
+    
+    # Hide unused subplots
+    for idx in range(n_datasets, len(axes)):
+        axes[idx].axis('off')
+    
+    plt.suptitle("TRUE PAvPU: Pixel Uncertainty vs Accuracy (NO thresholds)", 
+                 fontsize=14, fontweight='bold', y=1.0)
+    plt.tight_layout()
+    
+    # Save
+    plots_dir = output_path / "comparison_plots"
+    plots_dir.mkdir(exist_ok=True)
+    
+    scatter_path = plots_dir / "pavpu_scatter_comparison.png"
+    plt.savefig(scatter_path, dpi=300, bbox_inches="tight")
+    plt.savefig(plots_dir / "pavpu_scatter_comparison.pdf", bbox_inches="tight")
+    plt.close()
+    
+    print(f"  ✓ PAvPU scatter plots saved: {scatter_path}")
+
+
+def _plot_pavpu_hexbin(methods_with_pavpu: dict, output_path: Path):
+    """
+    Plot PAvPU hexbin density plots (better for large datasets with many overlapping points)
+    Shows density of points in hexagonal bins
+    """
+    print("\n  Creating PAvPU hexbin density plots...")
+    
+    # Get all datasets
+    all_datasets = set()
+    for method_data in methods_with_pavpu.values():
+        all_datasets.update(method_data.keys())
+    all_datasets = sorted(all_datasets)
+    
+    if not all_datasets:
+        print("⚠ No datasets found in PAvPU data")
+        return
+    
+    # Create subplots: one per dataset (combine all methods in a single hexbin per dataset)
+    n_datasets = len(all_datasets)
+    n_cols = min(3, n_datasets)
+    n_rows = (n_datasets + n_cols - 1) // n_cols
+    
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(6 * n_cols, 5 * n_rows))
+    if n_datasets == 1:
+        axes = np.array([axes])
+    axes = axes.flatten()
+    
+    for idx, dataset in enumerate(all_datasets):
+        ax = axes[idx]
+        
+        # Combine all methods' data for this dataset
+        all_uncertainty = []
+        all_accuracy = []
+        
+        for method, method_data in methods_with_pavpu.items():
+            if dataset not in method_data:
+                continue
+            
+            samples = method_data[dataset]
+            all_uncertainty.extend(samples['uncertainty'])
+            all_accuracy.extend(samples['accuracy'])
+        
+        if not all_uncertainty:
+            ax.text(0.5, 0.5, 'No data', ha='center', va='center', transform=ax.transAxes)
+            continue
+        
+        # Create hexbin density plot
+        hb = ax.hexbin(all_uncertainty, all_accuracy, gridsize=30, cmap='YlOrRd', 
+                      mincnt=1, reduce_C_function=np.sum, linewidths=0.2)
+        
+        # Ideal calibration line
+        ax.plot([0, 1], [0, 1], 'k--', alpha=0.5, linewidth=2, label='Perfect calibration')
+        
+        # Formatting
+        ax.set_xlabel("Pixel Uncertainty", fontsize=10)
+        ax.set_ylabel("Pixel Accuracy (0=wrong, 1=correct)", fontsize=10)
+        ax.set_title(f"{dataset}\n({len(all_uncertainty)} pixels, all methods)", 
+                    fontweight='bold', fontsize=10)
+        ax.set_xlim([0, 1])
+        ax.set_ylim([-0.05, 1.05])
+        ax.legend(fontsize=8, loc='upper left')
+        
+        # Add colorbar
+        plt.colorbar(hb, ax=ax, label='Pixel count')
+    
+    # Hide unused subplots
+    for idx in range(n_datasets, len(axes)):
+        axes[idx].axis('off')
+    
+    plt.suptitle("PAvPU Density (Hexbin): Pixel Uncertainty vs Accuracy (NO thresholds)", 
+                 fontsize=14, fontweight='bold', y=1.0)
+    plt.tight_layout()
+    
+    # Save
+    plots_dir = output_path / "comparison_plots"
+    plots_dir.mkdir(exist_ok=True)
+    
+    hexbin_path = plots_dir / "pavpu_hexbin_density.png"
+    plt.savefig(hexbin_path, dpi=300, bbox_inches="tight")
+    plt.savefig(plots_dir / "pavpu_hexbin_density.pdf", bbox_inches="tight")
+    plt.close()
+    
+    print(f"  ✓ PAvPU hexbin density plots saved: {hexbin_path}")
 
 
 def load_results_from_detailed_json(
@@ -1586,7 +1897,7 @@ def load_results_from_detailed_json(
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Compare SAM-2 vs SAM-2+BNDL zero-shot evaluation")
+    p = argparse.ArgumentParser(description="Compare SAM-2 vs BNDL vs BNDL_AUE zero-shot evaluation")
 
     # Dataset selection
     p.add_argument(
@@ -1609,28 +1920,28 @@ def parse_args():
         help="SAM-2 checkpoint path",
     )
 
-    # SAM-2+BNDL+AUE configuration
+    # BNDL configuration (optional, only needed if --run_bndl is set)
+    p.add_argument(
+        "--bndl_cfg",
+        default="configs/sam2.1/sam2.1_hiera_b+_bndl.yaml",
+        help="BNDL config file",
+    )
+    p.add_argument(
+        "--bndl_checkpoint",
+        default=None,
+        help="BNDL checkpoint path (required only if --run_bndl is set)",
+    )
+
+    # BNDL_AUE configuration
     p.add_argument(
         "--bndl_aue_cfg",
-        default="configs/sam2.1_training/sam2_bndl_aue.yaml",
-        help="SAM-2+BNDL+AUE config file",
+        default="configs/sam2.1/sam2.1_hiera_b+_bndl_aue.yaml",
+        help="BNDL_AUE config file",
     )
     p.add_argument(
         "--bndl_aue_checkpoint",
         default="/home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_012_02/checkpoints/checkpoint.pt",
-        help="SAM-2+BNDL+AUE checkpoint path",
-    )
-
-    # SAM-2+BNDL (pure) configuration
-    p.add_argument(
-        "--bndl_cfg",
-        default="configs/sam2.1_training/sam2_bndl.yaml",
-        help="SAM-2+BNDL (pure) config file",
-    )
-    p.add_argument(
-        "--bndl_checkpoint",
-        default="/home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_012_02/checkpoints/checkpoint.pt",
-        help="SAM-2+BNDL (pure) checkpoint path",
+        help="BNDL_AUE checkpoint path",
     )
 
     # SAM-2+UR-ERN configuration
@@ -1683,8 +1994,8 @@ def parse_args():
     # Method toggles
     p.add_argument("--run_sam", action="store_true", default=False, help="Run baseline SAM-2 branch")
     p.add_argument("--run_uctta", action="store_true", default=False, help="Run SAM-2 + UCTTA branch")
-    p.add_argument("--run_bndl_aue", action="store_true", default=False, help="Run SAM-2 + BNDL + AUE branch")
-    p.add_argument("--run_bndl", action="store_true", default=False, help="Run SAM-2 + BNDL (pure) branch")
+    p.add_argument("--run_bndl", action="store_true", default=False, help="Run BNDL branch")
+    p.add_argument("--run_bndl_aue", action="store_true", default=False, help="Run BNDL_AUE branch")
     p.add_argument("--run_ur_ern", action="store_true", default=False, help="Run SAM-2 + UR-ERN branch")
     # UCTTA options
     p.add_argument("--uctta_steps", type=int, default=2, help="UCTTA adaptation steps per frame/batch")
@@ -1710,16 +2021,19 @@ def main():
     print(f"Datasets: {args.datasets}")
     print(f"SAM-2 config: {args.sam2_cfg}")
     print(f"SAM-2 checkpoint: {args.sam2_checkpoint}")
-    print(f"BNDL+AUE config: {args.bndl_aue_cfg}")
-    print(f"BNDL+AUE checkpoint: {args.bndl_aue_checkpoint}")
-    print(f"BNDL (pure) config: {args.bndl_cfg}")
-    print(f"BNDL (pure) checkpoint: {args.bndl_checkpoint}")
+    print(f"BNDL config: {args.bndl_cfg}")
+    print(f"BNDL checkpoint: {args.bndl_checkpoint}")
+    print(f"BNDL_AUE config: {args.bndl_aue_cfg}")
+    print(f"BNDL_AUE checkpoint: {args.bndl_aue_checkpoint}")
 
     # Optionally load previous results to avoid re-running
     if args.load_detailed_json is not None:
         detailed_path = Path(args.load_detailed_json)
         print(f"Loading cached results from: {detailed_path}")
-        sam2_results, bndl_aue_results, bndl_aue_statistics, bndl_results, bndl_statistics, uctta_results, ur_ern_results, ua_data, uctta_statistics, ur_ern_statistics = load_results_from_detailed_json(detailed_path)
+        (sam2_results, bndl_aue_results, bndl_aue_statistics, bndl_results, bndl_statistics,
+         uctta_results, ur_ern_results, ua_data, uctta_statistics, ur_ern_statistics) = (
+            load_results_from_detailed_json(detailed_path)
+        )
     else:
         # Run comparison evaluation
         sam2_results, bndl_aue_results, bndl_aue_statistics, bndl_results, bndl_statistics, uctta_results, ur_ern_results, ua_data, uctta_statistics, ur_ern_statistics = run_comparison_evaluation(

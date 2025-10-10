@@ -411,6 +411,10 @@ def inference_with_uctta(
             if not np.any(gt_bool):
                 continue
             
+            # Clear GPU memory before processing each object to prevent OOM
+            if torch.cuda.is_available() and len(obj_ids) > 10:
+                torch.cuda.empty_cache()
+            
             # Try reused prompts first, fall back to generation
             prompt_applied = False
             if prompts_json and obj_id in prompts_json:
@@ -532,6 +536,10 @@ def inference_with_uctta(
                     )[0, 0]
                 scaled = _apply_temperature(logits_2d, logT)
                 seg[oid] = _threshold_bool(scaled, score_thresh)
+            
+            # Clear GPU memory after processing frame with many objects
+            if torch.cuda.is_available() and len(out_obj_ids) > 10:
+                torch.cuda.empty_cache()
 
             # Add to dataset evaluator (sample a few objects to limit memory)
             if dataset_eval is not None and len(out_obj_ids) > 0:
@@ -625,18 +633,39 @@ def inference_with_uctta(
             )
             
             # Extract and return statistics
+            # Use the correct data source based on whether we're using pixel-level or image-level stats
+            data_source = dataset_eval.pixel_uncertainties if dataset_eval.per_pixel_statistics else dataset_eval.image_uncertainties
+            iou_source = dataset_eval.pixel_ious if dataset_eval.per_pixel_statistics else dataset_eval.image_ious
+            dice_source = dataset_eval.pixel_dices if dataset_eval.per_pixel_statistics else dataset_eval.image_dices
+            accuracy_source = dataset_eval.pixel_accuracies if dataset_eval.per_pixel_statistics else dataset_eval.image_accuracies
+            
+            # Sample raw data for PAvPU scatter plot (no thresholds)
+            max_samples = 10000
+            if data_source and accuracy_source:
+                total_samples = min(len(data_source), len(accuracy_source))
+                if total_samples > max_samples:
+                    indices = np.random.choice(total_samples, max_samples, replace=False)
+                    uncertainty_samples = [data_source[i] for i in indices]
+                    accuracy_samples = [accuracy_source[i] for i in indices]
+                else:
+                    uncertainty_samples = list(data_source)
+                    accuracy_samples = list(accuracy_source)
+            else:
+                uncertainty_samples = []
+                accuracy_samples = []
+            
             uctta_statistics = {
-                # Pixel uncertainty statistics
-                'pixel_uncertainty_mean': float(np.mean([u.item() for u in dataset_eval.image_uncertainties])) if dataset_eval.image_uncertainties else 0.0,
-                'pixel_uncertainty_std': float(np.std([u.item() for u in dataset_eval.image_uncertainties])) if dataset_eval.image_uncertainties else 0.0,
-                'pixel_uncertainty_median': float(np.median([u.item() for u in dataset_eval.image_uncertainties])) if dataset_eval.image_uncertainties else 0.0,
-                'pixel_uncertainty_min': float(np.min([u.item() for u in dataset_eval.image_uncertainties])) if dataset_eval.image_uncertainties else 0.0,
-                'pixel_uncertainty_max': float(np.max([u.item() for u in dataset_eval.image_uncertainties])) if dataset_eval.image_uncertainties else 0.0,
+                # Pixel uncertainty statistics (works for both pixel-level and image-level)
+                'pixel_uncertainty_mean': float(np.mean(data_source)) if data_source else 0.0,
+                'pixel_uncertainty_std': float(np.std(data_source)) if data_source else 0.0,
+                'pixel_uncertainty_median': float(np.median(data_source)) if data_source else 0.0,
+                'pixel_uncertainty_min': float(np.min(data_source)) if data_source else 0.0,
+                'pixel_uncertainty_max': float(np.max(data_source)) if data_source else 0.0,
                 
                 # Performance metrics
-                'iou_mean': float(np.mean([iou.item() for iou in dataset_eval.image_ious])) if dataset_eval.image_ious else 0.0,
-                'dice_mean': float(np.mean([d.item() for d in dataset_eval.image_dices])) if dataset_eval.image_dices else 0.0,
-                'accuracy_mean': float(np.mean([a.item() for a in dataset_eval.image_accuracies])) if dataset_eval.image_accuracies else 0.0,
+                'iou_mean': float(np.mean(iou_source)) if iou_source else 0.0,
+                'dice_mean': float(np.mean(dice_source)) if dice_source else 0.0,
+                'accuracy_mean': float(np.mean(accuracy_source)) if accuracy_source else 0.0,
                 
                 # Correlation results (UA relationship)
                 'correlation_results': dataset_eval.correlation_results,
@@ -645,7 +674,11 @@ def inference_with_uctta(
                 'summary': dataset_eval.get_summary_statistics(),
                 
                 # Sample count
-                'num_samples': len(dataset_eval.image_uncertainties),
+                'num_samples': len(data_source),
+                
+                # Raw PAvPU samples for true scatter plot (no thresholds)
+                'eval_pavpu_uncertainty_samples': uncertainty_samples,
+                'eval_pavpu_accuracy_samples': accuracy_samples,
             }
             
             print(f"UCTTA statistics collected: {uctta_statistics['num_samples']} samples, "
