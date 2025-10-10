@@ -510,10 +510,21 @@ def inference_with_uctta(
                 mask_logits = out_logits[i]
                 # Make a normal tensor (not an inference tensor) before interacting with logT
                 logits_clean = mask_logits.detach().clone()
+                
+                # Handle multimask output (K>1): select mask 0 (singlemask output token)
+                # This matches SAM-2's default behavior when multimask_output=False
                 if logits_clean.ndim == 3:
-                    logits_2d = logits_clean.squeeze(0)
+                    if logits_clean.shape[0] == 1:
+                        # Single mask: squeeze it
+                        logits_2d = logits_clean.squeeze(0)
+                    elif logits_clean.shape[0] > 1:
+                        # Multiple masks: use mask 0 (singlemask token, SAM-2 default)
+                        logits_2d = logits_clean[0]
+                    else:
+                        logits_2d = logits_clean
                 else:
                     logits_2d = logits_clean
+                
                 # align to original image size
                 if tuple(logits_2d.shape[-2:]) != (H, W):
                     logits_2d = F.interpolate(
