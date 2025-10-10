@@ -490,7 +490,11 @@ trainer:
     visualize_bndl: true
     uncertainty_metric: ["entropy", "nll"]
     visualize_pavpu_overlay: true
+<<<<<<< HEAD
     uncertainty_sample_num: 10  # Reduced from 50 to 10 for training speed
+=======
+    uncertainty_sample_num: 50
+>>>>>>> b4025d6 (add aue config)
     # 像素级PAvPU统计配置
     correlation_foreground_dilation: 10      # 前景区域膨胀半径（像素），0表示不膨胀
     correlation_per_pixel: true              # 使用像素级统计（vs 图片级）
