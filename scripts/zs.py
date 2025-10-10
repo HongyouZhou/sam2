@@ -40,6 +40,8 @@ def run_comparison_evaluation(
     datasets: list[str],
     sam2_cfg: str,
     sam2_checkpoint: str,
+    bndl_aue_cfg: str,
+    bndl_aue_checkpoint: str,
     bndl_cfg: str,
     bndl_checkpoint: str,
     output_path: Path,
@@ -59,6 +61,7 @@ def run_comparison_evaluation(
     uctta_lr: float = 3e-4,
     run_sam: bool = True,
     run_uctta: bool = False,
+    run_bndl_aue: bool = True,
     run_bndl: bool = True,
     run_ur_ern: bool = False,
     # click protocol passed to baseline SAM run so prompts are saved
@@ -73,6 +76,8 @@ def run_comparison_evaluation(
     uctta_selection_p: float = 0.1,
 ) -> tuple[
     dict[str, tuple[float, float, float]],  # sam2_results
+    dict[str, tuple[float, float, float]],  # bndl_aue_results
+    dict[str, Any],                          # bndl_aue_statistics
     dict[str, tuple[float, float, float]],  # bndl_results
     dict[str, Any],                          # bndl_statistics
     dict[str, tuple[float, float, float]] | None,  # uctta_results
@@ -89,11 +94,14 @@ def run_comparison_evaluation(
 
     # Create output directories
     sam2_output = output_path / "sam2_results"
+    bndl_aue_output = output_path / "bndl_aue_results"
     bndl_output = output_path / "bndl_results"
     uctta_output = output_path / "sam2_uctta_results"
     ur_ern_output = output_path / "sam2_ur_ern_results"
     if run_sam:
         sam2_output.mkdir(parents=True, exist_ok=True)
+    if run_bndl_aue:
+        bndl_aue_output.mkdir(parents=True, exist_ok=True)
     if run_bndl:
         bndl_output.mkdir(parents=True, exist_ok=True)
     if run_uctta:
@@ -118,15 +126,25 @@ def run_comparison_evaluation(
     )
     print("SAM-2 loaded successfully!")
 
-    # Load SAM-2+BNDL predictor with the same overrides
-    print("\nLoading SAM-2+BNDL checkpoint...")
+    # Load SAM-2+BNDL+AUE predictor with the same overrides
+    print("\nLoading SAM-2+BNDL+AUE checkpoint...")
+    bndl_aue_predictor = build_sam2_video_predictor(
+        config_file=bndl_aue_cfg,
+        ckpt_path=bndl_aue_checkpoint,
+        device=device,
+        hydra_overrides_extra=hydra_overrides_extra,
+    )
+    print("SAM-2+BNDL+AUE loaded successfully!")
+
+    # Load SAM-2+BNDL (pure) predictor with the same overrides
+    print("\nLoading SAM-2+BNDL (pure) checkpoint...")
     bndl_predictor = build_sam2_video_predictor(
         config_file=bndl_cfg,
         ckpt_path=bndl_checkpoint,
         device=device,
         hydra_overrides_extra=hydra_overrides_extra,
     )
-    print("SAM-2+BNDL loaded successfully!")
+    print("SAM-2+BNDL (pure) loaded successfully!")
 
     # Load SAM-2+UR-ERN predictor with the same overrides (if needed)
     ur_ern_predictor = None
@@ -144,9 +162,11 @@ def run_comparison_evaluation(
 
     # Run evaluations
     sam2_results = {}
+    bndl_aue_results = {}
     bndl_results = {}
     uctta_results: dict[str, tuple[float, float, float]] | dict[str, list[tuple[float, float, float, float]]] | None = {} if run_uctta else None
     ur_ern_results: dict[str, tuple[float, float, float]] | None = {} if run_ur_ern else None
+    bndl_aue_statistics = {}
     bndl_statistics = {}
     uctta_statistics = {}  # Store UCTTA statistics per dataset
     ur_ern_statistics = {}  # Store UR-ERN statistics per dataset
@@ -186,6 +206,7 @@ def run_comparison_evaluation(
         try:
             # Per-threshold results buffers
             sam2_per_thresh: list[tuple[float, float, float, float]] = []  # (th, jf, j, f)
+            bndl_aue_per_thresh: list[tuple[float, float, float, float]] = []
             bndl_per_thresh: list[tuple[float, float, float, float]] = []
 
             for th in thresholds:
@@ -253,9 +274,36 @@ def run_comparison_evaluation(
                         uctta_results[dataset_name] = []  # type: ignore[assignment]
                     (uctta_results[dataset_name]).append((th, j_f_uctta, j_uctta, f_uctta))  # type: ignore[index]
 
-                # Run SAM-2+BNDL evaluation
+                # Run SAM-2+BNDL+AUE evaluation
+                if run_bndl_aue:
+                    print(f"--- Running SAM-2+BNDL+AUE evaluation for {dataset_name} @ thresh={th} ---")
+                    bndl_aue_start = time.time()
+                    j_f_bndl_aue, j_bndl_aue, f_bndl_aue, dataset_stats_aue = run_bndl_dataset(
+                        dataset_name=dataset_name,
+                        predictor=bndl_aue_predictor,
+                        output_path=bndl_aue_output,
+                        score_thresh=th,
+                        num_workers=num_workers,
+                        video_subset=video_subset,
+                        save_bndl_vis=save_vis,
+                        prompt_method=prompt_method,
+                        first_frame_only=first_frame_only,
+                        max_objects=max_objects,
+                        collect_statistics=True,  # Force collect statistics for comparison
+                        reuse_prompts_root=sam2_output if run_sam else None,  # Only reuse prompts if SAM ran
+                        click_protocol=click_protocol,
+                        min_click_dist=min_click_dist,
+                        seed=seed,
+                    )
+                    bndl_aue_time = time.time() - bndl_aue_start
+                    bndl_aue_per_thresh.append((th, j_f_bndl_aue, j_bndl_aue, f_bndl_aue))
+                    if dataset_stats_aue:
+                        bndl_aue_statistics[dataset_name] = dataset_stats_aue
+                    print(f"BNDL+AUE @ {th:.2f} - J&F: {j_f_bndl_aue:.2f}, J: {j_bndl_aue:.2f}, F: {f_bndl_aue:.2f} (Time: {bndl_aue_time:.2f}s)")
+
+                # Run SAM-2+BNDL (pure) evaluation
                 if run_bndl:
-                    print(f"--- Running SAM-2+BNDL evaluation for {dataset_name} @ thresh={th} ---")
+                    print(f"--- Running SAM-2+BNDL (pure) evaluation for {dataset_name} @ thresh={th} ---")
                     bndl_start = time.time()
                     j_f_bndl, j_bndl, f_bndl, dataset_stats = run_bndl_dataset(
                         dataset_name=dataset_name,
@@ -278,7 +326,7 @@ def run_comparison_evaluation(
                     bndl_per_thresh.append((th, j_f_bndl, j_bndl, f_bndl))
                     if dataset_stats:
                         bndl_statistics[dataset_name] = dataset_stats
-                    print(f"BNDL  @ {th:.2f} - J&F: {j_f_bndl:.2f}, J: {j_bndl:.2f}, F: {f_bndl:.2f} (Time: {bndl_time:.2f}s)")
+                    print(f"BNDL (pure) @ {th:.2f} - J&F: {j_f_bndl:.2f}, J: {j_bndl:.2f}, F: {f_bndl:.2f} (Time: {bndl_time:.2f}s)")
 
                 # Run SAM-2+UR-ERN evaluation
                 if run_ur_ern and ur_ern_predictor is not None:
@@ -318,8 +366,12 @@ def run_comparison_evaluation(
                 print("Per-threshold summary (SAM-2+UCTTA):")
                 for th, jf, j, f in uctta_results[dataset_name]:  # type: ignore[index]
                     print(f"  th={th:.2f}: J&F={jf:.2f}, J={j:.2f}, F={f:.2f}")
+            if run_bndl_aue:
+                print("Per-threshold summary (BNDL+AUE):")
+                for th, jf, j, f in bndl_aue_per_thresh:
+                    print(f"  th={th:.2f}: J&F={jf:.2f}, J={j:.2f}, F={f:.2f}")
             if run_bndl:
-                print("Per-threshold summary (BNDL):")
+                print("Per-threshold summary (BNDL pure):")
                 for th, jf, j, f in bndl_per_thresh:
                     print(f"  th={th:.2f}: J&F={jf:.2f}, J={j:.2f}, F={f:.2f}")
             if run_ur_ern and isinstance(ur_ern_results, dict) and dataset_name in ur_ern_results:
@@ -331,6 +383,9 @@ def run_comparison_evaluation(
             if run_sam and sam2_per_thresh:
                 best_sam2 = max(sam2_per_thresh, key=lambda x: x[1])
                 sam2_results[dataset_name] = (best_sam2[1], best_sam2[2], best_sam2[3])
+            if run_bndl_aue and bndl_aue_per_thresh:
+                best_bndl_aue = max(bndl_aue_per_thresh, key=lambda x: x[1])
+                bndl_aue_results[dataset_name] = (best_bndl_aue[1], best_bndl_aue[2], best_bndl_aue[3])
             if run_bndl and bndl_per_thresh:
                 best_bndl = max(bndl_per_thresh, key=lambda x: x[1])
                 bndl_results[dataset_name] = (best_bndl[1], best_bndl[2], best_bndl[3])
@@ -345,8 +400,10 @@ def run_comparison_evaluation(
 
             if run_sam and sam2_per_thresh:
                 print(f"\nBest (SAM-2) th={best_sam2[0]:.2f} -> J&F: {best_sam2[1]:.2f}, J: {best_sam2[2]:.2f}, F: {best_sam2[3]:.2f}")
+            if run_bndl_aue and bndl_aue_per_thresh:
+                print(f"Best (BNDL+AUE) th={best_bndl_aue[0]:.2f} -> J&F: {best_bndl_aue[1]:.2f}, J: {best_bndl_aue[2]:.2f}, F: {best_bndl_aue[3]:.2f}")
             if run_bndl and bndl_per_thresh:
-                print(f"Best (BNDL ) th={best_bndl[0]:.2f} -> J&F: {best_bndl[1]:.2f}, J: {best_bndl[2]:.2f}, F: {best_bndl[3]:.2f}")
+                print(f"Best (BNDL pure) th={best_bndl[0]:.2f} -> J&F: {best_bndl[1]:.2f}, J: {best_bndl[2]:.2f}, F: {best_bndl[3]:.2f}")
             if run_uctta and isinstance(uctta_results, dict) and dataset_name in uctta_results and isinstance(uctta_results[dataset_name], tuple):
                 print(f"Best (UCTTA) -> J&F: {uctta_results[dataset_name][0]:.2f}, J: {uctta_results[dataset_name][1]:.2f}, F: {uctta_results[dataset_name][2]:.2f}")
             if run_ur_ern and isinstance(ur_ern_results, dict) and dataset_name in ur_ern_results and isinstance(ur_ern_results[dataset_name], tuple):
@@ -366,15 +423,17 @@ def run_comparison_evaluation(
     total_time = time.time() - total_start_time
     print(f"\nTotal evaluation time: {total_time:.2f}s")
 
-    return (sam2_results, bndl_results, bndl_statistics, 
-            (uctta_results if isinstance(uctta_results, dict) else None), 
-            (ur_ern_results if isinstance(ur_ern_results, dict) else None), 
+    return (sam2_results, bndl_aue_results, bndl_aue_statistics, bndl_results, bndl_statistics,
+            (uctta_results if isinstance(uctta_results, dict) else None),
+            (ur_ern_results if isinstance(ur_ern_results, dict) else None),
             ua_data_per_dataset, uctta_statistics, ur_ern_statistics)
 
 
 def save_detailed_results(
     output_path: Path,
     sam2_results: dict[str, tuple[float, float, float]] | None = None,
+    bndl_aue_results: dict[str, tuple[float, float, float]] | None = None,
+    bndl_aue_statistics: dict[str, Any] | None = None,
     bndl_results: dict[str, tuple[float, float, float]] | None = None,
     bndl_statistics: dict[str, Any] | None = None,
     uctta_results: dict[str, tuple[float, float, float]] | None = None,
@@ -384,29 +443,33 @@ def save_detailed_results(
     ua_data: dict[str, dict[str, Any]] | None = None,
 ) -> Path:
     """Save detailed results to JSON file
-    
+
     Args:
         output_path: Root output directory
         sam2_results: SAM-2 results {dataset: (J&F, J, F)}
-        bndl_results: BNDL results {dataset: (J&F, J, F)}
-        bndl_statistics: BNDL statistics per dataset
+        bndl_aue_results: BNDL+AUE results {dataset: (J&F, J, F)}
+        bndl_aue_statistics: BNDL+AUE statistics per dataset
+        bndl_results: BNDL (pure) results {dataset: (J&F, J, F)}
+        bndl_statistics: BNDL (pure) statistics per dataset
         uctta_results: UCTTA results {dataset: (J&F, J, F)}
         uctta_statistics: UCTTA statistics per dataset
         ua_data: UA analysis data per dataset
-        
+
     Returns:
         Path to saved JSON file
     """
     plots_dir = output_path / "comparison_plots"
     plots_dir.mkdir(exist_ok=True)
     results_file = plots_dir / "detailed_results.json"
-    
+
     # Build detailed results dict
     # Always include all keys for consistent JSON structure
     detailed_results = {
         "sam2_results": {k: {"jf": v[0], "j": v[1], "f": v[2]} for k, v in sam2_results.items()} if sam2_results else {},
         "uctta_results": {k: {"jf": v[0], "j": v[1], "f": v[2]} for k, v in uctta_results.items()} if uctta_results else {},
         "ur_ern_results": {k: {"jf": v[0], "j": v[1], "f": v[2]} for k, v in ur_ern_results.items()} if ur_ern_results else {},
+        "bndl_aue_results": {k: {"jf": v[0], "j": v[1], "f": v[2]} for k, v in bndl_aue_results.items()} if bndl_aue_results else {},
+        "bndl_aue_statistics": bndl_aue_statistics if bndl_aue_statistics else {},
         "bndl_results": {k: {"jf": v[0], "j": v[1], "f": v[2]} for k, v in bndl_results.items()} if bndl_results else {},
         "bndl_statistics": bndl_statistics if bndl_statistics else {},
         "uctta_statistics": uctta_statistics if uctta_statistics else {},
@@ -1453,6 +1516,8 @@ def load_results_from_detailed_json(
     json_path: Path,
 ) -> tuple[
     dict[str, tuple[float, float, float]],  # sam2_results
+    dict[str, tuple[float, float, float]],  # bndl_aue_results
+    dict[str, Any],                          # bndl_aue_statistics
     dict[str, tuple[float, float, float]],  # bndl_results
     dict[str, Any],                          # bndl_statistics
     dict[str, tuple[float, float, float]] | None,  # uctta_results
@@ -1471,7 +1536,9 @@ def load_results_from_detailed_json(
         data = json.load(f)
 
     sam2_map = {}
+    bndl_aue_map = {}
     bndl_map = {}
+    bndl_aue_stats_map = data.get("bndl_aue_statistics", {})
     stats_map = data.get("bndl_statistics", {})
     uctta_map = None
     ur_ern_map = None
@@ -1486,6 +1553,11 @@ def load_results_from_detailed_json(
         j = float(v.get("j", 0.0))
         f = float(v.get("f", 0.0))
         sam2_map[k] = (jf, j, f)
+    for k, v in data.get("bndl_aue_results", {}).items():
+        jf = float(v.get("jf", 0.0))
+        j = float(v.get("j", 0.0))
+        f = float(v.get("f", 0.0))
+        bndl_aue_map[k] = (jf, j, f)
     for k, v in data.get("bndl_results", {}).items():
         jf = float(v.get("jf", 0.0))
         j = float(v.get("j", 0.0))
@@ -1510,7 +1582,7 @@ def load_results_from_detailed_json(
             f = float(v.get("f", 0.0))
             ur_ern_map[k] = (jf, j, f)
 
-    return sam2_map, bndl_map, stats_map, uctta_map, ur_ern_map, ua_data_map, uctta_stats_map, ur_ern_stats_map
+    return sam2_map, bndl_aue_map, bndl_aue_stats_map, bndl_map, stats_map, uctta_map, ur_ern_map, ua_data_map, uctta_stats_map, ur_ern_stats_map
 
 
 def parse_args():
@@ -1537,16 +1609,28 @@ def parse_args():
         help="SAM-2 checkpoint path",
     )
 
-    # SAM-2+BNDL configuration
+    # SAM-2+BNDL+AUE configuration
+    p.add_argument(
+        "--bndl_aue_cfg",
+        default="configs/sam2.1_training/sam2_bndl_aue.yaml",
+        help="SAM-2+BNDL+AUE config file",
+    )
+    p.add_argument(
+        "--bndl_aue_checkpoint",
+        default="/home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_012_02/checkpoints/checkpoint.pt",
+        help="SAM-2+BNDL+AUE checkpoint path",
+    )
+
+    # SAM-2+BNDL (pure) configuration
     p.add_argument(
         "--bndl_cfg",
-        default="configs/sam2.1/sam2.1_hiera_b+_bndl.yaml",
-        help="SAM-2+BNDL config file",
+        default="configs/sam2.1_training/sam2_bndl.yaml",
+        help="SAM-2+BNDL (pure) config file",
     )
     p.add_argument(
         "--bndl_checkpoint",
-        default="/home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_012_01/checkpoints/checkpoint.pt",
-        help="SAM-2+BNDL checkpoint path",
+        default="/home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_012_02/checkpoints/checkpoint.pt",
+        help="SAM-2+BNDL (pure) checkpoint path",
     )
 
     # SAM-2+UR-ERN configuration
@@ -1599,7 +1683,8 @@ def parse_args():
     # Method toggles
     p.add_argument("--run_sam", action="store_true", default=False, help="Run baseline SAM-2 branch")
     p.add_argument("--run_uctta", action="store_true", default=False, help="Run SAM-2 + UCTTA branch")
-    p.add_argument("--run_bndl", action="store_true", default=False, help="Run SAM-2 + BNDL branch")
+    p.add_argument("--run_bndl_aue", action="store_true", default=False, help="Run SAM-2 + BNDL + AUE branch")
+    p.add_argument("--run_bndl", action="store_true", default=False, help="Run SAM-2 + BNDL (pure) branch")
     p.add_argument("--run_ur_ern", action="store_true", default=False, help="Run SAM-2 + UR-ERN branch")
     # UCTTA options
     p.add_argument("--uctta_steps", type=int, default=2, help="UCTTA adaptation steps per frame/batch")
@@ -1625,20 +1710,24 @@ def main():
     print(f"Datasets: {args.datasets}")
     print(f"SAM-2 config: {args.sam2_cfg}")
     print(f"SAM-2 checkpoint: {args.sam2_checkpoint}")
-    print(f"BNDL config: {args.bndl_cfg}")
-    print(f"BNDL checkpoint: {args.bndl_checkpoint}")
+    print(f"BNDL+AUE config: {args.bndl_aue_cfg}")
+    print(f"BNDL+AUE checkpoint: {args.bndl_aue_checkpoint}")
+    print(f"BNDL (pure) config: {args.bndl_cfg}")
+    print(f"BNDL (pure) checkpoint: {args.bndl_checkpoint}")
 
     # Optionally load previous results to avoid re-running
     if args.load_detailed_json is not None:
         detailed_path = Path(args.load_detailed_json)
         print(f"Loading cached results from: {detailed_path}")
-        sam2_results, bndl_results, bndl_statistics, uctta_results, ur_ern_results, ua_data, uctta_statistics, ur_ern_statistics = load_results_from_detailed_json(detailed_path)
+        sam2_results, bndl_aue_results, bndl_aue_statistics, bndl_results, bndl_statistics, uctta_results, ur_ern_results, ua_data, uctta_statistics, ur_ern_statistics = load_results_from_detailed_json(detailed_path)
     else:
         # Run comparison evaluation
-        sam2_results, bndl_results, bndl_statistics, uctta_results, ur_ern_results, ua_data, uctta_statistics, ur_ern_statistics = run_comparison_evaluation(
+        sam2_results, bndl_aue_results, bndl_aue_statistics, bndl_results, bndl_statistics, uctta_results, ur_ern_results, ua_data, uctta_statistics, ur_ern_statistics = run_comparison_evaluation(
             datasets=args.datasets,
             sam2_cfg=args.sam2_cfg,
             sam2_checkpoint=args.sam2_checkpoint,
+            bndl_aue_cfg=args.bndl_aue_cfg,
+            bndl_aue_checkpoint=args.bndl_aue_checkpoint,
             bndl_cfg=args.bndl_cfg,
             bndl_checkpoint=args.bndl_checkpoint,
             output_path=output_path,
@@ -1658,6 +1747,7 @@ def main():
             uctta_lr=args.uctta_lr,
             run_sam=args.run_sam,
             run_uctta=args.run_uctta,
+            run_bndl_aue=args.run_bndl_aue,
             run_bndl=args.run_bndl,
             run_ur_ern=args.run_ur_ern,
             click_protocol=args.click_protocol,
@@ -1675,6 +1765,8 @@ def main():
     save_detailed_results(
         output_path=output_path,
         sam2_results=sam2_results,
+        bndl_aue_results=bndl_aue_results,
+        bndl_aue_statistics=bndl_aue_statistics,
         bndl_results=bndl_results,
         bndl_statistics=bndl_statistics,
         uctta_results=uctta_results,

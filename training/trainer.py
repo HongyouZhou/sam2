@@ -1110,11 +1110,17 @@ class Trainer:
 
         logging.info("Finished setting up components: Model, loss, optim, meters etc.")
 
+        # 获取像素级统计配置参数
+        foreground_dilation = getattr(self.logging_conf, 'correlation_foreground_dilation', 10)
+        per_pixel = getattr(self.logging_conf, 'correlation_per_pixel', True)
+
         self.dataset_evaluator = DistributedDatasetEvaluator(
             save_dir=os.path.join(self.logging_conf.log_dir, "dataset_evaluation"),
             distributed=True,
             rank=dist.get_rank(),
-            world_size=dist.get_world_size()
+            world_size=dist.get_world_size(),
+            foreground_dilation=foreground_dilation,
+            per_pixel_statistics=per_pixel
         )
 
     def _construct_optimizers(self):

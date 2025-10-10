@@ -488,9 +488,12 @@ trainer:
     log_freq: 10
     log_scalar_frequency: 100
     visualize_bndl: true
-    uncertainty_metric: ["entropy", "nll"] 
+    uncertainty_metric: ["entropy", "nll"]
     visualize_pavpu_overlay: true
     uncertainty_sample_num: 50
+    # 像素级PAvPU统计配置
+    correlation_foreground_dilation: 10      # 前景区域膨胀半径（像素），0表示不膨胀
+    correlation_per_pixel: true              # 使用像素级统计（vs 图片级）
 
   # initialize from a SAM 2 checkpoint
   checkpoint:
