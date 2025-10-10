@@ -602,19 +602,19 @@ class SAM2Base(torch.nn.Module):
             
             neg_feat = neg_feat_upscaled.permute(0, 2, 3, 1).contiguous()  # [M, H', W', C']
             
-            # BNDL部分保留梯度用于权重学习
-            # 为负样本生成external_pre_out_w：使用pixel_bndl的全局权重矩阵
+            # BNDL部分：为负样本生成external_pre_out_w，但停止梯度回传到BNDL
+            # 这样AdCo只训练负样本图像和image_encoder，不影响BNDL的权重
             M = neg_feat.shape[0]
             if pixel_bndl_model.enable_global_sparse:
                 neg_external_w = None
             else:
                 # 使用linear.weight作为负样本的基础权重 [K, C'] -> [M, K, C']
                 linear_weight = pixel_bndl_model.linear.weight  # [K, C']
-                neg_external_w = linear_weight.unsqueeze(0).expand(M, -1, -1)
+                neg_external_w = linear_weight.unsqueeze(0).expand(M, -1, -1).detach()
             
             neg_uq, neg_mean_logits = pixel_uncertain_sampling(
                 pixel_bndl_model,
-                neg_feat,
+                neg_feat.detach(),  # 停止梯度回传到BNDL
                 external_pre_out_w=neg_external_w,
                 sample_num=uq_sample_num,
             )
@@ -623,7 +623,7 @@ class SAM2Base(torch.nn.Module):
             eps = 1e-6
             ratio_neg = (neg_uq / (neg_conf + eps)).mean()
 
-        loss = alpha_pos * ratio_pos + alpha_neg * ratio_neg
+        loss = alpha_pos * ratio_pos - alpha_neg * ratio_neg
 
         return loss
 

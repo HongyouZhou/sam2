@@ -363,10 +363,21 @@ def calculate_pavpu_for_bndl(bndl_outputs, batch, targets, phase, model):
 
                         # Fix mask dimension mismatch
                         if K_pred != K_targ:
-                            min_k = min(K_pred, K_targ)
-                            pixel_predictions = pixel_predictions[..., :min_k]
-                            pixel_targets = pixel_targets[..., :min_k]
-                            logger.info(f"Fixed mask dimension mismatch by truncating to K={min_k}")
+                            if K_pred > K_targ and K_targ == 1:
+                                # Multiple mask heads (K_pred > 1) but single ground truth
+                                # Use mask 0 (singlemask token) to match SAM-2 behavior
+                                pixel_predictions = pixel_predictions[..., 0:1]  # [B,H,W,K] -> [B,H,W,1]
+                                logger.info(f"Fixed mask dimension mismatch by selecting mask 0 from {K_pred} masks")
+                            elif K_targ > K_pred:
+                                # More ground truth masks than predictions (rare case)
+                                pixel_targets = pixel_targets[..., :K_pred]
+                                logger.info(f"Truncated targets from K={K_targ} to K={K_pred}")
+                            else:
+                                # Fallback: use first K masks
+                                min_k = min(K_pred, K_targ)
+                                pixel_predictions = pixel_predictions[..., :min_k]
+                                pixel_targets = pixel_targets[..., :min_k]
+                                logger.info(f"Truncated to K={min_k} (fallback)")
 
                         # Final validation
                         if pixel_predictions.shape != pixel_targets.shape:

@@ -62,7 +62,13 @@ METHOD_CONFIGS = {
 }
 
 # 所有方法的列表（按执行顺序）
-ALL_METHODS = ["SAM", "UCTTA", "BNDL_AUE", "BNDL", "UR-ERN"]
+ALL_METHODS = [
+    "SAM",
+    "UCTTA",
+    "BNDL_AUE",
+    # "BNDL",
+    "UR-ERN",
+]
 
 RESET_COLOR = "\033[0m"
 
@@ -283,10 +289,7 @@ def create_parallel_comparison_wrapper(
     def convert_results(method: str) -> dict:
         if method not in all_results:
             return {}
-        return {
-            dataset: (metrics["J&F"], metrics["J"], metrics["F"])
-            for dataset, metrics in all_results[method].items()
-        }
+        return {dataset: (metrics["J&F"], metrics["J"], metrics["F"]) for dataset, metrics in all_results[method].items()}
 
     sam_results = convert_results("SAM")
     uctta_results = convert_results("UCTTA")
@@ -306,8 +309,8 @@ def create_parallel_comparison_wrapper(
         try:
             create_comprehensive_comparison_plots(
                 sam2_results=sam_results,
-                bndl_results=bndl_results,
-                bndl_statistics=bndl_statistics,
+                bndl_results=bndl_aue_results,
+                bndl_statistics=bndl_aue_statistics,
                 output_path=output_path,
                 uctta_results=uctta_results if uctta_results else None,
                 uctta_statistics=uctta_statistics if uctta_statistics else None,
@@ -327,18 +330,18 @@ def create_parallel_comparison_wrapper(
     print(f"  bndl_statistics: {bool(bndl_statistics)} ({len(bndl_statistics) if bndl_statistics else 0} datasets)")
     print(f"  bndl_results: {bool(bndl_results)} ({len(bndl_results) if bndl_results else 0} datasets)")
     print(f"  sam_results: {bool(sam_results)} ({len(sam_results) if sam_results else 0} datasets)")
-    
-    if bndl_statistics and bndl_results and sam_results:
+
+    if bndl_aue_statistics and bndl_aue_results and sam_results:
         try:
             # 智能选择源域：优先使用 MOSE_train（fine-tune域），如果不存在则使用第一个数据集
             available_datasets = list(bndl_results.keys())
             source_domain = "MOSE_train" if "MOSE_train" in available_datasets else (available_datasets[0] if available_datasets else "MOSE_train")
             print(f"✓ 开始生成 UA shift 分析，使用源域: {source_domain}")
-            
+
             create_ua_shift_analysis_plots(
-                bndl_statistics=bndl_statistics,
+                bndl_statistics=bndl_aue_statistics,
                 sam2_results=sam_results,
-                bndl_results=bndl_results,
+                bndl_results=bndl_aue_results,
                 output_path=output_path,
                 uctta_statistics=uctta_statistics if uctta_statistics else None,
                 uctta_results=uctta_results if uctta_results else None,
@@ -346,7 +349,7 @@ def create_parallel_comparison_wrapper(
                 source_domain=source_domain,
                 # Ensure PCC JSON lookup uses nested zs_parallel roots
                 sam2_root_override=(method_to_output["SAM"] / "sam2_results") if method_to_output and "SAM" in method_to_output else None,
-                bndl_root_override=(method_to_output["BNDL"] / "bndl_results") if method_to_output and "BNDL" in method_to_output else None,
+                bndl_aue_root_override=(method_to_output["BNDL_AUE"] / "bndl_aue_results") if method_to_output and "BNDL_AUE" in method_to_output else None,
                 uctta_root_override=(method_to_output["UCTTA"] / "sam2_uctta_results") if method_to_output and "UCTTA" in method_to_output else None,
                 ur_ern_root_override=(method_to_output["UR-ERN"] / "sam2_ur_ern_results") if method_to_output and "UR-ERN" in method_to_output else None,
             )
@@ -358,10 +361,10 @@ def create_parallel_comparison_wrapper(
             traceback.print_exc()
     else:
         print(f"⚠ 跳过 UA shift 分析:")
-        if not bndl_statistics:
-            print(f"  - BNDL statistics 缺失")
-        if not bndl_results:
-            print(f"  - BNDL results 缺失")
+        if not bndl_aue_statistics:
+            print(f"  - BNDL_AUE statistics 缺失")
+        if not bndl_aue_results:
+            print(f"  - BNDL_AUE results 缺失")
         if not sam_results:
             print(f"  - SAM results 缺失")
 
@@ -525,11 +528,11 @@ def main():
     parser.add_argument("--sam2_checkpoint", default="/home/hongyou/dev/ada_samp/sam2/checkpoints/sam2.1_hiera_base_plus.pt")
 
     # BNDL+AUE配置
-    parser.add_argument("--bndl_aue_cfg", default="configs/sam2.1_training/sam2_bndl_aue.yaml")
+    parser.add_argument("--bndl_aue_cfg", default="configs/sam2.1/sam2.1_hiera_b+_bndl_aue.yaml")
     parser.add_argument("--bndl_aue_checkpoint", default="/home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_012_02/checkpoints/checkpoint.pt")
 
     # BNDL (pure)配置
-    parser.add_argument("--bndl_cfg", default="configs/sam2.1_training/sam2_bndl.yaml")
+    parser.add_argument("--bndl_cfg", default="configs/sam2.1/sam2.1_hiera_b+_bndl.yaml")
     parser.add_argument("--bndl_checkpoint", default="/home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_012_02/checkpoints/checkpoint.pt")
 
     # UR-ERN配置
@@ -556,14 +559,14 @@ def main():
 
     # 输出
     parser.add_argument("--output_path", type=Path, default=Path("./outputs/parallel_compare"))
-    
+
     # 版本号配置（每个方法独立版本，格式：xxx_xx，前三位代码版本，后两位参数版本）
     parser.add_argument("--sam_version", type=str, default="001_01", help="SAM方法版本号 (格式: xxx_xx)")
     parser.add_argument("--uctta_version", type=str, default="001_01", help="UCTTA方法版本号 (格式: xxx_xx)")
     parser.add_argument("--bndl_aue_version", type=str, default="012_02", help="BNDL+AUE方法版本号 (格式: xxx_xx)")
     parser.add_argument("--bndl_version", type=str, default="012_02", help="BNDL (pure)方法版本号 (格式: xxx_xx)")
     parser.add_argument("--ur_ern_version", type=str, default="001_01", help="UR-ERN方法版本号 (格式: xxx_xx)")
-    
+
     # 复用缓存结果（若存在 detailed_results.json 则跳过对应方法的重新运行）
     parser.add_argument("--reuse_cached", action="store_true", default=False, help="若存在已缓存结果则跳过该方法的重新运行")
 
@@ -605,10 +608,7 @@ def main():
         "UR-ERN": args.ur_ern_version,
     }
 
-    method_to_output = {
-        method: args.output_path / f"output_{METHOD_CONFIGS[method]['output_suffix']}_{method_versions[method]}"
-        for method in ALL_METHODS
-    }
+    method_to_output = {method: args.output_path / f"output_{METHOD_CONFIGS[method]['output_suffix']}_{method_versions[method]}" for method in ALL_METHODS}
 
     tasks = []
     skipped_methods = []

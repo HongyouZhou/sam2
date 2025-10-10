@@ -361,13 +361,15 @@ class DistributedDatasetEvaluator:
             pixel_uncertainty = pixel_uncertainty.float()
 
             # 3. 计算像素级accuracy（二值正确性）
-            pred_binary = (pred_logits > 0).float()  # [H, W, K]
-            gt_binary = (gt_masks > 0).float()       # [H, W, K]
+            pred_binary_bool = (pred_logits > 0)  # [H, W, K] - keep as bool
+            gt_binary_bool = (gt_masks > 0)       # [H, W, K] - keep as bool
+            pred_binary = pred_binary_bool.float()  # [H, W, K] - convert to float for comparison
+            gt_binary = gt_binary_bool.float()       # [H, W, K]
             pixel_correct = (pred_binary == gt_binary).all(dim=-1).float()  # [H, W] 所有通道都正确
 
             # 4. 计算像素级IoU贡献（intersection / union per pixel across channels）
-            intersection = (pred_binary & gt_binary.bool()).float().sum(dim=-1)  # [H, W]
-            union = (pred_binary.bool() | gt_binary.bool()).float().sum(dim=-1)  # [H, W]
+            intersection = (pred_binary_bool & gt_binary_bool).float().sum(dim=-1)  # [H, W]
+            union = (pred_binary_bool | gt_binary_bool).float().sum(dim=-1)  # [H, W]
             pixel_iou = intersection / (union + 1e-8)  # [H, W]
             pixel_iou = torch.clamp(pixel_iou, 0.0, 1.0)
 
