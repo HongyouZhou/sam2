@@ -629,16 +629,16 @@ class SAM2Base(torch.nn.Module):
             )
             
             # Negative correlation (starts at stage threshold)
-            # OPTIMIZATION: Compute less frequently (every 10 steps) and cache result
+            # OPTIMIZATION: Compute less frequently (every 50 steps) and cache result
             loss_corr_neg = torch.tensor(0.0, device=device)
             if curriculum_stage > self.adco_stage1_end and pixel_bndl_model is not None:
-                # Only recompute every 10 steps, otherwise use cached value
-                if self._adco_step_count % 10 == 0:
+                # Only recompute every 50 steps, otherwise use cached value
+                if self._adco_step_count % 50 == 0:
                     loss_corr_neg = self._compute_neg_correlation(
                         neg_features=self.adco_neg_features,
                         pixel_bndl_model=pixel_bndl_model,
                     )
-                    # Cache for next 9 steps
+                    # Cache for next 49 steps
                     self._adco_neg_corr_cache = loss_corr_neg.detach()
                 else:
                     # Use cached value (detached, no extra backward)
@@ -663,8 +663,8 @@ class SAM2Base(torch.nn.Module):
         if self.training:
             self._adco_step_count += 1
             
-            # Update frequency: every 10 steps, and only when Stage >= 2
-            update_freq = 10
+            # Update frequency: every 50 steps, and only when Stage >= 2
+            update_freq = 50
             should_update = (
                 curriculum_stage >= self.adco_stage1_end and 
                 self._adco_step_count % update_freq == 0
@@ -755,8 +755,8 @@ class SAM2Base(torch.nn.Module):
         K, C = neg_features.shape
         
         # OPTIMIZATION: Subsample negatives to reduce computation
-        # Only use 512 random negatives instead of all K (4096)
-        max_negatives = min(512, K)
+        # Only use 128 random negatives instead of all K (4096)
+        max_negatives = min(128, K)
         if K > max_negatives:
             indices = torch.randperm(K, device=neg_features.device)[:max_negatives]
             neg_features_sub = neg_features[indices]
@@ -781,12 +781,12 @@ class SAM2Base(torch.nn.Module):
             prompts = self.adco_neg_prompt_gen(chunk_feats)  # [chunk_size, C']
             prompts = prompts.unsqueeze(1).expand(-1, num_tokens, -1)  # [chunk_size, num_tokens, C']
             
-            # Reduced sample_num from 10 to 3 for speed
+            # Reduced sample_num from 10 to 2 for speed
             uq, logits = pixel_uncertain_sampling(
                 pixel_bndl_model,
                 chunk_spatial,
                 external_pre_out_w=prompts,
-                sample_num=3,
+                sample_num=2,
             )
             
             # Prediction entropy as error proxy (no GT for negatives)
@@ -842,12 +842,12 @@ class SAM2Base(torch.nn.Module):
             prompts = self.adco_neg_prompt_gen(chunk_feats)  # [chunk_size, C']
             prompts = prompts.unsqueeze(1).expand(-1, num_tokens, -1)  # [chunk_size, num_tokens, C']
             
-            # Reduced sample_num from 10 to 5 for speed
+            # Reduced sample_num from 10 to 2 for speed
             uq, _ = pixel_uncertain_sampling(
                 pixel_bndl_model,
                 chunk_spatial,
                 external_pre_out_w=prompts,
-                sample_num=5,
+                sample_num=2,
             )
             uncertainties.append(uq.squeeze())
         

@@ -212,9 +212,9 @@ trainer:
     # AdCo options (feature-level with uncertainty curriculum)
     use_adco: true
     adco_proj_dim: 256
-    adco_queue_size: 4096              # Now means # feature negatives in bank
+    adco_queue_size: 512               # Reduced from 4096 to 512 for speed
     adco_temperature: 0.07             # Standard contrastive temperature
-    adco_curriculum_warmup_steps: 3000 # Total steps for curriculum (0→1)
+    adco_curriculum_warmup_steps: 1000 # Reduced from 3000 to 1000 for faster warmup
     adco_stage1_end: 0.33              # Stage 1 ends at 33% (pos only)
     adco_stage2_end: 0.67              # Stage 2 ends at 67% (pos + neg)
 
@@ -450,7 +450,7 @@ trainer:
       adco_loss:
         _target_: training.loss_adco.AdCoLoss
         weight: 0.5
-      adco_weight: 0.05
+      adco_weight: 0.02  # Reduced from 0.05 to 0.02 for less impact
       proco_loss:
         _target_: training.loss_proco.ProCoLoss
         weight: 0.5
@@ -490,7 +490,7 @@ trainer:
     visualize_bndl: true
     uncertainty_metric: ["entropy", "nll"]
     visualize_pavpu_overlay: true
-    uncertainty_sample_num: 50
+    uncertainty_sample_num: 10  # Reduced from 50 to 10 for training speed
     # 像素级PAvPU统计配置
     correlation_foreground_dilation: 10      # 前景区域膨胀半径（像素），0表示不膨胀
     correlation_per_pixel: true              # 使用像素级统计（vs 图片级）
@@ -517,7 +517,7 @@ trainer:
 launcher:
   num_nodes: 1
   gpus_per_node: 8
-  experiment_log_dir: /home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_013_01 # Path to log directory, defaults to ./sam2_logs/${config_name}
+  experiment_log_dir: /home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_aue_013_01 # Path to log directory, defaults to ./sam2_logs/${config_name}
 
 # SLURM args if running on a cluster
 submitit:

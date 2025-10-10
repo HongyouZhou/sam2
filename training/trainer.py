@@ -151,6 +151,8 @@ class LoggingConf:
     uncertainty_metric: set = field(default_factory=lambda: {"entropy"})  # Options: {"entropy"}, {"nll"}, {"sampling"}, {"entropy", "nll"}, {"entropy", "nll", "sampling"}, etc.
     visualize_pavpu_overlay: bool = True  # Enable PAvPU overlay visualization on original images
     uncertainty_sample_num: int = 50
+    correlation_foreground_dilation: int = 10  # Foreground dilation radius (pixels), 0 means no dilation
+    correlation_per_pixel: bool = True  # Use per-pixel statistics (vs per-image)
 
 class Trainer:
     """
