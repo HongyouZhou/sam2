@@ -2,6 +2,7 @@
 # Multi-dataset Zero-shot evaluation of SAM-2 with UR-ERN (Uncertainty Regularized Evidential Regression)
 # Based on "Uncertainty Regularized Evidential Regression" (AAAI 2024)
 
+import argparse
 import shutil
 from pathlib import Path
 from typing import Any, Optional
@@ -357,8 +358,17 @@ def inference_with_ur_ern(
             seg: dict[int, np.ndarray] = {}
             for i, oid in enumerate(out_obj_ids):
                 mask_logits = out_logits[i]
+                
+                # Handle multimask output (K>1): select mask 0 (singlemask output token)
+                # This matches SAM-2's default behavior when multimask_output=False
                 if mask_logits.ndim == 3:
-                    mask_logits = mask_logits.squeeze(0)
+                    if mask_logits.shape[0] == 1:
+                        # Single mask: squeeze it
+                        mask_logits = mask_logits.squeeze(0)
+                    elif mask_logits.shape[0] > 1:
+                        # Multiple masks: use mask 0 (singlemask token, SAM-2 default)
+                        mask_logits = mask_logits[0]
+                
                 # align to original image size
                 if tuple(mask_logits.shape[-2:]) != (H, W):
                     mask_logits = F.interpolate(
