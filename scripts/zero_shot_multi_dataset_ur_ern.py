@@ -285,11 +285,16 @@ def inference_with_ur_ern(
 
     # Prepare dataset evaluator (optional)
     dataset_eval = None
+    eval_dir = None
     if collect_statistics:
         # Use consistent path format: <output_root>/<dataset>_ur_ern_eval
         eval_dir = out_dir.parent / f"{dataset_name.lower()}_ur_ern_eval" if dataset_name else (out_dir.parent / "ur_ern_eval")
         eval_dir.mkdir(parents=True, exist_ok=True)
         dataset_eval = DistributedDatasetEvaluator(save_dir=str(eval_dir), distributed=False, rank=0, world_size=1)
+    
+    # Incremental save configuration to prevent OOM
+    checkpoint_interval = 50  # Save every 50 videos
+    checkpoint_files = []  # Track checkpoint files
 
     for v_idx, vid in enumerate(video_names, 1):
         print(f"[{v_idx:03}/{len(video_names)}] {vid}")
@@ -471,7 +476,52 @@ def inference_with_ur_ern(
         predictor.reset_state(state)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        
+        # Incremental checkpoint: save evaluator data periodically to prevent OOM
+        if collect_statistics and dataset_eval is not None and v_idx % checkpoint_interval == 0:
+            import pickle
+            import gc
+            checkpoint_file = out_dir.parent / f".ur_ern_checkpoint_{dataset_name}_{v_idx:04d}.pkl"
+            # Save evaluator's accumulated data
+            checkpoint_data = {
+                'pixel_uncertainties': dataset_eval.pixel_uncertainties.copy() if hasattr(dataset_eval, 'pixel_uncertainties') else [],
+                'pixel_ious': dataset_eval.pixel_ious.copy() if hasattr(dataset_eval, 'pixel_ious') else [],
+                'pixel_dices': dataset_eval.pixel_dices.copy() if hasattr(dataset_eval, 'pixel_dices') else [],
+                'pixel_accuracies': dataset_eval.pixel_accuracies.copy() if hasattr(dataset_eval, 'pixel_accuracies') else [],
+            }
+            with open(checkpoint_file, 'wb') as f:
+                pickle.dump(checkpoint_data, f)
+            checkpoint_files.append(checkpoint_file)
+            print(f"💾 UR-ERN: Saved checkpoint ({v_idx}/{len(video_names)} videos) to {checkpoint_file.name}")
+            
+            # Clear evaluator data and recreate
+            del dataset_eval
+            dataset_eval = DistributedDatasetEvaluator(save_dir=str(eval_dir), distributed=False, rank=0, world_size=1)
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
+    # Merge checkpoint files back into evaluator
+    if collect_statistics and checkpoint_files:
+        import pickle
+        print(f"\n🔄 UR-ERN: Merging {len(checkpoint_files)} checkpoint files...")
+        for checkpoint_file in checkpoint_files:
+            try:
+                with open(checkpoint_file, 'rb') as f:
+                    checkpoint_data = pickle.load(f)
+                    # Merge data back into current evaluator
+                    if dataset_eval is not None:
+                        if hasattr(dataset_eval, 'pixel_uncertainties'):
+                            dataset_eval.pixel_uncertainties.extend(checkpoint_data.get('pixel_uncertainties', []))
+                            dataset_eval.pixel_ious.extend(checkpoint_data.get('pixel_ious', []))
+                            dataset_eval.pixel_dices.extend(checkpoint_data.get('pixel_dices', []))
+                            dataset_eval.pixel_accuracies.extend(checkpoint_data.get('pixel_accuracies', []))
+                # Clean up checkpoint file
+                checkpoint_file.unlink()
+            except Exception as e:
+                print(f"Warning: Failed to merge UR-ERN checkpoint {checkpoint_file}: {e}")
+        print(f"✓ UR-ERN: Merged all checkpoints")
+    
     # Finalize dataset correlation visualization/results
     if dataset_eval is not None and len(dataset_eval) > 0:
         dataset_eval.evaluate_dataset_correlation()

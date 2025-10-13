@@ -297,7 +297,7 @@ def run_comparison_evaluation(
                         prompt_method=prompt_method,
                         first_frame_only=first_frame_only,
                         max_objects=max_objects,
-                        collect_statistics=True,  # Force collect statistics for comparison
+                        collect_statistics=collect_bndl_stats,  # Use parameter instead of forcing True
                         reuse_prompts_root=sam2_output if run_sam else None,  # Only reuse prompts if SAM ran
                         click_protocol=click_protocol,
                         min_click_dist=min_click_dist,
@@ -324,7 +324,7 @@ def run_comparison_evaluation(
                         prompt_method=prompt_method,
                         first_frame_only=first_frame_only,
                         max_objects=max_objects,
-                        collect_statistics=True,  # Force collect statistics for comparison
+                        collect_statistics=collect_bndl_stats,  # Use parameter instead of forcing True
                         reuse_prompts_root=sam2_output if run_sam else None,  # Only reuse prompts if SAM ran
                         click_protocol=click_protocol,
                         min_click_dist=min_click_dist,

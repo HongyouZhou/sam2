@@ -3,6 +3,7 @@
 # Supports TrashCan, GTEA, PIDRay, plittersdorf, Hypersim, DRAM, and CITYSCAPES datasets with UQ analysis
 
 import argparse
+import gc
 import json
 import shutil
 from pathlib import Path
@@ -802,9 +803,13 @@ def inference_with_bndl(
     if save_bndl_vis and vis_dir is not None:
         vis_dir.mkdir(parents=True, exist_ok=True)
 
-    # Initialize statistics collection
+    # Initialize statistics collection with incremental saving
     dataset_statistics = {} if collect_statistics else None
     total_frames_processed = 0
+    
+    # Incremental save configuration to prevent OOM
+    stats_checkpoint_interval = 50  # Save every 50 videos to free memory
+    stats_checkpoint_files = []  # Track checkpoint files for final merge
 
     # Initialize dataset evaluator for correlation analysis like in SAM trainer
     # Use consistent path format: <output_root>/<dataset>_bndl_eval
@@ -963,7 +968,8 @@ def inference_with_bndl(
             if collect_statistics:
                 # Map object IDs to their index in out_logits to fetch per-object logits reliably
                 id_to_idx = {oid: i for i, oid in enumerate(out_obj_ids)}
-                max_obj_stats = 2 if dataset_name == "Hypersim" else 3
+                # Limit to 3 objects per frame for stats collection (memory already managed by checkpoints)
+                max_obj_stats = 3
                 logger.info(f"Processing {len(out_obj_ids[:max_obj_stats])} objects for stats collection")
                 for obj_id in out_obj_ids[:max_obj_stats]:
                     # Convert obj_id to internal obj_idx using predictor's mapping
@@ -991,8 +997,8 @@ def inference_with_bndl(
                         video_statistics = log_bndl_statistics(bndl_outputs, f_idx, "eval", f"{dataset_name}_{vid}_obj{obj_id}", video_statistics)
                         total_frames_processed += 1
 
-                        # Add to dataset evaluator (skip Hypersim to save memory)
-                        if dataset_evaluator is not None and dataset_name != "Hypersim":
+                        # Add to dataset evaluator (memory managed by checkpoints)
+                        if dataset_evaluator is not None:
                             _idx = id_to_idx.get(obj_id)
                             if _idx is not None and _idx < len(out_logits):
                                 pred_logits = out_logits[_idx]
@@ -1127,6 +1133,23 @@ def inference_with_bndl(
         if collect_statistics and video_statistics and dataset_statistics is not None:
             dataset_statistics.update(video_statistics)
             print(f"Collected BNDL statistics for video {vid}: {len(video_statistics)} metrics")
+            
+            # Incremental save: periodically save statistics and clear memory to prevent OOM
+            if v_idx % stats_checkpoint_interval == 0:
+                checkpoint_file = out_dir.parent / f".stats_checkpoint_{dataset_name}_{v_idx:04d}.json"
+                with open(checkpoint_file, "w") as f:
+                    json.dump(dataset_statistics, f)
+                stats_checkpoint_files.append(checkpoint_file)
+                print(f"💾 Saved statistics checkpoint ({v_idx}/{len(video_names)} videos) to {checkpoint_file.name}")
+                
+                # Clear statistics from memory
+                dataset_statistics.clear()
+                
+                # Force garbage collection
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
         # Critical: Reset predictor state to free memory for this video
         predictor.reset_state(state)
@@ -1134,7 +1157,20 @@ def inference_with_bndl(
         # Final cleanup after each video (keep consistent with original)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-
+    
+    # Save any remaining statistics after the last video
+    if collect_statistics and dataset_statistics and len(dataset_statistics) > 0:
+        checkpoint_file = out_dir.parent / f".stats_checkpoint_{dataset_name}_final.json"
+        with open(checkpoint_file, "w") as f:
+            json.dump(dataset_statistics, f)
+        stats_checkpoint_files.append(checkpoint_file)
+        print(f"💾 Saved final statistics checkpoint to {checkpoint_file.name}")
+        dataset_statistics.clear()
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    
     # Generate dataset evaluation plots like in SAM trainer validation phase
     if collect_statistics and dataset_evaluator and len(dataset_evaluator) > 0:
         try:
@@ -1163,7 +1199,23 @@ def inference_with_bndl(
     elif collect_statistics and dataset_evaluator:
         logger.warning(f"No data collected for dataset evaluation in {dataset_name} (collected: {len(dataset_evaluator) if dataset_evaluator else 0})")
 
-    # Print final statistics summary
+    # Merge checkpoint files back into final statistics
+    if collect_statistics and stats_checkpoint_files:
+        print(f"\n🔄 Merging {len(stats_checkpoint_files)} checkpoint files...")
+        for checkpoint_file in stats_checkpoint_files:
+            try:
+                with open(checkpoint_file, "r") as f:
+                    checkpoint_data = json.load(f)
+                    if dataset_statistics is None:
+                        dataset_statistics = {}
+                    dataset_statistics.update(checkpoint_data)
+                # Clean up checkpoint file
+                checkpoint_file.unlink()
+            except Exception as e:
+                print(f"Warning: Failed to merge checkpoint {checkpoint_file}: {e}")
+        print(f"✓ Merged all checkpoints into final statistics")
+    
+
     if collect_statistics and dataset_statistics:
         print(f"\nBNDL Statistics Summary for {dataset_name}:")
         print(f"Total frames processed: {total_frames_processed}")
