@@ -1261,12 +1261,15 @@ class Trainer:
                 uncertainty_data['entropy'] = entropy_norm
             
             if "sampling" in self.logging_conf.uncertainty_metric:
-                pixel_uncertainty_p, mean_pixel_logits = pixel_uncertain_sampling(
+                pixel_uncertainty_pval, mean_pixel_logits = pixel_uncertain_sampling(
                     pixel_bndl_model,
                     pixel_feat,
                     external_pre_out_w=hyper_in,
                     sample_num=self.logging_conf.uncertainty_sample_num,
                 )
+                # CRITICAL FIX: pixel_uncertain_sampling returns p-values, not uncertainty!
+                # Convert p-value to true uncertainty: uncertainty = 1 - p_value
+                pixel_uncertainty_p = 1.0 - pixel_uncertainty_pval
                 uncertainty_data['sampling'] = pixel_uncertainty_p
             
             if "nll" in self.logging_conf.uncertainty_metric:

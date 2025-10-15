@@ -311,12 +311,18 @@ def calculate_pavpu_for_bndl(bndl_outputs, batch, targets, phase, model):
             external_pre_out_w = extract_hyper_in_from_bndl_outputs(bndl_outputs, batch, mask_decoder)
 
         # Perform pixel-level uncertainty sampling
-        pixel_uncertainty, mean_pixel_logits = pixel_uncertain_sampling(
+        pixel_uncertainty_pval, mean_pixel_logits = pixel_uncertain_sampling(
             pixel_bndl_model,
             pixel_feat,
             external_pre_out_w=external_pre_out_w,
             sample_num=20,  # Reduced sample number for speed during evaluation
         )
+        
+        # CRITICAL FIX: pixel_uncertain_sampling returns p-values, not uncertainty!
+        # - High p-value (→1) = top-2 masks are similar → LOW uncertainty (high confidence)
+        # - Low p-value (→0) = top-2 masks differ → HIGH uncertainty (low confidence)
+        # Convert p-value to true uncertainty: uncertainty = 1 - p_value
+        pixel_uncertainty = 1.0 - pixel_uncertainty_pval
 
         # Additionally compute entropy-based uncertainty (continuous, smooth)
         try:

@@ -623,12 +623,15 @@ class SAM2Base(torch.nn.Module):
                 linear_weight = pixel_bndl_model.linear.weight  # [K, C']
                 adv_external_w = linear_weight.unsqueeze(0).expand(M, -1, -1).detach()
             
-            adv_uq, adv_mean_logits = pixel_uncertain_sampling(
+            adv_uq_pval, adv_mean_logits = pixel_uncertain_sampling(
                 pixel_bndl_model,
                 adv_feat_for_uq,  # A3 Fix: Use partial gradient feature
                 external_pre_out_w=adv_external_w,
                 sample_num=uq_sample_num,
             )
+            # CRITICAL FIX: pixel_uncertain_sampling returns p-values, not uncertainty!
+            # Convert p-value to true uncertainty: uncertainty = 1 - p_value
+            adv_uq = 1.0 - adv_uq_pval
             adv_conf = self._adco_compute_conf_from_logits_tensor(adv_mean_logits)
             # Simplified: no need for mask, just compute global mean
             eps = 1e-6
