@@ -128,14 +128,19 @@ model:
   # Compilation flag
   # compile_image_encoder: False
 
-  # AdCo options (feature-level with uncertainty curriculum)
+  # AdCo options
   use_adco: true
   adco_proj_dim: 256
-  adco_queue_size: 512               # Reduced from 4096 to 512 for speed
-  adco_temperature: 0.07             # Standard contrastive temperature
-  adco_curriculum_warmup_steps: 1000 # Reduced from 3000 to 1000 for faster warmup
-  adco_stage1_end: 0.33              # Stage 1 ends at 33% (pos only)
-  adco_stage2_end: 0.67              # Stage 2 ends at 67% (pos + neg)
+  adco_queue_size: 65536
+  adco_temperature: 0.2
+  adco_use_uncertainty: false
+  # UQ-aware AdCo controls
+  adco_gate_by_uncertainty: false
+  adco_gate_floor: 0.2
+  adco_tau_beta: 0.7
+  adco_uncertainty_mask_threshold: 0.4
+  adco_scale_neg_by_uq: true
+  adco_curriculum_warmup_steps: 5000  # A5 Fix: Extended from 2000 to avoid early instability
 
   # ProCo options
   use_proco: false

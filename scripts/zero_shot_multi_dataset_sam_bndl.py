@@ -3,6 +3,7 @@
 # Supports TrashCan, GTEA, PIDRay, plittersdorf, Hypersim, DRAM, and CITYSCAPES datasets with UQ analysis
 
 import argparse
+import gc
 import json
 import shutil
 from pathlib import Path
@@ -33,8 +34,8 @@ from tools.vos_inference import (
     save_masks_to_dir,
 )
 
-# ----------  BNDL uncertainty and PAvPU functions ----------
-from BNDL.BNDL_upload.ViT_Sparse.utils.bndl import pixel_pavpu_calculation, pixel_uncertain_sampling, pixel_entropy_uncertainty
+# ----------  BNDL uncertainty functions ----------
+from BNDL.BNDL_upload.ViT_Sparse.utils.bndl import pixel_uncertain_sampling, pixel_entropy_uncertainty
 
 # ----------  Dataset Evaluator from SAM2 training ----------
 from training.utils.dataset_evaluator import DistributedDatasetEvaluator
@@ -259,6 +260,23 @@ def prepare_targets_for_pavpu(targets, bndl_outputs):
         elif "wei_lambda" in bndl_outputs and bndl_outputs["wei_lambda"] is not None:
             target_tensor = target_tensor.to(bndl_outputs["wei_lambda"].device)
 
+        # ===== IMPORTANT: Keep targets at original resolution =====
+        # Unlike training (where predictions are upsampled to a fixed resolution),
+        # for evaluation we want PAvPU calculated at the SAME resolution as the
+        # final mask evaluation (J&F metric), which is at original image resolution.
+        #
+        # Strategy: Keep targets at original resolution here, and upsample
+        # BNDL predictions to match in calculate_pavpu_for_bndl.
+        # This ensures consistency with how SAM2 evaluates final masks.
+        
+        logger.info(f"Keeping targets at original resolution: {target_tensor.shape}")
+        
+        # Note: We do NOT handle K (mask dimension) or spatial resolution here.
+        # The downstream calculate_pavpu_for_bndl will:
+        # 1. Upsample predictions to match target resolution (original image size)
+        # 2. Select the appropriate mask head (typically mask 0 for single-mask token)
+        # This design keeps PAvPU evaluation consistent with final mask evaluation.
+
         return target_tensor
 
     except Exception as e:
@@ -267,7 +285,7 @@ def prepare_targets_for_pavpu(targets, bndl_outputs):
 
 
 def calculate_pavpu_for_bndl(bndl_outputs, batch, targets, phase, model):
-    """Calculate PAvPU metric for BNDL outputs during evaluation"""
+    """Store raw pixel-level uncertainty and accuracy for true PAvPU analysis (no thresholds)"""
     try:
         # Extract pixel BNDL model for uncertainty sampling
         pixel_bndl_model = extract_pixel_bndl_model_simple(model)
@@ -318,7 +336,7 @@ def calculate_pavpu_for_bndl(bndl_outputs, batch, targets, phase, model):
         # Prepare ground truth masks for PAvPU calculation
         pixel_targets = prepare_targets_for_pavpu(targets, bndl_outputs)
 
-        # Calculate PAvPU scores
+        # Store raw data for true PAvPU analysis (scatter plot: uncertainty vs accuracy)
         if pixel_targets is not None:
             pixel_predictions = bndl_outputs.get("pixel_logits_raw", mean_pixel_logits)
             if pixel_predictions is not None:
@@ -334,40 +352,59 @@ def calculate_pavpu_for_bndl(bndl_outputs, batch, targets, phase, model):
                     logger.warning(f"Unexpected pixel_predictions shape: {pixel_predictions.shape}")
                     return bndl_outputs
 
-                # Validate that dimensions match between predictions and targets
+                # Validate and align dimensions between predictions and targets
                 if pixel_predictions.shape != pixel_targets.shape:
-                    logger.warning(f"Shape mismatch - predictions: {pixel_predictions.shape}, targets: {pixel_targets.shape}")
-                    # Try to fix common mismatches
                     if len(pixel_targets.shape) == 4 and len(pixel_predictions.shape) == 4:
                         B_pred, H_pred, W_pred, K_pred = pixel_predictions.shape
                         B_targ, H_targ, W_targ, K_targ = pixel_targets.shape
 
-                        # Fix batch dimension mismatch
+                        # Upsample predictions to match target resolution (original image size)
+                        # This ensures PAvPU is evaluated at the same resolution as final J&F metrics
+                        if H_pred != H_targ or W_pred != W_targ:
+                            logger.info(
+                                f"Upsampling predictions from {H_pred}x{W_pred} to {H_targ}x{W_targ} "
+                                f"to match original image resolution for PAvPU evaluation"
+                            )
+                            pixel_predictions = F.interpolate(
+                                pixel_predictions.permute(0, 3, 1, 2),  # [B, H, W, K] -> [B, K, H, W]
+                                size=(H_targ, W_targ),
+                                mode="bilinear",
+                                align_corners=False,
+                            ).permute(0, 2, 3, 1)  # [B, K, H, W] -> [B, H, W, K]
+                            
+                            # Also upsample pixel_uncertainty to match
+                            if pixel_uncertainty is not None and pixel_uncertainty.shape[-2:] != (H_targ, W_targ):
+                                if len(pixel_uncertainty.shape) == 3:  # [B, H, W]
+                                    pixel_uncertainty = F.interpolate(
+                                        pixel_uncertainty.unsqueeze(1),  # [B, H, W] -> [B, 1, H, W]
+                                        size=(H_targ, W_targ),
+                                        mode="bilinear",
+                                        align_corners=False,
+                                    ).squeeze(1)  # [B, 1, H, W] -> [B, H, W]
+                                    logger.info(f"Upsampled uncertainty to {pixel_uncertainty.shape}")
+                                elif len(pixel_uncertainty.shape) == 4:  # [B, H, W, C]
+                                    pixel_uncertainty = F.interpolate(
+                                        pixel_uncertainty.permute(0, 3, 1, 2),
+                                        size=(H_targ, W_targ),
+                                        mode="bilinear",
+                                        align_corners=False,
+                                    ).permute(0, 2, 3, 1)
+                                    logger.info(f"Upsampled uncertainty to {pixel_uncertainty.shape}")
+
+                        # Fix batch dimension mismatch (rare edge case)
                         if B_pred != B_targ:
                             min_batch = min(B_pred, B_targ)
                             pixel_predictions = pixel_predictions[:min_batch]
                             pixel_targets = pixel_targets[:min_batch]
                             logger.info(f"Fixed batch dimension mismatch: using first {min_batch} samples")
 
-                        # Fix spatial dimension mismatch (resolution difference)
-                        if H_pred != H_targ or W_pred != W_targ:
-                            # Resize targets to match predictions resolution
-                            pixel_targets_resized = F.interpolate(
-                                pixel_targets.permute(0, 3, 1, 2),  # [B, H, W, K] -> [B, K, H, W]
-                                size=(H_pred, W_pred),
-                                mode="bilinear",
-                                align_corners=False,
-                            ).permute(0, 2, 3, 1)  # [B, K, H, W] -> [B, H, W, K]
-                            pixel_targets = pixel_targets_resized
-                            logger.info(f"Resized targets from {H_targ}x{W_targ} to {H_pred}x{W_pred}")
-
-                        # Fix mask dimension mismatch
+                        # Fix mask dimension mismatch (expected: K_pred=4, K_targ=1)
                         if K_pred != K_targ:
                             if K_pred > K_targ and K_targ == 1:
                                 # Multiple mask heads (K_pred > 1) but single ground truth
-                                # Use mask 0 (singlemask token) to match SAM-2 behavior
+                                # Use mask 0 (single-mask token) to match SAM-2 behavior
                                 pixel_predictions = pixel_predictions[..., 0:1]  # [B,H,W,K] -> [B,H,W,1]
-                                logger.info(f"Fixed mask dimension mismatch by selecting mask 0 from {K_pred} masks")
+                                logger.info(f"Selected mask 0 from {K_pred} prediction heads to match single ground truth mask")
                             elif K_targ > K_pred:
                                 # More ground truth masks than predictions (rare case)
                                 pixel_targets = pixel_targets[..., :K_pred]
@@ -377,31 +414,62 @@ def calculate_pavpu_for_bndl(bndl_outputs, batch, targets, phase, model):
                                 min_k = min(K_pred, K_targ)
                                 pixel_predictions = pixel_predictions[..., :min_k]
                                 pixel_targets = pixel_targets[..., :min_k]
-                                logger.info(f"Truncated to K={min_k} (fallback)")
+                                logger.info(f"Truncated to K={min_k} masks (fallback)")
 
                         # Final validation
                         if pixel_predictions.shape != pixel_targets.shape:
-                            logger.warning(f"Still shape mismatch after fixes - predictions: {pixel_predictions.shape}, targets: {pixel_targets.shape}")
+                            logger.error(f"Shape mismatch remains after alignment - predictions: {pixel_predictions.shape}, targets: {pixel_targets.shape}")
                             return bndl_outputs
                         else:
-                            logger.info(f"Successfully fixed shape mismatch! Final shapes: {pixel_predictions.shape}")
+                            logger.info(f"Successfully aligned shapes: {pixel_predictions.shape}")
                     else:
-                        logger.warning("Cannot fix dimension mismatch, skipping PAvPU calculation")
+                        logger.error(f"Unexpected tensor dimensions - predictions: {pixel_predictions.shape}, targets: {pixel_targets.shape}")
                         return bndl_outputs
 
-                # Determine thresholds with wider scan. Match to the uncertainty used here (pixel_uncertainty)
-                # pixel_uncertainty here is p-value style from pixel_uncertain_sampling
-                thresholds = [0.005, 0.010, 0.020, 0.050, 0.100, 0.200, 0.300]
-
-                pavpu_scores = pixel_pavpu_calculation(pixel_uncertainty, pixel_predictions, pixel_targets, thresholds=thresholds)
-
-                # Add PAvPU results to BNDL outputs
+                # Calculate pixel-level accuracy for true PAvPU (no thresholds)
+                # pixel_accuracy = whether prediction matches ground truth (binary: 0 or 1)
+                
+                # Convert predictions to binary (sigmoid + threshold 0.5)
+                pixel_pred_probs = torch.sigmoid(pixel_predictions)  # [B, H, W, K]
+                # Use best mask per pixel (argmax across K dimension, same as training)
+                best_mask_indices = torch.argmax(pixel_pred_probs, dim=-1)  # [B, H, W]
+                best_pred_probs = torch.gather(pixel_pred_probs, -1, best_mask_indices.unsqueeze(-1)).squeeze(-1)  # [B, H, W]
+                best_pred_binary = (best_pred_probs > 0.5).float()
+                
+                # Extract corresponding ground truth
+                best_target_vals = torch.gather(pixel_targets, -1, best_mask_indices.unsqueeze(-1)).squeeze(-1)  # [B, H, W]
+                best_target_binary = (best_target_vals > 0.5).float()
+                
+                # Calculate pixel accuracy: 1 if match, 0 if mismatch
+                pixel_accurate = (best_pred_binary == best_target_binary).float()  # [B, H, W]
+                
+                # Store raw uncertainty and accuracy for later plotting (sample to reduce storage)
+                # Flatten to [B*H*W] and sample a subset
+                B, H, W = pixel_accurate.shape
+                total_pixels = B * H * W
+                max_samples = 10000  # Sample up to 10k pixels per frame
+                sample_size = min(total_pixels, max_samples)
+                
+                # Flatten
+                uncertainty_flat = pixel_uncertainty.reshape(-1)  # [B*H*W]
+                accuracy_flat = pixel_accurate.reshape(-1)  # [B*H*W]
+                
+                # Random sampling
+                if total_pixels > sample_size:
+                    indices = torch.randperm(total_pixels, device=uncertainty_flat.device)[:sample_size]
+                    uncertainty_sampled = uncertainty_flat[indices]
+                    accuracy_sampled = accuracy_flat[indices]
+                else:
+                    uncertainty_sampled = uncertainty_flat
+                    accuracy_sampled = accuracy_flat
+                
+                # Store raw data for PAvPU scatter plot (uncertainty vs accuracy)
                 bndl_outputs["pixel_uncertainty"] = pixel_uncertainty.detach()
-                bndl_outputs["pixel_pavpu"] = pavpu_scores
-                bndl_outputs["pavpu_thresholds"] = thresholds
                 bndl_outputs["mean_pixel_logits"] = mean_pixel_logits.detach()
-
-                logger.info(f"PAvPU scores calculated: {pavpu_scores}")
+                bndl_outputs["pavpu_uncertainty_samples"] = uncertainty_sampled.detach().cpu().numpy()
+                bndl_outputs["pavpu_accuracy_samples"] = accuracy_sampled.detach().cpu().numpy()
+                
+                logger.info(f"Stored {len(uncertainty_sampled)} pixel samples for true PAvPU analysis (no thresholds)")
             else:
                 logger.warning("No pixel predictions found for PAvPU calculation")
         else:
@@ -450,15 +518,16 @@ def log_bndl_statistics(bndl_outputs, step, phase, dataset_name, statistics_dict
             except Exception as e:
                 logger.warning(f"Failed to log pixel_entropy: {e}")
 
-        # Log PAvPU scores if available
-        if "pixel_pavpu" in bndl_outputs and bndl_outputs["pixel_pavpu"] is not None:
-            pavpu_scores = bndl_outputs["pixel_pavpu"]
-            thresholds = bndl_outputs.get("pavpu_thresholds", [0.01, 0.05, 0.1])
-            for i, threshold in enumerate(thresholds):
-                if i < len(pavpu_scores):
-                    score = pavpu_scores[i].item() if hasattr(pavpu_scores[i], "item") else pavpu_scores[i]
-                    statistics_dict[f"{key_prefix}_pavpu_{threshold}"] = score
-                    logger.info(f"BNDL Stats - {key_prefix}: pavpu_{threshold}={score:.4f}")
+        # Store raw PAvPU samples for true scatter plot (no thresholds)
+        if "pavpu_uncertainty_samples" in bndl_outputs and "pavpu_accuracy_samples" in bndl_outputs:
+            uncertainty_samples = bndl_outputs["pavpu_uncertainty_samples"]
+            accuracy_samples = bndl_outputs["pavpu_accuracy_samples"]
+            
+            # Store raw samples in statistics dict
+            statistics_dict[f"{key_prefix}_pavpu_uncertainty_samples"] = uncertainty_samples.tolist() if hasattr(uncertainty_samples, "tolist") else list(uncertainty_samples)
+            statistics_dict[f"{key_prefix}_pavpu_accuracy_samples"] = accuracy_samples.tolist() if hasattr(accuracy_samples, "tolist") else list(accuracy_samples)
+            
+            logger.info(f"BNDL Stats - {key_prefix}: stored {len(uncertainty_samples)} PAvPU samples for true scatter plot")
 
     # Global w statistics (original BNDL)
     if "wei_lambda_w" in bndl_outputs and "inv_k_w" in bndl_outputs and bndl_outputs["wei_lambda_w"] is not None and bndl_outputs["inv_k_w"] is not None:
@@ -734,9 +803,15 @@ def inference_with_bndl(
     if save_bndl_vis and vis_dir is not None:
         vis_dir.mkdir(parents=True, exist_ok=True)
 
-    # Initialize statistics collection
+    # Initialize statistics collection with incremental saving
     dataset_statistics = {} if collect_statistics else None
     total_frames_processed = 0
+    
+    # Incremental save configuration to prevent OOM
+    # Reduced from 50 to 2 for aggressive memory management on high-res datasets
+    stats_checkpoint_interval = 2  # Save every 2 videos to free memory
+    stats_checkpoint_files = []  # Track checkpoint files for final merge
+    eval_checkpoint_files = []  # Track evaluator checkpoint files for final merge
 
     # Initialize dataset evaluator for correlation analysis like in SAM trainer
     # Use consistent path format: <output_root>/<dataset>_bndl_eval
@@ -886,12 +961,17 @@ def inference_with_bndl(
                     )[0, 0]
                 seg[oid] = (mask_logits > score_thresh).cpu().numpy()
             video_segments[f_idx] = seg
+            
+            # Clear GPU memory after processing each frame to prevent OOM with many objects
+            if torch.cuda.is_available() and len(out_obj_ids) > 10:
+                torch.cuda.empty_cache()
 
             # Collect BNDL statistics if enabled (with memory optimization)
             if collect_statistics:
                 # Map object IDs to their index in out_logits to fetch per-object logits reliably
                 id_to_idx = {oid: i for i, oid in enumerate(out_obj_ids)}
-                max_obj_stats = 2 if dataset_name == "Hypersim" else 3
+                # Limit to 3 objects per frame for stats collection (memory already managed by checkpoints)
+                max_obj_stats = 3
                 logger.info(f"Processing {len(out_obj_ids[:max_obj_stats])} objects for stats collection")
                 for obj_id in out_obj_ids[:max_obj_stats]:
                     # Convert obj_id to internal obj_idx using predictor's mapping
@@ -919,8 +999,8 @@ def inference_with_bndl(
                         video_statistics = log_bndl_statistics(bndl_outputs, f_idx, "eval", f"{dataset_name}_{vid}_obj{obj_id}", video_statistics)
                         total_frames_processed += 1
 
-                        # Add to dataset evaluator (skip Hypersim to save memory)
-                        if dataset_evaluator is not None and dataset_name != "Hypersim":
+                        # Add to dataset evaluator (memory managed by checkpoints)
+                        if dataset_evaluator is not None:
                             _idx = id_to_idx.get(obj_id)
                             if _idx is not None and _idx < len(out_logits):
                                 pred_logits = out_logits[_idx]
@@ -1055,6 +1135,47 @@ def inference_with_bndl(
         if collect_statistics and video_statistics and dataset_statistics is not None:
             dataset_statistics.update(video_statistics)
             print(f"Collected BNDL statistics for video {vid}: {len(video_statistics)} metrics")
+            
+            # Incremental save: periodically save statistics and clear memory to prevent OOM
+            if v_idx % stats_checkpoint_interval == 0:
+                checkpoint_file = out_dir.parent / f".stats_checkpoint_{dataset_name}_{v_idx:04d}.json"
+                with open(checkpoint_file, "w") as f:
+                    json.dump(dataset_statistics, f)
+                stats_checkpoint_files.append(checkpoint_file)
+                print(f"💾 Saved statistics checkpoint ({v_idx}/{len(video_names)} videos) to {checkpoint_file.name}")
+                
+                # Clear statistics from memory
+                dataset_statistics.clear()
+                
+                # Force garbage collection
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                
+                # Also checkpoint dataset_evaluator to prevent OOM from pixel-level data accumulation
+                if dataset_evaluator is not None and len(dataset_evaluator) > 0:
+                    import pickle
+                    eval_checkpoint_file = out_dir.parent / f".eval_checkpoint_{dataset_name}_{v_idx:04d}.pkl"
+                    # Save evaluator's accumulated data
+                    eval_checkpoint_data = {
+                        'pixel_uncertainties': dataset_evaluator.pixel_uncertainties.copy() if hasattr(dataset_evaluator, 'pixel_uncertainties') else [],
+                        'pixel_ious': dataset_evaluator.pixel_ious.copy() if hasattr(dataset_evaluator, 'pixel_ious') else [],
+                        'pixel_dices': dataset_evaluator.pixel_dices.copy() if hasattr(dataset_evaluator, 'pixel_dices') else [],
+                        'pixel_accuracies': dataset_evaluator.pixel_accuracies.copy() if hasattr(dataset_evaluator, 'pixel_accuracies') else [],
+                    }
+                    with open(eval_checkpoint_file, 'wb') as f:
+                        pickle.dump(eval_checkpoint_data, f)
+                    
+                    # Track checkpoint file
+                    eval_checkpoint_files.append(eval_checkpoint_file)
+                    print(f"💾 Saved evaluator checkpoint ({v_idx}/{len(video_names)} videos) to {eval_checkpoint_file.name}")
+                    
+                    # Clear evaluator data using built-in reset method (more efficient than del + recreate)
+                    dataset_evaluator.reset()
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
         # Critical: Reset predictor state to free memory for this video
         predictor.reset_state(state)
@@ -1062,7 +1183,41 @@ def inference_with_bndl(
         # Final cleanup after each video (keep consistent with original)
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-
+    
+    # Save any remaining statistics after the last video
+    if collect_statistics and dataset_statistics and len(dataset_statistics) > 0:
+        checkpoint_file = out_dir.parent / f".stats_checkpoint_{dataset_name}_final.json"
+        with open(checkpoint_file, "w") as f:
+            json.dump(dataset_statistics, f)
+        stats_checkpoint_files.append(checkpoint_file)
+        print(f"💾 Saved final statistics checkpoint to {checkpoint_file.name}")
+        dataset_statistics.clear()
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    
+    # Merge evaluator checkpoint files back into dataset_evaluator BEFORE generating evaluation
+    # CRITICAL: Must merge checkpoints first, otherwise len(dataset_evaluator) will be 0
+    if collect_statistics and eval_checkpoint_files and dataset_evaluator is not None:
+        print(f"\n🔄 Merging {len(eval_checkpoint_files)} evaluator checkpoint files...")
+        import pickle
+        for eval_checkpoint_file in eval_checkpoint_files:
+            with open(eval_checkpoint_file, 'rb') as f:
+                checkpoint_data = pickle.load(f)
+                # Restore data to evaluator
+                if 'pixel_uncertainties' in checkpoint_data:
+                    dataset_evaluator.pixel_uncertainties.extend(checkpoint_data['pixel_uncertainties'])
+                if 'pixel_ious' in checkpoint_data:
+                    dataset_evaluator.pixel_ious.extend(checkpoint_data['pixel_ious'])
+                if 'pixel_dices' in checkpoint_data:
+                    dataset_evaluator.pixel_dices.extend(checkpoint_data['pixel_dices'])
+                if 'pixel_accuracies' in checkpoint_data:
+                    dataset_evaluator.pixel_accuracies.extend(checkpoint_data['pixel_accuracies'])
+            # Clean up checkpoint file
+            eval_checkpoint_file.unlink()
+        print(f"✓ Merged all evaluator checkpoints into final evaluator")
+    
     # Generate dataset evaluation plots like in SAM trainer validation phase
     if collect_statistics and dataset_evaluator and len(dataset_evaluator) > 0:
         try:
@@ -1091,7 +1246,20 @@ def inference_with_bndl(
     elif collect_statistics and dataset_evaluator:
         logger.warning(f"No data collected for dataset evaluation in {dataset_name} (collected: {len(dataset_evaluator) if dataset_evaluator else 0})")
 
-    # Print final statistics summary
+    # Merge checkpoint files back into final statistics
+    if collect_statistics and stats_checkpoint_files:
+        print(f"\n🔄 Merging {len(stats_checkpoint_files)} checkpoint files...")
+        for checkpoint_file in stats_checkpoint_files:
+            with open(checkpoint_file, "r") as f:
+                checkpoint_data = json.load(f)
+                if dataset_statistics is None:
+                    dataset_statistics = {}
+                dataset_statistics.update(checkpoint_data)
+            # Clean up checkpoint file
+            checkpoint_file.unlink()
+        print(f"✓ Merged all checkpoints into final statistics")
+    
+
     if collect_statistics and dataset_statistics:
         print(f"\nBNDL Statistics Summary for {dataset_name}:")
         print(f"Total frames processed: {total_frames_processed}")

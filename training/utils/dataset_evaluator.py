@@ -7,8 +7,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib
 matplotlib.use('Agg')  # 使用非交互式后端
-from typing import Dict, List, Optional, Tuple, Any
-from collections import defaultdict
+from typing import Any
 
 from .metric_calculator import MetricCalculator
 from .visualization_utils import VisualizationUtils
@@ -24,10 +23,13 @@ def _dilate_mask(mask: torch.Tensor, kernel_size: int = 10) -> torch.Tensor:
         kernel_size: 膨胀核大小（像素），推荐5-15
 
     Returns:
-        dilated_mask: [H, W] 膨胀后的二值mask
+        dilated_mask: [H, W] 膨胀后的二值mask（与输入尺寸完全一致）
     """
     if kernel_size <= 0:
         return mask
+
+    # 保存原始尺寸
+    orig_h, orig_w = mask.shape
 
     # 使用max_pool2d实现膨胀：将mask reshape为[1, 1, H, W]
     mask_4d = mask.unsqueeze(0).unsqueeze(0).float()  # [1, 1, H, W]
@@ -39,6 +41,16 @@ def _dilate_mask(mask: torch.Tensor, kernel_size: int = 10) -> torch.Tensor:
 
     # 转回[H, W]并转为bool
     dilated_mask = dilated.squeeze(0).squeeze(0) > 0.5
+
+    # 确保输出尺寸与输入完全一致（修复由于padding/kernel_size组合导致的尺寸差异）
+    if dilated_mask.shape != (orig_h, orig_w):
+        # 如果尺寸不一致，使用插值调整回原始尺寸
+        dilated_mask = F.interpolate(
+            dilated_mask.unsqueeze(0).unsqueeze(0).float(),
+            size=(orig_h, orig_w),
+            mode='nearest'  # 使用nearest保持二值性质
+        ).squeeze(0).squeeze(0) > 0.5
+        logging.debug(f"Adjusted dilated mask size from {dilated.shape[2:]} to {(orig_h, orig_w)}")
 
     return dilated_mask
 
@@ -120,9 +132,6 @@ class DistributedDatasetEvaluator:
             if uncertainty.numel() == 0 or pred_logits.numel() == 0 or gt_masks.numel() == 0:
                 logging.warning("One or more inputs have zero elements, skipping batch")
                 return
-            
-            # 确保张量在正确的设备上
-            device = uncertainty.device
             
             # 标准化格式
             uncertainty_norm = self.metric_calculator.normalize_tensor_format(uncertainty, "uncertainty")
@@ -325,7 +334,7 @@ class DistributedDatasetEvaluator:
         return values.median()
 
     def _calculate_pixel_wise_metrics(self, uncertainty: torch.Tensor, pred_logits: torch.Tensor,
-                                      gt_masks: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+                                      gt_masks: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         计算像素级指标，返回前景扩展区域内每个像素的值
 
@@ -412,8 +421,7 @@ class DistributedDatasetEvaluator:
             empty = torch.tensor([], dtype=torch.float32)
             return empty, empty, empty, empty, empty
     
-    def _gather_distributed_data(self) -> tuple[list[float], list[float],
-                                               list[float], list[float], list[float]]:
+    def _gather_distributed_data(self) -> tuple[list, list, list, list, list]:
         """收集所有GPU进程的数据（使用NCCL-safe all_gather + padding）"""
         if not self.distributed or not dist.is_initialized():
             if self.per_pixel_statistics:
@@ -430,7 +438,7 @@ class DistributedDatasetEvaluator:
                     [t.item() if hasattr(t, 'item') else t for t in self.image_nlls]
                 )
 
-        def gather_float_list(values: list[float]) -> list[float]:
+        def gather_float_list(values: list) -> list:
             """聚合float列表（支持像素级和图片级）"""
             device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
             local_vals = torch.tensor(values, device=device, dtype=torch.float32)
@@ -477,9 +485,9 @@ class DistributedDatasetEvaluator:
 
         return all_uncertainties, all_ious, all_dices, all_accuracies, all_nlls
 
-    def _calculate_correlation_from_lists(self, uncertainties: list[float],
-                                          metrics: list[float],
-                                          metric_name: str) -> Dict[str, float]:
+    def _calculate_correlation_from_lists(self, uncertainties: list,
+                                          metrics: list,
+                                          metric_name: str) -> dict[str, float]:
         """
         从float列表计算相关性（支持像素级和图片级统计）
 
@@ -545,7 +553,7 @@ class DistributedDatasetEvaluator:
             indices = np.random.choice(len(data), max_points, replace=False)
             return data[indices].tolist()
 
-    def evaluate_dataset_correlation(self) -> Dict[str, Dict[str, float]]:
+    def evaluate_dataset_correlation(self) -> dict[str, dict[str, float]]:
         """评估整个数据集的指标与不确定性相关性"""
         try:
             # 检查是否有数据
@@ -731,7 +739,7 @@ class DistributedDatasetEvaluator:
             logging.warning(f"Traceback: {traceback.format_exc()}")
             return ""
     
-    def get_summary_statistics(self) -> Dict[str, Any]:
+    def get_summary_statistics(self) -> dict[str, Any]:
         """
         获取汇总统计信息
         
@@ -742,8 +750,11 @@ class DistributedDatasetEvaluator:
             if not self.correlation_results:
                 return {}
             
+            # Use the correct data source based on mode
+            data_source = self.pixel_uncertainties if self.per_pixel_statistics else self.image_uncertainties
+            
             summary = {
-                'total_batches': len(self.image_uncertainties),
+                'total_batches': len(data_source),
                 'metrics_evaluated': list(self.correlation_results.keys()),
                 'correlation_summary': {},
                 'overall_statistics': {},

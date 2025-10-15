@@ -151,6 +151,8 @@ class LoggingConf:
     uncertainty_metric: set = field(default_factory=lambda: {"entropy"})  # Options: {"entropy"}, {"nll"}, {"sampling"}, {"entropy", "nll"}, {"entropy", "nll", "sampling"}, etc.
     visualize_pavpu_overlay: bool = True  # Enable PAvPU overlay visualization on original images
     uncertainty_sample_num: int = 50
+    correlation_foreground_dilation: int = 10  # Foreground dilation radius (pixels), 0 means no dilation
+    correlation_per_pixel: bool = True  # Use per-pixel statistics (vs per-image)
 
 class Trainer:
     """
@@ -702,8 +704,8 @@ class Trainer:
                                 makedir(vis_dir)
                                 # Ensure PAvPU is calculated for visualization
                                 self._create_unified_visualization(bndl_outputs, batch, outputs, vis_dir, data_iter, step_index, frame_index, 'full')
-                                # After BNDL visualization, also visualize AdCo negatives (bank + sampled)
-                                self._visualize_adco_negatives(phase=phase, data_iter=data_iter)
+                                # After BNDL visualization, also visualize AdCo adversarials (bank + sampled)
+                                self._visualize_adco_adversarials(phase=phase, data_iter=data_iter)
                             
                             # Dataset evaluation using BNDL outputs (use postprocessed masks)
                             pixel_predictions = bndl_outputs.get('masks_bndl_postprocessed', bndl_outputs.get('masks_bndl_raw'))
@@ -898,7 +900,7 @@ class Trainer:
                             self.steps[phase],
                         )
 
-                # (train) We keep AdCo negatives visualization off to avoid overhead
+                # (train) We keep AdCo adversarials visualization off to avoid overhead
 
             # Catching NaN/Inf errors in the loss
             except FloatingPointError as e:
@@ -1594,12 +1596,11 @@ class Trainer:
             else:
                 bndl_viz.plot_uncertainty_visualization(axes[3, :], bndl_outputs, step_index)
 
-    def _visualize_adco_negatives(self, phase: str, data_iter: int):
-        """Minimal visualization for AdCo negative bank and sampled negatives.
+    def _visualize_adco_adversarials(self, phase: str, data_iter: int):
+        """Visualization for AdCo feature adversarial bank with uncertainty distribution.
 
-        Saves two optional grids under log_dir/bndl_visualizations/{phase}/adco_negatives/:
-        - epoch_{e}_iter_{i}_adco_bank.png (learnable bank snapshot)
-        - epoch_{e}_iter_{i}_adco_sampled.png (on-the-fly sampled negatives)
+        Saves plots under log_dir/bndl_visualizations/{phase}/adco_adversarials/:
+        - epoch_{e}_iter_{i}_adco_feature_stats.png (feature bank statistics and uncertainty)
         """
         # Locate underlying model (unwrap DDP)
         model = self.model
@@ -1607,74 +1608,91 @@ class Trainer:
             model = model.module
 
         # Build output directory
-        vis_dir = os.path.join(self.logging_conf.log_dir, "bndl_visualizations", phase, "adco_negatives")
+        vis_dir = os.path.join(self.logging_conf.log_dir, "bndl_visualizations", phase, "adco_adversarials")
         makedir(vis_dir)
 
-        def _to_numpy_grid(img_tensor: torch.Tensor, max_items: int = 16) -> np.ndarray:
-            """Convert a [N, 3, H, W] tensor to a grid numpy image [Hgrid, Wgrid, 3] in [0,1]."""
-            n = min(int(max_items), int(img_tensor.shape[0]))
-            sel = img_tensor[:n].detach().to("cpu")
-            # Per-image min-max normalize to [0,1]
-            imgs = []
-            for t in sel:
-                c, h, w = t.shape
-                t_flat = t.view(c, -1)
-                t_min = t_flat.min(dim=1, keepdim=True).values
-                t_max = t_flat.max(dim=1, keepdim=True).values
-                denom = torch.clamp(t_max - t_min, min=1e-6)
-                t_norm = ((t - t_min.view(c, 1, 1)) / denom.view(c, 1, 1)).clamp(0.0, 1.0)
-                imgs.append(t_norm.permute(1, 2, 0).numpy())  # H W C
-            # Arrange into a square-ish grid
-            cols = int(math.ceil(math.sqrt(n)))
-            rows = int(math.ceil(n / cols))
-            h, w, _ = imgs[0].shape
-            grid = np.ones((rows * h, cols * w, 3), dtype=np.float32)
-            idx = 0
-            for r in range(rows):
-                for cidx in range(cols):
-                    if idx >= n:
-                        break
-                    grid[r * h:(r + 1) * h, cidx * w:(cidx + 1) * w, :] = imgs[idx]
-                    idx += 1
-            return grid
-
-        # 1) Visualize the learnable negative bank if present
         try:
-            neg_bank = getattr(model, "adco_negatives", None)
-            if isinstance(neg_bank, torch.Tensor) and neg_bank.ndim == 4 and neg_bank.shape[1] == 3:
-                bank_grid = _to_numpy_grid(neg_bank)
-                plt.figure(figsize=(12, 12))
-                plt.imshow(bank_grid)
-                plt.axis("off")
-                save_path = os.path.join(
-                    vis_dir,
-                    f"epoch_{self.epoch}_iter_{data_iter}_adco_bank.png",
-                )
-                plt.tight_layout()
-                plt.savefig(save_path, dpi=150)
-                plt.close()
+            # Get feature adversarial bank and uncertainty
+            adv_features = getattr(model, "adco_adversarials", None)
+            adv_uncertainty = getattr(model, "adco_adversarial_uncertainty", None)
+            
+            if adv_features is None:
+                return
+            
+            # Convert to numpy
+            adv_feats_np = adv_features.detach().cpu().numpy()  # [K, C']
+            K, C = adv_feats_np.shape
+            
+            # Create visualization with 2 rows, 3 columns
+            fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+            
+            # Row 1: Feature statistics
+            # 1.1: Feature norm distribution
+            feat_norms = np.linalg.norm(adv_feats_np, axis=1)
+            axes[0, 0].hist(feat_norms, bins=50, alpha=0.7, color='blue', edgecolor='black')
+            axes[0, 0].set_title('Adversarial Feature Norms')
+            axes[0, 0].set_xlabel('L2 Norm')
+            axes[0, 0].set_ylabel('Count')
+            axes[0, 0].grid(True, alpha=0.3)
+            
+            # 1.2: Feature dimension variance
+            feat_std = adv_feats_np.std(axis=0)  # Std per dimension
+            axes[0, 1].plot(feat_std, alpha=0.7, color='green')
+            axes[0, 1].set_title(f'Per-Dimension Std (C={C})')
+            axes[0, 1].set_xlabel('Feature Dimension')
+            axes[0, 1].set_ylabel('Std Dev')
+            axes[0, 1].grid(True, alpha=0.3)
+            
+            # 1.3: Feature mean activation
+            feat_mean = adv_feats_np.mean(axis=0)
+            axes[0, 2].plot(feat_mean, alpha=0.7, color='red')
+            axes[0, 2].set_title(f'Per-Dimension Mean (C={C})')
+            axes[0, 2].set_xlabel('Feature Dimension')
+            axes[0, 2].set_ylabel('Mean Activation')
+            axes[0, 2].grid(True, alpha=0.3)
+            
+            # Row 2: Uncertainty statistics
+            if adv_uncertainty is not None and adv_uncertainty.numel() > 0:
+                uq_np = adv_uncertainty.detach().cpu().numpy()
+                
+                # 2.1: Uncertainty distribution
+                axes[1, 0].hist(uq_np, bins=50, alpha=0.7, color='purple', edgecolor='black')
+                axes[1, 0].set_title(f'Adversarial Uncertainty Distribution (K={K})')
+                axes[1, 0].set_xlabel('Uncertainty')
+                axes[1, 0].set_ylabel('Count')
+                axes[1, 0].grid(True, alpha=0.3)
+                
+                # 2.2: Uncertainty vs feature norm
+                axes[1, 1].scatter(feat_norms, uq_np, alpha=0.5, s=10)
+                axes[1, 1].set_title('Uncertainty vs Feature Norm')
+                axes[1, 1].set_xlabel('Feature Norm')
+                axes[1, 1].set_ylabel('Uncertainty')
+                axes[1, 1].grid(True, alpha=0.3)
+                
+                # 2.3: Top-k uncertain adversarials
+                top_k = min(20, K)
+                top_indices = np.argsort(uq_np)[-top_k:]
+                axes[1, 2].barh(range(top_k), uq_np[top_indices], alpha=0.7, color='orange')
+                axes[1, 2].set_title(f'Top-{top_k} Hardest Adversarials')
+                axes[1, 2].set_xlabel('Uncertainty')
+                axes[1, 2].set_ylabel('Adversarial Index (sorted)')
+                axes[1, 2].grid(True, alpha=0.3)
+            else:
+                for ax in axes[1, :]:
+                    ax.text(0.5, 0.5, 'Uncertainty not available', 
+                           ha='center', va='center', transform=ax.transAxes)
+                    ax.axis('off')
+            
+            plt.tight_layout()
+            save_path = os.path.join(
+                vis_dir,
+                f"epoch_{self.epoch}_iter_{data_iter}_adco_feature_stats.png",
+            )
+            plt.savefig(save_path, dpi=150)
+            plt.close()
+            
         except Exception as e:
-            logging.warning(f"AdCo bank visualization failed: {e}")
-
-        # 2) Visualize a fresh sample via model._adco_sample_neg_images if available
-        try:
-            sample_fn = getattr(model, "_adco_sample_neg_images", None)
-            if callable(sample_fn):
-                sampled = sample_fn(16)
-                if isinstance(sampled, torch.Tensor) and sampled.ndim == 4 and sampled.shape[1] == 3:
-                    sampled_grid = _to_numpy_grid(sampled)
-                    plt.figure(figsize=(12, 12))
-                    plt.imshow(sampled_grid)
-                    plt.axis("off")
-                    save_path = os.path.join(
-                        vis_dir,
-                        f"epoch_{self.epoch}_iter_{data_iter}_adco_sampled.png",
-                    )
-                    plt.tight_layout()
-                    plt.savefig(save_path, dpi=150)
-                    plt.close()
-        except Exception as e:
-            logging.warning(f"AdCo sampled visualization failed: {e}")
+            logging.warning(f"AdCo feature bank visualization failed: {e}")
 
 
 def print_model_summary(model: torch.nn.Module, log_dir: str = ""):

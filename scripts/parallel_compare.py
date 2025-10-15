@@ -9,23 +9,18 @@ Parallel Comparison Runner
 """
 
 import argparse
-import subprocess
-import multiprocessing
-import time
 import json
-import sys
+import multiprocessing
 import os
+import subprocess
+import sys
+import time
 from pathlib import Path
-from typing import Dict, Tuple, List, Any
-import pandas as pd
-import numpy as np
+from typing import Any
 
-from dataset_configs import (
-    DATASET_CONFIGS,
-    DATASET_TO_TYPE,
-    DATASET_TYPE_CATEGORIES,
-    DEFAULT_DATASETS,
-)
+import pandas as pd
+
+from dataset_configs import DATASET_CONFIGS, DEFAULT_DATASETS
 
 # 导入 compare_sam2_vs_bndl 中的可视化函数
 sys.path.insert(0, str(Path(__file__).parent))
@@ -66,14 +61,14 @@ ALL_METHODS = [
     "SAM",
     "UCTTA",
     "BNDL_AUE",
-    # "BNDL",
+    "BNDL",
     "UR-ERN",
 ]
 
 RESET_COLOR = "\033[0m"
 
 
-def build_command(method: str, gpu_id: int, output_dir: Path, args: argparse.Namespace) -> List[str]:
+def build_command(method: str, gpu_id: int, output_dir: Path, args: argparse.Namespace) -> list[str]:
     """构建单个方法的命令行"""
 
     cmd = [
@@ -151,7 +146,7 @@ def build_command(method: str, gpu_id: int, output_dir: Path, args: argparse.Nam
     return cmd
 
 
-def run_method(method: str, gpu_id: int, output_base: Path, args: argparse.Namespace, version: str) -> Tuple[str, int, float, Path]:
+def run_method(method: str, gpu_id: int, output_base: Path, args: argparse.Namespace, version: str) -> tuple[str, int, float, Path]:
     """在指定GPU上运行单个方法"""
 
     output_dir = output_base / f"output_{METHOD_CONFIGS[method]['output_suffix']}_{version}"
@@ -163,6 +158,8 @@ def run_method(method: str, gpu_id: int, output_base: Path, args: argparse.Names
     # 设置环境变量指定GPU
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    # Add memory-saving flag to reduce GPU memory fragmentation
+    env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
     color = METHOD_CONFIGS[method]["color"]
     print(f"\n{color}{'=' * 80}{RESET_COLOR}")
@@ -194,16 +191,35 @@ def run_method(method: str, gpu_id: int, output_base: Path, args: argparse.Names
         else:
             print(f"{color}[{method}] ✗ Failed with code {process.returncode} after {elapsed:.1f}s{RESET_COLOR}")
             print(f"{color}[{method}] Check log: {log_file}{RESET_COLOR}")
+            
+            # Check log for OOM errors (no try-except to expose file read errors)
+            with open(log_file) as f:
+                log_content = f.read()
+                if 'CUDA out of memory' in log_content or 'OutOfMemoryError' in log_content:
+                    print(f"{color}[{method}] ⚠️  CUDA OUT OF MEMORY detected!{RESET_COLOR}")
+                    print(f"{color}[{method}] Suggestion: Try with --first_frame_only or reduce --video_limit{RESET_COLOR}")
+                elif 'KeyboardInterrupt' in log_content:
+                    print(f"{color}[{method}] ⚠️  Process was interrupted (KeyboardInterrupt){RESET_COLOR}")
 
         return method, process.returncode, elapsed, output_dir
 
+    except KeyboardInterrupt:
+        elapsed = time.time() - start_time
+        print(f"{color}[{method}] ✗ Interrupted by user after {elapsed:.1f}s{RESET_COLOR}")
+        return method, -2, elapsed, output_dir
+    except subprocess.CalledProcessError as e:
+        elapsed = time.time() - start_time
+        print(f"{color}[{method}] ✗ Process failed: {e}{RESET_COLOR}")
+        return method, e.returncode, elapsed, output_dir
     except Exception as e:
         elapsed = time.time() - start_time
         print(f"{color}[{method}] ✗ Exception: {e}{RESET_COLOR}")
+        import traceback
+        print(f"{color}[{method}] Traceback: {traceback.format_exc()}{RESET_COLOR}")
         return method, -1, elapsed, output_dir
 
 
-def parse_results_from_output(output_dir: Path, method: str) -> Dict:
+def parse_results_from_output(output_dir: Path, method: str) -> dict:
     """从输出目录解析结果"""
     # 查找 detailed_results.json
     json_files = list(output_dir.glob("**/detailed_results.json"))
@@ -244,7 +260,7 @@ def parse_results_from_output(output_dir: Path, method: str) -> Dict:
     return results
 
 
-def parse_statistics_from_output(output_dir: Path, method: str) -> Dict[str, Any]:
+def parse_statistics_from_output(output_dir: Path, method: str) -> dict[str, Any]:
     """从输出目录解析统计数据（用于UA分析）"""
     json_files = list(output_dir.glob("**/detailed_results.json"))
     if not json_files:
@@ -274,12 +290,12 @@ def parse_statistics_from_output(output_dir: Path, method: str) -> Dict[str, Any
 
 
 def create_parallel_comparison_wrapper(
-    all_results: Dict[str, Dict],
-    all_statistics: Dict[str, Dict],
-    times: Dict[str, float],
-    datasets: List[str],
+    all_results: dict[str, dict],
+    all_statistics: dict[str, dict],
+    times: dict[str, float],
+    datasets: list[str],
     output_path: Path,
-    method_to_output: Dict[str, Path] | None = None,
+    method_to_output: dict[str, Path] | None = None,
 ):
     """调用zs中的可视化函数"""
 
@@ -301,7 +317,7 @@ def create_parallel_comparison_wrapper(
     uctta_statistics = all_statistics.get("UCTTA", {})
     bndl_aue_statistics = all_statistics.get("BNDL_AUE", {})
     bndl_statistics = all_statistics.get("BNDL", {})
-    ur_ern_statistics = all_statistics.get("UR-ERN", {})
+    # ur_ern_statistics = all_statistics.get("UR-ERN", {})  # 未使用，注释掉
 
     # 创建comprehensive对比图（复用原有函数）
     # 注意：原函数需要至少有SAM和BNDL的结果
@@ -322,11 +338,11 @@ def create_parallel_comparison_wrapper(
 
             traceback.print_exc()
     elif sam_results or bndl_results or uctta_results:
-        print(f"⚠ 跳过综合对比图: 需要至少有SAM和BNDL的结果")
+        print("⚠ 跳过综合对比图: 需要至少有SAM和BNDL的结果")
         print(f"  当前有: SAM={'✓' if sam_results else '✗'}, UCTTA={'✓' if uctta_results else '✗'}, BNDL={'✓' if bndl_results else '✗'}")
 
     # 创建UA shift分析图（复用原有函数）
-    print(f"\n检查 UA shift 分析条件:")
+    print("\n检查 UA shift 分析条件:")
     print(f"  bndl_statistics: {bool(bndl_statistics)} ({len(bndl_statistics) if bndl_statistics else 0} datasets)")
     print(f"  bndl_results: {bool(bndl_results)} ({len(bndl_results) if bndl_results else 0} datasets)")
     print(f"  sam_results: {bool(sam_results)} ({len(sam_results) if sam_results else 0} datasets)")
@@ -346,12 +362,15 @@ def create_parallel_comparison_wrapper(
                 uctta_statistics=uctta_statistics if uctta_statistics else None,
                 uctta_results=uctta_results if uctta_results else None,
                 ur_ern_results=ur_ern_results if ur_ern_results else None,
+                bndl_pure_statistics=bndl_statistics if bndl_statistics else None,
+                bndl_pure_results=bndl_results if bndl_results else None,
                 source_domain=source_domain,
                 # Ensure PCC JSON lookup uses nested zs_parallel roots
                 sam2_root_override=(method_to_output["SAM"] / "sam2_results") if method_to_output and "SAM" in method_to_output else None,
-                bndl_aue_root_override=(method_to_output["BNDL_AUE"] / "bndl_aue_results") if method_to_output and "BNDL_AUE" in method_to_output else None,
+                bndl_root_override=(method_to_output["BNDL_AUE"] / "bndl_aue_results") if method_to_output and "BNDL_AUE" in method_to_output else None,
                 uctta_root_override=(method_to_output["UCTTA"] / "sam2_uctta_results") if method_to_output and "UCTTA" in method_to_output else None,
                 ur_ern_root_override=(method_to_output["UR-ERN"] / "sam2_ur_ern_results") if method_to_output and "UR-ERN" in method_to_output else None,
+                bndl_pure_root_override=(method_to_output["BNDL"] / "bndl_results") if method_to_output and "BNDL" in method_to_output else None,
             )
             print("✓ UA shift分析图已生成")
         except Exception as e:
@@ -360,19 +379,19 @@ def create_parallel_comparison_wrapper(
 
             traceback.print_exc()
     else:
-        print(f"⚠ 跳过 UA shift 分析:")
+        print("⚠ 跳过 UA shift 分析:")
         if not bndl_aue_statistics:
-            print(f"  - BNDL_AUE statistics 缺失")
+            print("  - BNDL_AUE statistics 缺失")
         if not bndl_aue_results:
-            print(f"  - BNDL_AUE results 缺失")
+            print("  - BNDL_AUE results 缺失")
         if not sam_results:
-            print(f"  - SAM results 缺失")
+            print("  - SAM results 缺失")
 
 
 def create_merged_comparison(
-    all_results: Dict[str, Dict],
-    times: Dict[str, float],
-    datasets: List[str],
+    all_results: dict[str, dict],
+    times: dict[str, float],
+    datasets: list[str],
     output_path: Path,
 ):
     """创建合并的对比表格"""
@@ -430,9 +449,9 @@ def create_merged_comparison(
 
 
 def create_detailed_report(
-    all_results: Dict[str, Dict],
-    times: Dict[str, float],
-    datasets: List[str],
+    all_results: dict[str, dict],
+    times: dict[str, float],
+    datasets: list[str],
     output_path: Path,
 ):
     """创建详细的文本报告"""
@@ -529,7 +548,7 @@ def main():
 
     # BNDL+AUE配置
     parser.add_argument("--bndl_aue_cfg", default="configs/sam2.1/sam2.1_hiera_b+_bndl_aue.yaml")
-    parser.add_argument("--bndl_aue_checkpoint", default="/home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_012_02/checkpoints/checkpoint.pt")
+    parser.add_argument("--bndl_aue_checkpoint", default="/home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_aue_012_03/checkpoints/checkpoint.pt")
 
     # BNDL (pure)配置
     parser.add_argument("--bndl_cfg", default="configs/sam2.1/sam2.1_hiera_b+_bndl.yaml")
@@ -626,7 +645,10 @@ def main():
 
     results = []
     if tasks:
-        with multiprocessing.Pool(processes=4) as pool:
+        # 使用实际GPU数量作为进程数（最多运行len(tasks)个并行任务）
+        num_processes = min(len(tasks), len(args.gpu_ids))
+        print(f"使用 {num_processes} 个并行进程运行 {len(tasks)} 个任务\n")
+        with multiprocessing.Pool(processes=num_processes) as pool:
             results = pool.starmap(run_method, tasks)
 
     total_time = time.time() - start_time

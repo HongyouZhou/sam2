@@ -220,8 +220,9 @@ trainer:
     adco_gate_floor: 0.2
     adco_tau_beta: 0.7
     adco_uncertainty_mask_threshold: 0.4
-    adco_scale_neg_by_uq: true
-    adco_curriculum_warmup_steps: 2000
+    adco_scale_adversarial_by_uq: true
+    adco_diversity_loss_weight: 0.01  # Diversity regularization weight for adversarial samples
+    adco_curriculum_warmup_steps: 5000  # A5 Fix: Extended from 2000 to avoid early instability
 
     # ProCo options
     use_proco: false
@@ -380,7 +381,7 @@ trainer:
             _target_: fvcore.common.param_scheduler.ConstantParamScheduler
             value: 1.0e-2
           param_names:
-            - 'adco_negatives'
+            - 'adco_adversarials'
         - scheduler:
             _target_: fvcore.common.param_scheduler.CosineParamScheduler
             start_value: 1.0e-6          # 通用/其余模块很小的LR
@@ -398,12 +399,12 @@ trainer:
           param_names:
             - 'sam_mask_decoder.pixel_bndl.*'
       weight_decay:
-        # adco_negatives 不做正则
+        # adco_adversarials 不做正则
         - scheduler:
             _target_: fvcore.common.param_scheduler.ConstantParamScheduler
             value: 0.0
           param_names:
-            - 'adco_negatives'
+            - 'adco_adversarials'
         # 其余参数默认正则
         - scheduler:
             _target_: fvcore.common.param_scheduler.ConstantParamScheduler
@@ -510,7 +511,7 @@ trainer:
 launcher:
   num_nodes: 1
   gpus_per_node: 8
-  experiment_log_dir: /home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_012_02 # Path to log directory, defaults to ./sam2_logs/${config_name}
+  experiment_log_dir: /home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_aue_012_03 # Path to log directory, defaults to ./sam2_logs/${config_name}
 
 # SLURM args if running on a cluster
 submitit:

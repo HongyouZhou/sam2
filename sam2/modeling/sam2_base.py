@@ -117,8 +117,8 @@ class SAM2Base(torch.nn.Module):
         adco_queue_size: int = 65536,
         adco_temperature: float = 0.2,
         adco_loss_weight: float = 0.1,
-        # AdCo negative image bank resolution (for memory safety)
-        adco_neg_image_size: int = 128,
+        # AdCo adversarial image bank resolution (for memory safety)
+        adco_adversarial_image_size: int = 128,
         # Whether AdCo uses uncertainty for ROI weighting (can be disabled)
         adco_use_uncertainty: bool = True,
         # Uncertainty-aware controls
@@ -126,8 +126,10 @@ class SAM2Base(torch.nn.Module):
         adco_gate_floor: float = 0.2,
         adco_tau_beta: float = 0.5,
         adco_uncertainty_mask_threshold: float | None = None,
-        adco_scale_neg_by_uq: bool = True,
+        adco_scale_adversarial_by_uq: bool = True,
         adco_curriculum_warmup_steps: int = 0,
+        # Diversity regularization for adversarial samples
+        adco_diversity_loss_weight: float = 0.0,  # Weight for diversity regularization (0 = disabled)
         # ProCo options (prototype contrastive, optional)
         use_proco: bool = False,
         proco_proj_dim: int = 256,
@@ -251,15 +253,16 @@ class SAM2Base(torch.nn.Module):
         self.adco_queue_size = int(adco_queue_size)
         self.adco_temperature = float(adco_temperature)
         self.adco_loss_weight = float(adco_loss_weight)
-        self.adco_neg_image_size = int(adco_neg_image_size)
+        self.adco_adversarial_image_size = int(adco_adversarial_image_size)
         ############################################################
         self.adco_use_uncertainty = bool(adco_use_uncertainty)
         self.adco_gate_by_uncertainty = bool(adco_gate_by_uncertainty)
         self.adco_gate_floor = float(adco_gate_floor)
         self.adco_tau_beta = float(adco_tau_beta)
         self.adco_uncertainty_mask_threshold = adco_uncertainty_mask_threshold
-        self.adco_scale_neg_by_uq = bool(adco_scale_neg_by_uq)
+        self.adco_scale_adversarial_by_uq = bool(adco_scale_adversarial_by_uq)
         self.adco_curriculum_warmup_steps = int(adco_curriculum_warmup_steps)
+        self.adco_diversity_loss_weight = float(adco_diversity_loss_weight)
         self._adco_step_count = 0
         self.adco_grl_scale = 1.0
         if self.use_adco:
@@ -353,20 +356,25 @@ class SAM2Base(torch.nn.Module):
             torch.nn.ReLU(inplace=True),
             torch.nn.Linear(self.adco_proj_dim, self.adco_proj_dim, bias=False),
         )
-        # Scheme A: Learnable negative image bank for AdCo (sample → encode → BNDL)
+        # Scheme A: Learnable adversarial image bank for AdCo (sample → encode → BNDL)
         # Store at a reduced resolution for memory safety; upsample on use.
-        # Shape: [K_eff, 3, Hneg, Wneg]
-        Hneg = int(self.adco_neg_image_size)
-        Wneg = int(self.adco_neg_image_size)
+        # Shape: [K_eff, 3, H_adv, W_adv]
+        H_adv = int(self.adco_adversarial_image_size)
+        W_adv = int(self.adco_adversarial_image_size)
         # Budget ~128M elements to avoid OOM (float32 ~ 512MB). Clamp K accordingly.
         max_elems = 128 * 1024 * 1024
-        per_item = 3 * Hneg * Wneg
+        per_item = 3 * H_adv * W_adv
         K_eff = max(64, min(int(self.adco_queue_size), int(max_elems // max(per_item, 1))))
-        neg_images = torch.randn(K_eff, 3, Hneg, Wneg) * 0.01
-        self.adco_negatives = torch.nn.Parameter(neg_images)
-        # Gradient reversal on negatives to approximate adversarial ascent
+        
+        # A2 Fix: Use ImageNet statistics for more natural adversarial sample initialization
+        # This makes adversarials closer to natural image distribution rather than pure noise
+        imagenet_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        imagenet_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        adv_images = torch.randn(K_eff, 3, H_adv, W_adv) * imagenet_std + imagenet_mean
+        self.adco_adversarials = torch.nn.Parameter(adv_images)
+        # Gradient reversal on adversarials to approximate adversarial ascent
         # Use fixed gradient reversal scale (standard GRL implementation)
-        self.adco_negatives.register_hook(lambda g: (-1.0 * g) if g is not None else g)
+        self.adco_adversarials.register_hook(lambda g: (-1.0 * g) if g is not None else g)
 
     def _build_proco_components(self) -> None:
         """Build ProCo projection head and prototype banks (object/background)."""
@@ -547,13 +555,13 @@ class SAM2Base(torch.nn.Module):
         pixel_uncertainty: torch.Tensor | None = None,
         pixel_gt: torch.Tensor | None = None,
         pixel_logits: torch.Tensor | None = None,
-        neg_sample_M: int | None = 4,
+        adversarial_sample_M: int | None = 4,
         roi_z1: torch.Tensor | None = None,
         roi_z2: torch.Tensor | None = None,
         roi_w1: torch.Tensor | None = None,
         roi_w2: torch.Tensor | None = None,
         pixel_bndl_model=None,
-        uq_sample_num: int = 4,  # Reduced from 50 to save ~2GB GPU memory
+        uq_sample_num: int = 20,  # A5 Fix: Increased from 4 to 20 for more reliable t-test statistics
     ) -> torch.Tensor:
         
         # TODO
@@ -586,44 +594,62 @@ class SAM2Base(torch.nn.Module):
         alpha_pos = 1.0
         alpha_neg = 1.0
 
-        ratio_neg = torch.tensor(0.0, device=device, dtype=dtype)
-        # Negative samples
-        neg_images = self._adco_sample_neg_images(neg_sample_M)  # [M, 3, Himg, Wimg]
-        if neg_images is not None:
-            enc_out = self.image_encoder(neg_images)
+        ratio_adversarial = torch.tensor(0.0, device=device, dtype=dtype)
+        # Adversarial samples
+        adv_images = self._adco_sample_adversarial_images(adversarial_sample_M)  # [M, 3, Himg, Wimg]
+        if adv_images is not None:
+            enc_out = self.image_encoder(adv_images)
             feat = enc_out["backbone_fpn"][-1]  # [M, C, H, W], C=256
             
             # Apply upscaling to match the feature dimension expected by pixel_bndl
             if self.use_high_res_features_in_sam:
                 dc1, ln1, act1, dc2, act2 = self.sam_mask_decoder.output_upscaling
-                neg_feat_upscaled = act2(dc2(act1(ln1(dc1(feat)))))
+                adv_feat_upscaled = act2(dc2(act1(ln1(dc1(feat)))))
             else:
-                neg_feat_upscaled = self.sam_mask_decoder.output_upscaling(feat)
+                adv_feat_upscaled = self.sam_mask_decoder.output_upscaling(feat)
             
-            neg_feat = neg_feat_upscaled.permute(0, 2, 3, 1).contiguous()  # [M, H', W', C']
+            adv_feat = adv_feat_upscaled.permute(0, 2, 3, 1).contiguous()  # [M, H', W', C']
             
-            # BNDL部分：为负样本生成external_pre_out_w，但停止梯度回传到BNDL
-            # 这样AdCo只训练负样本图像和image_encoder，不影响BNDL的权重
-            M = neg_feat.shape[0]
+            # A3 Fix: Allow partial gradient flow to BNDL so AdCo can help it learn
+            # Conservative approach: 10% gradient + 90% detached to avoid BNDL being dominated by AdCo
+            adv_feat_for_uq = adv_feat * 0.1 + adv_feat.detach() * 0.9
+            
+            # BNDL部分：为adversarial样本生成external_pre_out_w
+            M = adv_feat.shape[0]
             if pixel_bndl_model.enable_global_sparse:
-                neg_external_w = None
+                adv_external_w = None
             else:
-                # 使用linear.weight作为负样本的基础权重 [K, C'] -> [M, K, C']
+                # 使用linear.weight作为adversarial样本的基础权重 [K, C'] -> [M, K, C']
                 linear_weight = pixel_bndl_model.linear.weight  # [K, C']
-                neg_external_w = linear_weight.unsqueeze(0).expand(M, -1, -1).detach()
+                adv_external_w = linear_weight.unsqueeze(0).expand(M, -1, -1).detach()
             
-            neg_uq, neg_mean_logits = pixel_uncertain_sampling(
+            adv_uq, adv_mean_logits = pixel_uncertain_sampling(
                 pixel_bndl_model,
-                neg_feat.detach(),  # 停止梯度回传到BNDL
-                external_pre_out_w=neg_external_w,
+                adv_feat_for_uq,  # A3 Fix: Use partial gradient feature
+                external_pre_out_w=adv_external_w,
                 sample_num=uq_sample_num,
             )
-            neg_conf = self._adco_compute_conf_from_logits_tensor(neg_mean_logits)
+            adv_conf = self._adco_compute_conf_from_logits_tensor(adv_mean_logits)
             # Simplified: no need for mask, just compute global mean
             eps = 1e-6
-            ratio_neg = (neg_uq / (neg_conf + eps)).mean()
+            ratio_adversarial = (adv_uq / (adv_conf + eps)).mean()
+            
+            # Compute diversity regularization to prevent mode collapse
+            # Store adv_feat for diversity computation
+            self._adco_last_adv_feat = adv_feat.detach() if self.adco_diversity_loss_weight > 0 else None
 
-        loss = alpha_pos * ratio_pos - alpha_neg * ratio_neg
+        # A1 Fix: Unified optimization direction with numerical stability
+        # Goal: minimize positive sample uncertainty, maximize adversarial sample uncertainty/confidence ratio
+        # - ratio_pos: small → positive samples have high confidence and low uncertainty ✓
+        # - 1/(ratio_adversarial+eps): small → ratio_adversarial large → adversarial samples have low confidence and high uncertainty ✓
+        # Both terms are now minimized (unified direction), preventing loss from going negative
+        alpha_adversarial = alpha_neg  # Keep same weight for backward compatibility
+        loss = alpha_pos * ratio_pos + alpha_adversarial * torch.clamp(1.0 / (ratio_adversarial + 1e-6), max=10.0)
+        
+        # Add diversity regularization to prevent mode collapse of adversarial samples
+        if self.adco_diversity_loss_weight > 0 and adv_images is not None:
+            diversity_loss = self._compute_adversarial_diversity_loss()
+            loss = loss + self.adco_diversity_loss_weight * diversity_loss
 
         return loss
 
@@ -862,12 +888,12 @@ class SAM2Base(torch.nn.Module):
         roi_z2: torch.Tensor | None,
         roi_w1: torch.Tensor | None,
         roi_w2: torch.Tensor | None,
-        neg_sample_M: int | None,
+        adversarial_sample_M: int | None,
     ) -> torch.Tensor:
-        """Compute symmetric InfoNCE using two ROI queries and negatives from the image negative bank.
+        """Compute symmetric InfoNCE using two ROI queries and adversarials from the image adversarial bank.
 
         - Queries/keys: two ROI pooled views from pixel features (self-supervised invariance), no GT/UQ.
-        - Negatives: sample M images from `adco_negatives`, upsample to `image_size`, encode, global-pool, project.
+        - Adversarials: sample M images from `adco_adversarials`, upsample to `image_size`, encode, global-pool, project.
         """
         assert pixel_feat is not None and pixel_feat.ndim == 4
 
@@ -894,28 +920,28 @@ class SAM2Base(torch.nn.Module):
         k1 = F.normalize(self.adco_proj(z1).detach(), dim=1)
         k2 = F.normalize(self.adco_proj(z2).detach(), dim=1)
 
-        # 3) Build negatives from image bank
+        # 3) Build adversarials from image bank
         tau = float(self.adco_temperature)
-        neg = None
-        if (neg_sample_M is not None) and (neg_sample_M > 0) and (self.adco_negatives is not None):
-            neg_images = self._adco_sample_neg_images(neg_sample_M)  # [M, 3, Hneg, Wneg]
-            if neg_images is not None:
-                if (neg_images.shape[-2] != self.image_size) or (neg_images.shape[-1] != self.image_size):
-                    neg_images = F.interpolate(
-                        neg_images,
+        adv = None
+        if (adversarial_sample_M is not None) and (adversarial_sample_M > 0) and (self.adco_adversarials is not None):
+            adv_images = self._adco_sample_adversarial_images(adversarial_sample_M)  # [M, 3, H_adv, W_adv]
+            if adv_images is not None:
+                if (adv_images.shape[-2] != self.image_size) or (adv_images.shape[-1] != self.image_size):
+                    adv_images = F.interpolate(
+                        adv_images,
                         size=(self.image_size, self.image_size),
                         mode="bilinear",
                         align_corners=False,
                     )
                 with torch.no_grad():
-                    enc_out = self.image_encoder(neg_images)
+                    enc_out = self.image_encoder(adv_images)
                     feat = enc_out["backbone_fpn"][-1]  # [M, C, Hf, Wf]
                 # Global average pool spatial dims -> [M, C'] via simple mean over Hf,Wf then match adco_in dim
                 m, c, hf, wf = feat.shape
                 pooled = feat.mean(dim=(2, 3))  # [M, C]
                 # Down-project to AdCo input dim if needed (use same heuristic as ROI views)
                 # Our adco_proj expects in_dim = hidden_dim//8; ROI used z already in C' domain.
-                # For negatives, approximate by a 1x linear into that domain via the first layer of adco_proj's in_features.
+                # For adversarials, approximate by a 1x linear into that domain via the first layer of adco_proj's in_features.
                 # Simpler: map via the same adco_proj by faking a z-like feature using a linear adapter if sizes mismatch.
                 # If pooled shape matches adco_proj[0].in_features we can feed directly; else use a 1x linear adapter.
                 in_features = self.adco_proj[0].in_features
@@ -923,28 +949,28 @@ class SAM2Base(torch.nn.Module):
                     adapter = torch.nn.Linear(pooled.shape[1], in_features, bias=False).to(pooled.device, pooled.dtype)
                     torch.nn.init.orthogonal_(adapter.weight)
                     pooled = adapter(pooled)
-                neg = F.normalize(self.adco_proj(pooled), dim=1)  # [M, D]
+                adv = F.normalize(self.adco_proj(pooled), dim=1)  # [M, D]
 
         # 4) InfoNCE
         roi_w = (w1 + w2) * 0.5
-        loss_1 = self._adco_infonce_once(q1, k2, neg, tau, weights=roi_w)
-        loss_2 = self._adco_infonce_once(q2, k1, neg, tau, weights=roi_w)
+        loss_1 = self._adco_infonce_once(q1, k2, adv, tau, weights=roi_w)
+        loss_2 = self._adco_infonce_once(q2, k1, adv, tau, weights=roi_w)
         return 0.5 * loss_1 + 0.5 * loss_2
 
     def _adco_infonce_once(
         self,
         q: torch.Tensor,                # [B, D]
         k: torch.Tensor,                # [B, D]
-        negatives: torch.Tensor | None, # [M, D] or None
+        adversarials: torch.Tensor | None, # [M, D] or None
         tau: float,
         weights: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Single-direction InfoNCE from q to k with optional negatives."""
+        """Single-direction InfoNCE from q to k with optional adversarials."""
         pos = (q * k).sum(dim=1, keepdim=True) / tau
-        if negatives is None or negatives.numel() == 0:
+        if adversarials is None or adversarials.numel() == 0:
             logits = pos
         else:
-            logits = torch.cat([pos, (q @ negatives.t()) / tau], dim=1)
+            logits = torch.cat([pos, (q @ adversarials.t()) / tau], dim=1)
         labels = torch.zeros(logits.size(0), dtype=torch.long, device=logits.device)
         if weights is None:
             return F.cross_entropy(logits, labels)
@@ -952,21 +978,21 @@ class SAM2Base(torch.nn.Module):
         ww = weights / (weights.mean().detach() + 1e-6)
         return (loss_per * ww).mean()
 
-    def _adco_sample_neg_images(self, M: int) -> torch.Tensor | None:
-        """Sample M images from spatial negative bank as RGB tensors [M, 3, Himg, Wimg].
+    def _adco_sample_adversarial_images(self, M: int) -> torch.Tensor | None:
+        """Sample M images from spatial adversarial bank as RGB tensors [M, 3, Himg, Wimg].
 
-        Here we store adco_negatives as image-aligned RGB patches: [K, 3, Himg, Wimg].
+        Here we store adco_adversarials as image-aligned RGB patches: [K, 3, Himg, Wimg].
         Returns None if the bank doesn't match this assumption.
         """
-        neg = self.adco_negatives
-        if neg is None or neg.ndim != 4 or neg.shape[1] != 3:
+        adv = self.adco_adversarials
+        if adv is None or adv.ndim != 4 or adv.shape[1] != 3:
             return None
-        K = neg.shape[0]
-        device = neg.device
+        K = adv.shape[0]
+        device = adv.device
         if M <= 0:
             return None
         idx = torch.randint(0, K, (min(M, K),), device=device)
-        return neg.index_select(0, idx)
+        return adv.index_select(0, idx)
 
     def _adco_compute_conf_from_logits_tensor(self, logits: torch.Tensor, tau_conf: float = 2.0) -> torch.Tensor:
         """Compute confidence from logits tensor [*, H, W, K] -> [*, H, W] via sigmoid(max(|logit|)/tau)."""
@@ -974,6 +1000,52 @@ class SAM2Base(torch.nn.Module):
             raise ValueError("logits tensor rank too low")
         mag = logits.abs().max(dim=-1).values  # [..., H, W]
         return torch.sigmoid(mag / float(tau_conf)).to(mag.dtype)
+    
+    def _compute_adversarial_diversity_loss(self) -> torch.Tensor:
+        """Compute diversity regularization loss to prevent mode collapse in adversarial samples.
+        
+        This encourages the adversarial samples in the bank to be different from each other,
+        preventing them from converging to the same adversarial pattern.
+        
+        Method: Compute negative pairwise cosine similarity of adversarial features.
+        Higher diversity → lower similarity → larger negative value → smaller loss.
+        
+        Returns:
+            Diversity loss scalar (minimize to encourage diversity).
+        """
+        if not hasattr(self, 'adco_adversarials') or self.adco_adversarials is None:
+            return torch.tensor(0.0, device='cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # Get adversarial images from bank
+        adv_images = self.adco_adversarials  # [K, 3, H, W]
+        K = adv_images.shape[0]
+        
+        if K < 2:
+            # Need at least 2 samples for diversity
+            return torch.tensor(0.0, device=adv_images.device, dtype=adv_images.dtype)
+        
+        # Flatten spatial dimensions for feature comparison
+        adv_flat = adv_images.view(K, -1)  # [K, 3*H*W]
+        
+        # Normalize features for cosine similarity
+        adv_norm = F.normalize(adv_flat, dim=1, p=2)  # [K, D]
+        
+        # Compute pairwise cosine similarity matrix
+        similarity_matrix = torch.mm(adv_norm, adv_norm.t())  # [K, K]
+        
+        # Mask out diagonal (self-similarity)
+        mask = torch.eye(K, device=adv_images.device, dtype=torch.bool)
+        similarity_matrix = similarity_matrix.masked_fill(mask, 0.0)
+        
+        # Average pairwise similarity (excluding diagonal)
+        # Higher similarity = less diversity = higher loss
+        num_pairs = K * (K - 1)
+        avg_similarity = similarity_matrix.sum() / num_pairs
+        
+        # Return positive loss value: minimize similarity to maximize diversity
+        diversity_loss = avg_similarity
+        
+        return diversity_loss
 
     def forward(self, *args, **kwargs):
         raise NotImplementedError(
