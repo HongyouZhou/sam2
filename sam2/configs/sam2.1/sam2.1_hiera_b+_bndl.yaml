@@ -120,43 +120,9 @@ model:
   bndl_fuse_type: none
   bndl_replace_global_with_hyper: true
   bndl_hyper_in_sparse: true
-  # DSU options
-  use_dsu: false
-  dsu_strength_mu: 0.1
-  dsu_strength_sigma: 0.1
-  dsu_prob: 1.0
-  dsu_apply_high_res: true
-  dsu_stats_eps: 1e-6
   # Compilation flag
   # compile_image_encoder: False
 
-  # AdCo options
-  use_adco: true
-  adco_proj_dim: 256
-  adco_queue_size: 65536
-  adco_temperature: 0.2
-  adco_use_uncertainty: false
-  # UQ-aware AdCo controls
-  adco_gate_by_uncertainty: false
-  adco_gate_floor: 0.2
-  adco_tau_beta: 0.7
-  adco_uncertainty_mask_threshold: 0.4
-  adco_scale_adversarial_by_uq: true
-  adco_curriculum_warmup_steps: 2000
-
-  # ProCo options
-  use_proco: false
-  proco_proj_dim: 256
-  proco_num_obj_prototypes: 128
-  proco_num_bg_prototypes: 32
-  proco_temperature: 0.1
-  
-  # MoCo options
-  use_moco: false
-  moco_proj_dim: 256
-  moco_queue_size: 65536
-  moco_momentum: 0.996
-  moco_temperature: 0.2
-
-  # ROI sharing
-  share_roi_views: true
+  # AUE options (基础配置，不使用不确定性)
+  use_aue: false
+  aue_use_uncertainty: false

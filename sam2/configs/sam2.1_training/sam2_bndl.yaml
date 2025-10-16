@@ -199,46 +199,11 @@ trainer:
     bndl_fuse_type: none
     bndl_replace_global_with_hyper: true
     bndl_hyper_in_sparse: true
-    # DSU options
-    use_dsu: false
-    dsu_strength_mu: 0.1
-    dsu_strength_sigma: 0.1
-    dsu_prob: 1.0
-    dsu_apply_high_res: true
-    dsu_stats_eps: 1e-6
     # Compilation flag
     # compile_image_encoder: False
 
-    # AdCo options
-    use_adco: false
-    adco_proj_dim: 256
-    adco_queue_size: 65536
-    adco_temperature: 0.2
-    adco_use_uncertainty: false
-    # UQ-aware AdCo controls
-    adco_gate_by_uncertainty: false
-    adco_gate_floor: 0.2
-    adco_tau_beta: 0.7
-    adco_uncertainty_mask_threshold: 0.4
-    adco_scale_adversarial_by_uq: true
-    adco_curriculum_warmup_steps: 2000
-
-    # ProCo options
-    use_proco: false
-    proco_proj_dim: 256
-    proco_num_obj_prototypes: 128
-    proco_num_bg_prototypes: 32
-    proco_temperature: 0.1
-    
-    # MoCo options
-    use_moco: false
-    moco_proj_dim: 256
-    moco_queue_size: 65536
-    moco_momentum: 0.996
-    moco_temperature: 0.2
-
-    # ROI sharing
-    share_roi_views: true
+    # AUE options
+    use_aue: false
 
     ####### Training specific params #######
     # box/point input and corrections
@@ -429,18 +394,10 @@ trainer:
         kl_weight: 0.001
       sam_weight: 1.0
       bndl_weight: 0.5
-      adco_loss:
-        _target_: training.loss_adco.AdCoLoss
+      aue_loss:
+        _target_: training.loss_aue.AUELoss
         weight: 0.5
-      adco_weight: 0.0
-      proco_loss:
-        _target_: training.loss_proco.ProCoLoss
-        weight: 0.5
-      proco_weight: 0.1
-      moco_loss:
-        _target_: training.loss_moco.MoCoLoss
-        weight: 0.5
-      moco_weight: 0.1
+      aue_weight: 0.0
     # val:
     #   _target_: training.loss_combined.CombinedSAMBNDLLoss
     #   sam_loss: ${trainer.loss.all.sam_loss}

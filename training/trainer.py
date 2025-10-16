@@ -704,8 +704,8 @@ class Trainer:
                                 makedir(vis_dir)
                                 # Ensure PAvPU is calculated for visualization
                                 self._create_unified_visualization(bndl_outputs, batch, outputs, vis_dir, data_iter, step_index, frame_index, 'full')
-                                # After BNDL visualization, also visualize AdCo adversarials (bank + sampled)
-                                self._visualize_adco_adversarials(phase=phase, data_iter=data_iter)
+                                # After BNDL visualization, also visualize AUE adversarials (bank + sampled)
+                                self._visualize_aue_adversarials(phase=phase, data_iter=data_iter)
                             
                             # Dataset evaluation using BNDL outputs (use postprocessed masks)
                             pixel_predictions = bndl_outputs.get('masks_bndl_postprocessed', bndl_outputs.get('masks_bndl_raw'))
@@ -900,7 +900,7 @@ class Trainer:
                             self.steps[phase],
                         )
 
-                # (train) We keep AdCo adversarials visualization off to avoid overhead
+                # (train) We keep AUE adversarials visualization off to avoid overhead
 
             # Catching NaN/Inf errors in the loss
             except FloatingPointError as e:
@@ -1599,11 +1599,11 @@ class Trainer:
             else:
                 bndl_viz.plot_uncertainty_visualization(axes[3, :], bndl_outputs, step_index)
 
-    def _visualize_adco_adversarials(self, phase: str, data_iter: int):
-        """Visualization for AdCo feature adversarial bank with uncertainty distribution.
+    def _visualize_aue_adversarials(self, phase: str, data_iter: int):
+        """Visualization for AUE feature adversarial bank with uncertainty distribution.
 
-        Saves plots under log_dir/bndl_visualizations/{phase}/adco_adversarials/:
-        - epoch_{e}_iter_{i}_adco_feature_stats.png (feature bank statistics and uncertainty)
+        Saves plots under log_dir/bndl_visualizations/{phase}/aue_adversarials/:
+        - epoch_{e}_iter_{i}_aue_feature_stats.png (feature bank statistics and uncertainty)
         """
         # Locate underlying model (unwrap DDP)
         model = self.model
@@ -1611,13 +1611,13 @@ class Trainer:
             model = model.module
 
         # Build output directory
-        vis_dir = os.path.join(self.logging_conf.log_dir, "bndl_visualizations", phase, "adco_adversarials")
+        vis_dir = os.path.join(self.logging_conf.log_dir, "bndl_visualizations", phase, "aue_adversarials")
         makedir(vis_dir)
 
         try:
             # Get feature adversarial bank and uncertainty
-            adv_features = getattr(model, "adco_adversarials", None)
-            adv_uncertainty = getattr(model, "adco_adversarial_uncertainty", None)
+            adv_features = getattr(model, "aue_adversarials", None)
+            adv_uncertainty = getattr(model, "aue_adversarial_uncertainty", None)
             
             if adv_features is None:
                 return
@@ -1689,13 +1689,13 @@ class Trainer:
             plt.tight_layout()
             save_path = os.path.join(
                 vis_dir,
-                f"epoch_{self.epoch}_iter_{data_iter}_adco_feature_stats.png",
+                f"epoch_{self.epoch}_iter_{data_iter}_aue_feature_stats.png",
             )
             plt.savefig(save_path, dpi=150)
             plt.close()
             
         except Exception as e:
-            logging.warning(f"AdCo feature bank visualization failed: {e}")
+            logging.warning(f"AUE feature bank visualization failed: {e}")
 
 
 def print_model_summary(model: torch.nn.Module, log_dir: str = ""):
