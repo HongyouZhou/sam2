@@ -141,7 +141,7 @@ model:
   adco_gate_floor: 0.2
   adco_tau_beta: 0.7
   adco_uncertainty_mask_threshold: 0.4
-  adco_scale_neg_by_uq: true
+  adco_scale_adversarial_by_uq: true
   adco_curriculum_warmup_steps: 2000
 
   # ProCo options

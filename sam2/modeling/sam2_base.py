@@ -371,10 +371,10 @@ class SAM2Base(torch.nn.Module):
         imagenet_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
         imagenet_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
         adv_images = torch.randn(K_eff, 3, H_adv, W_adv) * imagenet_std + imagenet_mean
-        self.adco_adversarials = torch.nn.Parameter(adv_images)
+        self.adco_negatives = torch.nn.Parameter(adv_images)
         # Gradient reversal on adversarials to approximate adversarial ascent
         # Use fixed gradient reversal scale (standard GRL implementation)
-        self.adco_adversarials.register_hook(lambda g: (-1.0 * g) if g is not None else g)
+        self.adco_negatives.register_hook(lambda g: (-1.0 * g) if g is not None else g)
 
     def _build_proco_components(self) -> None:
         """Build ProCo projection head and prototype banks (object/background)."""
@@ -926,7 +926,7 @@ class SAM2Base(torch.nn.Module):
         # 3) Build adversarials from image bank
         tau = float(self.adco_temperature)
         adv = None
-        if (adversarial_sample_M is not None) and (adversarial_sample_M > 0) and (self.adco_adversarials is not None):
+        if (adversarial_sample_M is not None) and (adversarial_sample_M > 0) and (self.adco_negatives is not None):
             adv_images = self._adco_sample_adversarial_images(adversarial_sample_M)  # [M, 3, H_adv, W_adv]
             if adv_images is not None:
                 if (adv_images.shape[-2] != self.image_size) or (adv_images.shape[-1] != self.image_size):
@@ -987,7 +987,7 @@ class SAM2Base(torch.nn.Module):
         Here we store adco_adversarials as image-aligned RGB patches: [K, 3, Himg, Wimg].
         Returns None if the bank doesn't match this assumption.
         """
-        adv = self.adco_adversarials
+        adv = self.adco_negatives
         if adv is None or adv.ndim != 4 or adv.shape[1] != 3:
             return None
         K = adv.shape[0]
@@ -1016,11 +1016,11 @@ class SAM2Base(torch.nn.Module):
         Returns:
             Diversity loss scalar (minimize to encourage diversity).
         """
-        if not hasattr(self, 'adco_adversarials') or self.adco_adversarials is None:
+        if not hasattr(self, 'adco_negatives') or self.adco_negatives is None:
             return torch.tensor(0.0, device='cuda' if torch.cuda.is_available() else 'cpu')
         
         # Get adversarial images from bank
-        adv_images = self.adco_adversarials  # [K, 3, H, W]
+        adv_images = self.adco_negatives  # [K, 3, H, W]
         K = adv_images.shape[0]
         
         if K < 2:
