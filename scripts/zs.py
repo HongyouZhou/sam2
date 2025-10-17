@@ -36,6 +36,163 @@ from zero_shot_multi_dataset_ur_ern import (
 matplotlib.use("Agg")  # Use non-interactive backend
 
 
+# ==================== MMD Computation for UA Distribution Invariance ====================
+
+def maximum_mean_discrepancy_np(X: np.ndarray, Y: np.ndarray, gamma: float = 1.0) -> float:
+    """
+    Numpy implementation of Maximum Mean Discrepancy with RBF kernel
+    
+    理论: MMD^2(P,Q) = E[k(x,x')] + E[k(y,y')] - 2*E[k(x,y)]
+    当MMD=0时，P=Q (分布完全相同)
+    
+    Args:
+        X: samples from distribution P, shape [n, d]
+        Y: samples from distribution Q, shape [m, d]
+        gamma: RBF kernel bandwidth
+    
+    Returns:
+        mmd: scalar MMD distance
+    """
+    def rbf_kernel(A: np.ndarray, B: np.ndarray, gamma: float) -> np.ndarray:
+        """RBF kernel: k(x,y) = exp(-gamma * ||x-y||^2)"""
+        # A: [n, d], B: [m, d]
+        A_sq = np.sum(A**2, axis=1, keepdims=True)  # [n, 1]
+        B_sq = np.sum(B**2, axis=1, keepdims=True).T  # [1, m]
+        AB = A @ B.T  # [n, m]
+        sq_dist = A_sq + B_sq - 2 * AB
+        return np.exp(-gamma * sq_dist)
+    
+    n = X.shape[0]
+    m = Y.shape[0]
+    
+    # Compute kernels
+    XX = rbf_kernel(X, X, gamma).sum() / (n * (n - 1)) if n > 1 else 0.0
+    YY = rbf_kernel(Y, Y, gamma).sum() / (m * (m - 1)) if m > 1 else 0.0
+    XY = rbf_kernel(X, Y, gamma).sum() / (n * m)
+    
+    # MMD
+    mmd = np.sqrt(max(XX + YY - 2 * XY, 0.0))
+    
+    return float(mmd)
+
+
+def compute_mmd_consistency_metrics(
+    ua_samples_per_dataset: dict[str, dict[str, list]],
+    source_domain: str = "MOSE_train",
+    gamma: float = 1.0
+) -> dict[str, Any]:
+    """
+    计算MMD-based UA distribution invariance metrics
+    
+    核心理论:
+    - 度量每个target dataset与source domain的UA distribution距离
+    - MMD_mean: 平均分布距离 (越小越好)
+    - MMD_std: 分布距离的variance (越小越一致)
+    - UA_dist_consistency: 归一化consistency score
+    
+    Args:
+        ua_samples_per_dataset: {dataset: {'uncertainty': [...], 'error': [...]}}
+        source_domain: source domain name
+        gamma: RBF kernel bandwidth
+    
+    Returns:
+        metrics: {
+            'mmd_per_dataset': {dataset: mmd_value},
+            'mmd_mean': float,
+            'mmd_std': float,
+            'mmd_min': float,
+            'mmd_max': float,
+            'ua_dist_consistency': float (0-1, 越大越好)
+        }
+    """
+    if source_domain not in ua_samples_per_dataset:
+        print(f"Warning: Source domain '{source_domain}' not found in UA samples")
+        return {}
+    
+    # Source domain UA distribution
+    source_unc = np.array(ua_samples_per_dataset[source_domain]['uncertainty'])
+    source_err = np.array(ua_samples_per_dataset[source_domain]['error'])
+    
+    if len(source_unc) == 0 or len(source_err) == 0:
+        print(f"Warning: Empty UA samples for source domain '{source_domain}'")
+        return {}
+    
+    source_joint = np.stack([source_unc, source_err], axis=1)  # [N_source, 2]
+    
+    # Compute MMD for each target dataset
+    mmd_scores = {}
+    
+    for dataset_name in ua_samples_per_dataset:
+        if dataset_name == source_domain:
+            mmd_scores[dataset_name] = 0.0  # MMD(source, source) = 0
+            continue
+        
+        target_unc = np.array(ua_samples_per_dataset[dataset_name]['uncertainty'])
+        target_err = np.array(ua_samples_per_dataset[dataset_name]['error'])
+        
+        if len(target_unc) == 0 or len(target_err) == 0:
+            print(f"Warning: Empty UA samples for dataset '{dataset_name}'")
+            continue
+        
+        target_joint = np.stack([target_unc, target_err], axis=1)  # [N_target, 2]
+        
+        # Compute MMD
+        mmd = maximum_mean_discrepancy_np(source_joint, target_joint, gamma=gamma)
+        mmd_scores[dataset_name] = mmd
+    
+    if len(mmd_scores) == 0:
+        return {}
+    
+    # Compute summary statistics (excluding source)
+    mmd_values = [v for k, v in mmd_scores.items() if k != source_domain]
+    
+    if len(mmd_values) == 0:
+        return {'mmd_per_dataset': mmd_scores}
+    
+    return {
+        'mmd_per_dataset': mmd_scores,
+        'mmd_mean': float(np.mean(mmd_values)),
+        'mmd_std': float(np.std(mmd_values)),
+        'mmd_min': float(np.min(mmd_values)),
+        'mmd_max': float(np.max(mmd_values)),
+        'ua_dist_consistency': float(1.0 / (1.0 + np.mean(mmd_values)))  # 归一化到[0,1]
+    }
+
+
+def compute_correlation_consistency_metrics(
+    correlation_map: dict[str, float]
+) -> dict[str, Any]:
+    """
+    计算correlation consistency metrics (PCC or Spearman)
+    
+    Args:
+        correlation_map: {dataset: correlation_value}
+    
+    Returns:
+        metrics: {
+            'corr_mean': float,
+            'corr_std': float (越小越一致),
+            'corr_min': float,
+            'corr_max': float,
+            'corr_consistency': float (1 - std/mean)
+        }
+    """
+    if not correlation_map:
+        return {}
+    
+    corr_values = list(correlation_map.values())
+    corr_mean = float(np.mean(corr_values))
+    corr_std = float(np.std(corr_values))
+    
+    return {
+        'corr_mean': corr_mean,
+        'corr_std': corr_std,
+        'corr_min': float(np.min(corr_values)),
+        'corr_max': float(np.max(corr_values)),
+        'corr_consistency': float(1.0 - corr_std / corr_mean) if corr_mean > 0 else 0.0
+    }
+
+
 def run_comparison_evaluation(
     datasets: list[str],
     sam2_cfg: str,
@@ -1618,6 +1775,471 @@ def create_ua_shift_analysis_plots(
                                  (f"{delta_r:+.6f}" if isinstance(delta_r, float) else delta_r),
                                  ])
         print(f"UA PCC summary CSV saved to: {csv_path}")
+    
+    # ===== MMD-based UA Distribution Invariance Analysis =====
+    # 计算并可视化MMD metrics (Phase 2新增)
+    print("\n📊 Computing MMD-based UA Distribution Invariance metrics...")
+    
+    # 从eval_pavpu_uncertainty_samples和eval_pavpu_accuracy_samples构建UA samples
+    # 注意: accuracy_samples现在需要转换为error_samples
+    ua_samples_per_dataset = {}
+    
+    # 从BNDL_AUE statistics提取
+    if bndl_statistics:
+        for dataset in bndl_statistics:
+            stats = bndl_statistics[dataset]
+            if isinstance(stats, dict):
+                unc_samples = stats.get('eval_pavpu_uncertainty_samples', [])
+                acc_samples = stats.get('eval_pavpu_accuracy_samples', [])
+                
+                if unc_samples and acc_samples and len(unc_samples) == len(acc_samples):
+                    # Convert accuracy to error: error = 1 - accuracy
+                    error_samples = [1.0 - acc for acc in acc_samples]
+                    ua_samples_per_dataset[dataset] = {
+                        'uncertainty': unc_samples,
+                        'error': error_samples
+                    }
+    
+    # 计算MMD consistency metrics
+    if ua_samples_per_dataset and source_domain in ua_samples_per_dataset:
+        mmd_metrics = compute_mmd_consistency_metrics(
+            ua_samples_per_dataset,
+            source_domain=source_domain,
+            gamma=1.0
+        )
+        
+        if mmd_metrics:
+            print(f"✓ MMD Metrics computed:")
+            print(f"  - MMD_mean: {mmd_metrics.get('mmd_mean', 0):.4f}")
+            print(f"  - MMD_std: {mmd_metrics.get('mmd_std', 0):.4f}")
+            print(f"  - UA_dist_consistency: {mmd_metrics.get('ua_dist_consistency', 0):.4f}")
+            
+            # 计算PCC consistency for comparison
+            if accuracy_pcc_map:
+                pcc_metrics = compute_correlation_consistency_metrics(accuracy_pcc_map)
+                print(f"  - PCC_std (for comparison): {pcc_metrics.get('corr_std', 0):.4f}")
+                print(f"  - PCC_consistency: {pcc_metrics.get('corr_consistency', 0):.4f}")
+            
+            # Save MMD summary to CSV
+            mmd_csv_path = plots_dir / "ua_mmd_summary.csv"
+            import csv
+            with open(mmd_csv_path, "w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    "Dataset",
+                    "MMD_vs_Source",
+                    "Delta_MMD",
+                ])
+                
+                mmd_per_dataset = mmd_metrics.get('mmd_per_dataset', {})
+                for dataset in sorted(mmd_per_dataset.keys()):
+                    mmd_val = mmd_per_dataset[dataset]
+                    delta_mmd = mmd_val if dataset != source_domain else 0.0
+                    writer.writerow([
+                        dataset,
+                        f"{mmd_val:.6f}",
+                        f"{delta_mmd:+.6f}" if dataset != source_domain else "0.000000"
+                    ])
+                
+                # Add summary row
+                writer.writerow([])
+                writer.writerow(["Summary Metrics", "", ""])
+                writer.writerow(["MMD_mean", f"{mmd_metrics.get('mmd_mean', 0):.6f}", ""])
+                writer.writerow(["MMD_std", f"{mmd_metrics.get('mmd_std', 0):.6f}", ""])
+                writer.writerow(["MMD_min", f"{mmd_metrics.get('mmd_min', 0):.6f}", ""])
+                writer.writerow(["MMD_max", f"{mmd_metrics.get('mmd_max', 0):.6f}", ""])
+                writer.writerow(["UA_dist_consistency", f"{mmd_metrics.get('ua_dist_consistency', 0):.6f}", ""])
+            
+            print(f"✓ MMD summary CSV saved to: {mmd_csv_path}")
+            
+            # ===== Create Enhanced MMD Visualizations =====
+            # 在同一个figure中添加MMD相关plots
+            
+            # Create a new figure for MMD-specific analysis
+            fig_mmd = plt.figure(figsize=(20, 12))
+            gs_mmd = fig_mmd.add_gridspec(2, 3, hspace=0.4, wspace=0.4)
+            fig_mmd.suptitle("MMD-based UA Distribution Invariance Analysis", 
+                            fontsize=16, fontweight="bold", y=0.98)
+            
+            # Plot 1: MMD Distribution Box Plot
+            ax_mmd_box = fig_mmd.add_subplot(gs_mmd[0, 0])
+            mmd_per_dataset = mmd_metrics.get('mmd_per_dataset', {})
+            target_datasets = [d for d in mmd_per_dataset.keys() if d != source_domain]
+            mmd_vals = [mmd_per_dataset[d] for d in target_datasets]
+            
+            if mmd_vals:
+                bp = ax_mmd_box.boxplot([mmd_vals], 
+                                       labels=['BNDL_AUE (MMD-based)'],
+                                       patch_artist=True,
+                                       showmeans=True)
+                bp['boxes'][0].set_facecolor('#4ECDC4')
+                bp['boxes'][0].set_alpha(0.7)
+                
+                ax_mmd_box.set_ylabel('MMD vs Source Domain', fontsize=11)
+                ax_mmd_box.set_title(f'MMD Distribution (n={len(target_datasets)} datasets)', 
+                                    fontweight='bold', fontsize=12)
+                ax_mmd_box.grid(True, alpha=0.3, axis='y')
+                
+                # Add statistics text
+                stats_text = (f'Mean: {mmd_metrics.get("mmd_mean", 0):.4f}\n'
+                             f'Std: {mmd_metrics.get("mmd_std", 0):.4f}\n'
+                             f'Consistency: {mmd_metrics.get("ua_dist_consistency", 0):.3f}')
+                ax_mmd_box.text(0.98, 0.98, stats_text,
+                               transform=ax_mmd_box.transAxes,
+                               fontsize=9,
+                               verticalalignment='top',
+                               horizontalalignment='right',
+                               bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+            
+            # Plot 2: ΔMMD Bar Chart (sorted by absolute value)
+            ax_mmd_bar = fig_mmd.add_subplot(gs_mmd[0, 1])
+            sorted_items = sorted(
+                [(d, mmd_per_dataset[d]) for d in target_datasets],
+                key=lambda x: abs(x[1])
+            )
+            labels = [d for d, _ in sorted_items]
+            values = [v for _, v in sorted_items]
+            y_pos = np.arange(len(labels))
+            
+            bars = ax_mmd_bar.barh(y_pos, values, 
+                                  color=['#4ECDC4' for _ in values],
+                                  alpha=0.7, edgecolor='black')
+            ax_mmd_bar.set_yticks(y_pos)
+            ax_mmd_bar.set_yticklabels(labels, fontsize=9)
+            ax_mmd_bar.set_xlabel(f'MMD vs {source_domain}', fontsize=11)
+            ax_mmd_bar.set_title('ΔMMD: UA Distribution Shift', fontweight='bold', fontsize=12)
+            ax_mmd_bar.grid(True, alpha=0.3, axis='x')
+            
+            # Add value labels
+            for bar in bars:
+                width = bar.get_width()
+                ax_mmd_bar.text(width + 0.001, bar.get_y() + bar.get_height() / 2,
+                               f'{width:.4f}', va='center', ha='left', fontsize=8)
+            
+            # Plot 3: Consistency Comparison Table (PCC vs MMD)
+            ax_table = fig_mmd.add_subplot(gs_mmd[0, 2])
+            ax_table.axis('off')
+            
+            # Prepare comparison data
+            table_data = [
+                ['Metric', 'BNDL_AUE (MMD)'],
+            ]
+            
+            # Add MMD metrics
+            table_data.append(['MMD_mean ↓', f"{mmd_metrics.get('mmd_mean', 0):.4f}"])
+            table_data.append(['MMD_std ↓', f"{mmd_metrics.get('mmd_std', 0):.4f}"])
+            table_data.append(['MMD_min', f"{mmd_metrics.get('mmd_min', 0):.4f}"])
+            table_data.append(['MMD_max', f"{mmd_metrics.get('mmd_max', 0):.4f}"])
+            
+            # Add PCC metrics if available
+            if accuracy_pcc_map:
+                pcc_metrics = compute_correlation_consistency_metrics(accuracy_pcc_map)
+                table_data.append(['', ''])  # Separator
+                table_data.append(['PCC_mean', f"{pcc_metrics.get('corr_mean', 0):.4f}"])
+                table_data.append(['PCC_std ↓', f"{pcc_metrics.get('corr_std', 0):.4f}"])
+                table_data.append(['', ''])  # Separator
+                table_data.append(['UA Dist Consistency ↑', 
+                                  f"{mmd_metrics.get('ua_dist_consistency', 0):.4f}"])
+                table_data.append(['PCC Consistency ↑', 
+                                  f"{pcc_metrics.get('corr_consistency', 0):.4f}"])
+            
+            table = ax_table.table(
+                cellText=table_data,
+                cellLoc='left',
+                loc='center',
+                bbox=[0, 0, 1, 1]
+            )
+            table.auto_set_font_size(False)
+            table.set_fontsize(10)
+            table.scale(1, 2)
+            
+            # Color header
+            for i in range(len(table_data[0])):
+                table[(0, i)].set_facecolor('#CCCCCC')
+                table[(0, i)].set_text_props(weight='bold')
+            
+            ax_table.set_title('UA Consistency Metrics Summary', 
+                              fontweight='bold', fontsize=12, pad=20)
+            
+            # Plot 4-6: UA Distribution 2D Heatmaps (representative datasets)
+            # 选择6个representative datasets展示UA distribution pattern
+            representative_datasets = []
+            if source_domain in ua_samples_per_dataset:
+                representative_datasets.append(source_domain)
+            
+            # 添加几个不同类型的datasets
+            for dataset in target_datasets[:5]:  # 最多5个
+                if dataset in ua_samples_per_dataset:
+                    representative_datasets.append(dataset)
+                if len(representative_datasets) >= 6:
+                    break
+            
+            for idx, dataset in enumerate(representative_datasets[:6]):
+                row = 1 + idx // 3
+                col = idx % 3
+                ax_heatmap = fig_mmd.add_subplot(gs_mmd[row, col])
+                
+                if dataset in ua_samples_per_dataset:
+                    unc = np.array(ua_samples_per_dataset[dataset]['uncertainty'])
+                    err = np.array(ua_samples_per_dataset[dataset]['error'])
+                    
+                    # 2D histogram
+                    H, xedges, yedges = np.histogram2d(unc, err, bins=50, 
+                                                       range=[[0, 1], [0, 1]])
+                    
+                    im = ax_heatmap.imshow(H.T, origin='lower', cmap='viridis',
+                                          aspect='auto', extent=[0, 1, 0, 1],
+                                          interpolation='bilinear')
+                    
+                    # Add ideal calibration line (diagonal)
+                    ax_heatmap.plot([0, 1], [0, 1], 'r--', alpha=0.5, linewidth=2,
+                                   label='Perfect calibration')
+                    
+                    # Show MMD value
+                    mmd_val = mmd_per_dataset.get(dataset, 0.0)
+                    ax_heatmap.text(0.05, 0.95, 
+                                   f'MMD = {mmd_val:.4f}',
+                                   transform=ax_heatmap.transAxes,
+                                   fontsize=9,
+                                   bbox=dict(boxstyle='round', facecolor='yellow', alpha=0.7),
+                                   verticalalignment='top')
+                    
+                    ax_heatmap.set_xlabel('Uncertainty', fontsize=10)
+                    ax_heatmap.set_ylabel('Error (1-Accuracy)', fontsize=10)
+                    ax_heatmap.set_title(f'{dataset}', fontweight='bold', fontsize=11)
+                    ax_heatmap.legend(fontsize=8, loc='lower right')
+                    
+                    # Add colorbar
+                    plt.colorbar(im, ax=ax_heatmap, label='Pixel count', fraction=0.046)
+            
+            # Save MMD figure
+            mmd_fig_path = plots_dir / "ua_mmd_analysis.png"
+            plt.savefig(mmd_fig_path, dpi=300, bbox_inches="tight")
+            plt.savefig(plots_dir / "ua_mmd_analysis.pdf", bbox_inches="tight")
+            plt.close()
+            
+            print(f"✓ MMD analysis plots saved to: {mmd_fig_path}")
+    else:
+        print("⚠️  Skipping MMD computation: insufficient UA samples")
+
+
+def create_mmd_comparison_across_methods(
+    output_path: Path,
+    bndl_aue_statistics: dict[str, Any] | None = None,
+    bndl_statistics: dict[str, Any] | None = None,
+    uctta_statistics: dict[str, Any] | None = None,
+    ur_ern_statistics: dict[str, Any] | None = None,
+    source_domain: str = "MOSE_train",
+):
+    """
+    Create MMD comparison box plots across different methods
+    
+    理论重点: 展示MMD-based方法的distribution invariance优势
+    """
+    print("\n📊 Creating MMD comparison across methods...")
+    
+    # Extract UA samples for all methods
+    methods_ua_samples = {}
+    
+    # BNDL_AUE
+    if bndl_aue_statistics:
+        ua_samples = {}
+        for dataset, stats in bndl_aue_statistics.items():
+            if isinstance(stats, dict):
+                unc = stats.get('eval_pavpu_uncertainty_samples', [])
+                acc = stats.get('eval_pavpu_accuracy_samples', [])
+                if unc and acc and len(unc) == len(acc):
+                    # Normalize to [0, 1] for fair comparison
+                    unc_array = np.array(unc)
+                    unc_min, unc_max = unc_array.min(), unc_array.max()
+                    if unc_max > unc_min:
+                        unc_normalized = ((unc_array - unc_min) / (unc_max - unc_min)).tolist()
+                    else:
+                        unc_normalized = unc
+                    
+                    ua_samples[dataset] = {
+                        'uncertainty': unc_normalized,
+                        'error': [1.0 - a for a in acc]
+                    }
+        if ua_samples:
+            methods_ua_samples['BNDL_AUE'] = ua_samples
+    
+    # BNDL (pure)
+    if bndl_statistics:
+        ua_samples = {}
+        for dataset, stats in bndl_statistics.items():
+            if isinstance(stats, dict):
+                unc = stats.get('eval_pavpu_uncertainty_samples', [])
+                acc = stats.get('eval_pavpu_accuracy_samples', [])
+                if unc and acc and len(unc) == len(acc):
+                    # Normalize to [0, 1] for fair comparison
+                    unc_array = np.array(unc)
+                    unc_min, unc_max = unc_array.min(), unc_array.max()
+                    if unc_max > unc_min:
+                        unc_normalized = ((unc_array - unc_min) / (unc_max - unc_min)).tolist()
+                    else:
+                        unc_normalized = unc
+                    
+                    ua_samples[dataset] = {
+                        'uncertainty': unc_normalized,
+                        'error': [1.0 - a for a in acc]
+                    }
+        if ua_samples:
+            methods_ua_samples['BNDL'] = ua_samples
+    
+    # UCTTA
+    if uctta_statistics:
+        ua_samples = {}
+        for dataset, stats in uctta_statistics.items():
+            if isinstance(stats, dict):
+                unc = stats.get('eval_pavpu_uncertainty_samples', [])
+                acc = stats.get('eval_pavpu_accuracy_samples', [])
+                if unc and acc and len(unc) == len(acc):
+                    # Normalize uncertainty to [0, 1] (不同方法可能有不同范围)
+                    unc_array = np.array(unc)
+                    unc_min, unc_max = unc_array.min(), unc_array.max()
+                    if unc_max > unc_min:
+                        unc_normalized = ((unc_array - unc_min) / (unc_max - unc_min)).tolist()
+                    else:
+                        unc_normalized = unc
+                    
+                    ua_samples[dataset] = {
+                        'uncertainty': unc_normalized,
+                        'error': [1.0 - a for a in acc]
+                    }
+        if ua_samples:
+            methods_ua_samples['UCTTA'] = ua_samples
+    
+    # UR-ERN
+    if ur_ern_statistics:
+        ua_samples = {}
+        for dataset, stats in ur_ern_statistics.items():
+            if isinstance(stats, dict):
+                unc = stats.get('eval_pavpu_uncertainty_samples', [])
+                acc = stats.get('eval_pavpu_accuracy_samples', [])
+                if unc and acc and len(unc) == len(acc):
+                    # Normalize uncertainty to [0, 1] (UR-ERN可能有不同范围)
+                    unc_array = np.array(unc)
+                    unc_min, unc_max = unc_array.min(), unc_array.max()
+                    if unc_max > unc_min:
+                        unc_normalized = ((unc_array - unc_min) / (unc_max - unc_min)).tolist()
+                    else:
+                        unc_normalized = unc
+                    
+                    ua_samples[dataset] = {
+                        'uncertainty': unc_normalized,
+                        'error': [1.0 - a for a in acc]
+                    }
+        if ua_samples:
+            methods_ua_samples['UR-ERN'] = ua_samples
+    
+    if not methods_ua_samples:
+        print("⚠️  No UA samples available for MMD comparison")
+        return
+    
+    # Compute MMD metrics for each method
+    methods_mmd_metrics = {}
+    for method, ua_samples in methods_ua_samples.items():
+        mmd_metrics = compute_mmd_consistency_metrics(ua_samples, source_domain, gamma=1.0)
+        if mmd_metrics:
+            methods_mmd_metrics[method] = mmd_metrics
+    
+    if not methods_mmd_metrics:
+        print("⚠️  No MMD metrics computed")
+        return
+    
+    # Create comparison figure
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+    fig.suptitle("MMD-based UA Distribution Invariance: Multi-Method Comparison",
+                fontsize=14, fontweight='bold')
+    
+    # Plot 1: MMD distribution box plot (multi-method)
+    ax1 = axes[0]
+    mmd_data = []
+    method_names = []
+    
+    for method in ['BNDL', 'UCTTA', 'UR-ERN', 'BNDL_AUE']:
+        if method in methods_mmd_metrics:
+            mmd_per_dataset = methods_mmd_metrics[method].get('mmd_per_dataset', {})
+            mmd_vals = [v for k, v in mmd_per_dataset.items() if k != source_domain]
+            if mmd_vals:
+                mmd_data.append(mmd_vals)
+                method_names.append(method)
+    
+    if mmd_data:
+        bp = ax1.boxplot(mmd_data, labels=method_names, patch_artist=True, showmeans=True)
+        
+        # Color boxes
+        colors = {'BNDL': '#2E86AB', 'UCTTA': '#FF6B6B', 'UR-ERN': '#95E1D3', 'BNDL_AUE': '#4ECDC4'}
+        for patch, method in zip(bp['boxes'], method_names):
+            patch.set_facecolor(colors.get(method, '#CCCCCC'))
+            patch.set_alpha(0.7)
+        
+        ax1.set_ylabel('MMD vs Source Domain', fontsize=11)
+        ax1.set_title('MMD Distribution Comparison', fontweight='bold', fontsize=12)
+        ax1.grid(True, alpha=0.3, axis='y')
+    
+    # Plot 2: Consistency metrics comparison
+    ax2 = axes[1]
+    metrics_names = ['MMD_mean', 'MMD_std', 'UA_Consistency']
+    x_pos = np.arange(len(metrics_names))
+    width = 0.2
+    
+    for i, method in enumerate(method_names):
+        if method in methods_mmd_metrics:
+            metrics = methods_mmd_metrics[method]
+            values = [
+                metrics.get('mmd_mean', 0),
+                metrics.get('mmd_std', 0),
+                metrics.get('ua_dist_consistency', 0)
+            ]
+            ax2.bar(x_pos + i * width, values, width, 
+                   label=method, color=colors.get(method, '#CCCCCC'), alpha=0.7)
+    
+    ax2.set_xticks(x_pos + width * (len(method_names) - 1) / 2)
+    ax2.set_xticklabels(metrics_names)
+    ax2.set_ylabel('Value', fontsize=11)
+    ax2.set_title('Consistency Metrics Comparison', fontweight='bold', fontsize=12)
+    ax2.legend()
+    ax2.grid(True, alpha=0.3, axis='y')
+    
+    # Plot 3: Summary table
+    ax3 = axes[2]
+    ax3.axis('off')
+    
+    table_data = [['Method', 'MMD_mean↓', 'MMD_std↓', 'Consistency↑']]
+    for method in method_names:
+        if method in methods_mmd_metrics:
+            metrics = methods_mmd_metrics[method]
+            table_data.append([
+                method,
+                f"{metrics.get('mmd_mean', 0):.4f}",
+                f"{metrics.get('mmd_std', 0):.4f}",
+                f"{metrics.get('ua_dist_consistency', 0):.4f}"
+            ])
+    
+    table = ax3.table(cellText=table_data, cellLoc='center', loc='center', bbox=[0, 0, 1, 1])
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1, 2)
+    
+    # Color header and highlight best values
+    for i in range(len(table_data[0])):
+        table[(0, i)].set_facecolor('#CCCCCC')
+        table[(0, i)].set_text_props(weight='bold')
+    
+    ax3.set_title('MMD Metrics Summary', fontweight='bold', fontsize=12, pad=20)
+    
+    # Save
+    plots_dir = output_path / "comparison_plots"
+    plots_dir.mkdir(exist_ok=True)
+    
+    comparison_path = plots_dir / "mmd_multi_method_comparison.png"
+    plt.savefig(comparison_path, dpi=300, bbox_inches="tight")
+    plt.savefig(plots_dir / "mmd_multi_method_comparison.pdf", bbox_inches="tight")
+    plt.close()
+    
+    print(f"✓ MMD multi-method comparison saved to: {comparison_path}")
 
 
 def create_pavpu_comparison_plots(

@@ -202,10 +202,16 @@ trainer:
     # Compilation flag
     # compile_image_encoder: False
 
-    # AUE options (AUE 优化配置)
+    # AUE options (MMD-based UA Distribution Invariance)
     use_aue: true
     aue_use_uncertainty: true
     aue_diversity_loss_weight: 0.01  # 多样性正则化防止模式崩溃
+    # UA Distribution Invariance Loss weights
+    ua_loss_alpha_corr: 1.0      # Spearman correlation (基础)
+    ua_loss_alpha_mmd: 0.5       # MMD distribution invariance (核心)
+    alpha_diversity: 0.01        # Feature bank diversity (正则)
+    ua_loss_use_spearman: true   # Use Spearman instead of Pearson
+    ua_loss_mmd_gamma: 1.0       # RBF kernel bandwidth
 
     ####### Training specific params #######
     # box/point input and corrections
@@ -400,6 +406,9 @@ trainer:
         _target_: training.loss_aue.AUELoss
         weight: 0.5
       aue_weight: 0.05
+      # Conflict-Aware and Staged Training (梯度冲突解决)
+      use_conflict_aware: true      # 基于loss magnitude动态调整weights
+      use_staged_training: true      # 分阶段引入losses避免early conflicts
     # val:
     #   _target_: training.loss_combined.CombinedSAMBNDLLoss
     #   sam_loss: ${trainer.loss.all.sam_loss}

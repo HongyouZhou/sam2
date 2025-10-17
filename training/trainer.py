@@ -820,6 +820,15 @@ class Trainer:
             self._get_meters([phase]),
             prefix="Train Epoch: [{}]".format(self.epoch),
         )
+        
+        # Update loss function's training progress for staged training
+        for phase_key in self.loss.keys():
+            loss_fn = self.loss[phase_key]
+            if hasattr(loss_fn, 'set_training_progress'):
+                loss_fn.set_training_progress(
+                    current_epoch=int(self.epoch),
+                    max_epochs=self.max_epochs
+                )
 
         # Model training loop
         self.model.train()

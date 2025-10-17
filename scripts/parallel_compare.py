@@ -24,7 +24,11 @@ from dataset_configs import DATASET_CONFIGS, DEFAULT_DATASETS
 
 # 导入 compare_sam2_vs_bndl 中的可视化函数
 sys.path.insert(0, str(Path(__file__).parent))
-from zs import create_comprehensive_comparison_plots, create_ua_shift_analysis_plots
+from zs import (
+    create_comprehensive_comparison_plots, 
+    create_ua_shift_analysis_plots,
+    create_mmd_comparison_across_methods
+)
 
 
 # 方法配置
@@ -386,6 +390,26 @@ def create_parallel_comparison_wrapper(
             print("  - BNDL_AUE results 缺失")
         if not sam_results:
             print("  - SAM results 缺失")
+    
+    # Create MMD multi-method comparison (Phase 2新增)
+    if bndl_aue_statistics or bndl_statistics or uctta_statistics:
+        try:
+            print("\n🔬 生成MMD多方法对比图...")
+            create_mmd_comparison_across_methods(
+                output_path=output_path,
+                bndl_aue_statistics=bndl_aue_statistics,
+                bndl_statistics=bndl_statistics if bndl_statistics else None,
+                uctta_statistics=uctta_statistics if uctta_statistics else None,
+                ur_ern_statistics=all_statistics.get('UR-ERN', None),
+                source_domain="MOSE_train"
+            )
+            print("✓ MMD多方法对比图已生成")
+        except Exception as e:
+            print(f"警告: 无法生成MMD对比图: {e}")
+            import traceback
+            traceback.print_exc()
+    else:
+        print("⚠ 跳过MMD对比: 缺少statistics数据")
 
 
 def create_merged_comparison(

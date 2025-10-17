@@ -23,6 +23,84 @@ from BNDL.BNDL_upload.ViT_Sparse.utils.bndl import (
 NO_OBJ_SCORE = -1024.0
 
 
+class UAShiftGuidedPseudoPromptGenerator(torch.nn.Module):
+    """
+    UA-Shift-Guided Pseudo Prompt Generator
+    
+    受ICML'25 "Unlocking the Power of SAM 2 for Few-Shot Segmentation"启发
+    但应用于adversarial training而非few-shot learning
+    
+    核心理论:
+    - 在UA distribution shift最大的spatial regions生成prompts
+    - 不是在uncertainty最大的regions (理论一致性)
+    - Focus learning on critical shift bottlenecks
+    """
+    def __init__(self, feat_dim: int = 256, prompt_dim: int = 256):
+        super().__init__()
+        
+        # Prompt aggregation MLP
+        # Input: features from top UA-shift regions
+        # Output: prompt embedding
+        self.prompt_mlp = torch.nn.Sequential(
+            torch.nn.Linear(feat_dim, 512),
+            torch.nn.ReLU(inplace=True),
+            torch.nn.Linear(512, 256),
+            torch.nn.ReLU(inplace=True),
+            torch.nn.Linear(256, prompt_dim)
+        )
+    
+    def forward(
+        self,
+        adv_feat: torch.Tensor,           # [M, H, W, C]
+        ua_shift_map: torch.Tensor,       # [B, H, W]
+        top_k: int = 10,
+    ) -> torch.Tensor:
+        """
+        从UA shift map采样features生成pseudo prompts
+        
+        Args:
+            adv_feat: adversarial features
+            ua_shift_map: local UA distribution shift map (不是uncertainty map!)
+            top_k: 采样top-k个shift最大的locations
+        
+        Returns:
+            pseudo_prompts: [M, prompt_dim]
+        """
+        M, H, W, C = adv_feat.shape
+        B = ua_shift_map.shape[0]
+        
+        pseudo_prompts = []
+        
+        for i in range(M):
+            # 当前adversarial sample对应的shift map
+            shift_map_i = ua_shift_map[i % B]  # [H, W]
+            
+            # Top-k UA shift locations
+            # 关键理论: 不是top-k uncertainty，而是top-k distribution shift
+            shift_flat = shift_map_i.flatten()
+            
+            # 确保有足够的locations
+            k_actual = min(top_k, shift_flat.numel())
+            if k_actual == 0:
+                # Fallback: use mean features
+                pseudo_prompts.append(adv_feat[i].mean(dim=[0, 1]))
+                continue
+            
+            _, topk_indices = torch.topk(shift_flat, k_actual)
+            
+            # 这些locations的adversarial features
+            adv_feat_flat = adv_feat[i].view(-1, C)  # [H*W, C]
+            critical_features = adv_feat_flat[topk_indices]  # [k, C]
+            
+            # Aggregate通过MLP生成prompt
+            # 类似Few-Shot论文的Pseudo Prompt Generator
+            prompt = self.prompt_mlp(critical_features.mean(dim=0))  # [prompt_dim]
+            
+            pseudo_prompts.append(prompt)
+        
+        return torch.stack(pseudo_prompts, dim=0)  # [M, prompt_dim]
+
+
 class SAM2Base(torch.nn.Module):
     def __init__(
         self,
@@ -118,6 +196,12 @@ class SAM2Base(torch.nn.Module):
         aue_uncertainty_mask_threshold: float | None = None,
         # Diversity regularization for adversarial samples
         aue_diversity_loss_weight: float = 0.0,  # Weight for diversity regularization (0 = disabled)
+        # MMD-based UA Distribution Invariance parameters
+        ua_loss_alpha_corr: float = 1.0,      # Spearman correlation weight
+        ua_loss_alpha_mmd: float = 0.5,       # MMD loss weight
+        alpha_diversity: float = 0.01,        # Feature bank diversity weight
+        ua_loss_use_spearman: bool = True,    # Use Spearman vs Pearson
+        ua_loss_mmd_gamma: float = 1.0,       # RBF kernel bandwidth
     ):
         super().__init__()
 
@@ -221,6 +305,13 @@ class SAM2Base(torch.nn.Module):
         self.aue_use_uncertainty = bool(aue_use_uncertainty)
         self.aue_uncertainty_mask_threshold = aue_uncertainty_mask_threshold
         self.aue_diversity_loss_weight = float(aue_diversity_loss_weight)
+        # MMD-based UA Distribution Invariance parameters
+        self.ua_loss_alpha_corr = float(ua_loss_alpha_corr)
+        self.ua_loss_alpha_mmd = float(ua_loss_alpha_mmd)
+        self.alpha_diversity = float(alpha_diversity)
+        self.ua_loss_use_spearman = bool(ua_loss_use_spearman)
+        self.ua_loss_mmd_gamma = float(ua_loss_mmd_gamma)
+        
         if self.use_aue:
             self._build_aue_components()
 
@@ -238,7 +329,7 @@ class SAM2Base(torch.nn.Module):
             )
 
     def _build_aue_components(self) -> None:
-        """Build AUE projection head and adversarial negatives."""
+        """Build AUE projection head and feature-space adversarial bank."""
         # AUE operates on global vectors from pixel features (C' = hidden_dim // 8)
         aue_in_dim = max(8, self.hidden_dim // 8)
         self.aue_proj = torch.nn.Sequential(
@@ -246,25 +337,37 @@ class SAM2Base(torch.nn.Module):
             torch.nn.ReLU(inplace=True),
             torch.nn.Linear(self.aue_proj_dim, self.aue_proj_dim, bias=False),
         )
-        # Scheme A: Learnable adversarial image bank for AUE (sample → encode → BNDL)
-        # Store at a reduced resolution for memory safety; upsample on use.
-        # Shape: [K_eff, 3, H_adv, W_adv]
-        H_adv = int(self.aue_adversarial_image_size)
-        W_adv = int(self.aue_adversarial_image_size)
-        # Budget ~128M elements to avoid OOM (float32 ~ 512MB). Clamp K accordingly.
-        max_elems = 128 * 1024 * 1024
-        per_item = 3 * H_adv * W_adv
-        K_eff = max(64, min(int(self.aue_queue_size), int(max_elems // max(per_item, 1))))
         
-        # A2 Fix: Use ImageNet statistics for more natural adversarial sample initialization
-        # This makes adversarials closer to natural image distribution rather than pure noise
-        imagenet_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
-        imagenet_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
-        adv_images = torch.randn(K_eff, 3, H_adv, W_adv) * imagenet_std + imagenet_mean
-        self.aue_adversarials = torch.nn.Parameter(adv_images)
-        # Gradient reversal on adversarials to approximate adversarial ascent
-        # Use fixed gradient reversal scale (standard GRL implementation)
-        self.aue_adversarials.register_hook(lambda g: (-1.0 * g) if g is not None else g)
+        # Feature-Space Adversarial Bank (替代Image Bank)
+        # 理论优势:
+        # 1. 短优化路径: Features → BNDL → UA → MMD (不经过encoder)
+        # 2. 参数高效: K × C vs K × 3 × H × W (减少200倍)
+        # 3. 理论直接: Feature perturbation直接影响UA distribution
+        # 4. 训练稳定: 减少gradient path的non-linearity
+        
+        K = 16  # Number of perturbation modes
+        C_feat = max(8, self.hidden_dim // 8)  # Feature dimension after upscaling
+        
+        # Learnable feature perturbations
+        # Prior: Small Gaussian initialization (假设meaningful shifts是small的)
+        self.feature_perturbations = torch.nn.Parameter(
+            torch.randn(K, C_feat) * 0.01
+        )
+        
+        # Gradient Reversal for adversarial learning
+        # Bank objective: max_φ MMD(clean_UA, adv_UA)
+        # 通过GRL实现: φ收到 -∇_φ MMD
+        self.feature_perturbations.register_hook(
+            lambda g: (-1.0 * g) if g is not None else g
+        )
+        
+        # UA-Shift-Guided Pseudo Prompt Generator
+        # 受ICML'25 Few-Shot论文启发
+        # 在UA distribution shift最大的regions生成prompts
+        self.ua_prompt_generator = UAShiftGuidedPseudoPromptGenerator(
+            feat_dim=C_feat,
+            prompt_dim=C_feat
+        )
 
     @torch.no_grad()
     def _aue_roi_view(
@@ -339,107 +442,161 @@ class SAM2Base(torch.nn.Module):
         pixel_bndl_model=None,
         uq_sample_num: int = 20,
     ) -> torch.Tensor:
+        """
+        MMD-based UA Distribution Invariance Loss
         
-        # TODO
-        # 计算logits与uncertainty的相关性
+        核心理论:
+        1. 优化UA joint distribution的domain-invariance (不只是correlation)
+        2. Feature-space adversarial bank (稳定+高效)
+        3. UA-shift-guided pseudo prompts (理论一致)
+        4. Min-Max game: Model minimizes MMD, Bank maximizes MMD (via GRL)
         
-        # 1. 损失中要最大化相关性
-        # 2. 采样neg样本
-        # 3. 从neg样本中得到不确定性以及预测
-        # 4. 最大化正/负样本的相关性 (分阶段 1. 正  2. 负 3. 正+负)
-        
-        # New AUE implementation (independent of aue_bk):
-        # - Use BNDL t-test pixel_uncertainty p-values directly
-
+        Pipeline:
+        1. Compute clean UA distribution
+        2. Generate adversarial features from bank
+        3. Compute initial adversarial UA
+        4. Compute local UA shift map
+        5. Generate prompts from top-shift regions
+        6. Refine adversarial features with prompts
+        7. Compute final MMD loss + Spearman correlation
+        """
         assert pixel_feat is not None and pixel_feat.ndim == 4
-        B, H, W, _ = pixel_feat.shape
+        B, H, W, C = pixel_feat.shape
         device = pixel_feat.device
         dtype = pixel_feat.dtype
-
-        # Positive samples: compute global uncertainty/confidence ratio
-        ratio_pos = self._compute_pos_ratios(
-            pixel_logits=pixel_logits,
-            pixel_uncertainty=pixel_uncertainty,
-            pixel_gt=pixel_gt,
-            spatial_hw=(H, W),
-            batch_size=B,
-            device=device,
-            dtype=dtype,
-        )
-
-        alpha_pos = 1.0
-        alpha_neg = 1.0
-
-        ratio_adversarial = torch.tensor(0.0, device=device, dtype=dtype)
-        # Adversarial samples
-        adv_images = self._aue_sample_adversarial_images(adversarial_sample_M)  # [M, 3, Himg, Wimg]
-        if adv_images is not None:
-            enc_out = self.image_encoder(adv_images)
-            feat = enc_out["backbone_fpn"][-1]  # [M, C, H, W], C=256
-            
-            # Apply upscaling to match the feature dimension expected by pixel_bndl
-            if self.use_high_res_features_in_sam:
-                dc1, ln1, act1, dc2, act2 = self.sam_mask_decoder.output_upscaling
-                adv_feat_upscaled = act2(dc2(act1(ln1(dc1(feat)))))
-            else:
-                adv_feat_upscaled = self.sam_mask_decoder.output_upscaling(feat)
-            
-            adv_feat = adv_feat_upscaled.permute(0, 2, 3, 1).contiguous()  # [M, H', W', C']
-            
-            # A3 Fix: Allow partial gradient flow to BNDL so AUE can help it learn
-            # Conservative approach: 10% gradient + 90% detached to avoid BNDL being dominated by AUE
-            adv_feat_for_uq = adv_feat * 0.1 + adv_feat.detach() * 0.9
-            
-            # BNDL部分：为adversarial样本生成external_pre_out_w
-            M = adv_feat.shape[0]
-            if pixel_bndl_model.enable_global_sparse:
-                adv_external_w = None
-            else:
-                # 使用linear.weight作为adversarial样本的基础权重 [K, C'] -> [M, K, C']
-                linear_weight = pixel_bndl_model.linear.weight  # [K, C']
-                adv_external_w = linear_weight.unsqueeze(0).expand(M, -1, -1).detach()
-            
-            adv_uq_pval, adv_mean_logits = pixel_uncertain_sampling(
-                pixel_bndl_model,
-                adv_feat_for_uq,  # A3 Fix: Use partial gradient feature
-                external_pre_out_w=adv_external_w,
-                sample_num=uq_sample_num,
-            )
-            # CRITICAL FIX: pixel_uncertain_sampling returns p-values, not uncertainty!
-            # Convert p-value to true uncertainty: uncertainty = 1 - p_value
-            adv_uq = 1.0 - adv_uq_pval
-            adv_conf = self._aue_compute_conf_from_logits_tensor(adv_mean_logits)
-            # Simplified: no need for mask, just compute global mean
-            eps = 1e-6
-            ratio_adversarial = (adv_uq / (adv_conf + eps)).mean()
-            
-            # Compute diversity regularization to prevent mode collapse
-            # Store adv_feat for diversity computation
-            self._aue_last_adv_feat = adv_feat.detach() if self.aue_diversity_loss_weight > 0 else None
-
-        # A1 Fix: Unified optimization direction for adversarial training
-        # Goal: Model learns to minimize uncertainty/confidence ratio on BOTH positive and adversarial samples
-        # - ratio_pos: minimize → positive samples have high confidence and low uncertainty ✓
-        # - ratio_adversarial: minimize → model learns to be confident on adversarial samples ✓
-        # - Adversarial Bank (via gradient reversal, line 267): maximizes ratio_adversarial → finds hard examples ✓
-        # This creates a proper min-max adversarial training framework:
-        #   min_θ [ratio_pos + ratio_adv]  (model optimization)
-        #   max_φ ratio_adv                 (adversarial bank optimization via GRL)
-        alpha_adversarial = alpha_neg  # Keep same weight for backward compatibility
-        loss = alpha_pos * ratio_pos + alpha_adversarial * ratio_adversarial
         
-        # Add diversity regularization to prevent mode collapse of adversarial samples
-        diversity_term = torch.tensor(0.0, device=device, dtype=dtype)
-        if self.aue_diversity_loss_weight > 0 and adv_images is not None:
-            diversity_term = self._compute_adversarial_diversity_loss()
-            loss = loss + self.aue_diversity_loss_weight * diversity_term
-
-        # Optional: Log ratio values for monitoring (only during training with low frequency)
-        # You can enable this for debugging by uncommenting:
-        # if self.training and torch.rand(1).item() < 0.01:  # 1% chance to log
-        #     print(f"AUE ratios - pos: {ratio_pos.item():.4f}, adv: {ratio_adversarial.item():.4f}, "
-        #           f"diversity: {diversity_term.item():.4f}, total_loss: {loss.item():.4f}")
-
+        # Default weights (可通过config override)
+        alpha_corr = getattr(self, 'ua_loss_alpha_corr', 1.0)
+        alpha_mmd = getattr(self, 'ua_loss_alpha_mmd', 0.5)
+        alpha_diversity = getattr(self, 'alpha_diversity', 0.01)
+        use_spearman = getattr(self, 'ua_loss_use_spearman', True)
+        mmd_gamma = getattr(self, 'ua_loss_mmd_gamma', 1.0)
+        
+        # ===== Step 1: Clean UA Distribution =====
+        if pixel_logits is None or pixel_uncertainty is None or pixel_gt is None:
+            # Fallback: no loss if missing inputs
+            return torch.tensor(0.0, device=device, dtype=dtype, requires_grad=True)
+        
+        clean_error = torch.abs(torch.sigmoid(pixel_logits) - pixel_gt.float())
+        
+        # ===== Step 2: Correlation Loss (基础) =====
+        if use_spearman:
+            loss_corr = -self.spearman_correlation_differentiable(
+                pixel_uncertainty.flatten(),
+                clean_error.flatten(),
+                temperature=0.1
+            )
+        else:
+            loss_corr = -self.pearson_correlation(
+                pixel_uncertainty.flatten(),
+                clean_error.flatten()
+            )
+        
+        # Regularization: 防止uncertainty collapse
+        loss_reg = -torch.log(pixel_uncertainty.std() + 1e-6)
+        loss_corr_total = loss_corr + 0.1 * loss_reg
+        
+        # ===== Step 3: Generate Adversarial Features (Feature Bank) =====
+        if pixel_bndl_model is None or adversarial_sample_M is None or adversarial_sample_M <= 0:
+            # No adversarial training
+            return loss_corr_total
+        
+        adv_feat_init = self.sample_adversarial_features(
+            pixel_feat,
+            num_samples=adversarial_sample_M
+        )  # [M, H, W, C]
+        
+        # ===== Step 4: Forward Initial Adversarial through BNDL =====
+        M = adv_feat_init.shape[0]
+        
+        # Configure external_pre_out_w
+        if pixel_bndl_model.enable_global_sparse:
+            adv_external_w = None
+        else:
+            linear_weight = pixel_bndl_model.linear.weight
+            adv_external_w = linear_weight.unsqueeze(0).expand(M, -1, -1).detach()
+        
+        adv_uq_pval_init, adv_logits_init = pixel_uncertain_sampling(
+            pixel_bndl_model,
+            adv_feat_init,
+            external_pre_out_w=adv_external_w,
+            sample_num=uq_sample_num
+        )
+        adv_uq_init = 1.0 - adv_uq_pval_init  # Convert p-value to uncertainty
+        
+        # Error proxy for adversarial (无GT)
+        # 使用BNDL predictive variance
+        adv_error_init = self._compute_bndl_predictive_variance(
+            pixel_bndl_model,
+            adv_feat_init,
+            num_samples=20
+        )
+        
+        # ===== Step 5: Compute Local UA Shift Map (理论关键!) =====
+        ua_shift_map = self.compute_local_ua_shift_map(
+            clean_uncertainty=pixel_uncertainty,
+            adv_uncertainty=adv_uq_init,
+            clean_error=clean_error,
+            adv_error=adv_error_init,
+            window_size=7
+        )  # [B, H, W]
+        
+        # ===== Step 6: Generate Pseudo Prompts from UA Shift =====
+        # 理论: 在UA shift最大的regions采样，不是uncertainty最大
+        if hasattr(self, 'ua_prompt_generator'):
+            pseudo_prompts = self.ua_prompt_generator(
+                adv_feat_init,
+                ua_shift_map,
+                top_k=10
+            )  # [M, C]
+            
+            # ===== Step 7: Prompt-modulated Adversarial Features =====
+            # Prompt作为feature modulation
+            prompt_modulation = pseudo_prompts.view(M, 1, 1, -1)
+            adv_feat_final = adv_feat_init + 0.1 * prompt_modulation
+        else:
+            # No prompt generator (e.g., during testing or if disabled)
+            adv_feat_final = adv_feat_init
+        
+        # ===== Step 8: Re-forward Final Adversarial Features =====
+        adv_uq_pval_final, adv_logits_final = pixel_uncertain_sampling(
+            pixel_bndl_model,
+            adv_feat_final,
+            external_pre_out_w=adv_external_w,
+            sample_num=uq_sample_num
+        )
+        adv_uq_final = 1.0 - adv_uq_pval_final
+        
+        adv_error_final = self._compute_bndl_predictive_variance(
+            pixel_bndl_model,
+            adv_feat_final,
+            num_samples=20
+        )
+        
+        # ===== Step 9: Construct UA Joint Distributions =====
+        clean_ua_joint = torch.stack([
+            pixel_uncertainty.flatten(),
+            clean_error.flatten()
+        ], dim=1)  # [N_clean, 2]
+        
+        adv_ua_joint = torch.stack([
+            adv_uq_final.flatten(),
+            adv_error_final.flatten()
+        ], dim=1)  # [N_adv, 2]
+        
+        # ===== Step 10: MMD Loss (核心) =====
+        # Model: minimize MMD → 学习UA distribution invariance
+        # Bank: maximize MMD (via GRL) → 找worst-case perturbations
+        loss_mmd = self.compute_mmd(clean_ua_joint, adv_ua_joint, gamma=mmd_gamma)
+        
+        # ===== Step 11: Diversity Regularization =====
+        loss_diversity = self._compute_feature_diversity_loss()
+        
+        # ===== Total Loss =====
+        loss = (alpha_corr * loss_corr_total +      # 基础: UA correlation + regularization
+                alpha_mmd * loss_mmd +              # 核心: distribution invariance
+                alpha_diversity * loss_diversity)   # 正则: 防止mode collapse
+        
         return loss
 
     @property
@@ -563,22 +720,53 @@ class SAM2Base(torch.nn.Module):
         # Compute confidence from aligned logits
         return torch.sigmoid(aligned_logits / float(tau_conf))
 
-    def _aue_sample_adversarial_images(self, M: int) -> torch.Tensor | None:
-        """Sample M images from spatial adversarial bank as RGB tensors [M, 3, Himg, Wimg].
-
-        Here we store aue_adversarials as image-aligned RGB patches: [K, 3, Himg, Wimg].
-        Returns None if the bank doesn't match this assumption.
+    def sample_adversarial_features(
+        self, 
+        clean_feat: torch.Tensor,  # [B, H, W, C]
+        num_samples: int = 4,
+    ) -> torch.Tensor:
         """
-        adv = self.aue_adversarials
-        if adv is None or adv.ndim != 4 or adv.shape[1] != 3:
-            return None
-        K = adv.shape[0]
-        device = adv.device
-        if M <= 0:
-            return None
-        idx = torch.randint(0, K, (min(M, K),), device=device)
-        return adv.index_select(0, idx)
-
+        从Feature Bank采样adversarial features
+        
+        理论:
+        - Bank参数化adversarial perturbation distribution
+        - Random sampling探索不同的perturbation modes
+        - 通过GRL，bank自动学习worst-case perturbations
+        
+        Args:
+            clean_feat: clean样本的features
+            num_samples: 采样数量
+        
+        Returns:
+            adv_feat: [M, H, W, C] adversarial features
+        """
+        if not hasattr(self, 'feature_perturbations'):
+            # Fallback: 如果没有feature bank，返回clean features
+            return clean_feat[:num_samples]
+        
+        B, H, W, C = clean_feat.shape
+        device = clean_feat.device
+        K = self.feature_perturbations.shape[0]
+        
+        if num_samples <= 0:
+            return clean_feat[:0]  # Empty tensor
+        
+        # Sample M perturbations from bank
+        num_samples = min(num_samples, B)  # 不超过batch size
+        indices = torch.randint(0, K, (num_samples,), device=device)
+        deltas = self.feature_perturbations[indices]  # [M, C]
+        
+        # Broadcast to spatial dimensions
+        deltas_spatial = deltas.view(num_samples, 1, 1, C)  # [M, 1, 1, C]
+        
+        # Apply to batch samples
+        clean_sampled = clean_feat[:num_samples]  # [M, H, W, C]
+        
+        # Generate adversarial features
+        adv_feat = clean_sampled + deltas_spatial
+        
+        return adv_feat
+    
     def _aue_compute_conf_from_logits_tensor(self, logits: torch.Tensor, tau_conf: float = 2.0) -> torch.Tensor:
         """Compute confidence from logits tensor [*, H, W, K] -> [*, H, W] via sigmoid(max(|logit|)/tau)."""
         if logits.ndim < 3:
@@ -586,51 +774,297 @@ class SAM2Base(torch.nn.Module):
         mag = logits.abs().max(dim=-1).values  # [..., H, W]
         return torch.sigmoid(mag / float(tau_conf)).to(mag.dtype)
     
-    def _compute_adversarial_diversity_loss(self) -> torch.Tensor:
-        """Compute diversity regularization loss to prevent mode collapse in adversarial samples.
+    def _compute_feature_diversity_loss(self) -> torch.Tensor:
+        """
+        Diversity regularization for feature-space adversarial bank
         
-        This encourages the adversarial samples in the bank to be different from each other,
-        preventing them from converging to the same adversarial pattern.
-        
-        Method: Compute negative pairwise cosine similarity of adversarial features.
-        Higher diversity → lower similarity → larger negative value → smaller loss.
+        理论: 防止K个perturbations收敛到相同方向 (mode collapse)
+        鼓励bank探索不同的perturbation directions
         
         Returns:
-            Diversity loss scalar (minimize to encourage diversity).
+            Diversity loss (minimize to maximize diversity)
         """
-        if not hasattr(self, 'aue_adversarials') or self.aue_adversarials is None:
-            return torch.tensor(0.0, device='cuda' if torch.cuda.is_available() else 'cpu')
+        if not hasattr(self, 'feature_perturbations'):
+            return torch.tensor(0.0, device=self.device)
         
-        # Get adversarial images from bank
-        adv_images = self.aue_adversarials  # [K, 3, H, W]
-        K = adv_images.shape[0]
+        deltas = self.feature_perturbations  # [K, C]
+        K = deltas.shape[0]
         
         if K < 2:
-            # Need at least 2 samples for diversity
-            return torch.tensor(0.0, device=adv_images.device, dtype=adv_images.dtype)
+            return torch.tensor(0.0, device=deltas.device)
         
-        # Flatten spatial dimensions for feature comparison
-        adv_flat = adv_images.view(K, -1)  # [K, 3*H*W]
+        # Normalize for cosine similarity
+        deltas_norm = F.normalize(deltas, dim=1, p=2)
         
-        # Normalize features for cosine similarity
-        adv_norm = F.normalize(adv_flat, dim=1, p=2)  # [K, D]
+        # Pairwise similarity matrix
+        sim_matrix = torch.mm(deltas_norm, deltas_norm.t())  # [K, K]
         
-        # Compute pairwise cosine similarity matrix
-        similarity_matrix = torch.mm(adv_norm, adv_norm.t())  # [K, K]
+        # Mask diagonal
+        mask = torch.eye(K, device=deltas.device, dtype=torch.bool)
+        sim_matrix = sim_matrix.masked_fill(mask, 0.0)
         
-        # Mask out diagonal (self-similarity)
-        mask = torch.eye(K, device=adv_images.device, dtype=torch.bool)
-        similarity_matrix = similarity_matrix.masked_fill(mask, 0.0)
-        
-        # Average pairwise similarity (excluding diagonal)
-        # Higher similarity = less diversity = higher loss
+        # Average similarity (excluding diagonal)
+        # Minimize this to maximize diversity
         num_pairs = K * (K - 1)
-        avg_similarity = similarity_matrix.sum() / num_pairs
+        avg_similarity = sim_matrix.sum() / num_pairs
         
-        # Return positive loss value: minimize similarity to maximize diversity
-        diversity_loss = avg_similarity
+        return avg_similarity
+    
+    # ==================== MMD and Correlation Methods ====================
+    
+    def compute_mmd(
+        self, 
+        X: torch.Tensor,  # [N_X, d]
+        Y: torch.Tensor,  # [N_Y, d]
+        gamma: float = 1.0
+    ) -> torch.Tensor:
+        """
+        Maximum Mean Discrepancy with RBF kernel
         
-        return diversity_loss
+        理论: MMD^2(P,Q) = E[k(x,x')] + E[k(y,y')] - 2*E[k(x,y)]
+        当MMD=0时，P=Q (分布相同)
+        
+        Args:
+            X: samples from distribution P
+            Y: samples from distribution Q
+            gamma: RBF kernel bandwidth
+        
+        Returns:
+            mmd: scalar MMD distance
+        """
+        XX = self.rbf_kernel(X, X, gamma)
+        YY = self.rbf_kernel(Y, Y, gamma)
+        XY = self.rbf_kernel(X, Y, gamma)
+        
+        mmd_squared = XX.mean() + YY.mean() - 2 * XY.mean()
+        
+        # Ensure non-negative (numerical stability)
+        return torch.sqrt(torch.clamp(mmd_squared, min=0.0) + 1e-6)
+    
+    def rbf_kernel(
+        self, 
+        X: torch.Tensor,  # [n, d]
+        Y: torch.Tensor,  # [m, d]
+        gamma: float
+    ) -> torch.Tensor:
+        """
+        RBF (Gaussian) kernel: k(x,y) = exp(-gamma * ||x-y||^2)
+        
+        Args:
+            X, Y: input tensors
+            gamma: kernel bandwidth
+        
+        Returns:
+            kernel_matrix: [n, m]
+        """
+        # Compute squared Euclidean distances efficiently
+        XX = (X ** 2).sum(dim=1, keepdim=True)  # [n, 1]
+        YY = (Y ** 2).sum(dim=1, keepdim=True).T  # [1, m]
+        XY = X @ Y.T  # [n, m]
+        
+        sq_distances = XX + YY - 2 * XY  # [n, m]
+        
+        return torch.exp(-gamma * sq_distances)
+    
+    def pearson_correlation(
+        self, 
+        x: torch.Tensor,  # [n]
+        y: torch.Tensor   # [n]
+    ) -> torch.Tensor:
+        """
+        Pearson correlation coefficient
+        
+        PCC = Cov(X,Y) / (σ_X * σ_Y)
+        
+        Returns:
+            correlation: scalar in [-1, 1]
+        """
+        mean_x = x.mean()
+        mean_y = y.mean()
+        
+        xm = x - mean_x
+        ym = y - mean_y
+        
+        r_num = (xm * ym).sum()
+        r_den = torch.sqrt((xm ** 2).sum() * (ym ** 2).sum() + 1e-6)
+        
+        return r_num / r_den
+    
+    def spearman_correlation_differentiable(
+        self,
+        x: torch.Tensor,      # [n]
+        y: torch.Tensor,      # [n]
+        temperature: float = 0.1
+    ) -> torch.Tensor:
+        """
+        Differentiable Spearman correlation via soft-ranking
+        
+        理论:
+        - Spearman比Pearson更鲁棒 (rank-based)
+        - 只要求单调关系，不要求线性
+        - 对outliers不敏感
+        - 更适合domain shift场景
+        
+        Args:
+            x, y: input tensors
+            temperature: soft-rank temperature (smaller = closer to hard rank)
+        
+        Returns:
+            spearman_rho: scalar correlation
+        """
+        rank_x = self.soft_rank(x, temperature)
+        rank_y = self.soft_rank(y, temperature)
+        
+        return self.pearson_correlation(rank_x, rank_y)
+    
+    def soft_rank(
+        self,
+        x: torch.Tensor,      # [n]
+        temperature: float
+    ) -> torch.Tensor:
+        """
+        Differentiable soft ranking
+        
+        理论: rank(x_i) = Σ_j I(x_i > x_j)
+        Soft version: rank(x_i) ≈ Σ_j sigmoid((x_i - x_j) / temp)
+        
+        Args:
+            x: input tensor [n]
+            temperature: controls softness
+        
+        Returns:
+            soft_ranks: [n]
+        """
+        # Pairwise differences [n, n]
+        diff = x.unsqueeze(0) - x.unsqueeze(1)  # x_i - x_j
+        
+        # Soft indicator via sigmoid
+        soft_indicator = torch.sigmoid(diff / temperature)
+        
+        # Sum over j to get soft rank
+        soft_ranks = soft_indicator.sum(dim=1)
+        
+        return soft_ranks
+    
+    def compute_local_ua_shift_map(
+        self,
+        clean_uncertainty: torch.Tensor,  # [B, H, W]
+        adv_uncertainty: torch.Tensor,    # [M, H, W]
+        clean_error: torch.Tensor,        # [B, H, W]
+        adv_error: torch.Tensor,          # [M, H, W]
+        window_size: int = 7,
+    ) -> torch.Tensor:
+        """
+        计算spatial map of local UA distribution shift
+        
+        理论关键:
+        - 不是看uncertainty的absolute value
+        - 而是看UA joint distribution的local change
+        - 这与MMD loss的目标完全对齐
+        
+        方法:
+        - 对每个spatial location的local window
+        - 计算clean vs adv的local UA distribution MMD
+        - 返回spatial map of local MMD values
+        
+        Returns:
+            shift_map: [B, H, W] 每个location的local UA shift强度
+        """
+        B, H, W = clean_uncertainty.shape
+        M = adv_uncertainty.shape[0]
+        device = clean_uncertainty.device
+        
+        shift_map = torch.zeros(B, H, W, device=device)
+        pad = window_size // 2
+        
+        # 使用stride减少计算 (每隔stride计算一次)
+        stride = max(1, window_size // 2)
+        
+        for b in range(B):
+            for h in range(0, H, stride):
+                for w in range(0, W, stride):
+                    # Local window bounds
+                    h_start = max(0, h - pad)
+                    h_end = min(H, h + pad + 1)
+                    w_start = max(0, w - pad)
+                    w_end = min(W, w + pad + 1)
+                    
+                    # Clean local UA samples
+                    clean_unc_local = clean_uncertainty[b, h_start:h_end, w_start:w_end].flatten()
+                    clean_err_local = clean_error[b, h_start:h_end, w_start:w_end].flatten()
+                    
+                    if clean_unc_local.numel() == 0:
+                        continue
+                    
+                    clean_ua_local = torch.stack([clean_unc_local, clean_err_local], dim=1)
+                    
+                    # Adversarial local UA samples (对应的adv sample)
+                    adv_idx = b % M
+                    adv_unc_local = adv_uncertainty[adv_idx, h_start:h_end, w_start:w_end].flatten()
+                    adv_err_local = adv_error[adv_idx, h_start:h_end, w_start:w_end].flatten()
+                    
+                    if adv_unc_local.numel() == 0:
+                        continue
+                    
+                    adv_ua_local = torch.stack([adv_unc_local, adv_err_local], dim=1)
+                    
+                    # Compute local MMD (小心: 小样本时MMD可能不稳定)
+                    if clean_ua_local.shape[0] > 5 and adv_ua_local.shape[0] > 5:
+                        local_mmd = self.compute_mmd(
+                            clean_ua_local,
+                            adv_ua_local,
+                            gamma=1.0
+                        )
+                        
+                        # 填充到shift map (填充整个window)
+                        shift_map[b, h_start:h_end, w_start:w_end] = local_mmd.item()
+        
+        return shift_map
+    
+    def _compute_bndl_predictive_variance(
+        self,
+        bndl_model,
+        feat: torch.Tensor,  # [M, H, W, C]
+        num_samples: int = 20
+    ) -> torch.Tensor:
+        """
+        通过BNDL多次sampling估计predictive variance
+        
+        理论: 作为adversarial samples的error proxy (无GT时使用)
+        Var_p(w|D)[f_w(x)] ≈ E[(y - ŷ)²] (Bayesian expected squared error)
+        
+        Args:
+            bndl_model: BNDL model
+            feat: features [M, H, W, C]
+            num_samples: number of BNDL samples
+        
+        Returns:
+            variance: [M, H, W] predictive variance
+        """
+        predictions = []
+        
+        # Multiple forward passes through BNDL
+        for _ in range(num_samples):
+            _, logits = pixel_uncertain_sampling(
+                bndl_model,
+                feat,
+                external_pre_out_w=None,
+                sample_num=1
+            )
+            # Convert to probabilities
+            predictions.append(torch.sigmoid(logits))
+        
+        # Stack and compute variance
+        pred_stacked = torch.stack(predictions, dim=0)  # [num_samples, M, H, W, K]
+        
+        # Variance across samples, then average across output channels
+        variance = pred_stacked.var(dim=0)  # [M, H, W, K]
+        
+        # Average over K (多个mask outputs)
+        if variance.ndim == 4:
+            variance = variance.mean(dim=-1)  # [M, H, W]
+        
+        return variance
 
     def forward(self, *args, **kwargs):
         raise NotImplementedError(
