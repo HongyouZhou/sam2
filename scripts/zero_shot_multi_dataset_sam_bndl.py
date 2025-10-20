@@ -3,10 +3,9 @@
 # Supports TrashCan, GTEA, PIDRay, plittersdorf, Hypersim, DRAM, and CITYSCAPES datasets with UQ analysis
 
 import argparse
-import gc
 import json
-import shutil
 from pathlib import Path
+from typing import Any
 
 import cv2
 import matplotlib
@@ -14,7 +13,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
-from typing import Any
 
 matplotlib.use("Agg")  # Use non-interactive backend to avoid Qt issues
 import logging
@@ -24,9 +22,6 @@ import time
 import matplotlib.pyplot as plt
 import pandas as pd
 import seaborn as sns
-
-# ----------  Metric ----------
-from sav_dataset.utils.sav_benchmark import benchmark
 
 # ----------  Tools -----------
 from tools.vos_inference import (
@@ -43,7 +38,15 @@ from training.utils.dataset_evaluator import DistributedDatasetEvaluator
 # ----------  SAM-2 -----------
 from sam2.build_sam import build_sam2_video_predictor
 
-# ----------  Click sampling ----------
+# ----------  Shared utilities (NEW) ----------
+from zero_shot_utils import (
+    load_first_frame_mask,
+    threshold_mask_logits,
+    select_top_objects_by_area,
+    cleanup_gpu_memory,
+)
+from checkpoint_manager import CheckpointManager, StatisticsCheckpointManager
+from evaluation_pipeline import run_benchmark_evaluation
 
 # ----------  Import refactored visualization modules (lazy import inside function) ----------
 import sys
@@ -432,50 +435,12 @@ def calculate_pavpu_for_bndl(bndl_outputs, batch, targets, phase, model):
                         logger.error(f"Unexpected tensor dimensions - predictions: {pixel_predictions.shape}, targets: {pixel_targets.shape}")
                         return bndl_outputs
 
-                # Calculate pixel-level accuracy for true PAvPU (no thresholds)
-                # pixel_accuracy = whether prediction matches ground truth (binary: 0 or 1)
-                
-                # Convert predictions to binary (sigmoid + threshold 0.5)
-                pixel_pred_probs = torch.sigmoid(pixel_predictions)  # [B, H, W, K]
-                # Use best mask per pixel (argmax across K dimension, same as training)
-                best_mask_indices = torch.argmax(pixel_pred_probs, dim=-1)  # [B, H, W]
-                best_pred_probs = torch.gather(pixel_pred_probs, -1, best_mask_indices.unsqueeze(-1)).squeeze(-1)  # [B, H, W]
-                best_pred_binary = (best_pred_probs > 0.5).float()
-                
-                # Extract corresponding ground truth
-                best_target_vals = torch.gather(pixel_targets, -1, best_mask_indices.unsqueeze(-1)).squeeze(-1)  # [B, H, W]
-                best_target_binary = (best_target_vals > 0.5).float()
-                
-                # Calculate pixel accuracy: 1 if match, 0 if mismatch
-                pixel_accurate = (best_pred_binary == best_target_binary).float()  # [B, H, W]
-                
-                # Store raw uncertainty and accuracy for later plotting (sample to reduce storage)
-                # Flatten to [B*H*W] and sample a subset
-                B, H, W = pixel_accurate.shape
-                total_pixels = B * H * W
-                max_samples = 10000  # Sample up to 10k pixels per frame
-                sample_size = min(total_pixels, max_samples)
-                
-                # Flatten
-                uncertainty_flat = pixel_uncertainty.reshape(-1)  # [B*H*W]
-                accuracy_flat = pixel_accurate.reshape(-1)  # [B*H*W]
-                
-                # Random sampling
-                if total_pixels > sample_size:
-                    indices = torch.randperm(total_pixels, device=uncertainty_flat.device)[:sample_size]
-                    uncertainty_sampled = uncertainty_flat[indices]
-                    accuracy_sampled = accuracy_flat[indices]
-                else:
-                    uncertainty_sampled = uncertainty_flat
-                    accuracy_sampled = accuracy_flat
-                
-                # Store raw data for PAvPU scatter plot (uncertainty vs accuracy)
+                # Store uncertainty and logits for evaluator
+                # Accuracy will be calculated by DistributedDatasetEvaluator for consistency
                 bndl_outputs["pixel_uncertainty"] = pixel_uncertainty.detach()
                 bndl_outputs["mean_pixel_logits"] = mean_pixel_logits.detach()
-                bndl_outputs["pavpu_uncertainty_samples"] = uncertainty_sampled.detach().cpu().numpy()
-                bndl_outputs["pavpu_accuracy_samples"] = accuracy_sampled.detach().cpu().numpy()
                 
-                logger.info(f"Stored {len(uncertainty_sampled)} pixel samples for true PAvPU analysis (no thresholds)")
+                logger.info("Stored pixel uncertainty and logits for dataset evaluator")
             else:
                 logger.warning("No pixel predictions found for PAvPU calculation")
         else:
@@ -799,7 +764,8 @@ def inference_with_bndl(
     else:
         video_names = sorted(set(video_names))
 
-    print(f"{click_protocol} inference with BNDL UQ analysis on {len(video_names)} videos")
+    # 打印格式要与其他方法一致，以便 parallel_compare.py 的进度监控器能正确捕获
+    print(f"BNDL ({click_protocol}) inference on {len(video_names)} videos")
 
     # Optional seeding
     if seed is not None:
@@ -813,11 +779,19 @@ def inference_with_bndl(
     dataset_statistics = {} if collect_statistics else None
     total_frames_processed = 0
     
-    # Incremental save configuration to prevent OOM
-    # Reduced from 50 to 2 for aggressive memory management on high-res datasets
-    stats_checkpoint_interval = 2  # Save every 2 videos to free memory
-    stats_checkpoint_files = []  # Track checkpoint files for final merge
-    eval_checkpoint_files = []  # Track evaluator checkpoint files for final merge
+    # Checkpoint managers for statistics and evaluator data
+    stats_checkpoint_mgr = StatisticsCheckpointManager(
+        output_dir=out_dir.parent,
+        dataset_name=dataset_name,
+        interval=10,  # Increased from 2 to 10 for better performance
+    ) if collect_statistics else None
+    
+    eval_checkpoint_mgr = CheckpointManager(
+        output_dir=out_dir.parent,
+        dataset_name=dataset_name,
+        checkpoint_type="eval",
+        interval=10,  # Increased from 2 to 10 for better performance
+    ) if collect_statistics else None
 
     # Initialize dataset evaluator for correlation analysis like in SAM trainer
     # Use consistent path format: <output_root>/<dataset>_bndl_eval
@@ -845,7 +819,10 @@ def inference_with_bndl(
             dataset_evaluator = None
 
     for v_idx, vid in enumerate(video_names, 1):
-        print(f"[{v_idx:03}/{len(video_names)}] {vid}")
+        print(f"\n{'=' * 60}")
+        print(f"📹 Processing video [{v_idx:03}/{len(video_names)}]: {vid}")
+        print(f"   Progress: {v_idx}/{len(video_names)} ({100.0 * v_idx / len(video_names):.1f}%)")
+        print(f"{'=' * 60}")
         video_dir = jpeg_dir / vid
         frame_names = sorted([p.stem for p in video_dir.iterdir() if p.suffix.lower() in [".jpg", ".jpeg"]], key=lambda x: int(x))
 
@@ -854,12 +831,10 @@ def inference_with_bndl(
         H, W = state["video_height"], state["video_width"]
 
         # Read first frame GT to determine object IDs
-        first_mask_path = ann_dir / vid / f"{frame_names[0]}.png"
-        if not first_mask_path.exists():
-            print(f"Warning: First frame annotation not found: {first_mask_path}")
+        first_mask = load_first_frame_mask(ann_dir, vid, frame_names)
+        if first_mask is None:
             continue
 
-        first_mask = np.array(Image.open(first_mask_path))
         all_obj_ids = [oid for oid in np.unique(first_mask) if oid > 0]
 
         if len(all_obj_ids) == 0:
@@ -867,19 +842,9 @@ def inference_with_bndl(
             continue
 
         # Apply object limit if specified (select largest areas)
-        effective_max_objects = max_objects
-        if effective_max_objects and len(all_obj_ids) > effective_max_objects:
-            # Select objects with largest areas for more meaningful evaluation
-            obj_areas = {}
-            for oid in all_obj_ids:
-                obj_areas[oid] = np.sum(first_mask == oid)
-
-            # Sort by area and take top N objects
-            sorted_objs = sorted(obj_areas.items(), key=lambda x: x[1], reverse=True)
-            obj_ids = [oid for oid, _ in sorted_objs[:effective_max_objects]]
-            print(f"Limited to {effective_max_objects} largest objects in video {vid} (from {len(all_obj_ids)} total)")
-        else:
-            obj_ids = all_obj_ids
+        obj_ids = select_top_objects_by_area(first_mask, max_objects if max_objects else 10**9)
+        if max_objects and len(all_obj_ids) > len(obj_ids):
+            print(f"Limited to {len(obj_ids)} largest objects in video {vid} (from {len(all_obj_ids)} total)")
 
         # Load reused prompts if available
         prompts_json = load_reused_prompts(reuse_prompts_root, dataset_name, vid)
@@ -965,7 +930,7 @@ def inference_with_bndl(
                         mode="bilinear",
                         align_corners=False,
                     )[0, 0]
-                seg[oid] = (mask_logits > score_thresh).cpu().numpy()
+                seg[oid] = threshold_mask_logits(mask_logits, score_thresh)
             video_segments[f_idx] = seg
             
             # Clear GPU memory after processing each frame to prevent OOM with many objects
@@ -1143,86 +1108,54 @@ def inference_with_bndl(
             print(f"Collected BNDL statistics for video {vid}: {len(video_statistics)} metrics")
             
             # Incremental save: periodically save statistics and clear memory to prevent OOM
-            if v_idx % stats_checkpoint_interval == 0:
-                checkpoint_file = out_dir.parent / f".stats_checkpoint_{dataset_name}_{v_idx:04d}.json"
-                with open(checkpoint_file, "w") as f:
-                    json.dump(dataset_statistics, f)
-                stats_checkpoint_files.append(checkpoint_file)
+            if stats_checkpoint_mgr and stats_checkpoint_mgr.should_checkpoint(v_idx):
+                checkpoint_file = stats_checkpoint_mgr.save_checkpoint(dataset_statistics, v_idx)
                 print(f"💾 Saved statistics checkpoint ({v_idx}/{len(video_names)} videos) to {checkpoint_file.name}")
                 
                 # Clear statistics from memory
                 dataset_statistics.clear()
-                
-                # Force garbage collection
-                import gc
-                gc.collect()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                CheckpointManager.force_memory_cleanup()
                 
                 # Also checkpoint dataset_evaluator to prevent OOM from pixel-level data accumulation
-                if dataset_evaluator is not None and len(dataset_evaluator) > 0:
-                    import pickle
-                    eval_checkpoint_file = out_dir.parent / f".eval_checkpoint_{dataset_name}_{v_idx:04d}.pkl"
-                    # Save evaluator's accumulated data
+                if eval_checkpoint_mgr and dataset_evaluator is not None and len(dataset_evaluator) > 0:
                     eval_checkpoint_data = {
                         'pixel_uncertainties': dataset_evaluator.pixel_uncertainties.copy() if hasattr(dataset_evaluator, 'pixel_uncertainties') else [],
                         'pixel_ious': dataset_evaluator.pixel_ious.copy() if hasattr(dataset_evaluator, 'pixel_ious') else [],
                         'pixel_dices': dataset_evaluator.pixel_dices.copy() if hasattr(dataset_evaluator, 'pixel_dices') else [],
                         'pixel_accuracies': dataset_evaluator.pixel_accuracies.copy() if hasattr(dataset_evaluator, 'pixel_accuracies') else [],
                     }
-                    with open(eval_checkpoint_file, 'wb') as f:
-                        pickle.dump(eval_checkpoint_data, f)
-                    
-                    # Track checkpoint file
-                    eval_checkpoint_files.append(eval_checkpoint_file)
+                    eval_checkpoint_file = eval_checkpoint_mgr.save_checkpoint(eval_checkpoint_data, v_idx)
                     print(f"💾 Saved evaluator checkpoint ({v_idx}/{len(video_names)} videos) to {eval_checkpoint_file.name}")
                     
-                    # Clear evaluator data using built-in reset method (more efficient than del + recreate)
+                    # Clear evaluator data using built-in reset method
                     dataset_evaluator.reset()
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
+                    CheckpointManager.force_memory_cleanup()
 
         # Critical: Reset predictor state to free memory for this video
-        predictor.reset_state(state)
-        
-        # Final cleanup after each video (keep consistent with original)
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        cleanup_gpu_memory(predictor, state)
+        print(f"✓ Video {vid} completed ({v_idx}/{len(video_names)})")
     
     # Save any remaining statistics after the last video
-    if collect_statistics and dataset_statistics and len(dataset_statistics) > 0:
-        checkpoint_file = out_dir.parent / f".stats_checkpoint_{dataset_name}_final.json"
-        with open(checkpoint_file, "w") as f:
-            json.dump(dataset_statistics, f)
-        stats_checkpoint_files.append(checkpoint_file)
+    if stats_checkpoint_mgr and dataset_statistics and len(dataset_statistics) > 0:
+        checkpoint_file = stats_checkpoint_mgr.save_checkpoint(dataset_statistics, len(video_names))
         print(f"💾 Saved final statistics checkpoint to {checkpoint_file.name}")
         dataset_statistics.clear()
-        import gc
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        CheckpointManager.force_memory_cleanup()
     
     # Merge evaluator checkpoint files back into dataset_evaluator BEFORE generating evaluation
     # CRITICAL: Must merge checkpoints first, otherwise len(dataset_evaluator) will be 0
-    if collect_statistics and eval_checkpoint_files and dataset_evaluator is not None:
-        print(f"\n🔄 Merging {len(eval_checkpoint_files)} evaluator checkpoint files...")
-        import pickle
-        for eval_checkpoint_file in eval_checkpoint_files:
-            with open(eval_checkpoint_file, 'rb') as f:
-                checkpoint_data = pickle.load(f)
-                # Restore data to evaluator
-                if 'pixel_uncertainties' in checkpoint_data:
-                    dataset_evaluator.pixel_uncertainties.extend(checkpoint_data['pixel_uncertainties'])
-                if 'pixel_ious' in checkpoint_data:
-                    dataset_evaluator.pixel_ious.extend(checkpoint_data['pixel_ious'])
-                if 'pixel_dices' in checkpoint_data:
-                    dataset_evaluator.pixel_dices.extend(checkpoint_data['pixel_dices'])
-                if 'pixel_accuracies' in checkpoint_data:
-                    dataset_evaluator.pixel_accuracies.extend(checkpoint_data['pixel_accuracies'])
-            # Clean up checkpoint file
-            eval_checkpoint_file.unlink()
-        print(f"✓ Merged all evaluator checkpoints into final evaluator")
+    if eval_checkpoint_mgr and dataset_evaluator is not None:
+        merged_data = eval_checkpoint_mgr.merge_checkpoints()
+        # Restore data to evaluator
+        if merged_data:
+            if 'pixel_uncertainties' in merged_data:
+                dataset_evaluator.pixel_uncertainties.extend(merged_data['pixel_uncertainties'])
+            if 'pixel_ious' in merged_data:
+                dataset_evaluator.pixel_ious.extend(merged_data['pixel_ious'])
+            if 'pixel_dices' in merged_data:
+                dataset_evaluator.pixel_dices.extend(merged_data['pixel_dices'])
+            if 'pixel_accuracies' in merged_data:
+                dataset_evaluator.pixel_accuracies.extend(merged_data['pixel_accuracies'])
     
     # Generate dataset evaluation plots like in SAM trainer validation phase
     if collect_statistics and dataset_evaluator and len(dataset_evaluator) > 0:
@@ -1253,17 +1186,11 @@ def inference_with_bndl(
         logger.warning(f"No data collected for dataset evaluation in {dataset_name} (collected: {len(dataset_evaluator) if dataset_evaluator else 0})")
 
     # Merge checkpoint files back into final statistics
-    if collect_statistics and stats_checkpoint_files:
-        print(f"\n🔄 Merging {len(stats_checkpoint_files)} checkpoint files...")
-        for checkpoint_file in stats_checkpoint_files:
-            with open(checkpoint_file, "r") as f:
-                checkpoint_data = json.load(f)
-                if dataset_statistics is None:
-                    dataset_statistics = {}
-                dataset_statistics.update(checkpoint_data)
-            # Clean up checkpoint file
-            checkpoint_file.unlink()
-        print(f"✓ Merged all checkpoints into final statistics")
+    if stats_checkpoint_mgr:
+        merged_stats = stats_checkpoint_mgr.merge_checkpoints()
+        if dataset_statistics is None:
+            dataset_statistics = {}
+        dataset_statistics.update(merged_stats)
     
 
     if collect_statistics and dataset_statistics:
@@ -1406,105 +1333,24 @@ def run_single_dataset_with_bndl(
         raise
     inference_time = time.time() - start_time
 
-    # Run evaluation
+    # Use unified evaluation pipeline (with symlinks for better performance)
     eval_start_time = time.time()
-
-    # Prepare evaluation roots (support first-frame-only copy)
-    if first_frame_only:
-        base_videos = video_subset if video_subset is not None else [d.name for d in ann_dir.iterdir() if d.is_dir()]
-        base_videos = sorted(base_videos)
-        gt_tmp = output_path / f"{dataset_name.lower()}_tmp_gt_first"
-        pred_tmp = output_path / f"{dataset_name.lower()}_tmp_pred_first"
-        if gt_tmp.exists():
-            shutil.rmtree(gt_tmp)
-        if pred_tmp.exists():
-            shutil.rmtree(pred_tmp)
-        for v in base_videos:
-            v_gt_dir = ann_dir / v
-            v_pred_dir = out_dir / v
-            if not v_gt_dir.exists() or not v_pred_dir.exists():
-                continue
-            gt_pngs = sorted([p for p in v_gt_dir.iterdir() if p.suffix.lower() == ".png"])
-            if not gt_pngs:
-                continue
-            first_png = gt_pngs[0].name
-            if not (v_pred_dir / first_png).exists():
-                continue
-            (gt_tmp / v).mkdir(parents=True, exist_ok=True)
-            (pred_tmp / v).mkdir(parents=True, exist_ok=True)
-            shutil.copy2(v_gt_dir / first_png, gt_tmp / v / first_png)
-            shutil.copy2(v_pred_dir / first_png, pred_tmp / v / first_png)
-        gt_root_eval, pred_root_eval = gt_tmp, pred_tmp
-    else:
-        if video_subset is not None:
-            gt_tmp = output_path / f"{dataset_name.lower()}_tmp_gt"
-            pred_tmp = output_path / f"{dataset_name.lower()}_tmp_pred"
-            if gt_tmp.exists():
-                shutil.rmtree(gt_tmp)
-            if pred_tmp.exists():
-                shutil.rmtree(pred_tmp)
-            gt_tmp.mkdir(parents=True, exist_ok=True)
-            pred_tmp.mkdir(parents=True, exist_ok=True)
-            for v in video_subset:
-                if (ann_dir / v).exists() and (out_dir / v).exists():
-                    shutil.copytree(ann_dir / v, gt_tmp / v, symlinks=True)
-                    shutil.copytree(out_dir / v, pred_tmp / v, symlinks=True)
-            gt_root_eval, pred_root_eval = gt_tmp, pred_tmp
-        else:
-            gt_root_eval, pred_root_eval = ann_dir, out_dir
-
     try:
-        J_F, global_J, global_F, _ = benchmark(
-            gt_roots=[str(gt_root_eval)],
-            mask_roots=[str(pred_root_eval)],
-            strict=False,
-            num_processes=num_workers,
-            skip_first_and_last=config["skip_first_and_last"],
-            verbose=True,
+        j_f_val, j_val, f_val = run_benchmark_evaluation(
+            gt_dir=ann_dir,
+            pred_dir=out_dir,
+            dataset_config=config,
+            video_subset=video_subset,
+            first_frame_only=first_frame_only,
+            num_workers=num_workers,
+            output_path=output_path,
+            use_symlinks=True,  # Use symlinks for 10-100x speed improvement
+            dataset_name=dataset_name,  # Pass dataset name for proper temp directory naming
         )
-
-        # Check for NaN values and handle them
-        if len(J_F) == 0 or len(global_J) == 0 or len(global_F) == 0:
-            print(f"Warning: Empty evaluation results for {dataset_name}")
-            return 0.0, 0.0, 0.0, dataset_statistics or {}
-
-        j_f_val = J_F[0] if not np.isnan(J_F[0]) else 0.0
-        j_val = global_J[0] if not np.isnan(global_J[0]) else 0.0
-        f_val = global_F[0] if not np.isnan(global_F[0]) else 0.0
-
-        if np.isnan(j_f_val) or np.isnan(j_val) or np.isnan(f_val):
-            print(f"Warning: NaN values detected in {dataset_name} evaluation results")
-            print(f"  J&F: {J_F[0]}, J: {global_J[0]}, F: {global_F[0]}")
-            # Return zeros instead of NaN
-            j_f_val = 0.0 if np.isnan(j_f_val) else j_f_val
-            j_val = 0.0 if np.isnan(j_val) else j_val
-            f_val = 0.0 if np.isnan(f_val) else f_val
-
-        # Removed PIDRay special-case macro averaging to keep a single evaluation pass
-
     except Exception as e:
         print(f"Error during evaluation of {dataset_name}: {e}")
-        
-        # Clean up temporary files even if evaluation failed
-        try:
-            if first_frame_only:
-                gt_tmp = output_path / f"{dataset_name.lower()}_tmp_gt_first"
-                pred_tmp = output_path / f"{dataset_name.lower()}_tmp_pred_first"
-            else:
-                gt_tmp = output_path / f"{dataset_name.lower()}_tmp_gt"
-                pred_tmp = output_path / f"{dataset_name.lower()}_tmp_pred"
-            
-            # Remove temporary directories if they exist
-            if gt_tmp.exists():
-                shutil.rmtree(gt_tmp)
-                print(f"Cleaned up temporary GT directory: {gt_tmp}")
-            if pred_tmp.exists():
-                shutil.rmtree(pred_tmp)
-                print(f"Cleaned up temporary prediction directory: {pred_tmp}")
-                
-        except Exception as cleanup_e:
-            print(f"Warning: Failed to clean up temporary files for {dataset_name}: {cleanup_e}")
-        
+        import traceback
+        traceback.print_exc()
         return 0.0, 0.0, 0.0, {}
 
     eval_time = time.time() - eval_start_time
@@ -1522,25 +1368,7 @@ def run_single_dataset_with_bndl(
             json.dump(dataset_statistics, f, indent=2)
         print(f"BNDL statistics saved to: {stats_file}")
 
-    # Clean up temporary files
-    try:
-        if first_frame_only:
-            gt_tmp = output_path / f"{dataset_name.lower()}_tmp_gt_first"
-            pred_tmp = output_path / f"{dataset_name.lower()}_tmp_pred_first"
-        else:
-            gt_tmp = output_path / f"{dataset_name.lower()}_tmp_gt"
-            pred_tmp = output_path / f"{dataset_name.lower()}_tmp_pred"
-        
-        # Remove temporary directories if they exist
-        if gt_tmp.exists():
-            shutil.rmtree(gt_tmp)
-            print(f"Cleaned up temporary GT directory: {gt_tmp}")
-        if pred_tmp.exists():
-            shutil.rmtree(pred_tmp)
-            print(f"Cleaned up temporary prediction directory: {pred_tmp}")
-            
-    except Exception as e:
-        print(f"Warning: Failed to clean up temporary files for {dataset_name}: {e}")
+    # Note: Temporary directories are automatically cleaned up by run_benchmark_evaluation
 
     return j_f_val, j_val, f_val, (dataset_statistics or {})
 

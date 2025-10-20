@@ -345,7 +345,7 @@ class DistributedDatasetEvaluator:
 
         Returns:
             pixel_uncertainties: [N] 前景区域像素的uncertainty
-            pixel_accuracies: [N] 前景区域像素的accuracy（二值正确性）
+            pixel_accuracies: [N] 前景区域像素的accuracy（使用原始logits，范围-∞到+∞）
             pixel_ious: [N] 前景区域像素的IoU贡献
             pixel_dices: [N] 前景区域像素的DICE贡献
             pixel_nlls: [N] 前景区域像素的NLL值
@@ -369,12 +369,22 @@ class DistributedDatasetEvaluator:
                 pixel_uncertainty = uncertainty
             pixel_uncertainty = pixel_uncertainty.float()
 
-            # 3. 计算像素级accuracy（二值正确性）
-            pred_binary_bool = (pred_logits > 0)  # [H, W, K] - keep as bool
-            gt_binary_bool = (gt_masks > 0)       # [H, W, K] - keep as bool
-            pred_binary = pred_binary_bool.float()  # [H, W, K] - convert to float for comparison
-            gt_binary = gt_binary_bool.float()       # [H, W, K]
-            pixel_correct = (pred_binary == gt_binary).all(dim=-1).float()  # [H, W] 所有通道都正确
+            # 3. 计算像素级accuracy（使用原始logits保留置信度信息）
+            # 对每个通道独立计算：当gt=1时用logits，当gt=0时用-logits
+            gt_binary_bool = (gt_masks > 0)  # [H, W, K] - keep as bool for IoU/DICE
+            pred_binary_bool = (pred_logits > 0)  # [H, W, K] - keep as bool for IoU/DICE
+            gt_binary = gt_binary_bool.float()  # [H, W, K]
+            
+            # 对每个通道计算带符号的logits准确率
+            # gt=1: 正logits表示准确； gt=0: 负logits表示准确
+            pixel_accuracy_per_channel = torch.where(
+                gt_binary > 0.5,
+                pred_logits,           # 真值=1：高logits → 高准确率
+                -pred_logits           # 真值=0：低logits → 高准确率（翻转符号）
+            )  # [H, W, K], range (-∞, +∞)
+            
+            # 跨通道聚合：使用均值（也可以考虑min/max）
+            pixel_correct = pixel_accuracy_per_channel.mean(dim=-1)  # [H, W]
 
             # 4. 计算像素级IoU贡献（intersection / union per pixel across channels）
             intersection = (pred_binary_bool & gt_binary_bool).float().sum(dim=-1)  # [H, W]

@@ -1004,9 +1004,9 @@ def create_ua_shift_analysis_plots(
     
     # Determine figure layout: put all ΔPCC plots together
     # Row 0: Basic UA analysis (U vs Perf, U comparison, Improvement vs U, U distribution)
-    # Row 1: All ΔPCC plots side by side (BNDL, UCTTA, UR-ERN)
-    # Row 2: Summary table and additional analysis
-    fig = plt.figure(figsize=(24, 18))
+    # Row 1: All ΔPCC plots side by side (BNDL_AUE, BNDL, UCTTA, UR-ERN) - up to 4 plots
+    # Row 2: J&F Performance comparison + Summary table
+    fig = plt.figure(figsize=(28, 20))
     gs = fig.add_gridspec(3, 4, hspace=0.5, wspace=0.4)
     title = "UA Consistency Analysis"
     
@@ -1451,8 +1451,8 @@ def create_ua_shift_analysis_plots(
                       f"{width:+.3f}", va='center', ha='left' if width >= 0 else 'right', fontsize=8)
         current_col += 1
     
-    # 8. J&F Performance Comparison (gs[1, 3]) - Similar to NLL plot
-    ax8 = fig.add_subplot(gs[1, 3])
+    # 8. J&F Performance Comparison - MOVED to Row 2 to avoid overlap with ΔPCC plots
+    ax8 = fig.add_subplot(gs[2, 2:])
     
     # Get all datasets that have results from at least one method
     all_datasets_for_jf = sorted(set(sam2_results.keys()) | set(bndl_results.keys()) | 
@@ -1516,6 +1516,8 @@ def create_ua_shift_analysis_plots(
     if has_uctta and uctta_results:
         title_methods.append('UCTTA')
     title_methods.append('BNDL_AUE')
+    if has_bndl_pure and bndl_pure_results:
+        title_methods.append('BNDL')
     if has_ur_ern and ur_ern_results:
         title_methods.append('UR-ERN')
     ax8.set_title(f'J&F Performance: {" vs ".join(title_methods)}', fontweight='bold', fontsize=12)
@@ -2089,6 +2091,7 @@ def parse_args():
 
     # Cached results options
     p.add_argument("--load_detailed_json", type=str, default=None, help="Path to a previously saved detailed_results.json to render plots and summaries without re-running")
+    p.add_argument("--plot_only", action="store_true", default=False, help="Only generate plots from existing detailed_results.json (requires --load_detailed_json or existing results in output_path)")
     # Method toggles
     p.add_argument("--run_sam", action="store_true", default=False, help="Run baseline SAM-2 branch")
     p.add_argument("--run_uctta", action="store_true", default=False, help="Run SAM-2 + UCTTA branch")
@@ -2116,16 +2119,31 @@ def main():
 
     print("Starting comparison evaluation...")
     print(f"Output directory: {output_path}")
-    print(f"Datasets: {args.datasets}")
-    print(f"SAM-2 config: {args.sam2_cfg}")
-    print(f"SAM-2 checkpoint: {args.sam2_checkpoint}")
-    print(f"BNDL config: {args.bndl_cfg}")
-    print(f"BNDL checkpoint: {args.bndl_checkpoint}")
-    print(f"BNDL_AUE config: {args.bndl_aue_cfg}")
-    print(f"BNDL_AUE checkpoint: {args.bndl_aue_checkpoint}")
-
+    
+    # If plot_only mode, try to load existing results
+    if args.plot_only:
+        print("\n🎨 Plot-only mode enabled - will only generate visualizations from existing results")
+        
+        # Try to find detailed_results.json
+        if args.load_detailed_json is not None:
+            detailed_path = Path(args.load_detailed_json)
+        else:
+            # Auto-detect from output_path
+            detailed_path = output_path / "comparison_plots" / "detailed_results.json"
+            if not detailed_path.exists():
+                print(f"❌ Error: No detailed_results.json found at {detailed_path}")
+                print("   Please specify --load_detailed_json or run evaluation first without --plot_only")
+                return
+        
+        print(f"📂 Loading results from: {detailed_path}")
+        (sam2_results, bndl_aue_results, bndl_aue_statistics, bndl_results, bndl_statistics,
+         uctta_results, ur_ern_results, ua_data, uctta_statistics, ur_ern_statistics) = (
+            load_results_from_detailed_json(detailed_path)
+        )
+        print("✓ Results loaded successfully")
+        
     # Optionally load previous results to avoid re-running
-    if args.load_detailed_json is not None:
+    elif args.load_detailed_json is not None:
         detailed_path = Path(args.load_detailed_json)
         print(f"Loading cached results from: {detailed_path}")
         (sam2_results, bndl_aue_results, bndl_aue_statistics, bndl_results, bndl_statistics,
@@ -2134,6 +2152,13 @@ def main():
         )
     else:
         # Run comparison evaluation
+        print(f"Datasets: {args.datasets}")
+        print(f"SAM-2 config: {args.sam2_cfg}")
+        print(f"SAM-2 checkpoint: {args.sam2_checkpoint}")
+        print(f"BNDL config: {args.bndl_cfg}")
+        print(f"BNDL checkpoint: {args.bndl_checkpoint}")
+        print(f"BNDL_AUE config: {args.bndl_aue_cfg}")
+        print(f"BNDL_AUE checkpoint: {args.bndl_aue_checkpoint}")
         sam2_results, bndl_aue_results, bndl_aue_statistics, bndl_results, bndl_statistics, uctta_results, ur_ern_results, ua_data, uctta_statistics, ur_ern_statistics = run_comparison_evaluation(
             datasets=args.datasets,
             sam2_cfg=args.sam2_cfg,
@@ -2173,38 +2198,82 @@ def main():
             uctta_selection_p=args.uctta_selection_p,
         )
 
-    # Always save detailed results JSON (needed for parallel_compare.py)
-    save_detailed_results(
-        output_path=output_path,
-        sam2_results=sam2_results,
-        bndl_aue_results=bndl_aue_results,
-        bndl_aue_statistics=bndl_aue_statistics,
-        bndl_results=bndl_results,
-        bndl_statistics=bndl_statistics,
-        uctta_results=uctta_results,
-        ur_ern_results=ur_ern_results,
-        uctta_statistics=uctta_statistics,
-        ur_ern_statistics=ur_ern_statistics,
-        ua_data=ua_data,
-    )
+    # Save detailed results JSON (needed for parallel_compare.py) - skip if plot_only mode
+    if not args.plot_only:
+        save_detailed_results(
+            output_path=output_path,
+            sam2_results=sam2_results,
+            bndl_aue_results=bndl_aue_results,
+            bndl_aue_statistics=bndl_aue_statistics,
+            bndl_results=bndl_results,
+            bndl_statistics=bndl_statistics,
+            uctta_results=uctta_results,
+            ur_ern_results=ur_ern_results,
+            uctta_statistics=uctta_statistics,
+            ur_ern_statistics=ur_ern_statistics,
+            ua_data=ua_data,
+        )
     
-    # Create comparison plots (optional, commented out for parallel execution)
-    # if sam2_results and bndl_results:
-    #     create_comprehensive_comparison_plots(
-    #         sam2_results, bndl_results, bndl_statistics, 
-    #         output_path, uctta_results, uctta_statistics
-    #     )
-    
-    # Create UA shift analysis plots (optional, commented out for parallel execution)
-    # if bndl_statistics and sam2_results and bndl_results:
-    #     create_ua_shift_analysis_plots(
-    #         bndl_statistics, 
-    #         sam2_results, 
-    #         bndl_results, 
-    #         output_path,
-    #         uctta_statistics=uctta_statistics,
-    #         uctta_results=uctta_results
-    #     )
+    # Generate plots if requested or if plot_only mode
+    if args.plot_only or (not args.load_detailed_json and any([args.run_sam, args.run_bndl, args.run_bndl_aue])):
+        print("\n" + "=" * 80)
+        print("📊 Generating visualization plots...")
+        print("=" * 80)
+        
+        # Create comparison plots
+        if sam2_results and bndl_aue_results:
+            print("\n🎨 Creating comprehensive comparison plots...")
+            try:
+                create_comprehensive_comparison_plots(
+                    sam2_results=sam2_results,
+                    bndl_results=bndl_aue_results,
+                    bndl_statistics=bndl_aue_statistics,
+                    output_path=output_path,
+                    uctta_results=uctta_results,
+                    uctta_statistics=uctta_statistics,
+                )
+                print("✓ Comprehensive comparison plots generated")
+            except Exception as e:
+                print(f"⚠️  Warning: Failed to generate comparison plots: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        # Create UA shift analysis plots
+        if bndl_aue_statistics and sam2_results and bndl_aue_results:
+            print("\n🎨 Creating UA shift analysis plots...")
+            try:
+                # Build root paths for loading per-dataset results
+                sam2_root = output_path / "sam2_results" if (output_path / "sam2_results").exists() else None
+                bndl_aue_root = output_path / "bndl_aue_results" if (output_path / "bndl_aue_results").exists() else None
+                bndl_root = output_path / "bndl_results" if (output_path / "bndl_results").exists() else None
+                uctta_root = output_path / "sam2_uctta_results" if (output_path / "sam2_uctta_results").exists() else None
+                ur_ern_root = output_path / "sam2_ur_ern_results" if (output_path / "sam2_ur_ern_results").exists() else None
+                
+                create_ua_shift_analysis_plots(
+                    bndl_statistics=bndl_aue_statistics,
+                    sam2_results=sam2_results,
+                    bndl_results=bndl_aue_results,
+                    output_path=output_path,
+                    uctta_statistics=uctta_statistics,
+                    uctta_results=uctta_results,
+                    ur_ern_results=ur_ern_results,
+                    bndl_pure_statistics=bndl_statistics,
+                    bndl_pure_results=bndl_results,
+                    sam2_root_override=sam2_root,
+                    bndl_root_override=bndl_aue_root,
+                    uctta_root_override=uctta_root,
+                    ur_ern_root_override=ur_ern_root,
+                    bndl_pure_root_override=bndl_root,
+                )
+                print("✓ UA shift analysis plots generated")
+            except Exception as e:
+                print(f"⚠️  Warning: Failed to generate UA shift plots: {e}")
+                import traceback
+                traceback.print_exc()
+        
+        print("\n" + "=" * 80)
+        print("✓ All visualization plots generated successfully!")
+        print("=" * 80)
 
 
 if __name__ == "__main__":

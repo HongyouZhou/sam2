@@ -315,3 +315,65 @@ class VisualizationUtils:
         plt.tight_layout()
         plt.savefig(save_path, dpi=dpi)
         plt.close(fig)
+    
+    @staticmethod
+    def create_ua_ratio_visualization(
+        out_logits: np.ndarray,
+        uncertainty_map: np.ndarray,
+        original_img: np.ndarray,
+        vid: str,
+        frame_name: str,
+        vis_dir: Any,
+        method_name: str = "Method",
+    ) -> None:
+        """创建通用的U/A ratio可视化
+        
+        适用于所有方法（UCTTA, UR-ERN, BNDL等）的统一可视化接口
+        
+        Args:
+            out_logits: 预测logits [1, H, W, K] 或其他格式
+            uncertainty_map: 不确定性图 [1, H, W] 或 [H, W]
+            original_img: 原始图像 [H, W, 3]
+            vid: 视频名称
+            frame_name: 帧名称
+            vis_dir: 可视化输出目录（Path对象）
+            method_name: 方法名称（用于标题）
+        """
+        try:
+            from pathlib import Path
+            from bndl_visualizer import BNDLVisualizer
+            
+            # 确保vis_dir是Path对象
+            if not isinstance(vis_dir, Path):
+                vis_dir = Path(vis_dir)
+            
+            viz_utils = VisualizationUtils()
+            bndl_viz = BNDLVisualizer()
+            
+            # 准备数据格式（与BNDL visualizer期望的格式一致）
+            method_outputs = {
+                "pixel_uncertainty": uncertainty_map,
+                "mean_pixel_logits": out_logits,
+            }
+            
+            # 创建figure
+            fig, axes = viz_utils.create_figure_layout(1, 3, (18, 6))
+            
+            # 使用BNDL visualizer的U/A ratio可视化
+            bndl_viz.plot_uncertainty_accuracy_ratio_visualization(
+                axes[0, :], method_outputs, original_img, step_index=0, ratio_type="U/A"
+            )
+            
+            # 更新标题以包含方法名
+            if axes[0, 0].get_title():
+                axes[0, 0].set_title(f"{method_name}: {axes[0, 0].get_title()}")
+            
+            # 保存可视化
+            save_path = vis_dir / vid / f"{frame_name}_{method_name.lower().replace(' ', '_')}_ua_ratio.png"
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            viz_utils.save_and_close_figure(fig, str(save_path), dpi=150)
+            
+        except Exception as e:
+            logging.warning(f"Failed to create UA ratio visualization for {method_name}: {e}")
+            import traceback
+            logging.warning(f"Traceback: {traceback.format_exc()}")

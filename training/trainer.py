@@ -9,6 +9,7 @@ import json
 import logging
 import math
 import os
+import random
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -19,12 +20,12 @@ import matplotlib.pyplot as plt
 import matplotlib
 matplotlib.use('Agg')  # 使用非交互式后端
 import cv2
-import random
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from contextlib import nullcontext
 from hydra.utils import instantiate
 from iopath.common.file_io import g_pathmgr
 
@@ -42,7 +43,7 @@ from training.utils.distributed import all_reduce_max, barrier, get_rank
 from training.utils.logger import Logger, setup_logging
 
 # Import BNDL uncertainty and PAvPU functions
-from BNDL.BNDL_upload.ViT_Sparse.utils.bndl import pixel_uncertain_sampling, pixel_pavpu_calculation, pixel_entropy_uncertainty, pixel_nll_uncertainty
+from BNDL.BNDL_upload.ViT_Sparse.utils.bndl import pixel_uncertain_sampling, pixel_entropy_uncertainty, pixel_nll_uncertainty
 
 from training.utils.dataset_evaluator import DistributedDatasetEvaluator
 
@@ -148,11 +149,25 @@ class LoggingConf:
     scalar_keys_to_log: Optional[Dict[str, Any]] = None
     log_batch_stats: bool = False
     visualize_bndl: bool = False
+    bndl_vis_sample_rate: float = 0.05  # Probability of saving BNDL visualization for each validation batch (0.05 = 5%)
     uncertainty_metric: set = field(default_factory=lambda: {"entropy"})  # Options: {"entropy"}, {"nll"}, {"sampling"}, {"entropy", "nll"}, {"entropy", "nll", "sampling"}, etc.
     visualize_pavpu_overlay: bool = True  # Enable PAvPU overlay visualization on original images
     uncertainty_sample_num: int = 50
     correlation_foreground_dilation: int = 10  # Foreground dilation radius (pixels), 0 means no dilation
     correlation_per_pixel: bool = True  # Use per-pixel statistics (vs per-image)
+
+@dataclass
+class AlternatingBackwardConf:
+    enabled: bool = False
+    ddp_no_sync: bool = True
+    symmetric_average: bool = True  # 0.5 per phase
+    include_adv_seg: bool = False   # reserved; not used initially
+    sample_adv_every: int = 1       # reserved; not used initially
+
+@dataclass
+class TrainStrategyConf:
+    alternating_backward: AlternatingBackwardConf = field(default_factory=AlternatingBackwardConf)
+
 
 class Trainer:
     """
@@ -180,6 +195,7 @@ class Trainer:
         optim_overrides: Optional[List[Dict[str, Any]]] = None,
         meters: Optional[Dict[str, Any]] = None,
         loss: Optional[Dict[str, Any]] = None,
+        train_strategy: Optional[Dict[str, Any]] = None,
     ):
 
         self._setup_env_variables(env_variables)
@@ -197,6 +213,7 @@ class Trainer:
         self.loss_conf = loss
         distributed = DistributedConf(**distributed or {})
         cuda = CudaConf(**cuda or {})
+        self.train_strategy = TrainStrategyConf(**(train_strategy or {}))
         self.where = 0.0
 
         self._infer_distributed_backend_if_none(distributed, accelerator)
@@ -240,7 +257,21 @@ class Trainer:
                 g_pathmgr.copy(self.checkpoint_conf.resume_from, dst)
             barrier()
 
+        # Initialize evaluators for PAvPU analysis during training and validation
+        self.train_evaluator = None
+        self.val_evaluator = None
+        self._setup_evaluators()
+        
         self.load_checkpoint()
+        
+        # Initialize AUE adversarial samples from dataset (only when starting from scratch)
+        if (hasattr(unwrap_ddp_if_wrapped(self.model), 'use_aue') and 
+            unwrap_ddp_if_wrapped(self.model).use_aue and 
+            self.train_dataset is not None and 
+            self.epoch == 0):
+            # Initialize adversarial samples from training dataset
+            unwrap_ddp_if_wrapped(self.model).init_aue_adversarials_from_dataset(self.train_dataset)
+        
         self._setup_ddp_distributed_training(distributed, accelerator)
         barrier()
 
@@ -488,16 +519,20 @@ class Trainer:
         if getattr(_model, 'use_bndl_for_pixels', False):
             bndl_outputs, step_index, frame_index = self._extract_bndl_outputs(outputs)
             if bndl_outputs is not None:
-                # Calculate PAvPU if in validation phase and targets are available
+                # Calculate uncertainty and add to evaluator if in validation phase
                 if phase == "val" and targets is not None:
-                    # Use frame_index to get the corresponding mask for the current frame
-                    # targets shape: [4, 2, 1024, 1024] -> [frames, batch_size, height, width]
-                    # We need to extract the specific frame and transpose to [batch_size, height, width]
+                    # Extract the current frame targets
                     if frame_index is not None and targets.shape[0] > frame_index:
-                        current_frame_targets = targets[frame_index]  # Shape: [2, 1024, 1024]
+                        current_frame_targets = targets[frame_index]
                     else:
-                        current_frame_targets = targets[0] if targets.shape[0] > 0 else targets  # Fallback to first frame
-                    bndl_outputs = self._calculate_pavpu_for_bndl(bndl_outputs, batch, current_frame_targets)
+                        current_frame_targets = targets[0] if targets.shape[0] > 0 else targets
+                    
+                    # Calculate uncertainty and add to evaluator
+                    bndl_outputs = self._calculate_uncertainty_for_bndl(bndl_outputs, batch, current_frame_targets)
+                    if self.val_evaluator is not None:
+                        self._add_to_evaluator(bndl_outputs, current_frame_targets, self.val_evaluator)
+                
+                # Log BNDL statistics for both train and val
                 self._log_bndl_statistics(bndl_outputs, self.steps[phase], phase)
 
         if isinstance(loss, dict):
@@ -680,41 +715,6 @@ class Trainer:
                         if k not in extra_loss_mts:
                             extra_loss_mts[k] = AverageMeter(k, self.device, ":.2e")
                         extra_loss_mts[k].update(v.item(), batch_size)
-                    
-                    outputs = self.model(batch)
-
-                    # Only process BNDL outputs if BNDL is enabled
-                    _model = unwrap_ddp_if_wrapped(self.model)
-                    if getattr(_model, 'use_bndl_for_pixels', False):
-                        bndl_outputs, step_index, frame_index = self._extract_bndl_outputs(outputs)
-                        if bndl_outputs is not None:
-                            # Use frame_index to get the corresponding mask for the current frame
-                            # batch.masks shape: [4, 2, 1024, 1024] -> [frames, batch_size, height, width]
-                            # We need to extract the specific frame and transpose to [batch_size, height, width]
-                            if frame_index is not None and batch.masks.shape[0] > frame_index:
-                                current_frame_masks = batch.masks[frame_index]  # Shape: [2, 1024, 1024]
-                            else:
-                                current_frame_masks = batch.masks[0] if batch.masks.shape[0] > 0 else batch.masks  # Fallback to first frame
-                            bndl_outputs = self._calculate_pavpu_for_bndl(bndl_outputs, batch, current_frame_masks)
-                            # BNDL visualization and evaluation (moved inside the for loop)
-                            if (random.random() < 0.15 and self.logging_conf.visualize_bndl) and get_rank() == 0:
-                                logging.info(f"Starting BNDL visualization for iter {data_iter}")
-                                # Use bndl_outputs already returned from _step instead of re-extracting
-                                vis_dir = os.path.join(self.logging_conf.log_dir, "bndl_visualizations", phase)
-                                makedir(vis_dir)
-                                # Ensure PAvPU is calculated for visualization
-                                self._create_unified_visualization(bndl_outputs, batch, outputs, vis_dir, data_iter, step_index, frame_index, 'full')
-                                # After BNDL visualization, also visualize AdCo adversarials (bank + sampled)
-                                self._visualize_adco_adversarials(phase=phase, data_iter=data_iter)
-                            
-                            # Dataset evaluation using BNDL outputs (use postprocessed masks)
-                            pixel_predictions = bndl_outputs.get('masks_bndl_postprocessed', bndl_outputs.get('masks_bndl_raw'))
-                            self.dataset_evaluator.add_batch_data(
-                                uncertainty=bndl_outputs['pixel_uncertainty'],
-                                pred_logits=pixel_predictions,
-                                gt_masks=current_frame_masks
-                            )
-                            logging.info(f"Added batch {data_iter} to dataset evaluator (batch size: {pixel_predictions.shape[0]})")
                                                 
             # measure elapsed time
             batch_time.update(time.time() - end)
@@ -738,29 +738,59 @@ class Trainer:
                         progress_meter.val,
                         self.steps[Phase.VAL],
                     )
+            
+            # Randomly visualize BNDL parameters during validation
+            if (self.distributed_rank == 0 and
+                self.logging_conf.visualize_bndl and
+                getattr(unwrap_ddp_if_wrapped(self.model), 'use_bndl_for_pixels', False) and
+                random.random() < self.logging_conf.bndl_vis_sample_rate):
+                # Extract BNDL outputs for visualization
+                _model = unwrap_ddp_if_wrapped(self.model)
+                if hasattr(batch, 'img_batch'):
+                    # Re-run forward pass to get outputs with BNDL data
+                    with torch.no_grad():
+                        outputs_for_vis = _model(batch)
+                    bndl_outputs, step_index, frame_index = self._extract_bndl_outputs(outputs_for_vis)
+                    if bndl_outputs is not None:
+                        vis_dir = os.path.join(self.logging_conf.log_dir, "bndl_visualizations", phase)
+                        makedir(vis_dir)
+                        # Create full visualization with uncertainty and PAvPU overlays
+                        self._create_unified_visualization(
+                            bndl_outputs, batch, outputs_for_vis, vis_dir, 
+                            data_iter, step_index, frame_index, layout_type='full'
+                        )
+            
+            # Visualize AUE adversarial images periodically during validation
+            if (data_iter % self.logging_conf.log_visual_frequency == 0 and 
+                self.distributed_rank == 0 and
+                hasattr(unwrap_ddp_if_wrapped(self.model), 'use_aue') and
+                unwrap_ddp_if_wrapped(self.model).use_aue):
+                self._visualize_aue_adversarials(phase, data_iter)
 
             if data_iter % 10 == 0:
                 dist.barrier()
 
-        total_images = self.dataset_evaluator.get_total_images_across_all_processes()
-        logging.info(f"Dataset evaluator status: {len(self.dataset_evaluator)} images on rank {self.rank}, {total_images} total across all processes")
-        
-        # 评估相关性
-        correlation_results = self.dataset_evaluator.evaluate_dataset_correlation()
-        logging.info(f"Correlation evaluation completed with {len(correlation_results)} metrics")
-        
-        # 生成可视化
-        self.dataset_evaluator.create_dataset_correlation_visualization(
-            title=f"Epoch {self.epoch} - Dataset Analysis",
-            save_name=f"epoch_{self.epoch}_dataset_analysis.png"
-        )
-        # 保存结果
-        self.dataset_evaluator.save_correlation_results(
-            save_name=f"epoch_{self.epoch}_results.json"
-        )
-        logging.info(f"Dataset evaluation completed for epoch {self.epoch}")
-        # 重置evaluator
-        self.dataset_evaluator.reset()
+        # Use val_evaluator for validation epoch analysis
+        if self.val_evaluator is not None:
+            total_images = self.val_evaluator.get_total_images_across_all_processes()
+            logging.info(f"Val evaluator status: {len(self.val_evaluator)} images on rank {self.rank}, {total_images} total across all processes")
+            
+            # 评估相关性
+            correlation_results = self.val_evaluator.evaluate_dataset_correlation()
+            logging.info(f"Correlation evaluation completed with {len(correlation_results)} metrics")
+            
+            # 生成可视化
+            self.val_evaluator.create_dataset_correlation_visualization(
+                title=f"Epoch {self.epoch} - Validation PAvPU Analysis",
+                save_name=f"epoch_{self.epoch}_val_pavpu_analysis.png"
+            )
+            # 保存结果
+            self.val_evaluator.save_correlation_results(
+                save_name=f"epoch_{self.epoch}_val_pavpu_results.json"
+            )
+            logging.info(f"Validation PAvPU evaluation completed for epoch {self.epoch}")
+            # 重置evaluator准备下一个epoch
+            self.val_evaluator.reset()
 
         self.est_epoch_time[phase] = batch_time.avg * iters_per_epoch
         self._log_timers(phase)
@@ -900,7 +930,7 @@ class Trainer:
                             self.steps[phase],
                         )
 
-                # (train) We keep AdCo adversarials visualization off to avoid overhead
+                # (train) BNDL visualization disabled during training to avoid overhead
 
             # Catching NaN/Inf errors in the loss
             except FloatingPointError as e:
@@ -943,40 +973,132 @@ class Trainer:
         """
         Run the forward / backward
         """
-
         # it's important to set grads to None, especially with Adam since 0
         # grads will also update a model even if the step doesn't produce
         # gradients
         self.optim.zero_grad(set_to_none=True)
+
+        ab_conf = getattr(self.train_strategy, "alternating_backward", AlternatingBackwardConf())
+
+        def _get_component(loss_map: Dict[str, torch.Tensor], suffix: str) -> torch.Tensor:
+            for k, v in loss_map.items():
+                if k.endswith("_" + suffix):
+                    return v
+            return torch.tensor(0.0, device=self.device)
+
+        if not ab_conf.enabled:
+            with torch.cuda.amp.autocast(
+                enabled=self.optim_conf.amp.enabled,
+                dtype=get_amp_type(self.optim_conf.amp.amp_dtype),
+            ):
+                loss_dict, batch_size, extra_losses = self._step(
+                    batch,
+                    self.model,
+                    phase,
+                )
+
+            assert len(loss_dict) == 1
+            loss_key, loss = loss_dict.popitem()
+
+            if not math.isfinite(loss.item()):
+                error_msg = f"Loss is {loss.item()}, attempting to stop training"
+                logging.error(error_msg)
+                if raise_on_error:
+                    raise FloatingPointError(error_msg)
+                else:
+                    return
+
+            self.scaler.scale(loss).backward()
+            loss_mts[loss_key].update(loss.item(), batch_size)
+            for extra_loss_key, extra_loss in extra_losses.items():
+                if extra_loss_key not in extra_loss_mts:
+                    extra_loss_mts[extra_loss_key] = AverageMeter(
+                        extra_loss_key, self.device, ":.2e"
+                    )
+                extra_loss_mts[extra_loss_key].update(extra_loss.item(), batch_size)
+            return
+
+        # Alternating two-phase backward within a single optimizer step
+        ddp_no_sync = (
+            ab_conf.ddp_no_sync and isinstance(self.model, torch.nn.parallel.DistributedDataParallel)
+        )
+        ddp_ctx = self.model.no_sync() if ddp_no_sync else nullcontext()
+
+        # Phase 1: Main
+        unwrap_ddp_if_wrapped(self.model).__setattr__("_aue_phase", "main")
+        with ddp_ctx:
+            with torch.cuda.amp.autocast(
+                enabled=self.optim_conf.amp.enabled,
+                dtype=get_amp_type(self.optim_conf.amp.amp_dtype),
+            ):
+                loss_dict_main, batch_size_main, extra_losses_main = self._step(
+                    batch,
+                    self.model,
+                    phase,
+                )
+
+            assert len(loss_dict_main) == 1
+            loss_key, _ = loss_dict_main.popitem()
+
+            sam_core = _get_component(extra_losses_main, "sam_core_loss")
+            bndl_core = _get_component(extra_losses_main, "bndl_core_loss")
+            ur_core = _get_component(extra_losses_main, "ur_ern_core_loss")
+            aue_core_main = _get_component(extra_losses_main, "aue_core_loss")
+            coef = 0.5 if ab_conf.symmetric_average else 1.0
+            loss_main_adjusted = sam_core + bndl_core + ur_core + coef * aue_core_main
+
+            if not math.isfinite(loss_main_adjusted.item()):
+                error_msg = f"Adjusted main loss is {loss_main_adjusted.item()}, attempting to stop training"
+                logging.error(error_msg)
+                if raise_on_error:
+                    raise FloatingPointError(error_msg)
+                else:
+                    return
+
+            self.scaler.scale(loss_main_adjusted).backward()
+            for extra_loss_key, extra_loss in extra_losses_main.items():
+                if extra_loss_key not in extra_loss_mts:
+                    extra_loss_mts[extra_loss_key] = AverageMeter(
+                        extra_loss_key, self.device, ":.2e"
+                    )
+                extra_loss_mts[extra_loss_key].update(extra_loss.item(), batch_size_main)
+
+        # Phase 2: Adv
+        unwrap_ddp_if_wrapped(self.model).__setattr__("_aue_phase", "adv")
         with torch.cuda.amp.autocast(
             enabled=self.optim_conf.amp.enabled,
             dtype=get_amp_type(self.optim_conf.amp.amp_dtype),
         ):
-            loss_dict, batch_size, extra_losses = self._step(
+            loss_dict_adv, batch_size_adv, extra_losses_adv = self._step(
                 batch,
                 self.model,
                 phase,
             )
 
-        assert len(loss_dict) == 1
-        loss_key, loss = loss_dict.popitem()
+        aue_core_adv = _get_component(extra_losses_adv, "aue_core_loss")
+        coef = 0.5 if ab_conf.symmetric_average else 1.0
+        loss_adv_adjusted = coef * aue_core_adv
 
-        if not math.isfinite(loss.item()):
-            error_msg = f"Loss is {loss.item()}, attempting to stop training"
+        if not math.isfinite(loss_adv_adjusted.item()):
+            error_msg = f"Adjusted adv loss is {loss_adv_adjusted.item()}, attempting to stop training"
             logging.error(error_msg)
             if raise_on_error:
                 raise FloatingPointError(error_msg)
             else:
                 return
 
-        self.scaler.scale(loss).backward()
-        loss_mts[loss_key].update(loss.item(), batch_size)
-        for extra_loss_key, extra_loss in extra_losses.items():
+        self.scaler.scale(loss_adv_adjusted).backward()
+        for extra_loss_key, extra_loss in extra_losses_adv.items():
             if extra_loss_key not in extra_loss_mts:
                 extra_loss_mts[extra_loss_key] = AverageMeter(
                     extra_loss_key, self.device, ":.2e"
                 )
-            extra_loss_mts[extra_loss_key].update(extra_loss.item(), batch_size)
+            extra_loss_mts[extra_loss_key].update(extra_loss.item(), batch_size_adv)
+
+        total_loss = (loss_main_adjusted + loss_adv_adjusted).detach()
+        loss_mts[loss_key].update(total_loss.item(), batch_size_main)
+
+        unwrap_ddp_if_wrapped(self.model).__setattr__("_aue_phase", None)
 
     def _log_meters_and_save_best_ckpts(self, phases: List[str]):
         logging.info("Synchronizing meters")
@@ -1111,19 +1233,40 @@ class Trainer:
         )
 
         logging.info("Finished setting up components: Model, loss, optim, meters etc.")
-
-        # 获取像素级统计配置参数
+    
+    def _setup_evaluators(self):
+        """Setup separate evaluators for training and validation phases"""
+        # Get configuration
         foreground_dilation = getattr(self.logging_conf, 'correlation_foreground_dilation', 10)
         per_pixel = getattr(self.logging_conf, 'correlation_per_pixel', True)
-
-        self.dataset_evaluator = DistributedDatasetEvaluator(
-            save_dir=os.path.join(self.logging_conf.log_dir, "dataset_evaluation"),
+        
+        # Create evaluators for train and val phases
+        self.val_evaluator = DistributedDatasetEvaluator(
+            save_dir=os.path.join(self.logging_conf.log_dir, "val_pavpu_evaluation"),
             distributed=True,
             rank=dist.get_rank(),
             world_size=dist.get_world_size(),
             foreground_dilation=foreground_dilation,
-            per_pixel_statistics=per_pixel
+            per_pixel_statistics=per_pixel,
         )
+        
+        # Train evaluator can be initialized similarly if needed
+        # For now, we only use val_evaluator since PAvPU analysis is mainly done during validation
+        logging.info("Initialized PAvPU evaluators for training")
+    
+    def _add_to_evaluator(self, bndl_outputs, targets, evaluator):
+        """Add BNDL outputs to evaluator for PAvPU analysis"""
+        try:
+            uncertainty = bndl_outputs.get('pixel_uncertainty')
+            pred_logits = bndl_outputs.get('mean_pixel_logits')
+            if uncertainty is not None and pred_logits is not None and targets is not None:
+                evaluator.add_batch_data(
+                    uncertainty=uncertainty,
+                    pred_logits=pred_logits,
+                    gt_masks=targets
+                )
+        except Exception as e:
+            logging.warning(f"Failed to add data to evaluator: {e}")
 
     def _construct_optimizers(self):
         self.optim = construct_optimizer(
@@ -1142,7 +1285,7 @@ class Trainer:
         return core_loss
     
     def _log_bndl_statistics(self, bndl_outputs, step, phase):
-        """Log BNDL statistics including pixel-level uncertainty and PAvsPU"""
+        """Log BNDL statistics including pixel-level uncertainty"""
         if bndl_outputs is None:
             return
             
@@ -1158,15 +1301,6 @@ class Trainer:
             if 'pixel_uncertainty' in bndl_outputs and bndl_outputs['pixel_uncertainty'] is not None:
                 uncertainty_mean = bndl_outputs['pixel_uncertainty'].mean().detach()
                 self.logger.log(f"Stats/{phase}_pixel_uncertainty", uncertainty_mean, step)
-            
-            # Log PAvsPU scores if available
-            if 'pixel_pavpu' in bndl_outputs and bndl_outputs['pixel_pavpu'] is not None:
-                pavpu_scores = bndl_outputs['pixel_pavpu']
-                thresholds = bndl_outputs.get('pavpu_thresholds', [0.01, 0.05, 0.1])
-                for i, threshold in enumerate(thresholds):
-                    if i < len(pavpu_scores):
-                        score_val = pavpu_scores[i].item() if hasattr(pavpu_scores[i], 'item') else pavpu_scores[i]
-                        self.logger.log(f"Stats/{phase}_pavpu_{threshold}", score_val, step)
         
         # Global w statistics (original BNDL)
         if ('wei_lambda_w' in bndl_outputs and 
@@ -1205,7 +1339,6 @@ class Trainer:
             logging.warning(f"Failed to extract pixel_bndl model: {e}")
             return None
 
-
     def _extract_bndl_outputs(self, outputs):
         """提取BNDL输出（从统一的 aux_outputs）"""
         # Normalize outputs to an iterable of per-frame dicts
@@ -1225,8 +1358,8 @@ class Trainer:
                             return bndl_outputs, i, frame_idx
         return None, None, None
 
-    def _calculate_pavpu_for_bndl(self, bndl_outputs, batch, targets):
-        """Calculate PAvPU metric for BNDL outputs during validation"""
+    def _calculate_uncertainty_for_bndl(self, bndl_outputs, batch, targets):
+        """Calculate uncertainty for BNDL outputs during validation"""
         # Use no_grad to avoid gradient accumulation during uncertainty sampling
         with torch.no_grad():
             # Clear cache before uncertainty calculation to free up memory
@@ -1314,52 +1447,30 @@ class Trainer:
                 )
                 entropy_norm = torch.clamp(entropy_map / math.log(2.0), 0.0, 1.0)
                 uncertainty_data['entropy'] = entropy_norm
-            # Also get mean logits for downstream use
-            _, mean_pixel_logits = pixel_uncertain_sampling(
-                pixel_bndl_model,
-                pixel_feat,
-                external_pre_out_w=hyper_in,
-                sample_num=1,
-            )
             
-            # Prepare ground truth masks for PAvPU calculation
-            pixel_targets = self._prepare_targets_for_pavpu(targets, bndl_outputs)
+            # Get mean logits from sampling if not already computed
+            if mean_pixel_logits is None:
+                _, mean_pixel_logits = pixel_uncertain_sampling(
+                    pixel_bndl_model,
+                    pixel_feat,
+                    external_pre_out_w=hyper_in,
+                    sample_num=1,
+                )
+            elif 'masks_bndl_raw' not in bndl_outputs:
+                # Use sampling logits as fallback if masks_bndl_raw not available
+                mean_pixel_logits = bndl_outputs.get('mean_pixel_logits', mean_pixel_logits)
             
-            # Calculate PAvPU scores
-            pixel_predictions = bndl_outputs.get('masks_bndl_raw', mean_pixel_logits)
-
-            if pixel_predictions.shape != pixel_targets.shape:
-                if (pixel_predictions.shape[1:3] != pixel_targets.shape[1:3]):
-                    pixel_targets = F.interpolate(
-                        pixel_targets.permute(0, 3, 1, 2),
-                        size=pixel_predictions.shape[1:3],
-                        mode='bilinear',
-                        align_corners=False
-                    ).permute(0, 2, 3, 1)
-                    logging.info("Aligned spatial dimensions for PAvPU calculation")
-            
-            # Select primary uncertainty metric for PAvPU calculation (prefer entropy)
+            # Select primary uncertainty metric (prefer entropy)
             if entropy_norm is not None:
                 chosen_uncertainty = entropy_norm
-                thresholds = [0.10, 0.20, 0.30, 0.40, 0.60, 0.80]
             elif nll_norm is not None:
                 chosen_uncertainty = nll_norm
-                thresholds = [0.10, 0.20, 0.30, 0.40, 0.60, 0.80]
             else:
                 chosen_uncertainty = pixel_uncertainty_p
-                thresholds = [0.005, 0.010, 0.020, 0.050, 0.100, 0.200, 0.300]
 
-            pavpu_scores = pixel_pavpu_calculation(
-                chosen_uncertainty,
-                pixel_predictions,
-                pixel_targets,
-                thresholds=thresholds,
-            )
-            
-            # Add PAvPU results to BNDL outputs
+            # Store uncertainty and logits for evaluator
+            # Accuracy will be calculated by DistributedDatasetEvaluator for consistency
             bndl_outputs['pixel_uncertainty'] = chosen_uncertainty.detach()
-            bndl_outputs['pixel_pavpu'] = pavpu_scores
-            bndl_outputs['pavpu_thresholds'] = thresholds
             bndl_outputs['mean_pixel_logits'] = mean_pixel_logits.detach()
             
             # Add uncertainty-specific data
@@ -1381,52 +1492,6 @@ class Trainer:
             torch.cuda.empty_cache()
             
             return bndl_outputs
- 
-    def _prepare_targets_for_pavpu(self, targets, bndl_outputs):
-        """Prepare ground truth targets in the correct format for PAvPU calculation"""
-        try:
-            if targets is None:
-                return None
-            
-            # Extract target tensor
-            if isinstance(targets, torch.Tensor):
-                target_tensor = targets
-            elif isinstance(targets, list | tuple) and len(targets) > 0:
-                target_tensor = targets[0]
-            elif hasattr(targets, 'masks'):
-                target_tensor = targets.masks
-            else:
-                logging.warning(f"Unknown target format: {type(targets)}")
-                return None
-            
-            # Handle the new format: [B, H, W] -> [B, H, W, 1]
-            # This is for single-class segmentation where targets are [batch_size, height, width]
-            if len(target_tensor.shape) == 3:
-                # Add channel dimension for single class: [B, H, W] -> [B, H, W, 1]
-                target_tensor = target_tensor.unsqueeze(-1)
-            elif len(target_tensor.shape) == 4:
-                # Handle common format conversions
-                if target_tensor.shape[0] < target_tensor.shape[1] and target_tensor.shape[2] == target_tensor.shape[3]:
-                    target_tensor = target_tensor.permute(1, 2, 3, 0)  # [K, B, H, W] -> [B, H, W, K]
-                elif target_tensor.shape[1] > target_tensor.shape[0] and target_tensor.shape[1] > target_tensor.shape[2]:
-                    target_tensor = target_tensor.permute(0, 2, 3, 1)  # [B, K, H, W] -> [B, H, W, K]
-            elif len(target_tensor.shape) == 5:
-                target_tensor = target_tensor[:, 0, :, :, :].permute(0, 2, 3, 1)  # [B, T, K, H, W] -> [B, H, W, K]
-            else:
-                logging.warning(f"Unexpected target shape: {target_tensor.shape}")
-                return None
-            
-            # Clean and validate tensor
-            target_tensor = torch.nan_to_num(target_tensor, nan=0.0)
-            target_tensor = torch.clamp(target_tensor, 0.0, 1.0)
-            
-            target_tensor = target_tensor.to(bndl_outputs['masks_bndl_raw'].device)
-            
-            return target_tensor.detach()
-            
-        except Exception as e:
-            logging.warning(f"Failed to prepare targets for PAvPU: {e}")
-            return None
 
     def _has_global_params(self, bndl_outputs):
         """检查是否有全局权重参数"""
@@ -1599,11 +1664,12 @@ class Trainer:
             else:
                 bndl_viz.plot_uncertainty_visualization(axes[3, :], bndl_outputs, step_index)
 
-    def _visualize_adco_adversarials(self, phase: str, data_iter: int):
-        """Visualization for AdCo feature adversarial bank with uncertainty distribution.
+    def _visualize_aue_adversarials(self, phase: str, data_iter: int):
+        """Visualization for AUE adversarial image bank with sample images and statistics.
 
-        Saves plots under log_dir/bndl_visualizations/{phase}/adco_adversarials/:
-        - epoch_{e}_iter_{i}_adco_feature_stats.png (feature bank statistics and uncertainty)
+        Saves plots under log_dir/bndl_visualizations/{phase}/aue_adversarials/:
+        - epoch_{e}_iter_{i}_aue_images.png (actual adversarial sample images)
+        - epoch_{e}_iter_{i}_aue_stats.png (image statistics and uncertainty)
         """
         # Locate underlying model (unwrap DDP)
         model = self.model
@@ -1611,91 +1677,165 @@ class Trainer:
             model = model.module
 
         # Build output directory
-        vis_dir = os.path.join(self.logging_conf.log_dir, "bndl_visualizations", phase, "adco_adversarials")
+        vis_dir = os.path.join(self.logging_conf.log_dir, "bndl_visualizations", phase, "aue_adversarials")
         makedir(vis_dir)
 
         try:
-            # Get feature adversarial bank and uncertainty
-            adv_features = getattr(model, "adco_adversarials", None)
-            adv_uncertainty = getattr(model, "adco_adversarial_uncertainty", None)
+            # Get adversarial image bank (expected shape: [K, 3, H, W])
+            adv_images = getattr(model, "aue_adversarials", None)
+            adv_uncertainty = getattr(model, "aue_adversarial_uncertainty", None)
+            adv_prompts = getattr(model, "adv_prompts", None)  # [K, 4] bounding boxes
+            adv_gt = getattr(model, "adv_gt", None)  # [K, H, W] ground truth masks
             
-            if adv_features is None:
+            if adv_images is None:
                 return
             
-            # Convert to numpy
-            adv_feats_np = adv_features.detach().cpu().numpy()  # [K, C']
-            K, C = adv_feats_np.shape
+            # Validate image format
+            if adv_images.ndim != 4 or adv_images.shape[1] != 3:
+                logging.warning(f"Unexpected aue_adversarials shape: {adv_images.shape}, expected [K, 3, H, W]")
+                return
             
-            # Create visualization with 2 rows, 3 columns
-            fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+            K, C, H, W = adv_images.shape
+            adv_imgs_np = adv_images.detach().cpu().numpy()
             
-            # Row 1: Feature statistics
-            # 1.1: Feature norm distribution
-            feat_norms = np.linalg.norm(adv_feats_np, axis=1)
-            axes[0, 0].hist(feat_norms, bins=50, alpha=0.7, color='blue', edgecolor='black')
-            axes[0, 0].set_title('Adversarial Feature Norms')
-            axes[0, 0].set_xlabel('L2 Norm')
-            axes[0, 0].set_ylabel('Count')
-            axes[0, 0].grid(True, alpha=0.3)
+            # ==== Visualization 1: Display actual adversarial sample images ====
+            fig1, axes1 = plt.subplots(3, 4, figsize=(16, 12))
+            axes1 = axes1.flatten()
             
-            # 1.2: Feature dimension variance
-            feat_std = adv_feats_np.std(axis=0)  # Std per dimension
-            axes[0, 1].plot(feat_std, alpha=0.7, color='green')
-            axes[0, 1].set_title(f'Per-Dimension Std (C={C})')
-            axes[0, 1].set_xlabel('Feature Dimension')
-            axes[0, 1].set_ylabel('Std Dev')
-            axes[0, 1].grid(True, alpha=0.3)
+            num_display = min(12, K)
+            for i in range(num_display):
+                # 简单可视化：按初始化保持 [0,1]，否则直接裁剪
+                img = adv_imgs_np[i].transpose(1, 2, 0)
+                img = np.clip(img, 0.0, 1.0)
+                
+                axes1[i].imshow(img)
+                
+                # Add title with raw statistics (to detect changes even if visually similar)
+                raw_img = adv_imgs_np[i]  # Original [3, H, W] values
+                title = f'Adv #{i}\n'
+                title += f'μ={raw_img.mean():.3f} σ={raw_img.std():.3f}\n'
+                title += f'[{raw_img.min():.2f}, {raw_img.max():.2f}]'
+                if adv_uncertainty is not None and i < len(adv_uncertainty):
+                    unc_val = adv_uncertainty[i].item()
+                    title += f'\nU={unc_val:.3f}'
+                
+                axes1[i].set_title(title, fontsize=9)
+                
+                # Draw bounding box if available
+                if adv_prompts is not None and i < len(adv_prompts):
+                    x1, y1, x2, y2 = adv_prompts[i].cpu().numpy()
+                    # Convert normalized coords to pixel coords if needed
+                    if x2 <= 1.0:  # Normalized coordinates
+                        x1, x2 = x1 * W, x2 * W
+                        y1, y2 = y1 * H, y2 * H
+                    rect_w, rect_h = x2 - x1, y2 - y1
+                    from matplotlib.patches import Rectangle
+                    rect = Rectangle((x1, y1), rect_w, rect_h, linewidth=2, 
+                                   edgecolor='red', facecolor='none')
+                    axes1[i].add_patch(rect)
+                
+                axes1[i].axis('off')
             
-            # 1.3: Feature mean activation
-            feat_mean = adv_feats_np.mean(axis=0)
-            axes[0, 2].plot(feat_mean, alpha=0.7, color='red')
-            axes[0, 2].set_title(f'Per-Dimension Mean (C={C})')
-            axes[0, 2].set_xlabel('Feature Dimension')
-            axes[0, 2].set_ylabel('Mean Activation')
-            axes[0, 2].grid(True, alpha=0.3)
+            # Hide unused subplots
+            for i in range(num_display, 12):
+                axes1[i].axis('off')
             
-            # Row 2: Uncertainty statistics
+            plt.tight_layout()
+            save_path1 = os.path.join(vis_dir, f"epoch_{self.epoch}_iter_{data_iter}_aue_images.png")
+            plt.savefig(save_path1, dpi=150)
+            plt.close(fig1)
+            logging.info(f"AUE adversarial images saved: {save_path1}")
+            
+            # ==== Visualization 2: Statistics and uncertainty ====
+            fig2, axes2 = plt.subplots(2, 3, figsize=(18, 12))
+            
+            # 2.1: Image pixel intensity distribution
+            pixel_means = adv_imgs_np.reshape(K, -1).mean(axis=1)
+            axes2[0, 0].hist(pixel_means, bins=50, alpha=0.7, color='blue', edgecolor='black')
+            axes2[0, 0].set_title(f'Mean Pixel Intensity (K={K})')
+            axes2[0, 0].set_xlabel('Mean Intensity')
+            axes2[0, 0].set_ylabel('Count')
+            axes2[0, 0].grid(True, alpha=0.3)
+            
+            # 2.2: Image pixel standard deviation
+            pixel_stds = adv_imgs_np.reshape(K, -1).std(axis=1)
+            axes2[0, 1].hist(pixel_stds, bins=50, alpha=0.7, color='green', edgecolor='black')
+            axes2[0, 1].set_title(f'Pixel Std Dev (K={K})')
+            axes2[0, 1].set_xlabel('Std Dev')
+            axes2[0, 1].set_ylabel('Count')
+            axes2[0, 1].grid(True, alpha=0.3)
+            
+            # 2.3: Per-channel mean across all images
+            channel_means = adv_imgs_np.mean(axis=(0, 2, 3))  # [3]
+            axes2[0, 2].bar(['R', 'G', 'B'], channel_means, color=['red', 'green', 'blue'], alpha=0.7)
+            axes2[0, 2].set_title('Mean per Channel')
+            axes2[0, 2].set_ylabel('Mean Intensity')
+            axes2[0, 2].grid(True, alpha=0.3, axis='y')
+            
+            # Row 2: Uncertainty statistics (if available)
             if adv_uncertainty is not None and adv_uncertainty.numel() > 0:
                 uq_np = adv_uncertainty.detach().cpu().numpy()
                 
-                # 2.1: Uncertainty distribution
-                axes[1, 0].hist(uq_np, bins=50, alpha=0.7, color='purple', edgecolor='black')
-                axes[1, 0].set_title(f'Adversarial Uncertainty Distribution (K={K})')
-                axes[1, 0].set_xlabel('Uncertainty')
-                axes[1, 0].set_ylabel('Count')
-                axes[1, 0].grid(True, alpha=0.3)
+                # 2.4: Uncertainty distribution
+                axes2[1, 0].hist(uq_np, bins=50, alpha=0.7, color='purple', edgecolor='black')
+                axes2[1, 0].set_title(f'Adversarial Uncertainty Distribution (K={K})')
+                axes2[1, 0].set_xlabel('Uncertainty')
+                axes2[1, 0].set_ylabel('Count')
+                axes2[1, 0].grid(True, alpha=0.3)
                 
-                # 2.2: Uncertainty vs feature norm
-                axes[1, 1].scatter(feat_norms, uq_np, alpha=0.5, s=10)
-                axes[1, 1].set_title('Uncertainty vs Feature Norm')
-                axes[1, 1].set_xlabel('Feature Norm')
-                axes[1, 1].set_ylabel('Uncertainty')
-                axes[1, 1].grid(True, alpha=0.3)
+                # 2.5: Uncertainty vs pixel intensity
+                axes2[1, 1].scatter(pixel_means, uq_np, alpha=0.5, s=20, c='purple')
+                axes2[1, 1].set_title('Uncertainty vs Mean Pixel Intensity')
+                axes2[1, 1].set_xlabel('Mean Pixel Intensity')
+                axes2[1, 1].set_ylabel('Uncertainty')
+                axes2[1, 1].grid(True, alpha=0.3)
                 
-                # 2.3: Top-k uncertain adversarials
+                # 2.6: Top-k uncertain adversarials
                 top_k = min(20, K)
                 top_indices = np.argsort(uq_np)[-top_k:]
-                axes[1, 2].barh(range(top_k), uq_np[top_indices], alpha=0.7, color='orange')
-                axes[1, 2].set_title(f'Top-{top_k} Hardest Adversarials')
-                axes[1, 2].set_xlabel('Uncertainty')
-                axes[1, 2].set_ylabel('Adversarial Index (sorted)')
-                axes[1, 2].grid(True, alpha=0.3)
+                axes2[1, 2].barh(range(top_k), uq_np[top_indices], alpha=0.7, color='orange')
+                axes2[1, 2].set_title(f'Top-{top_k} Hardest Adversarials')
+                axes2[1, 2].set_xlabel('Uncertainty')
+                axes2[1, 2].set_ylabel('Sample Index (sorted)')
+                axes2[1, 2].grid(True, alpha=0.3)
             else:
-                for ax in axes[1, :]:
-                    ax.text(0.5, 0.5, 'Uncertainty not available', 
-                           ha='center', va='center', transform=ax.transAxes)
-                    ax.axis('off')
+                # Display ground truth masks with original images if available
+                if adv_gt is not None and adv_gt.numel() > 0:
+                    gt_np = adv_gt.detach().cpu().numpy()
+                    num_gt_display = min(3, len(gt_np))
+                    for i in range(num_gt_display):
+                        # 简单可视化背景图
+                        img = adv_imgs_np[i].transpose(1, 2, 0)
+                        img = np.clip(img, 0.0, 1.0)
+                        
+                        # Display original image
+                        axes2[1, i].imshow(img)
+                        
+                        # Overlay mask with transparency
+                        mask = gt_np[i]
+                        # Create colored mask overlay (red for mask regions)
+                        mask_overlay = np.zeros((*mask.shape, 4))
+                        mask_overlay[mask > 0.5] = [1, 0, 0, 0.4]  # Red with 40% opacity
+                        axes2[1, i].imshow(mask_overlay)
+                        
+                        axes2[1, i].set_title(f'Image + GT Mask #{i}')
+                        axes2[1, i].axis('off')
+                else:
+                    for ax in axes2[1, :]:
+                        ax.text(0.5, 0.5, 'Uncertainty not available', 
+                               ha='center', va='center', transform=ax.transAxes)
+                        ax.axis('off')
             
             plt.tight_layout()
-            save_path = os.path.join(
-                vis_dir,
-                f"epoch_{self.epoch}_iter_{data_iter}_adco_feature_stats.png",
-            )
-            plt.savefig(save_path, dpi=150)
-            plt.close()
+            save_path2 = os.path.join(vis_dir, f"epoch_{self.epoch}_iter_{data_iter}_aue_stats.png")
+            plt.savefig(save_path2, dpi=150)
+            plt.close(fig2)
+            logging.info(f"AUE adversarial statistics saved: {save_path2}")
             
         except Exception as e:
-            logging.warning(f"AdCo feature bank visualization failed: {e}")
+            logging.warning(f"AUE adversarial visualization failed: {e}")
+            import traceback
+            logging.warning(traceback.format_exc())
 
 
 def print_model_summary(model: torch.nn.Module, log_dir: str = ""):

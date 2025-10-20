@@ -3,7 +3,6 @@
 # Based on "Uncertainty Regularized Evidential Regression" (AAAI 2024)
 
 import argparse
-import shutil
 from pathlib import Path
 from typing import Any, Optional
 import os
@@ -36,66 +35,18 @@ from training.utils.dataset_evaluator import DistributedDatasetEvaluator
 from prompt_generation import generate_click_prompts
 from prompt_loader import load_reused_prompts, apply_reused_prompts
 
+# ----------  Shared utilities (NEW) ----------
+from zero_shot_utils import (
+    load_first_frame_mask,
+    threshold_mask_logits,
+    select_top_objects_by_area,
+    cleanup_gpu_memory,
+)
+from checkpoint_manager import CheckpointManager
+from evaluation_pipeline import run_benchmark_evaluation
+
 # Add path for visualization utils
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "training", "utils"))
-
-
-def create_ur_ern_ua_ratio_visualization(
-    out_logits, uncertainty_map, original_img, vid, frame_name, vis_dir
-):
-    """Create U/A ratio visualization for UR-ERN"""
-    from visualization_utils import VisualizationUtils
-    from bndl_visualizer import BNDLVisualizer
-    
-    viz_utils = VisualizationUtils()
-    bndl_viz = BNDLVisualizer()
-    
-    # Prepare data in format expected by visualizer
-    ur_ern_outputs = {
-        "pixel_uncertainty": uncertainty_map,
-        "mean_pixel_logits": out_logits,
-    }
-    
-    # Create figure with U/A ratio visualization
-    fig, axes = viz_utils.create_figure_layout(1, 3, (18, 6))
-    bndl_viz.plot_uncertainty_accuracy_ratio_visualization(
-        axes[0, :], ur_ern_outputs, original_img, step_index=0, ratio_type="U/A"
-    )
-    
-    # Save visualization
-    save_path = vis_dir / vid / f"{frame_name}_ur_ern_ua_ratio.png"
-    save_path.parent.mkdir(parents=True, exist_ok=True)
-    viz_utils.save_and_close_figure(fig, str(save_path), dpi=150)
-
-
-def _load_first_frame_mask(ann_dir: Path, vid: str, frame_names: list[str]) -> Optional[np.ndarray]:
-    first_mask_path = ann_dir / vid / f"{frame_names[0]}.png"
-    if not first_mask_path.exists():
-        print(f"Warning: First frame annotation not found: {first_mask_path}")
-        return None
-    return np.array(Image.open(first_mask_path))
-
-
-def _get_video_subset(jpeg_dir: Path, limit: Optional[int]) -> Optional[list[str]]:
-    if limit is None or not jpeg_dir.exists():
-        return None
-    all_videos = sorted([d.name for d in jpeg_dir.iterdir() if d.is_dir()])
-    return all_videos[: limit]
-
-
-def _threshold_bool(mask_logits: torch.Tensor, score_thresh: float) -> np.ndarray:
-    if mask_logits.ndim == 3:
-        mask_logits = mask_logits.squeeze(0)
-    return (mask_logits > score_thresh).detach().cpu().numpy().astype(bool)
-
-
-def _select_top_objects_by_area(mask_np: np.ndarray, max_objects: int) -> list[int]:
-    all_ids = [oid for oid in np.unique(mask_np) if oid > 0]
-    if (max_objects is None) or (len(all_ids) <= max_objects):
-        return all_ids
-    areas = {oid: int((mask_np == oid).sum()) for oid in all_ids}
-    sorted_objs = sorted(areas.items(), key=lambda x: x[1], reverse=True)
-    return [oid for oid, _ in sorted_objs[:max_objects]]
 
 
 def extract_ur_ern_outputs(outputs):
@@ -292,12 +243,19 @@ def inference_with_ur_ern(
         eval_dir.mkdir(parents=True, exist_ok=True)
         dataset_eval = DistributedDatasetEvaluator(save_dir=str(eval_dir), distributed=False, rank=0, world_size=1)
     
-    # Incremental save configuration to prevent OOM
-    checkpoint_interval = 2  # Save every 2 videos (reduced from 50 for aggressive memory management)
-    checkpoint_files = []  # Track checkpoint files
+    # Incremental save configuration to prevent OOM (using new CheckpointManager)
+    checkpoint_mgr = CheckpointManager(
+        output_dir=out_dir.parent,
+        dataset_name=dataset_name if dataset_name else "ur_ern",
+        checkpoint_type="eval",
+        interval=10,  # Increased from 2 to 10 for better performance
+    ) if collect_statistics else None
 
     for v_idx, vid in enumerate(video_names, 1):
-        print(f"[{v_idx:03}/{len(video_names)}] {vid}")
+        print(f"\n{'=' * 60}")
+        print(f"📹 Processing video [{v_idx:03}/{len(video_names)}]: {vid}")
+        print(f"   Progress: {v_idx}/{len(video_names)} ({100.0 * v_idx / len(video_names):.1f}%)")
+        print(f"{'=' * 60}")
         video_dir = jpeg_dir / vid
         frame_names = sorted(
             [p.stem for p in video_dir.iterdir() if p.suffix.lower() in [".jpg", ".jpeg"]],
@@ -309,10 +267,10 @@ def inference_with_ur_ern(
         H, W = state["video_height"], state["video_width"]
 
         # Discover object ids from first frame GT
-        first_mask_np = _load_first_frame_mask(ann_dir, vid, frame_names)
+        first_mask_np = load_first_frame_mask(ann_dir, vid, frame_names)
         if first_mask_np is None:
             continue
-        obj_ids = _select_top_objects_by_area(first_mask_np, max_objects if max_objects else 10**9)
+        obj_ids = select_top_objects_by_area(first_mask_np, max_objects if max_objects else 10**9)
         if len(obj_ids) == 0:
             print(f"Warning: No objects found in first frame of video {vid}")
             continue
@@ -383,7 +341,7 @@ def inference_with_ur_ern(
                     mask_logits = F.interpolate(
                         mask_logits.unsqueeze(0).unsqueeze(0), size=(H, W), mode="bilinear", align_corners=False
                     )[0, 0]
-                seg[oid] = _threshold_bool(mask_logits, score_thresh)
+                seg[oid] = threshold_mask_logits(mask_logits, score_thresh)
             
             # Clear GPU memory after processing frame with many objects
             if torch.cuda.is_available() and len(out_obj_ids) > 10:
@@ -447,14 +405,20 @@ def inference_with_ur_ern(
                     if img_path.exists():
                         img = Image.open(img_path).convert("RGB")
                         img_np = np.array(img).astype(np.float32) / 255.0
-                        create_ur_ern_ua_ratio_visualization(
-                            logits_hwk,
-                            u_agg,
-                            img_np,
-                            vid,
-                            frame_names[f_idx],
-                            out_dir.parent / "ur_ern_visualizations",
-                        )
+                        # Use unified UA visualization
+                        try:
+                            from training.utils.visualization_utils import VisualizationUtils
+                            VisualizationUtils.create_ua_ratio_visualization(
+                                logits_hwk,
+                                u_agg,
+                                img_np,
+                                vid,
+                                frame_names[f_idx],
+                                out_dir.parent / "ur_ern_visualizations",
+                                method_name="UR-ERN",
+                            )
+                        except ImportError as e:
+                            print(f"Warning: Could not create UA visualization: {e}")
 
             video_segments[f_idx] = seg
 
@@ -473,54 +437,38 @@ def inference_with_ur_ern(
             )
         
         # Critical: Reset predictor state to free memory for this video
-        predictor.reset_state(state)
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        cleanup_gpu_memory(predictor, state)
+        print(f"✓ Video {vid} completed ({v_idx}/{len(video_names)})")
         
         # Incremental checkpoint: save evaluator data periodically to prevent OOM
-        if collect_statistics and dataset_eval is not None and v_idx % checkpoint_interval == 0:
-            import pickle
-            import gc
-            checkpoint_file = out_dir.parent / f".ur_ern_checkpoint_{dataset_name}_{v_idx:04d}.pkl"
-            # Save evaluator's accumulated data
+        if checkpoint_mgr and dataset_eval is not None and checkpoint_mgr.should_checkpoint(v_idx):
             checkpoint_data = {
                 'pixel_uncertainties': dataset_eval.pixel_uncertainties.copy() if hasattr(dataset_eval, 'pixel_uncertainties') else [],
                 'pixel_ious': dataset_eval.pixel_ious.copy() if hasattr(dataset_eval, 'pixel_ious') else [],
                 'pixel_dices': dataset_eval.pixel_dices.copy() if hasattr(dataset_eval, 'pixel_dices') else [],
                 'pixel_accuracies': dataset_eval.pixel_accuracies.copy() if hasattr(dataset_eval, 'pixel_accuracies') else [],
             }
-            with open(checkpoint_file, 'wb') as f:
-                pickle.dump(checkpoint_data, f)
-            checkpoint_files.append(checkpoint_file)
+            checkpoint_file = checkpoint_mgr.save_checkpoint(checkpoint_data, v_idx)
             print(f"💾 UR-ERN: Saved checkpoint ({v_idx}/{len(video_names)} videos) to {checkpoint_file.name}")
             
             # Clear evaluator data and recreate
             del dataset_eval
             dataset_eval = DistributedDatasetEvaluator(save_dir=str(eval_dir), distributed=False, rank=0, world_size=1)
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            CheckpointManager.force_memory_cleanup()
 
     # Merge checkpoint files back into evaluator
-    if collect_statistics and checkpoint_files:
-        import pickle
-        print(f"\n🔄 UR-ERN: Merging {len(checkpoint_files)} checkpoint files...")
-        for checkpoint_file in checkpoint_files:
-            try:
-                with open(checkpoint_file, 'rb') as f:
-                    checkpoint_data = pickle.load(f)
-                    # Merge data back into current evaluator
-                    if dataset_eval is not None:
-                        if hasattr(dataset_eval, 'pixel_uncertainties'):
-                            dataset_eval.pixel_uncertainties.extend(checkpoint_data.get('pixel_uncertainties', []))
-                            dataset_eval.pixel_ious.extend(checkpoint_data.get('pixel_ious', []))
-                            dataset_eval.pixel_dices.extend(checkpoint_data.get('pixel_dices', []))
-                            dataset_eval.pixel_accuracies.extend(checkpoint_data.get('pixel_accuracies', []))
-                # Clean up checkpoint file
-                checkpoint_file.unlink()
-            except Exception as e:
-                print(f"Warning: Failed to merge UR-ERN checkpoint {checkpoint_file}: {e}")
-        print(f"✓ UR-ERN: Merged all checkpoints")
+    if checkpoint_mgr and dataset_eval is not None:
+        merged_data = checkpoint_mgr.merge_checkpoints()
+        # Restore data to evaluator
+        if merged_data:
+            if 'pixel_uncertainties' in merged_data:
+                dataset_eval.pixel_uncertainties.extend(merged_data['pixel_uncertainties'])
+            if 'pixel_ious' in merged_data:
+                dataset_eval.pixel_ious.extend(merged_data['pixel_ious'])
+            if 'pixel_dices' in merged_data:
+                dataset_eval.pixel_dices.extend(merged_data['pixel_dices'])
+            if 'pixel_accuracies' in merged_data:
+                dataset_eval.pixel_accuracies.extend(merged_data['pixel_accuracies'])
     
     # Finalize dataset correlation visualization/results
     if dataset_eval is not None and len(dataset_eval) > 0:
@@ -672,84 +620,29 @@ def run_single_dataset_with_ur_ern(
     )
     t_infer = time.time() - t0
 
-    # Prepare eval roots (match baseline behavior)
-    if first_frame_only:
-        base_videos = video_subset if video_subset is not None else [d.name for d in ann_dir.iterdir() if d.is_dir()]
-        base_videos = sorted(base_videos)
-        gt_tmp = output_path / f"{dataset_name.lower()}_tmp_gt_first"
-        pred_tmp = output_path / f"{dataset_name.lower()}_tmp_pred_first"
-        if gt_tmp.exists():
-            shutil.rmtree(gt_tmp)
-        if pred_tmp.exists():
-            shutil.rmtree(pred_tmp)
-        for v in base_videos:
-            v_gt_dir = ann_dir / v
-            v_pred_dir = out_dir / v
-            if not v_gt_dir.exists() or not v_pred_dir.exists():
-                continue
-            gt_pngs = sorted([p for p in v_gt_dir.iterdir() if p.suffix.lower() == ".png"])
-            if not gt_pngs:
-                continue
-            first_png = gt_pngs[0].name
-            if not (v_pred_dir / first_png).exists():
-                continue
-            (gt_tmp / v).mkdir(parents=True, exist_ok=True)
-            (pred_tmp / v).mkdir(parents=True, exist_ok=True)
-            shutil.copy2(v_gt_dir / first_png, gt_tmp / v / first_png)
-            shutil.copy2(v_pred_dir / first_png, pred_tmp / v / first_png)
-        gt_root_eval, pred_root_eval = gt_tmp, pred_tmp
-    else:
-        if video_subset is not None:
-            gt_tmp = output_path / f"{dataset_name.lower()}_tmp_gt"
-            pred_tmp = output_path / f"{dataset_name.lower()}_tmp_pred"
-            if gt_tmp.exists():
-                shutil.rmtree(gt_tmp)
-            if pred_tmp.exists():
-                shutil.rmtree(pred_tmp)
-            gt_tmp.mkdir(parents=True, exist_ok=True)
-            pred_tmp.mkdir(parents=True, exist_ok=True)
-            for v in video_subset:
-                if (ann_dir / v).exists() and (out_dir / v).exists():
-                    shutil.copytree(ann_dir / v, gt_tmp / v, symlinks=True)
-                    shutil.copytree(out_dir / v, pred_tmp / v, symlinks=True)
-            gt_root_eval, pred_root_eval = gt_tmp, pred_tmp
-        else:
-            gt_root_eval, pred_root_eval = ann_dir, out_dir
-
-    # Evaluate via SAV benchmark to keep metrics identical
-    from sav_dataset.utils.sav_benchmark import benchmark
-
+    # Use unified evaluation pipeline (with symlinks for better performance)
     t1 = time.time()
-    J_F, global_J, global_F, _ = benchmark(
-        gt_roots=[str(gt_root_eval)],
-        mask_roots=[str(pred_root_eval)],
-        strict=False,
-        num_processes=num_workers,
-        skip_first_and_last=config["skip_first_and_last"],
-        verbose=True,
-    )
-    if len(J_F) == 0 or len(global_J) == 0 or len(global_F) == 0:
-        print(f"Warning: Empty evaluation results for {dataset_name}")
+    try:
+        j_f_val, j_val, f_val = run_benchmark_evaluation(
+            gt_dir=ann_dir,
+            pred_dir=out_dir,
+            dataset_config=config,
+            video_subset=video_subset,
+            first_frame_only=first_frame_only,
+            num_workers=num_workers,
+            output_path=output_path,
+            use_symlinks=True,  # Use symlinks for 10-100x speed improvement
+            dataset_name=dataset_name,  # Pass dataset name for proper temp directory naming
+        )
+    except Exception as e:
+        print(f"Error during evaluation of {dataset_name}: {e}")
+        import traceback
+        traceback.print_exc()
         return 0.0, 0.0, 0.0, None
-    j_f_val = float(J_F[0]) if not np.isnan(J_F[0]) else 0.0
-    j_val = float(global_J[0]) if not np.isnan(global_J[0]) else 0.0
-    f_val = float(global_F[0]) if not np.isnan(global_F[0]) else 0.0
     t_eval = time.time() - t1
 
     print(f"Inference time (UR-ERN): {t_infer:.2f}s")
     print(f"Evaluation time: {t_eval:.2f}s")
-
-    # Cleanup temporary directories
-    if first_frame_only:
-        gt_tmp = output_path / f"{dataset_name.lower()}_tmp_gt_first"
-        pred_tmp = output_path / f"{dataset_name.lower()}_tmp_pred_first"
-    else:
-        gt_tmp = output_path / f"{dataset_name.lower()}_tmp_gt"
-        pred_tmp = output_path / f"{dataset_name.lower()}_tmp_pred"
-    if gt_tmp.exists():
-        shutil.rmtree(gt_tmp)
-    if pred_tmp.exists():
-        shutil.rmtree(pred_tmp)
 
     return j_f_val, j_val, f_val, ur_ern_stats
 

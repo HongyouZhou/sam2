@@ -534,7 +534,10 @@ def inference_interactive(
 
     print(f"{click_protocol} inference on {len(video_names)} videos")
     for v_idx, vid in enumerate(video_names, 1):
-        print(f"[{v_idx:03}/{len(video_names)}] {vid}")
+        print(f"\n{'=' * 60}")
+        print(f"📹 Processing video [{v_idx:03}/{len(video_names)}]: {vid}")
+        print(f"   Progress: {v_idx}/{len(video_names)} ({100.0 * v_idx / len(video_names):.1f}%)")
+        print(f"{'=' * 60}")
         video_dir = jpeg_dir / vid
         frame_names = sorted([p.stem for p in video_dir.iterdir() if p.suffix.lower() in [".jpg", ".jpeg"]], key=lambda x: int(x))
 

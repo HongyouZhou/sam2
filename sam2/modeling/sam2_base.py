@@ -4,20 +4,22 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import random
+from contextlib import nullcontext
+
 import torch
-import torch.distributed
 import torch.nn.functional as F
 from torch.nn.init import trunc_normal_
-import random
+# from torch.utils.checkpoint import checkpoint
 
+from BNDL.BNDL_upload.ViT_Sparse.utils.bndl import (
+    pixel_uncertain_sampling,
+)
+from sam2.modeling.aue_utils import sample_adversarials_from_dataset
 from sam2.modeling.sam.mask_decoder import MaskDecoder
 from sam2.modeling.sam.prompt_encoder import PromptEncoder
 from sam2.modeling.sam.transformer import TwoWayTransformer
 from sam2.modeling.sam2_utils import get_1d_sine_pe, MLP, select_closest_cond_frames
-from BNDL.BNDL_upload.ViT_Sparse.utils.bndl import (
-    pixel_uncertain_sampling,
-    pixel_entropy_uncertainty,
-)
 
 # a large negative value as a placeholder score for missing objects
 NO_OBJ_SCORE = -1024.0
@@ -101,49 +103,23 @@ class SAM2Base(torch.nn.Module):
         use_ur_ern_for_pixels: bool = False,
         # add no obj embedding to spatial frames
         no_obj_embed_spatial: bool = False,
-        # DSU options
-        use_dsu: bool = False,
-        dsu_strength_mu: float = 0.1,
-        dsu_strength_sigma: float = 0.1,
-        dsu_prob: float = 1.0,
-        dsu_apply_high_res: bool = False,
-        dsu_stats_eps: float = 1e-6,
         # extra arguments used to construct the SAM mask decoder; if not None, it should be a dict of kwargs to be passed into `MaskDecoder` class.
         sam_mask_decoder_extra_args=None,
         compile_image_encoder: bool = False,
-        # AdCo options (optional auxiliary contrastive loss)
-        use_adco: bool = False,
-        adco_proj_dim: int = 256,
-        adco_queue_size: int = 65536,
-        adco_temperature: float = 0.2,
-        adco_loss_weight: float = 0.1,
-        # AdCo adversarial image bank resolution (for memory safety)
-        adco_adversarial_image_size: int = 128,
-        # Whether AdCo uses uncertainty for ROI weighting (can be disabled)
-        adco_use_uncertainty: bool = True,
+        # AUE options (Adversarial Uncertainty Estimation)
+        use_aue: bool = False,
+        # AUE adversarial image bank resolution (for memory safety)
+        aue_adversarial_image_size: int = 128,
+        # Number of adversarial samples in the bank
+        aue_num_adversarial_samples: int = 256,
+        # Whether AUE uses uncertainty for ROI weighting (can be disabled)
+        aue_use_uncertainty: bool = True,
         # Uncertainty-aware controls
-        adco_gate_by_uncertainty: bool = True,
-        adco_gate_floor: float = 0.2,
-        adco_tau_beta: float = 0.5,
-        adco_uncertainty_mask_threshold: float | None = None,
-        adco_scale_adversarial_by_uq: bool = True,
-        adco_curriculum_warmup_steps: int = 0,
+        aue_uncertainty_mask_threshold: float | None = None,
         # Diversity regularization for adversarial samples
-        adco_diversity_loss_weight: float = 0.0,  # Weight for diversity regularization (0 = disabled)
-        # ProCo options (prototype contrastive, optional)
-        use_proco: bool = False,
-        proco_proj_dim: int = 256,
-        proco_num_obj_prototypes: int = 128,
-        proco_num_bg_prototypes: int = 32,
-        proco_temperature: float = 0.1,
-        proco_loss_weight: float = 0.1,
-        # MoCo options (momentum contrast, optional)
-        use_moco: bool = False,
-        moco_proj_dim: int = 256,
-        moco_queue_size: int = 65536,
-        moco_momentum: float = 0.996,
-        moco_temperature: float = 0.2,
-        moco_loss_weight: float = 0.1,
+        aue_diversity_loss_weight: float = 0.0,  # Weight for diversity regularization (0 = disabled)
+        # Total Variation loss for natural adversarial samples (style generalization)
+        aue_tv_loss_weight: float = 0.01,  # Weight for Total Variation loss (0 = disabled)
         # ROI view sharing option
         share_roi_views: bool = True,
     ):
@@ -236,57 +212,19 @@ class SAM2Base(torch.nn.Module):
             self.no_obj_embed_spatial = torch.nn.Parameter(torch.zeros(1, self.mem_dim))
             trunc_normal_(self.no_obj_embed_spatial, std=0.02)
 
-        # DSU settings
-        self.use_dsu = use_dsu
-        self.dsu_strength_mu = float(dsu_strength_mu)
-        self.dsu_strength_sigma = float(dsu_strength_sigma)
-        self.dsu_prob = float(dsu_prob)
-        self.dsu_apply_high_res = bool(dsu_apply_high_res)
-        self.dsu_stats_eps = float(dsu_stats_eps)
-
         self._build_sam_heads()
         self.max_cond_frames_in_attn = max_cond_frames_in_attn
 
-        # AdCo components
-        self.use_adco = bool(use_adco)
-        self.adco_proj_dim = int(adco_proj_dim)
-        self.adco_queue_size = int(adco_queue_size)
-        self.adco_temperature = float(adco_temperature)
-        self.adco_loss_weight = float(adco_loss_weight)
-        self.adco_adversarial_image_size = int(adco_adversarial_image_size)
-        ############################################################
-        self.adco_use_uncertainty = bool(adco_use_uncertainty)
-        self.adco_gate_by_uncertainty = bool(adco_gate_by_uncertainty)
-        self.adco_gate_floor = float(adco_gate_floor)
-        self.adco_tau_beta = float(adco_tau_beta)
-        self.adco_uncertainty_mask_threshold = adco_uncertainty_mask_threshold
-        self.adco_scale_adversarial_by_uq = bool(adco_scale_adversarial_by_uq)
-        self.adco_curriculum_warmup_steps = int(adco_curriculum_warmup_steps)
-        self.adco_diversity_loss_weight = float(adco_diversity_loss_weight)
-        self._adco_step_count = 0
-        self.adco_grl_scale = 1.0
-        if self.use_adco:
-            self._build_adco_components()
-
-        # ProCo components
-        self.use_proco = bool(use_proco)
-        self.proco_proj_dim = int(proco_proj_dim)
-        self.proco_num_obj_prototypes = int(proco_num_obj_prototypes)
-        self.proco_num_bg_prototypes = int(proco_num_bg_prototypes)
-        self.proco_temperature = float(proco_temperature)
-        self.proco_loss_weight = float(proco_loss_weight)
-        if self.use_proco:
-            self._build_proco_components()
-
-        # MoCo components
-        self.use_moco = bool(use_moco)
-        self.moco_proj_dim = int(moco_proj_dim)
-        self.moco_queue_size = int(moco_queue_size)
-        self.moco_momentum = float(moco_momentum)
-        self.moco_temperature = float(moco_temperature)
-        self.moco_loss_weight = float(moco_loss_weight)
-        if self.use_moco:
-            self._build_moco_components()
+        # AUE components
+        self.use_aue = bool(use_aue)
+        self.aue_adversarial_image_size = int(aue_adversarial_image_size)
+        self.aue_num_adversarial_samples = int(aue_num_adversarial_samples)
+        self.aue_use_uncertainty = bool(aue_use_uncertainty)
+        self.aue_uncertainty_mask_threshold = aue_uncertainty_mask_threshold
+        self.aue_diversity_loss_weight = float(aue_diversity_loss_weight)
+        self.aue_tv_loss_weight = float(aue_tv_loss_weight)
+        if self.use_aue:
+            self._build_aue_components()
 
         # ROI sharing control
         self.share_roi_views = bool(share_roi_views)
@@ -304,194 +242,69 @@ class SAM2Base(torch.nn.Module):
                 dynamic=False,
             )
 
-    def _dsu_perturb(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        DSU-style feature statistic perturbation on BCHW features.
-        Active only during training and when `use_dsu=True`.
-        """
-        if not self.training or not self.use_dsu:
-            return x
-        if self.dsu_strength_mu <= 0.0 and self.dsu_strength_sigma <= 0.0:
-            return x
-
-        orig_dtype = x.dtype
-        x_f32 = x.float()
-        # Per-sample, per-channel stats
-        mu = x_f32.mean(dim=(2, 3), keepdim=True)
-        var = x_f32.var(dim=(2, 3), keepdim=True, unbiased=False)
-        std = torch.sqrt(var + self.dsu_stats_eps)
-
-        x_hat = (x_f32 - mu) / (std + 1e-12)
-
-        # Per-sample gating
-        if self.dsu_prob >= 1.0:
-            gate = 1.0
-        elif self.dsu_prob <= 0.0:
-            gate = 0.0
-        else:
-            gate = torch.bernoulli(
-                torch.full((x.size(0), 1, 1, 1), float(self.dsu_prob), device=x.device, dtype=x_f32.dtype)
-            )
-
-        # Sample noise
-        if isinstance(gate, torch.Tensor):
-            eps_mu = torch.randn_like(mu) * self.dsu_strength_mu * gate
-            eps_sigma = torch.randn_like(std) * self.dsu_strength_sigma * gate
-        else:
-            eps_mu = torch.randn_like(mu) * self.dsu_strength_mu * gate
-            eps_sigma = torch.randn_like(std) * self.dsu_strength_sigma * gate
-
-        mu_tilde = mu + eps_mu * std
-        sigma_tilde = torch.clamp(std * (1.0 + eps_sigma), min=self.dsu_stats_eps)
-
-        x_out = x_hat * sigma_tilde + mu_tilde
-        return x_out.to(orig_dtype)
-
-    def _build_adco_components(self) -> None:
-        """Build AdCo projection head and adversarial negatives."""
-        # AdCo operates on global vectors from pixel features (C' = hidden_dim // 8)
-        adco_in_dim = max(8, self.hidden_dim // 8)
-        self.adco_proj = torch.nn.Sequential(
-            torch.nn.Linear(adco_in_dim, self.adco_proj_dim, bias=True),
-            torch.nn.ReLU(inplace=True),
-            torch.nn.Linear(self.adco_proj_dim, self.adco_proj_dim, bias=False),
-        )
-        # Scheme A: Learnable adversarial image bank for AdCo (sample → encode → BNDL)
+    def _build_aue_components(self) -> None:
+        """Build adversarial image bank for AUE."""
+        # Learnable adversarial image bank for AUE (sample → encode → BNDL)
         # Store at a reduced resolution for memory safety; upsample on use.
         # Shape: [K_eff, 3, H_adv, W_adv]
-        H_adv = int(self.adco_adversarial_image_size)
-        W_adv = int(self.adco_adversarial_image_size)
-        # Budget ~128M elements to avoid OOM (float32 ~ 512MB). Clamp K accordingly.
-        max_elems = 128 * 1024 * 1024
-        per_item = 3 * H_adv * W_adv
-        K_eff = max(64, min(int(self.adco_queue_size), int(max_elems // max(per_item, 1))))
+        H_adv = int(self.aue_adversarial_image_size)
+        W_adv = int(self.aue_adversarial_image_size)
+        K_eff = int(self.aue_num_adversarial_samples)
         
-        # A2 Fix: Use ImageNet statistics for more natural adversarial sample initialization
-        # This makes adversarials closer to natural image distribution rather than pure noise
-        imagenet_mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
-        imagenet_std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
-        adv_images = torch.randn(K_eff, 3, H_adv, W_adv) * imagenet_std + imagenet_mean
-        self.adco_negatives = torch.nn.Parameter(adv_images)
+        # Save config parameters for dataset initialization
+        self.aue_K_eff = K_eff
+        self.aue_H_adv = H_adv
+        self.aue_W_adv = W_adv
+        
+        adv_images = torch.randn(K_eff, 3, H_adv, W_adv)
+        self.aue_adversarials = torch.nn.Parameter(adv_images)
         # Gradient reversal on adversarials to approximate adversarial ascent
         # Use fixed gradient reversal scale (standard GRL implementation)
-        self.adco_negatives.register_hook(lambda g: (-1.0 * g) if g is not None else g)
-
-    def _build_proco_components(self) -> None:
-        """Build ProCo projection head and prototype banks (object/background)."""
-        # Use the same pixel feature input dim heuristic as AdCo
-        proco_in_dim = max(8, self.hidden_dim // 8)
-        self.proco_proj = torch.nn.Sequential(
-            torch.nn.Linear(proco_in_dim, self.proco_proj_dim, bias=True),
-            torch.nn.ReLU(inplace=True),
-            torch.nn.Linear(self.proco_proj_dim, self.proco_proj_dim, bias=False),
+        self.aue_adversarials.register_hook(lambda g: (-1.0 * g) if g is not None else g)
+        
+        # Initialize prompts and GT as parameters
+        # adv_prompts: Learnable with gradient reversal (adversarial prompts move to hard positions)
+        # adv_gt: Fixed (ground truth should not change - it defines the task)
+        self.adv_prompts = torch.nn.Parameter(
+            torch.zeros(K_eff, 4), requires_grad=False
         )
-        # Learnable prototypes (Proxy-NCA style)
-        obj_proto = torch.randn(self.proco_num_obj_prototypes, self.proco_proj_dim) * 0.01
-        bg_proto = torch.randn(self.proco_num_bg_prototypes, self.proco_proj_dim) * 0.01
-        self.proco_obj_prototypes = torch.nn.Parameter(F.normalize(obj_proto, dim=1))
-        self.proco_bg_prototypes = torch.nn.Parameter(F.normalize(bg_proto, dim=1))
-
-    def _build_moco_components(self) -> None:
-        """Build MoCo projection heads (query and key) and the queue."""
-        in_dim = max(8, self.hidden_dim // 8)
-        # Query encoder head
-        self.moco_proj_q = torch.nn.Sequential(
-            torch.nn.Linear(in_dim, self.moco_proj_dim, bias=True),
-            torch.nn.ReLU(inplace=True),
-            torch.nn.Linear(self.moco_proj_dim, self.moco_proj_dim, bias=False),
+        # Apply gradient reversal to prompts (like adv_images)
+        # self.adv_prompts.register_hook(lambda g: (-1.0 * g) if g is not None else g)
+        
+        self.adv_gt = torch.nn.Parameter(
+            torch.zeros(K_eff, H_adv, W_adv), requires_grad=False  # ← 保持 False
         )
-        # Key encoder head (same arch), initialized as copy, not directly optimized
-        self.moco_proj_k = torch.nn.Sequential(
-            torch.nn.Linear(in_dim, self.moco_proj_dim, bias=True),
-            torch.nn.ReLU(inplace=True),
-            torch.nn.Linear(self.moco_proj_dim, self.moco_proj_dim, bias=False),
-        )
-        # Initialize key with query params
-        for p_k, p_q in zip(self.moco_proj_k.parameters(), self.moco_proj_q.parameters()):
-            p_k.data.copy_(p_q.data)
-            p_k.requires_grad = False
-        # Create the queue as a buffer (D x K)
-        self.register_buffer("moco_queue", F.normalize(torch.randn(self.moco_proj_dim, self.moco_queue_size), dim=0))
-        self.register_buffer("moco_queue_ptr", torch.zeros(1, dtype=torch.long))
 
     @torch.no_grad()
-    def _moco_momentum_update_key_encoder(self) -> None:
-        """Momentum update of the key encoder."""
-        m = self.moco_momentum
-        for p_k, p_q in zip(self.moco_proj_k.parameters(), self.moco_proj_q.parameters()):
-            p_k.data = p_k.data * m + p_q.data * (1.0 - m)
-
-    @torch.no_grad()
-    def _moco_dequeue_and_enqueue(self, keys: torch.Tensor) -> None:
-        """Enqueue keys and dequeue the oldest ones."""
-        keys = F.normalize(keys, dim=1)  # [N, D]
-        batch_size = keys.shape[0]
-        K = self.moco_queue_size
-        ptr = int(self.moco_queue_ptr.item())
-        # Transpose to (D x N) to fit queue layout (D x K)
-        keys_T = keys.t()  # [D, N]
-        end = ptr + batch_size
-        if end <= K:
-            self.moco_queue[:, ptr:end] = keys_T
-        else:
-            first = K - ptr
-            if first > 0:
-                self.moco_queue[:, ptr:] = keys_T[:, :first]
-            remain = batch_size - first
-            self.moco_queue[:, :remain] = keys_T[:, first:]
-        ptr = (ptr + batch_size) % K
-        self.moco_queue_ptr[0] = ptr
-
-    @torch.no_grad()
-    def _gather_batchwise(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Safe all_gather for variable batch sizes: pad to max B, gather, then unpad.
-
-        Input:  tensor [B, D]
-        Output: concatenated across ranks [sum_B, D]
+    def init_aue_adversarials_from_dataset(self, dataset, num_samples: int = None):
         """
-        if not (torch.distributed.is_available() and torch.distributed.is_initialized()):
-            return tensor
-        device = tensor.device
-        B_local = torch.tensor([tensor.shape[0]], device=device, dtype=torch.long)
-        sizes = [torch.zeros_like(B_local) for _ in range(torch.distributed.get_world_size())]
-        torch.distributed.all_gather(sizes, B_local)
-        sizes_int = [int(s.item()) for s in sizes]
-        max_B = max(sizes_int) if len(sizes_int) > 0 else 0
-        if max_B == 0:
-            return tensor.new_zeros((0, tensor.shape[1]))
-        D = tensor.shape[1]
-        if tensor.shape[0] < max_B:
-            pad = torch.zeros((max_B - tensor.shape[0], D), device=device, dtype=tensor.dtype)
-            tensor_pad = torch.cat([tensor, pad], dim=0)
-        else:
-            tensor_pad = tensor
-        gather_list = [torch.zeros((max_B, D), device=device, dtype=tensor.dtype) for _ in range(torch.distributed.get_world_size())]
-        torch.distributed.all_gather(gather_list, tensor_pad)
-        # Unpad and concat
-        parts = []
-        for t, sz in zip(gather_list, sizes_int):
-            if sz > 0:
-                parts.append(t[:sz, :])
-        if len(parts) == 0:
-            return tensor.new_zeros((0, D))
-        return torch.cat(parts, dim=0)
+        从训练数据集随机采样初始化 AUE 对抗样本库。
+        
+        Args:
+            dataset: 训练数据集 (TorchTrainMixedDataset 或 VOSDataset)
+            num_samples: 采样数量，默认使用 self.aue_K_eff
+        """
+        if not self.use_aue:
+            return
+        
+        K_eff = num_samples if num_samples is not None else self.aue_K_eff
+        H_adv, W_adv = self.aue_H_adv, self.aue_W_adv
+        device = self.aue_adversarials.device
+        
+        # 使用工具函数从数据集采样
+        adv_images, adv_boxes, adv_masks = sample_adversarials_from_dataset(
+            dataset, K_eff, H_adv, W_adv, device
+        )
+        
+        # 更新参数
+        # aue_adversarials: 保持梯度反转钩子
+        self.aue_adversarials.data.copy_(adv_images)
+        # adv_prompts 和 adv_gt: 作为 requires_grad=False 的参数，无梯度
+        self.adv_prompts.data.copy_(adv_boxes)
+        self.adv_gt.data.copy_(adv_masks)
 
     @torch.no_grad()
-    def _adco_random_crop(self, feat: torch.Tensor, min_scale: float = 0.6) -> torch.Tensor:
-        """Random spatial crop on [B, H, W, C] features; fallback to center if tiny."""
-        B, H, W, C = feat.shape
-        if H < 4 or W < 4:
-            return feat
-        crop_h = max(2, int(H * (min_scale + (1 - min_scale) * random.random())))
-        crop_w = max(2, int(W * (min_scale + (1 - min_scale) * random.random())))
-        if crop_h >= H and crop_w >= W:
-            return feat
-        top = 0 if H == crop_h else random.randint(0, H - crop_h)
-        left = 0 if W == crop_w else random.randint(0, W - crop_w)
-        return feat[:, top:top + crop_h, left:left + crop_w, :]
-
-    @torch.no_grad()
-    def _adco_roi_view(
+    def _aue_roi_view(
         self,
         feat: torch.Tensor,                # [B, H, W, C]
         min_scale: float = 0.6,
@@ -533,8 +346,8 @@ class SAM2Base(torch.nn.Module):
             # Base weight is (1 - uncertainty)
             w = torch.clamp(1.0 - u, 0.0, 1.0) * mask
             # Optional hard masking: keep only confident pixels (u <= t)
-            if self.adco_uncertainty_mask_threshold is not None:
-                thr = float(self.adco_uncertainty_mask_threshold)
+            if self.aue_uncertainty_mask_threshold is not None:
+                thr = float(self.aue_uncertainty_mask_threshold)
                 keep = (u <= thr).to(feat.dtype)
                 w = w * keep
             num = (feat * w).sum(dim=(1, 2))          # [B, C]
@@ -549,38 +362,25 @@ class SAM2Base(torch.nn.Module):
 
         return z, roi_weight
 
-    def compute_adco_loss(
+    def compute_aue_loss(
         self,
-        pixel_feat: torch.Tensor,                                # [B, H, W, C']
+        pixel_feat: torch.Tensor,
         pixel_uncertainty: torch.Tensor | None = None,
         pixel_gt: torch.Tensor | None = None,
         pixel_logits: torch.Tensor | None = None,
-        adversarial_sample_M: int | None = 4,
+        adversarial_sample_M: int | None = 2, 
         roi_z1: torch.Tensor | None = None,
         roi_z2: torch.Tensor | None = None,
         roi_w1: torch.Tensor | None = None,
         roi_w2: torch.Tensor | None = None,
         pixel_bndl_model=None,
-        uq_sample_num: int = 20,  # A5 Fix: Increased from 4 to 20 for more reliable t-test statistics
+        uq_sample_num: int = 4,
     ) -> torch.Tensor:
-        
-        # TODO
-        # 计算logits与uncertainty的相关性
-        
-        # 1. 损失中要最大化相关性
-        # 2. 采样neg样本
-        # 3. 从neg样本中得到不确定性以及预测
-        # 4. 最大化正/负样本的相关性 (分阶段 1. 正  2. 负 3. 正+负)
-        
-        # New AdCo implementation (independent of adco_bk):
-        # - Use BNDL t-test pixel_uncertainty p-values directly
-
-        assert pixel_feat is not None and pixel_feat.ndim == 4
         B, H, W, _ = pixel_feat.shape
         device = pixel_feat.device
         dtype = pixel_feat.dtype
 
-        # Positive samples: compute global uncertainty/confidence ratio
+        # Compute positive sample ratio
         ratio_pos = self._compute_pos_ratios(
             pixel_logits=pixel_logits,
             pixel_uncertainty=pixel_uncertainty,
@@ -590,176 +390,162 @@ class SAM2Base(torch.nn.Module):
             device=device,
             dtype=dtype,
         )
-
-        alpha_pos = 1.0
-        alpha_neg = 1.0
-
-        ratio_adversarial = torch.tensor(0.0, device=device, dtype=dtype)
-        # Adversarial samples
-        adv_images = self._adco_sample_adversarial_images(adversarial_sample_M)  # [M, 3, Himg, Wimg]
-        if adv_images is not None:
-            enc_out = self.image_encoder(adv_images)
-            feat = enc_out["backbone_fpn"][-1]  # [M, C, H, W], C=256
-            
-            # Apply upscaling to match the feature dimension expected by pixel_bndl
-            if self.use_high_res_features_in_sam:
-                dc1, ln1, act1, dc2, act2 = self.sam_mask_decoder.output_upscaling
-                adv_feat_upscaled = act2(dc2(act1(ln1(dc1(feat)))))
-            else:
-                adv_feat_upscaled = self.sam_mask_decoder.output_upscaling(feat)
-            
-            adv_feat = adv_feat_upscaled.permute(0, 2, 3, 1).contiguous()  # [M, H', W', C']
-            
-            # A3 Fix: Allow partial gradient flow to BNDL so AdCo can help it learn
-            # Conservative approach: 10% gradient + 90% detached to avoid BNDL being dominated by AdCo
-            adv_feat_for_uq = adv_feat * 0.1 + adv_feat.detach() * 0.9
-            
-            # BNDL部分：为adversarial样本生成external_pre_out_w
-            M = adv_feat.shape[0]
-            if pixel_bndl_model.enable_global_sparse:
-                adv_external_w = None
-            else:
-                # 使用linear.weight作为adversarial样本的基础权重 [K, C'] -> [M, K, C']
-                linear_weight = pixel_bndl_model.linear.weight  # [K, C']
-                adv_external_w = linear_weight.unsqueeze(0).expand(M, -1, -1).detach()
-            
-            adv_uq_pval, adv_mean_logits = pixel_uncertain_sampling(
-                pixel_bndl_model,
-                adv_feat_for_uq,  # A3 Fix: Use partial gradient feature
-                external_pre_out_w=adv_external_w,
-                sample_num=uq_sample_num,
-            )
-            # CRITICAL FIX: pixel_uncertain_sampling returns p-values, not uncertainty!
-            # Convert p-value to true uncertainty: uncertainty = 1 - p_value
-            adv_uq = 1.0 - adv_uq_pval
-            adv_conf = self._adco_compute_conf_from_logits_tensor(adv_mean_logits)
-            # Simplified: no need for mask, just compute global mean
-            eps = 1e-6
-            ratio_adversarial = (adv_uq / (adv_conf + eps)).mean()
-            
-            # Compute diversity regularization to prevent mode collapse
-            # Store adv_feat for diversity computation
-            self._adco_last_adv_feat = adv_feat.detach() if self.adco_diversity_loss_weight > 0 else None
-
-        # A1 Fix: Unified optimization direction with numerical stability
-        # Goal: minimize positive sample uncertainty, maximize adversarial sample uncertainty/confidence ratio
-        # - ratio_pos: small → positive samples have high confidence and low uncertainty ✓
-        # - 1/(ratio_adversarial+eps): small → ratio_adversarial large → adversarial samples have low confidence and high uncertainty ✓
-        # Both terms are now minimized (unified direction), preventing loss from going negative
-        alpha_adversarial = alpha_neg  # Keep same weight for backward compatibility
-        loss = alpha_pos * ratio_pos + alpha_adversarial * torch.clamp(1.0 / (ratio_adversarial + 1e-6), max=10.0)
+ 
+        adv_images, adv_gts, adv_prompts = self._aue_sample_adversarial_images(adversarial_sample_M)
+        ratio_adversarial = torch.tensor(0.0, device=device, dtype=dtype, requires_grad=True)
         
-        # Add diversity regularization to prevent mode collapse of adversarial samples
-        if self.adco_diversity_loss_weight > 0 and adv_images is not None:
-            diversity_loss = self._compute_adversarial_diversity_loss()
-            loss = loss + self.adco_diversity_loss_weight * diversity_loss
+        if adv_images is not None:
+            # Decide whether to disable gradients on adversarial branch based on trainer phase
+            # When trainer sets `_aue_phase == 'main'`, we compute the adversarial branch under no_grad
+            # to avoid building two large graphs simultaneously.
+            phase = getattr(self, "_aue_phase", None)
+            adv_grad_ctx = nullcontext() if phase == "adv" else torch.no_grad()
 
-        return loss
+            with adv_grad_ctx:
+                M = adv_images.shape[0]
+                # Forward adversarial images at stored resolution (512×512) to save memory
+                # Features will be upsampled to match SAM's expected size (64×64)
+                # Normalize to match training transforms before feeding the encoder
+                mean = torch.tensor([0.485, 0.456, 0.406], device=device, dtype=dtype).view(1, 3, 1, 1)
+                std = torch.tensor([0.229, 0.224, 0.225], device=device, dtype=dtype).view(1, 3, 1, 1)
+                adv_images_in = (adv_images.clamp(0.0, 1.0) - mean) / std
+                backbone_out = self.forward_image(adv_images_in)
+                adv_backbone_feat = backbone_out["vision_features"]  # Will be 32×32 for 512 input
+                
+                # Upsample features to SAM's expected embedding size (64×64)
+                # This is memory-efficient: only upsample compact features, not full images
+                expected_size = self.sam_image_embedding_size  # 64
+                if adv_backbone_feat.size(2) != expected_size or adv_backbone_feat.size(3) != expected_size:
+                    adv_backbone_feat = F.interpolate(
+                        adv_backbone_feat,
+                        size=(expected_size, expected_size),
+                        mode='bilinear',
+                        align_corners=False
+                    )
+                
+                # Prepare high_res_features (if enabled) - upsample FPN features if needed
+                high_res_features = None
+                if self.use_high_res_features_in_sam:
+                    fpn = backbone_out.get("backbone_fpn", None)
+                    if fpn is not None and len(fpn) >= 2:
+                        # SAM decoder expects: feat_s0 at 256×256, feat_s1 at 128×128
+                        feat_s0_target = expected_size * 4  # 256
+                        feat_s1_target = expected_size * 2  # 128
+                        
+                        # Only interpolate if sizes don't match (avoid unnecessary ops when using 1024 resolution)
+                        feat_s0 = fpn[0] if fpn[0].shape[2] == feat_s0_target else \
+                                  F.interpolate(fpn[0], size=(feat_s0_target, feat_s0_target), mode='bilinear', align_corners=False)
+                        feat_s1 = fpn[1] if fpn[1].shape[2] == feat_s1_target else \
+                                  F.interpolate(fpn[1], size=(feat_s1_target, feat_s1_target), mode='bilinear', align_corners=False)
+                        high_res_features = [feat_s0, feat_s1]
+                
+                # Scale prompts from stored resolution (512) to SAM coordinate space (1024)
+                adv_img_size = adv_images.shape[2]  # 512
+                scale_factor = self.image_size / adv_img_size  # 1024 / 512 = 2.0
+                adv_prompts_scaled = adv_prompts * scale_factor
+                
+                adv_box_coords = torch.stack([adv_prompts_scaled[:, :2], adv_prompts_scaled[:, 2:]], dim=1)
+                adv_point_inputs = {
+                    "point_coords": adv_box_coords,
+                    "point_labels": torch.tensor([[2, 3]], dtype=torch.int32, device=device).expand(M, 2),
+                }
+                
+                # Forward through SAM heads; suppress nested AUE computation to avoid recursion
+                prev_suppress = getattr(self, "_suppress_nested_aue", False)
+                self._suppress_nested_aue = True
+                try:
+                    *_, adv_aux_outputs = self._forward_sam_heads(
+                        backbone_features=adv_backbone_feat,
+                        point_inputs=adv_point_inputs,
+                        high_res_features=high_res_features,
+                        multimask_output=False,
+                        pixel_gt_for_aue=None,
+                    )
+                finally:
+                    self._suppress_nested_aue = prev_suppress
+            
+            # Extract BNDL tensors and prepare logits with gradients if available
+            adv_bndl = adv_aux_outputs.get("bndl", {})
+            adv_pixel_feat = adv_bndl.get("pixel_feat_grad", adv_bndl.get("pixel_feat"))
+            adv_external_w = None
+            if pixel_bndl_model is not None and not pixel_bndl_model.enable_global_sparse:
+                adv_hyper_in = adv_bndl.get("hyper_in")
+                adv_external_w = adv_hyper_in if adv_hyper_in is not None else pixel_bndl_model.linear.weight.unsqueeze(0).expand(M, -1, -1)
 
-    def compute_proco_loss(
-        self,
-        pixel_feat: torch.Tensor,                                # [B, H, W, C']
-        use_background: bool = True,
-        roi_z1: torch.Tensor | None = None,
-        roi_z2: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """
-        Prototype contrastive (Proxy-NCA/Proto-InfoNCE) with learnable prototypes.
-        - Query q comes from ROI-averaged pixel feature (two views averaged for stability).
-        - Positive is nearest object prototype; negatives are remaining object prototypes
-          and optional background prototypes.
-        """
-        assert self.use_proco and pixel_feat is not None and pixel_feat.ndim == 4
+            adv_logits_grad = adv_bndl.get("pixel_logits", adv_bndl.get("masks_bndl_raw", None))
+            if adv_logits_grad is None and (pixel_bndl_model is not None) and (adv_pixel_feat is not None):
+                adv_logits_grad, *_ = pixel_bndl_model(
+                    adv_pixel_feat, force_sample=False, external_pre_out_w=adv_external_w
+                )
 
-        # Two ROI views for invariance, then average for a single query per sample
-        if (roi_z1 is None) or (roi_z2 is None):
+            # Compute uncertainty via sampling (no gradients)
             with torch.no_grad():
-                z1, _ = self._adco_roi_view(pixel_feat, min_scale=0.6, boundary_ignore=2, uncert=None)
-                z2, _ = self._adco_roi_view(pixel_feat, min_scale=0.6, boundary_ignore=2, uncert=None)
-                z = 0.5 * (z1 + z2)  # [B, C']
-        else:
-            z = 0.5 * (roi_z1 + roi_z2)
-
-        # Projection + L2 normalize
-        q = F.normalize(self.proco_proj(z), dim=1)  # [B, D]
-
-        # Normalize prototype banks
-        obj_bank = F.normalize(self.proco_obj_prototypes, dim=1)  # [Ko, D]
-        if use_background and (self.proco_num_bg_prototypes > 0):
-            bg_bank = F.normalize(self.proco_bg_prototypes, dim=1)  # [Kb, D]
-        else:
-            bg_bank = None
-
-        # Similarity to object prototypes and choose nearest as positive
-        sim_obj = q @ obj_bank.t()  # [B, Ko]
-        pos_idx = torch.argmax(sim_obj, dim=1)  # [B]
-        pos_sim = sim_obj.gather(dim=1, index=pos_idx.view(-1, 1))  # [B, 1]
-
-        # Negatives: all other object prototypes + optional background prototypes
-        if obj_bank.size(0) > 1:
-            arange = torch.arange(obj_bank.size(0), device=q.device).view(1, -1)
-            mask_other = (arange != pos_idx.view(-1, 1))  # [B, Ko]
-            neg_obj = sim_obj[mask_other].view(q.size(0), -1)  # [B, Ko-1]
-        else:
-            neg_obj = torch.empty(q.size(0), 0, device=q.device, dtype=q.dtype)
-
-        if bg_bank is not None:
-            sim_bg = q @ bg_bank.t()  # [B, Kb]
-            neg_all = torch.cat([neg_obj, sim_bg], dim=1) if neg_obj.numel() > 0 else sim_bg
-        else:
-            neg_all = neg_obj
-
-        # Build logits and CE target
-        tau = float(self.proco_temperature)
-        if neg_all.numel() == 0:
-            # Edge case: only one object prototype and no background prototypes
-            logits = pos_sim / tau
-        else:
-            logits = torch.cat([pos_sim, neg_all], dim=1) / tau  # [B, 1+Kneg]
-        labels = torch.zeros(logits.size(0), dtype=torch.long, device=logits.device)
-        loss = F.cross_entropy(logits, labels)
-        return loss
-
-    def compute_moco_loss(
-        self,
-        pixel_feat: torch.Tensor,                                # [B, H, W, C']
-        roi_z1: torch.Tensor | None = None,
-        roi_z2: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """
-        MoCo-style contrastive loss with momentum key encoder and queue negatives.
-        """
-        assert self.use_moco and pixel_feat is not None and pixel_feat.ndim == 4
-
-        # Build or use shared two ROI views
-        if (roi_z1 is None) or (roi_z2 is None):
-            z1, _ = self._adco_roi_view(pixel_feat, min_scale=0.6, boundary_ignore=2, uncert=None)
-            z2, _ = self._adco_roi_view(pixel_feat, min_scale=0.6, boundary_ignore=2, uncert=None)
-        else:
-            z1 = roi_z1
-            z2 = roi_z2
-
-        # Query projection
-        q = F.normalize(self.moco_proj_q(z1), dim=1)  # [B, D]
-
-        # Key projection with momentum update
-        with torch.no_grad():
-            self._moco_momentum_update_key_encoder()
-            k = F.normalize(self.moco_proj_k(z2), dim=1)  # [B, D]
-
-        # Positives: per-sample dot
-        l_pos = (q * k).sum(dim=1, keepdim=True)  # [B, 1]
-        # Negatives: queue
-        l_neg = q @ self.moco_queue  # [B, K]
-
-        logits = torch.cat([l_pos, l_neg], dim=1) / float(self.moco_temperature)
-        labels = torch.zeros(logits.size(0), dtype=torch.long, device=logits.device)
-        loss = F.cross_entropy(logits, labels)
-
-        # Update queue with keys from all GPUs if distributed
-        with torch.no_grad():
-            keys_to_enqueue = self._gather_batchwise(k)
-            self._moco_dequeue_and_enqueue(keys_to_enqueue)
+                adv_uq_pval, adv_logits_sample = pixel_uncertain_sampling(
+                    pixel_bndl_model, adv_pixel_feat, adv_external_w, uq_sample_num
+                )
+                adv_uq = 1.0 - adv_uq_pval
+            
+            # Resize GT to match logits (logits are at feature map resolution)
+            adv_logits_for_ratio = adv_logits_grad if adv_logits_grad is not None else adv_logits_sample
+            H_feat, W_feat = adv_logits_for_ratio.shape[1:3]
+            adv_gts_resized = F.interpolate(adv_gts.unsqueeze(1).float(), size=(H_feat, W_feat), mode='nearest')
+            
+            # Compute ratio
+            ratio_adversarial = self._compute_pos_ratios(
+                pixel_logits=adv_logits_for_ratio,
+                pixel_uncertainty=adv_uq,
+                pixel_gt=adv_gts_resized,
+                spatial_hw=(H_feat, W_feat),
+                batch_size=M,
+                device=device,
+                dtype=dtype,
+            )
+            
+            if self.aue_diversity_loss_weight > 0:
+                self._aue_last_adv_feat = adv_pixel_feat.detach()
+            
+            # Clean up intermediate tensors to save memory
+            del adv_backbone_feat, adv_bndl, adv_aux_outputs
+            
+        loss = ratio_pos + ratio_adversarial
+        # Additional lightweight losses that ALWAYS run to maintain gradient flow
+        # These are cheap to compute but keep gradients flowing to adversarial samples
+        if adv_images is not None:
+            # TV loss: encourages smoothness (natural-looking adversarials)
+            if self.aue_tv_loss_weight > 0:
+                tv_loss = torch.abs(adv_images[:, :, 1:, :] - adv_images[:, :, :-1, :]).mean() + \
+                          torch.abs(adv_images[:, :, :, 1:] - adv_images[:, :, :, :-1]).mean()
+                loss = loss + self.aue_tv_loss_weight * tv_loss
+            
+            # Range penalty: keep pixel values in valid range
+            range_penalty = F.relu(adv_images - 1.0).mean() + F.relu(-1.0 - adv_images).mean()
+            loss = loss + range_penalty
+            
+            # Diversity loss: prevent mode collapse in adversarial bank
+            if self.aue_diversity_loss_weight > 0:
+                loss = loss + self.aue_diversity_loss_weight * self._compute_adversarial_diversity_loss()
+        
+        # Constraint on adversarial prompts (if they have gradients)
+        if adv_prompts is not None and self.adv_prompts.requires_grad:
+            # Ensure prompts stay within valid range and maintain box validity
+            # This prevents prompts from "cheating" by moving to meaningless positions
+            H, W = adv_images.shape[2:] if adv_images is not None else (self.aue_H_adv, self.aue_W_adv)
+            
+            # Sample current prompts from bank to apply constraints
+            M_sample = min(4, self.aue_K_eff)  # Check a few samples
+            check_idx = torch.randint(0, self.aue_K_eff, (M_sample,), device=device)
+            check_prompts = self.adv_prompts[check_idx]
+            
+            # Box validity constraints (soft penalties)
+            prompt_penalty = (
+                F.relu(-check_prompts[:, 0]).mean() +  # x1 >= 0
+                F.relu(-check_prompts[:, 1]).mean() +  # y1 >= 0
+                F.relu(check_prompts[:, 2] - W).mean() +  # x2 <= W
+                F.relu(check_prompts[:, 3] - H).mean() +  # y2 <= H
+                F.relu(check_prompts[:, 0] - check_prompts[:, 2] + 5).mean() +  # x2 > x1 + 5
+                F.relu(check_prompts[:, 1] - check_prompts[:, 3] + 5).mean()    # y2 > y1 + 5
+            )
+            loss = loss + 0.1 * prompt_penalty
 
         return loss
 
@@ -767,7 +553,7 @@ class SAM2Base(torch.nn.Module):
     def device(self):
         return next(self.parameters()).device
 
-    # --------------------------- AdCo (new) helpers ---------------------------
+    # --------------------------- AUE helpers ---------------------------
     def _compute_pos_ratios(
         self,
         pixel_logits: torch.Tensor | None,
@@ -793,7 +579,7 @@ class SAM2Base(torch.nn.Module):
             return torch.tensor(0.0, device=device, dtype=dtype)
         
         # Compute GT-aligned confidence (automatically handles TP/FP/TN/FN)
-        confidence = self._adco_compute_confidence(
+        confidence = self._aue_compute_confidence(
             pixel_logits=pixel_logits,
             pixel_gt=pixel_gt,
         )
@@ -838,7 +624,7 @@ class SAM2Base(torch.nn.Module):
         
         return pos.to(torch.bool)
 
-    def _adco_compute_confidence(
+    def _aue_compute_confidence(
         self,
         pixel_logits: torch.Tensor,
         pixel_gt: torch.Tensor,
@@ -862,7 +648,7 @@ class SAM2Base(torch.nn.Module):
             logits_val = pixel_logits[:, 0]  # [B, 1, H, W] -> [B, H, W]
         else:
             B, H, W = pixel_logits.shape[0], pixel_logits.shape[1], pixel_logits.shape[2]
-            logits_val = pixel_logits.view(B, H, W, -1).mean(dim=-1).values
+            logits_val = pixel_logits.view(B, H, W, -1).mean(dim=-1)
         
         # Extract GT mask [B, H, W] as boolean
         H, W = logits_val.shape[1], logits_val.shape[2]
@@ -884,120 +670,33 @@ class SAM2Base(torch.nn.Module):
         # Compute confidence from aligned logits
         return torch.sigmoid(aligned_logits / float(tau_conf))
 
-    def _adco_infonce_loss(
-        self,
-        pixel_feat: torch.Tensor,                                # [B, H, W, C']
-        roi_z1: torch.Tensor | None,
-        roi_z2: torch.Tensor | None,
-        roi_w1: torch.Tensor | None,
-        roi_w2: torch.Tensor | None,
-        adversarial_sample_M: int | None,
-    ) -> torch.Tensor:
-        """Compute symmetric InfoNCE using two ROI queries and adversarials from the image adversarial bank.
+    def _aue_sample_adversarial_images(self, M: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | tuple[None, None, None]:
+        """Sample M images from spatial adversarial bank along with their GT masks and prompts.
 
-        - Queries/keys: two ROI pooled views from pixel features (self-supervised invariance), no GT/UQ.
-        - Adversarials: sample M images from `adco_adversarials`, upsample to `image_size`, encode, global-pool, project.
+        Returns:
+            adv_images: [M, 3, Himg, Wimg] - adversarial images
+            adv_gts: [M, Himg, Wimg] - ground truth masks
+            adv_prompts: [M, 4] - bounding box prompts
+            
+        Returns (None, None, None) if the bank is not properly initialized.
         """
-        assert pixel_feat is not None and pixel_feat.ndim == 4
-
-        # 1) Build or reuse ROI views
-        if (roi_z1 is None) or (roi_z2 is None):
-            with torch.no_grad():
-                z1, w1 = self._adco_roi_view(pixel_feat, min_scale=0.6, boundary_ignore=2, uncert=None)
-                z2, w2 = self._adco_roi_view(pixel_feat, min_scale=0.6, boundary_ignore=2, uncert=None)
-        else:
-            z1, z2 = roi_z1, roi_z2
-            # If external weights are provided, use them; else default to ones
-            if (roi_w1 is None) or (roi_w2 is None):
-                B = z1.shape[0]
-                device = z1.device
-                dtype = z1.dtype
-                w1 = torch.ones(B, device=device, dtype=dtype)
-                w2 = torch.ones(B, device=device, dtype=dtype)
-            else:
-                w1, w2 = roi_w1, roi_w2
-
-        # 2) Project queries/keys
-        q1 = F.normalize(self.adco_proj(z1), dim=1)
-        q2 = F.normalize(self.adco_proj(z2), dim=1)
-        k1 = F.normalize(self.adco_proj(z1).detach(), dim=1)
-        k2 = F.normalize(self.adco_proj(z2).detach(), dim=1)
-
-        # 3) Build adversarials from image bank
-        tau = float(self.adco_temperature)
-        adv = None
-        if (adversarial_sample_M is not None) and (adversarial_sample_M > 0) and (self.adco_negatives is not None):
-            adv_images = self._adco_sample_adversarial_images(adversarial_sample_M)  # [M, 3, H_adv, W_adv]
-            if adv_images is not None:
-                if (adv_images.shape[-2] != self.image_size) or (adv_images.shape[-1] != self.image_size):
-                    adv_images = F.interpolate(
-                        adv_images,
-                        size=(self.image_size, self.image_size),
-                        mode="bilinear",
-                        align_corners=False,
-                    )
-                with torch.no_grad():
-                    enc_out = self.image_encoder(adv_images)
-                    feat = enc_out["backbone_fpn"][-1]  # [M, C, Hf, Wf]
-                # Global average pool spatial dims -> [M, C'] via simple mean over Hf,Wf then match adco_in dim
-                m, c, hf, wf = feat.shape
-                pooled = feat.mean(dim=(2, 3))  # [M, C]
-                # Down-project to AdCo input dim if needed (use same heuristic as ROI views)
-                # Our adco_proj expects in_dim = hidden_dim//8; ROI used z already in C' domain.
-                # For adversarials, approximate by a 1x linear into that domain via the first layer of adco_proj's in_features.
-                # Simpler: map via the same adco_proj by faking a z-like feature using a linear adapter if sizes mismatch.
-                # If pooled shape matches adco_proj[0].in_features we can feed directly; else use a 1x linear adapter.
-                in_features = self.adco_proj[0].in_features
-                if pooled.shape[1] != in_features:
-                    adapter = torch.nn.Linear(pooled.shape[1], in_features, bias=False).to(pooled.device, pooled.dtype)
-                    torch.nn.init.orthogonal_(adapter.weight)
-                    pooled = adapter(pooled)
-                adv = F.normalize(self.adco_proj(pooled), dim=1)  # [M, D]
-
-        # 4) InfoNCE
-        roi_w = (w1 + w2) * 0.5
-        loss_1 = self._adco_infonce_once(q1, k2, adv, tau, weights=roi_w)
-        loss_2 = self._adco_infonce_once(q2, k1, adv, tau, weights=roi_w)
-        return 0.5 * loss_1 + 0.5 * loss_2
-
-    def _adco_infonce_once(
-        self,
-        q: torch.Tensor,                # [B, D]
-        k: torch.Tensor,                # [B, D]
-        adversarials: torch.Tensor | None, # [M, D] or None
-        tau: float,
-        weights: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Single-direction InfoNCE from q to k with optional adversarials."""
-        pos = (q * k).sum(dim=1, keepdim=True) / tau
-        if adversarials is None or adversarials.numel() == 0:
-            logits = pos
-        else:
-            logits = torch.cat([pos, (q @ adversarials.t()) / tau], dim=1)
-        labels = torch.zeros(logits.size(0), dtype=torch.long, device=logits.device)
-        if weights is None:
-            return F.cross_entropy(logits, labels)
-        loss_per = F.cross_entropy(logits, labels, reduction="none")
-        ww = weights / (weights.mean().detach() + 1e-6)
-        return (loss_per * ww).mean()
-
-    def _adco_sample_adversarial_images(self, M: int) -> torch.Tensor | None:
-        """Sample M images from spatial adversarial bank as RGB tensors [M, 3, Himg, Wimg].
-
-        Here we store adco_adversarials as image-aligned RGB patches: [K, 3, Himg, Wimg].
-        Returns None if the bank doesn't match this assumption.
-        """
-        adv = self.adco_negatives
+        adv = self.aue_adversarials
         if adv is None or adv.ndim != 4 or adv.shape[1] != 3:
-            return None
+            return None, None, None
+        if self.adv_gt is None or self.adv_prompts is None:
+            return None, None, None
         K = adv.shape[0]
         device = adv.device
         if M <= 0:
-            return None
+            return None, None, None
         idx = torch.randint(0, K, (min(M, K),), device=device)
-        return adv.index_select(0, idx)
+        return (
+            adv.index_select(0, idx),
+            self.adv_gt.index_select(0, idx),  # 已设置 requires_grad=False
+            self.adv_prompts.index_select(0, idx),  # 已设置 requires_grad=False
+        )
 
-    def _adco_compute_conf_from_logits_tensor(self, logits: torch.Tensor, tau_conf: float = 2.0) -> torch.Tensor:
+    def _aue_compute_conf_from_logits_tensor(self, logits: torch.Tensor, tau_conf: float = 2.0) -> torch.Tensor:
         """Compute confidence from logits tensor [*, H, W, K] -> [*, H, W] via sigmoid(max(|logit|)/tau)."""
         if logits.ndim < 3:
             raise ValueError("logits tensor rank too low")
@@ -1016,11 +715,11 @@ class SAM2Base(torch.nn.Module):
         Returns:
             Diversity loss scalar (minimize to encourage diversity).
         """
-        if not hasattr(self, 'adco_negatives') or self.adco_negatives is None:
+        if not hasattr(self, 'aue_adversarials') or self.aue_adversarials is None:
             return torch.tensor(0.0, device='cuda' if torch.cuda.is_available() else 'cpu')
         
         # Get adversarial images from bank
-        adv_images = self.adco_negatives  # [K, 3, H, W]
+        adv_images = self.aue_adversarials  # [K, 3, H, W]
         K = adv_images.shape[0]
         
         if K < 2:
@@ -1118,7 +817,7 @@ class SAM2Base(torch.nn.Module):
         mask_inputs=None,
         high_res_features=None,
         multimask_output=False,
-        pixel_gt_for_adco: torch.Tensor | None = None,
+        pixel_gt_for_aue: torch.Tensor | None = None,
     ):
         """
         Forward SAM prompt encoders and mask heads.
@@ -1225,6 +924,7 @@ class SAM2Base(torch.nn.Module):
                 sam_output_tokens,
                 object_score_logits,
             ) = mask_decoder_outputs
+            aux_outputs = {}  # 标准 SAM2 模式：空的辅助输出
 
         if self.pred_obj_scores:
             is_obj_appearing = object_score_logits > 0
@@ -1283,44 +983,35 @@ class SAM2Base(torch.nn.Module):
             shared_w2 = None
             # Build one pair of ROI views once (if enabled) and pass to all losses; methods handle None.
             if self.training and self.share_roi_views and (pixel_feat is not None):
-                uncert = bndl_outputs.get("pixel_uncertainty", None) if self.adco_use_uncertainty else None
-                shared_z1, shared_w1 = self._adco_roi_view(pixel_feat, min_scale=0.6, boundary_ignore=2, uncert=uncert)
-                shared_z2, shared_w2 = self._adco_roi_view(pixel_feat, min_scale=0.6, boundary_ignore=2, uncert=uncert)
-            # Optional per-frame uncertainty for AdCo
-            pixel_uncertainty = bndl_outputs.get("pixel_uncertainty", None) if self.adco_use_uncertainty else None
-            if self.use_adco and self.training and (pixel_feat is not None):
+                uncert = bndl_outputs.get("pixel_uncertainty", None) if self.aue_use_uncertainty else None
+                shared_z1, shared_w1 = self._aue_roi_view(pixel_feat, min_scale=0.6, boundary_ignore=2, uncert=uncert)
+                shared_z2, shared_w2 = self._aue_roi_view(pixel_feat, min_scale=0.6, boundary_ignore=2, uncert=uncert)
+            # Optional per-frame uncertainty for AUE
+            pixel_uncertainty = bndl_outputs.get("pixel_uncertainty", None) if self.aue_use_uncertainty else None
+            
+            if (
+                self.use_aue
+                and self.training
+                and (pixel_feat is not None)
+                and not getattr(self, "_suppress_nested_aue", False)
+            ):
                 # Prefer gradient-carrying logits key when training
-                pixel_logits_for_adco = bndl_outputs.get(
+                pixel_logits_for_aue = bndl_outputs.get(
                     "pixel_logits",
                     bndl_outputs.get("masks_bndl_raw", bndl_outputs.get("mean_pixel_logits", None)),
                 )
-                adco_loss = self.compute_adco_loss(
+                aue_loss = self.compute_aue_loss(
                     pixel_feat=pixel_feat,
                     pixel_uncertainty=pixel_uncertainty,
-                    pixel_gt=pixel_gt_for_adco,
-                    pixel_logits=pixel_logits_for_adco,
+                    pixel_gt=pixel_gt_for_aue,
+                    pixel_logits=pixel_logits_for_aue,
                     roi_z1=shared_z1,
                     roi_z2=shared_z2,
                     roi_w1=shared_w1,
                     roi_w2=shared_w2,
                     pixel_bndl_model=self.sam_mask_decoder.pixel_bndl if getattr(self.sam_mask_decoder, "pixel_bndl", None) is not None else None,
                 )
-                bndl_outputs["adco_aux_loss"] = adco_loss
-            if self.use_proco and self.training and (pixel_feat is not None):
-                proco_loss = self.compute_proco_loss(
-                    pixel_feat=pixel_feat,
-                    use_background=True,
-                    roi_z1=shared_z1,
-                    roi_z2=shared_z2,
-                )
-                bndl_outputs["proco_aux_loss"] = proco_loss
-            if self.use_moco and self.training and (pixel_feat is not None):
-                moco_loss = self.compute_moco_loss(
-                    pixel_feat=pixel_feat,
-                    roi_z1=shared_z1,
-                    roi_z2=shared_z2,
-                )
-                bndl_outputs["moco_aux_loss"] = moco_loss
+                bndl_outputs["aue_aux_loss"] = aue_loss
             # Write back updated BNDL namespace
             aux_outputs["bndl"] = bndl_outputs
             return (
@@ -1671,7 +1362,7 @@ class SAM2Base(torch.nn.Module):
         num_frames,
         track_in_reverse,
         prev_sam_mask_logits,
-        pixel_gt_for_adco: torch.Tensor | None = None,
+        pixel_gt_for_aue: torch.Tensor | None = None,
     ):
         current_out = {"point_inputs": point_inputs, "mask_inputs": mask_inputs}
         # High-resolution feature maps for the SAM head, reshape (HW)BC => BCHW
@@ -1702,11 +1393,6 @@ class SAM2Base(torch.nn.Module):
                 num_frames=num_frames,
                 track_in_reverse=track_in_reverse,
             )
-            # Apply DSU perturbation before SAM head
-            if self.use_dsu:
-                pix_feat = self._dsu_perturb(pix_feat)
-                if self.dsu_apply_high_res and high_res_features is not None:
-                    high_res_features = [self._dsu_perturb(f) for f in high_res_features]
             # apply SAM-style segmentation head
             # here we might feed previously predicted low-res SAM mask logits into the SAM mask decoder,
             # e.g. in demo where such logits come from earlier interaction instead of correction sampling
@@ -1721,7 +1407,7 @@ class SAM2Base(torch.nn.Module):
                 mask_inputs=mask_inputs,
                 high_res_features=high_res_features,
                 multimask_output=multimask_output,
-                pixel_gt_for_adco=pixel_gt_for_adco,
+                pixel_gt_for_aue=pixel_gt_for_aue,
             )
 
         return current_out, sam_outputs, high_res_features, pix_feat
@@ -1771,7 +1457,7 @@ class SAM2Base(torch.nn.Module):
         run_mem_encoder=True,
         # The previously predicted SAM mask logits (which can be fed together with new clicks in demo).
         prev_sam_mask_logits=None,
-        pixel_gt_for_adco: torch.Tensor | None = None,
+        pixel_gt_for_aue: torch.Tensor | None = None,
     ):
         current_out, sam_outputs, _, _ = self._track_step(
             frame_idx,
@@ -1785,7 +1471,7 @@ class SAM2Base(torch.nn.Module):
             num_frames,
             track_in_reverse,
             prev_sam_mask_logits,
-            pixel_gt_for_adco,
+            pixel_gt_for_aue,
         )
 
         # If SAM head returned auxiliary outputs (BNDL/UR-ERN), sam_outputs will have 8 elements
