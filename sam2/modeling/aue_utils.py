@@ -49,9 +49,12 @@ def _collate_adversarial_samples(batch, H_adv, W_adv):
     """自定义 collate function 用于批量处理对抗样本。"""
     valid_samples = []
     
-    for sample in batch:
+    for idx, sample in enumerate(batch):
         try:
             # 提取第一帧第一个对象
+            if not hasattr(sample, 'frames') or len(sample.frames) == 0:
+                continue
+            
             frame = sample.frames[0]
             if len(frame.objects) == 0:
                 continue
@@ -59,6 +62,9 @@ def _collate_adversarial_samples(batch, H_adv, W_adv):
             img = frame.data  # PIL Image 或 Tensor
             obj = frame.objects[0]
             mask = obj.segment  # [H, W] uint8 tensor
+            
+            if mask is None:
+                continue
             
             # 转换图像为 tensor
             if isinstance(img, torch.Tensor):
@@ -74,7 +80,9 @@ def _collate_adversarial_samples(batch, H_adv, W_adv):
             valid_samples.append((img_t, mask.float()))
             
         except Exception as e:
-            logging.warning(f"Failed to process sample: {e}")
+            # More detailed error logging
+            import traceback
+            logging.warning(f"Failed to process sample {idx} in batch: {e}\n{traceback.format_exc()}")
             continue
     
     if not valid_samples:
@@ -153,14 +161,12 @@ def sample_adversarials_from_dataset(
     # 快速路径：使用 DataLoader 并行加载
     if use_dataloader and num_workers > 0:
         try:
-            # 创建子集
             subset = Subset(actual_dataset, indices)
             
-            # 使用自定义 collate function
             collate_fn = partial(_collate_adversarial_samples, H_adv=H_adv, W_adv=W_adv)
             
-            # 创建 DataLoader（批量大小设置为合理值）
             batch_size = min(16, max(1, K_eff // 4))
+            
             loader = DataLoader(
                 subset,
                 batch_size=batch_size,
@@ -168,6 +174,7 @@ def sample_adversarials_from_dataset(
                 collate_fn=collate_fn,
                 pin_memory=True,
                 prefetch_factor=2,
+                timeout=30,
             )
             
             # 批量加载

@@ -456,19 +456,26 @@ def inference_with_ur_ern(
             dataset_eval = DistributedDatasetEvaluator(save_dir=str(eval_dir), distributed=False, rank=0, world_size=1)
             CheckpointManager.force_memory_cleanup()
 
-    # Merge checkpoint files back into evaluator
+    # Merge checkpoint files back into evaluator (streaming to reduce memory peak)
     if checkpoint_mgr and dataset_eval is not None:
-        merged_data = checkpoint_mgr.merge_checkpoints()
-        # Restore data to evaluator
-        if merged_data:
-            if 'pixel_uncertainties' in merged_data:
-                dataset_eval.pixel_uncertainties.extend(merged_data['pixel_uncertainties'])
-            if 'pixel_ious' in merged_data:
-                dataset_eval.pixel_ious.extend(merged_data['pixel_ious'])
-            if 'pixel_dices' in merged_data:
-                dataset_eval.pixel_dices.extend(merged_data['pixel_dices'])
-            if 'pixel_accuracies' in merged_data:
-                dataset_eval.pixel_accuracies.extend(merged_data['pixel_accuracies'])
+        def _append_shard_to_eval(shard_data):
+            if not shard_data:
+                return
+            u = shard_data.get('pixel_uncertainties')
+            if u:
+                dataset_eval.pixel_uncertainties.extend(u)
+            ious = shard_data.get('pixel_ious')
+            if ious:
+                dataset_eval.pixel_ious.extend(ious)
+            dices = shard_data.get('pixel_dices')
+            if dices:
+                dataset_eval.pixel_dices.extend(dices)
+            accs = shard_data.get('pixel_accuracies')
+            if accs:
+                dataset_eval.pixel_accuracies.extend(accs)
+            CheckpointManager.force_memory_cleanup()
+
+        checkpoint_mgr.merge_checkpoints_streaming(_append_shard_to_eval)
     
     # Finalize dataset correlation visualization/results
     if dataset_eval is not None and len(dataset_eval) > 0:

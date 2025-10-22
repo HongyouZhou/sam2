@@ -321,11 +321,11 @@ def calculate_pavpu_for_bndl(bndl_outputs, batch, targets, phase, model):
             sample_num=20,  # Reduced sample number for speed during evaluation
         )
         
-        # CRITICAL FIX: pixel_uncertain_sampling returns p-values, not uncertainty!
-        # - High p-value (→1) = top-2 masks are similar → LOW uncertainty (high confidence)
-        # - Low p-value (→0) = top-2 masks differ → HIGH uncertainty (low confidence)
-        # Convert p-value to true uncertainty: uncertainty = 1 - p_value
-        pixel_uncertainty = 1.0 - pixel_uncertainty_pval
+        # FIXED: p-value IS uncertainty (high p-value = no difference = high uncertainty)
+        # - High p-value (→1) = top-2 masks similar → HIGH uncertainty (model uncertain)
+        # - Low p-value (→0) = top-2 masks differ → LOW uncertainty (model confident)
+        # DO NOT invert: p-value directly represents uncertainty
+        pixel_uncertainty = pixel_uncertainty_pval  # No 1.0 - conversion!
 
         # Additionally compute entropy-based uncertainty (continuous, smooth)
         try:
@@ -1145,17 +1145,25 @@ def inference_with_bndl(
     # Merge evaluator checkpoint files back into dataset_evaluator BEFORE generating evaluation
     # CRITICAL: Must merge checkpoints first, otherwise len(dataset_evaluator) will be 0
     if eval_checkpoint_mgr and dataset_evaluator is not None:
-        merged_data = eval_checkpoint_mgr.merge_checkpoints()
-        # Restore data to evaluator
-        if merged_data:
-            if 'pixel_uncertainties' in merged_data:
-                dataset_evaluator.pixel_uncertainties.extend(merged_data['pixel_uncertainties'])
-            if 'pixel_ious' in merged_data:
-                dataset_evaluator.pixel_ious.extend(merged_data['pixel_ious'])
-            if 'pixel_dices' in merged_data:
-                dataset_evaluator.pixel_dices.extend(merged_data['pixel_dices'])
-            if 'pixel_accuracies' in merged_data:
-                dataset_evaluator.pixel_accuracies.extend(merged_data['pixel_accuracies'])
+        # Stream-merge to reduce memory peak and allow resumability
+        def _append_shard_to_evaluator(shard_data):
+            if not shard_data:
+                return
+            pixel_uncertainties = shard_data.get('pixel_uncertainties')
+            if pixel_uncertainties:
+                dataset_evaluator.pixel_uncertainties.extend(pixel_uncertainties)
+            pixel_ious = shard_data.get('pixel_ious')
+            if pixel_ious:
+                dataset_evaluator.pixel_ious.extend(pixel_ious)
+            pixel_dices = shard_data.get('pixel_dices')
+            if pixel_dices:
+                dataset_evaluator.pixel_dices.extend(pixel_dices)
+            pixel_accuracies = shard_data.get('pixel_accuracies')
+            if pixel_accuracies:
+                dataset_evaluator.pixel_accuracies.extend(pixel_accuracies)
+            CheckpointManager.force_memory_cleanup()
+
+        eval_checkpoint_mgr.merge_checkpoints_streaming(_append_shard_to_evaluator)
     
     # Generate dataset evaluation plots like in SAM trainer validation phase
     if collect_statistics and dataset_evaluator and len(dataset_evaluator) > 0:

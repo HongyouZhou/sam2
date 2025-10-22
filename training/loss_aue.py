@@ -4,7 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-from typing import Dict, List
+# typing imports removed
 
 import torch
 import torch.nn as nn
@@ -18,11 +18,10 @@ class AUELoss(nn.Module):
     it as a standard loss dict so it can be combined by a combined loss.
     """
 
-    def __init__(self, weight: float = 1.0):
+    def __init__(self):
         super().__init__()
-        self.weight = float(weight)
 
-    def forward(self, outs_batch: List[Dict], targets_batch: torch.Tensor | None = None):
+    def forward(self, outs_batch: list[dict], targets_batch: torch.Tensor | None = None):
         # Determine device consistently to avoid CPU/GPU add mismatch
         device = None
         if targets_batch is not None:

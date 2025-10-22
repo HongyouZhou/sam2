@@ -5,7 +5,9 @@
 # LICENSE file in the root directory of this source tree.
 
 import random
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
+import os
+import logging
 
 import torch
 import torch.nn.functional as F
@@ -111,15 +113,15 @@ class SAM2Base(torch.nn.Module):
         # AUE adversarial image bank resolution (for memory safety)
         aue_adversarial_image_size: int = 128,
         # Number of adversarial samples in the bank
-        aue_num_adversarial_samples: int = 256,
+        aue_num_adversarial_samples: int = 32,
         # Whether AUE uses uncertainty for ROI weighting (can be disabled)
         aue_use_uncertainty: bool = True,
         # Uncertainty-aware controls
         aue_uncertainty_mask_threshold: float | None = None,
         # Diversity regularization for adversarial samples
         aue_diversity_loss_weight: float = 0.0,  # Weight for diversity regularization (0 = disabled)
-        # Total Variation loss for natural adversarial samples (style generalization)
-        aue_tv_loss_weight: float = 0.01,  # Weight for Total Variation loss (0 = disabled)
+        # Constraint weight for adversarial samples (L1 distance to initial)
+        aue_constraint_loss_weight: float = 0.0,  # Weight for constraint regularization (0 = disabled)
         # ROI view sharing option
         share_roi_views: bool = True,
     ):
@@ -222,7 +224,7 @@ class SAM2Base(torch.nn.Module):
         self.aue_use_uncertainty = bool(aue_use_uncertainty)
         self.aue_uncertainty_mask_threshold = aue_uncertainty_mask_threshold
         self.aue_diversity_loss_weight = float(aue_diversity_loss_weight)
-        self.aue_tv_loss_weight = float(aue_tv_loss_weight)
+        self.aue_constraint_loss_weight = float(aue_constraint_loss_weight)
         if self.use_aue:
             self._build_aue_components()
 
@@ -256,7 +258,7 @@ class SAM2Base(torch.nn.Module):
         self.aue_H_adv = H_adv
         self.aue_W_adv = W_adv
         
-        adv_images = torch.randn(K_eff, 3, H_adv, W_adv)
+        adv_images = torch.zeros(K_eff, 3, H_adv, W_adv)
         self.aue_adversarials = torch.nn.Parameter(adv_images)
         # Gradient reversal on adversarials to approximate adversarial ascent
         # Use fixed gradient reversal scale (standard GRL implementation)
@@ -274,31 +276,40 @@ class SAM2Base(torch.nn.Module):
         self.adv_gt = torch.nn.Parameter(
             torch.zeros(K_eff, H_adv, W_adv), requires_grad=False  # ← 保持 False
         )
+        
+        # Store initial adversarial images for constraint loss
+        self.aue_adversarials_initial = torch.nn.Parameter(
+            torch.zeros_like(adv_images), requires_grad=False
+        )
 
     @torch.no_grad()
-    def init_aue_adversarials_from_dataset(self, dataset, num_samples: int = None):
+    def init_aue_adversarials_from_dataset(self, dataset, num_samples: int = None, num_workers: int = 4):
         """
         从训练数据集随机采样初始化 AUE 对抗样本库。
         
         Args:
             dataset: 训练数据集 (TorchTrainMixedDataset 或 VOSDataset)
             num_samples: 采样数量，默认使用 self.aue_K_eff
+            num_workers: DataLoader worker数量 (在CPU上初始化时可以安全使用多进程)
         """
         if not self.use_aue:
             return
         
         K_eff = num_samples if num_samples is not None else self.aue_K_eff
         H_adv, W_adv = self.aue_H_adv, self.aue_W_adv
-        device = self.aue_adversarials.device
+        # Always load data on CPU (will be moved to GPU later by trainer._move_to_device)
+        device = torch.device('cpu')
         
         # 使用工具函数从数据集采样
         adv_images, adv_boxes, adv_masks = sample_adversarials_from_dataset(
-            dataset, K_eff, H_adv, W_adv, device
+            dataset, K_eff, H_adv, W_adv, device, num_workers=num_workers
         )
         
         # 更新参数
         # aue_adversarials: 保持梯度反转钩子
         self.aue_adversarials.data.copy_(adv_images)
+        # 保存初始对抗图片用于约束损失
+        self.aue_adversarials_initial.data.copy_(adv_images)
         # adv_prompts 和 adv_gt: 作为 requires_grad=False 的参数，无梯度
         self.adv_prompts.data.copy_(adv_boxes)
         self.adv_gt.data.copy_(adv_masks)
@@ -368,30 +379,44 @@ class SAM2Base(torch.nn.Module):
         pixel_uncertainty: torch.Tensor | None = None,
         pixel_gt: torch.Tensor | None = None,
         pixel_logits: torch.Tensor | None = None,
-        adversarial_sample_M: int | None = 2, 
+        adversarial_sample_M: int | None = 1, 
         roi_z1: torch.Tensor | None = None,
         roi_z2: torch.Tensor | None = None,
         roi_w1: torch.Tensor | None = None,
         roi_w2: torch.Tensor | None = None,
         pixel_bndl_model=None,
-        uq_sample_num: int = 4,
+        uq_sample_num: int = 8,
     ) -> torch.Tensor:
         B, H, W, _ = pixel_feat.shape
         device = pixel_feat.device
         dtype = pixel_feat.dtype
 
-        # Compute positive sample ratio
+        # Compute positive sample ratio (strict shape checks; logits must be provided)
+        if pixel_logits is None:
+            raise ValueError("AUE expects non-null pixel_logits of shape [B,H,W,K]")
+        # Expect logits in channels-last format: [B, Hf, Wf, K]
+        if not (pixel_logits.ndim == 4 and pixel_logits.shape[-1] >= 1):
+            raise ValueError(f"AUE expects pixel_logits of shape [B,H,W,K], got {tuple(pixel_logits.shape)}")
+        H_feat, W_feat = int(pixel_logits.shape[1]), int(pixel_logits.shape[2])
+
+        # Optional GT: if provided, enforce [B,1,Hg,Wg] and resize; if None, ratio_pos will use default behavior
+        pixel_gt_resized = None
+        if pixel_gt is not None:
+            if not (pixel_gt.ndim == 4 and pixel_gt.shape[1] == 1):
+                raise ValueError(f"AUE expects pixel_gt of shape [B,1,H,W], got {tuple(pixel_gt.shape)}")
+            pixel_gt_resized = F.interpolate(pixel_gt.float(), size=(H_feat, W_feat), mode='nearest').squeeze(1)
+
         ratio_pos = self._compute_pos_ratios(
             pixel_logits=pixel_logits,
             pixel_uncertainty=pixel_uncertainty,
-            pixel_gt=pixel_gt,
-            spatial_hw=(H, W),
+            pixel_gt=pixel_gt_resized,
+            spatial_hw=(H_feat, W_feat),
             batch_size=B,
             device=device,
             dtype=dtype,
         )
  
-        adv_images, adv_gts, adv_prompts = self._aue_sample_adversarial_images(adversarial_sample_M)
+        adv_images, adv_gts, adv_prompts, adv_indices = self._aue_sample_adversarial_images(adversarial_sample_M)
         ratio_adversarial = torch.tensor(0.0, device=device, dtype=dtype, requires_grad=True)
         
         if adv_images is not None:
@@ -511,19 +536,21 @@ class SAM2Base(torch.nn.Module):
         # Additional lightweight losses that ALWAYS run to maintain gradient flow
         # These are cheap to compute but keep gradients flowing to adversarial samples
         if adv_images is not None:
-            # TV loss: encourages smoothness (natural-looking adversarials)
-            if self.aue_tv_loss_weight > 0:
-                tv_loss = torch.abs(adv_images[:, :, 1:, :] - adv_images[:, :, :-1, :]).mean() + \
-                          torch.abs(adv_images[:, :, :, 1:] - adv_images[:, :, :, :-1]).mean()
-                loss = loss + self.aue_tv_loss_weight * tv_loss
             
             # Range penalty: keep pixel values in valid range
             range_penalty = F.relu(adv_images - 1.0).mean() + F.relu(-1.0 - adv_images).mean()
-            loss = loss + range_penalty
+            # Subtract range penalty so reversed gradients push values back into [−1,1] pre-norm (or [0,1] after clamp)
+            loss = loss - range_penalty
             
             # Diversity loss: prevent mode collapse in adversarial bank
             if self.aue_diversity_loss_weight > 0:
                 loss = loss + self.aue_diversity_loss_weight * self._compute_adversarial_diversity_loss()
+            
+            # Constraint loss: keep adversarial images close to initial values
+            if self.aue_constraint_loss_weight > 0 and adv_indices is not None:
+                initial_sampled = self.aue_adversarials_initial.index_select(0, adv_indices)
+                constraint_loss = torch.abs(adv_images - initial_sampled).mean()
+                loss = loss + self.aue_constraint_loss_weight * constraint_loss
         
         # Constraint on adversarial prompts (if they have gradients)
         if adv_prompts is not None and self.adv_prompts.requires_grad:
@@ -547,6 +574,7 @@ class SAM2Base(torch.nn.Module):
             )
             loss = loss + 0.1 * prompt_penalty
 
+        # (debug removed)
         return loss
 
     @property
@@ -593,6 +621,9 @@ class SAM2Base(torch.nn.Module):
         # - No need for separate masks!
         eps = 1e-6
         ratio = uncertainty_p / (confidence + eps)  # [B, H, W]
+        # Clamp ratio to prevent gradient explosion from very low confidence pixels
+        # This stabilizes training while still penalizing low confidence regions
+        ratio = ratio.clamp(max=10.0)  # 限制 ratio 最大值，防止梯度爆炸
         return ratio.mean()  # Simple global mean
     
     def _extract_mask_from_gt(
@@ -670,30 +701,32 @@ class SAM2Base(torch.nn.Module):
         # Compute confidence from aligned logits
         return torch.sigmoid(aligned_logits / float(tau_conf))
 
-    def _aue_sample_adversarial_images(self, M: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | tuple[None, None, None]:
+    def _aue_sample_adversarial_images(self, M: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | tuple[None, None, None, None]:
         """Sample M images from spatial adversarial bank along with their GT masks and prompts.
 
         Returns:
             adv_images: [M, 3, Himg, Wimg] - adversarial images
             adv_gts: [M, Himg, Wimg] - ground truth masks
             adv_prompts: [M, 4] - bounding box prompts
+            adv_indices: [M] - indices of sampled images in the bank
             
-        Returns (None, None, None) if the bank is not properly initialized.
+        Returns (None, None, None, None) if the bank is not properly initialized.
         """
         adv = self.aue_adversarials
         if adv is None or adv.ndim != 4 or adv.shape[1] != 3:
-            return None, None, None
+            return None, None, None, None
         if self.adv_gt is None or self.adv_prompts is None:
-            return None, None, None
+            return None, None, None, None
         K = adv.shape[0]
         device = adv.device
         if M <= 0:
-            return None, None, None
+            return None, None, None, None
         idx = torch.randint(0, K, (min(M, K),), device=device)
         return (
             adv.index_select(0, idx),
             self.adv_gt.index_select(0, idx),  # 已设置 requires_grad=False
             self.adv_prompts.index_select(0, idx),  # 已设置 requires_grad=False
+            idx,  # 返回采样索引
         )
 
     def _aue_compute_conf_from_logits_tensor(self, logits: torch.Tensor, tau_conf: float = 2.0) -> torch.Tensor:
@@ -956,8 +989,12 @@ class SAM2Base(torch.nn.Module):
             high_res_masks = high_res_multimasks[batch_inds, best_iou_inds].unsqueeze(1)
             if sam_output_tokens.size(1) > 1:
                 sam_output_token = sam_output_tokens[batch_inds, best_iou_inds]
+            # Track selected index internally for downstream slicing (no external exposure)
+            selected_mask_index = best_iou_inds.to(dtype=torch.long)
         else:
             low_res_masks, high_res_masks = low_res_multimasks, high_res_multimasks
+            # Single-mask case: selected index is 0 for all samples
+            selected_mask_index = torch.zeros(B, dtype=torch.long, device=device)
 
         # Extract object pointer from the SAM output token (with occlusion handling)
         obj_ptr = self.obj_ptr_proj(sam_output_token)
@@ -977,6 +1014,13 @@ class SAM2Base(torch.nn.Module):
             aux_outputs = aux_outputs or {}
             bndl_outputs = aux_outputs.get("bndl", {})
             pixel_feat = bndl_outputs.get("pixel_feat_grad", bndl_outputs.get("pixel_feat", None))
+            # Also expose selected channel's hyper_in for single-channel UQ without revealing indices
+            if 'hyper_in' in bndl_outputs and bndl_outputs['hyper_in'] is not None:
+                hyper_in_full = bndl_outputs['hyper_in']  # [B, K, C'] (detached)
+                if isinstance(hyper_in_full, torch.Tensor) and hyper_in_full.ndim == 3:
+                    batch_inds = torch.arange(hyper_in_full.size(0), device=device)
+                    hyper_in_selected = hyper_in_full[batch_inds, selected_mask_index]  # [B, C']
+                    bndl_outputs['hyper_in_selected'] = hyper_in_selected.detach()
             shared_z1 = None
             shared_z2 = None
             shared_w1 = None
@@ -1012,6 +1056,7 @@ class SAM2Base(torch.nn.Module):
                     pixel_bndl_model=self.sam_mask_decoder.pixel_bndl if getattr(self.sam_mask_decoder, "pixel_bndl", None) is not None else None,
                 )
                 bndl_outputs["aue_aux_loss"] = aue_loss
+                # (debug removed)
             # Write back updated BNDL namespace
             aux_outputs["bndl"] = bndl_outputs
             return (
@@ -1061,11 +1106,17 @@ class SAM2Base(torch.nn.Module):
             )
         else:
             # produce an object pointer using the SAM decoder from the mask input
-            _, _, _, _, _, obj_ptr, _, *_ = self._forward_sam_heads(
-                backbone_features=backbone_features,
-                mask_inputs=self.mask_downsample(mask_inputs_float),
-                high_res_features=high_res_features,
-            )
+            # Suppress nested AUE here to avoid noisy supervision in this "mask-as-output" path
+            prev_suppress = getattr(self, "_suppress_nested_aue", False)
+            self._suppress_nested_aue = True
+            try:
+                _, _, _, _, _, obj_ptr, _, *_ = self._forward_sam_heads(
+                    backbone_features=backbone_features,
+                    mask_inputs=self.mask_downsample(mask_inputs_float),
+                    high_res_features=high_res_features,
+                )
+            finally:
+                self._suppress_nested_aue = prev_suppress
         # In this method, we are treating mask_input as output, e.g. using it directly to create spatial mem;
         # Below, we follow the same design axiom to use mask_input to decide if obj appears or not instead of relying
         # on the object_scores from the SAM decoder.

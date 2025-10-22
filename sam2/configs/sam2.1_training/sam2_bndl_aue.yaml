@@ -9,7 +9,7 @@ scratch:
   base_lr: 5.0e-6
   vision_lr: 3.0e-06
   phases_per_epoch: 1
-  num_epochs: 20
+  num_epochs: 12  # 减少到12个epoch，BNDL已快速收敛
 
 dataset:
   # PATHS to Dataset
@@ -77,7 +77,7 @@ vos:
 
 trainer:
   _target_: training.trainer.Trainer
-  mode: train 
+  mode: train
   max_epochs: ${times:${scratch.num_epochs},${scratch.phases_per_epoch}}
   accelerator: cuda
   seed_value: 123
@@ -210,16 +210,20 @@ trainer:
     bndl_hyper_in_sparse: true
     # Compilation flag
     # compile_image_encoder: False
+    
+    # Freeze image encoder backbone
+    freeze_image_encoder: true
 
     # AUE (Adversarial Uncertainty Estimation) options
     use_aue: true
-    aue_adversarial_image_size: 256  # 512x512 → 32x32 features (sufficient semantic resolution)
-    aue_num_adversarial_samples: 32  # Number of adversarial samples in the bank
+    aue_adversarial_image_size: 512
+    aue_num_adversarial_samples: 1
+    aue_init_from_dataset: false
     aue_use_uncertainty: false
     # UQ-aware AUE controls
     aue_uncertainty_mask_threshold: 0.4
-    aue_diversity_loss_weight: 0.05  # Diversity regularization weight
-    aue_tv_loss_weight: 0.05  # Total Variation loss weight for natural style generalization
+    aue_diversity_loss_weight: 0.0  # Diversity regularization weight
+    aue_constraint_loss_weight: 0.1  # Constraint regularization weight
 
     # ROI sharing
     share_roi_views: true
@@ -324,7 +328,7 @@ trainer:
 
     gradient_clip:
       _target_: training.optimizer.GradientClipper
-      max_norm: 0.1
+      max_norm: 1.0
       norm_type: 2
 
     param_group_modifiers:
@@ -358,35 +362,54 @@ trainer:
     #       param_names:
     #         - '*bias*'
     #       module_cls_names: ['torch.nn.LayerNorm']
+
     options:
       lr:
+        # ① AUE对抗变量：最高LR（内环优化）
         - scheduler:
             _target_: fvcore.common.param_scheduler.ConstantParamScheduler
-            value: 1.0e-5
+            value: 1.0e-2
           param_names:
             - '*aue_adversarials*'
+        
+        # ② 默认组（未被下面命中者）
         - scheduler:
             _target_: fvcore.common.param_scheduler.CosineParamScheduler
-            start_value: 1.0e-6          # 通用/其余模块很小的LR
-            end_value: 1.0e-7
+            start_value: 1.0e-5
+            end_value: 5.0e-6
+
+        # ③ BNDL 头：高 LR
         - scheduler:
             _target_: fvcore.common.param_scheduler.CosineParamScheduler
-            start_value: 1.0e-7          # 骨干极小LR（基本冻结）
-            end_value: 1.0e-7
-          param_names:
-            - 'image_encoder.*'
-        - scheduler:
-            _target_: fvcore.common.param_scheduler.CosineParamScheduler
-            start_value: 1.0e-4          # 仅 BNDL 有较高LR
-            end_value: 5.0e-5
+            start_value: 2.0e-4
+            end_value: 5.0e-5  # 更平缓的衰减，精细调优
           param_names:
             - 'sam_mask_decoder.pixel_bndl.*'
+
+        # ④ 解码器其他部分：极小 LR（避免破坏 SAM）
+        - scheduler:
+            _target_: fvcore.common.param_scheduler.CosineParamScheduler
+            start_value: 1.0e-7
+            end_value: 1.0e-8
+          param_names:
+            - 'sam_mask_decoder.mask_tokens.*'
+            - 'sam_mask_decoder.iou_token.*'
+            - 'sam_mask_decoder.obj_score_token.*'
+            - 'sam_mask_decoder.output_upscaling.*'
+            - 'sam_mask_decoder.conv_s0.*'
+            - 'sam_mask_decoder.conv_s1.*'
+            - 'sam_mask_decoder.output_hypernetworks_mlps.*'
+            - 'sam_mask_decoder.iou_prediction_head.*'
+            - 'sam_mask_decoder.pred_obj_score_head.*'
+
       weight_decay:
+        # AUE对抗变量：无正则化（内环优化）
         - scheduler:
             _target_: fvcore.common.param_scheduler.ConstantParamScheduler
-            value: 0.01
+            value: 0.0
           param_names:
             - '*aue_adversarials*'
+        
         # 其余参数默认正则
         - scheduler:
             _target_: fvcore.common.param_scheduler.ConstantParamScheduler
@@ -394,17 +417,6 @@ trainer:
 
   loss:
     all:
-      # _target_: training.loss_fns.MultiStepMultiMasksAndIous
-      # weight_dict:
-      #   loss_mask: 20
-      #   loss_dice: 1
-      #   loss_iou: 1
-      #   loss_class: 1
-      # supervise_all_iou: true
-      # iou_use_l1_loss: true
-      # pred_obj_scores: true
-      # focal_gamma_obj_score: 0.0
-      # focal_alpha_obj_score: -1.0
       _target_: training.loss_combined.CombinedSAMBNDLLoss
       sam_loss:
         _target_: training.loss_fns.MultiStepMultiMasksAndIous
@@ -420,13 +432,12 @@ trainer:
         focal_alpha_obj_score: -1.0
       bndl_loss:
         _target_: training.loss_bndl.BNDLLoss
-        kl_weight: 0.001
-      sam_weight: 1.0
-      bndl_weight: 0.5
+        kl_weight: 0.005  # 降低KL权重，减少正则化
+      sam_weight: 0.1    # 降低SAM权重，减少对基础分割的影响
+      bndl_weight: 0.5    # 提高BNDL权重，强化BNDL训练
       aue_loss:
         _target_: training.loss_aue.AUELoss
-        weight: 0.5
-      aue_weight: 0.2
+      aue_weight: 0.1     # 保持AUE权重
     # val:
     #   _target_: training.loss_combined.CombinedSAMBNDLLoss
     #   sam_loss: ${trainer.loss.all.sam_loss}
@@ -455,19 +466,20 @@ trainer:
     log_dir: ${launcher.experiment_log_dir}/logs
     log_freq: 10
     log_scalar_frequency: 100
-    log_visual_frequency: 10
+    log_visual_frequency: 20
     visualize_bndl: true
     uncertainty_metric: ["entropy", "nll"]
     visualize_pavpu_overlay: true
     uncertainty_sample_num: 50
     # 像素级PAvPU统计配置
-    correlation_foreground_dilation: 10      # 前景区域膨胀半径（像素），0表示不膨胀
+    correlation_foreground_dilation: 4       # 前景区域膨胀半径（像素），0表示不膨胀（仅在use_full_image=false时有效）
     correlation_per_pixel: true              # 使用像素级统计（vs 图片级）
+    correlation_use_full_image: false         # true=统计全图，false=仅统计前景区域
 
   # initialize from a SAM 2 checkpoint
   checkpoint:
     save_dir: ${launcher.experiment_log_dir}/checkpoints
-    save_freq: 10 # 0 only last checkpoint is saved.
+    save_freq: 2 # 0 only last checkpoint is saved.
     model_weight_initializer:
       _partial_: True
       _target_: training.utils.checkpoint_utils.load_state_dict_into_model
@@ -489,7 +501,7 @@ trainer:
 launcher:
   num_nodes: 1
   gpus_per_node: 8
-  experiment_log_dir: /home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_aue_012_08 # Path to log directory, defaults to ./sam2_logs/${config_name}
+  experiment_log_dir: /home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_aue_012_09 # Path to log directory, defaults to ./sam2_logs/${config_name}
 
 # SLURM args if running on a cluster
 submitit:

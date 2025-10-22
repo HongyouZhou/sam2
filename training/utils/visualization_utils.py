@@ -17,21 +17,133 @@ class VisualizationUtils:
     def plot_parameter_heatmap(ax, param_img: np.ndarray, title: str, cmap: str = "viridis") -> None:
         """绘制参数热图"""
         im = ax.imshow(param_img, cmap=cmap, interpolation="nearest")
-        ax.set_title(f"{title}\nMean: {param_img.mean():.4f}")
+        # 显示统计信息：mean, std, range
+        mean_val = param_img.mean()
+        std_val = param_img.std()
+        min_val = param_img.min()
+        max_val = param_img.max()
+        ax.set_title(f"{title}\nμ={mean_val:.3f}, σ={std_val:.3f}\n[{min_val:.3f}, {max_val:.3f}]", fontsize=9)
         ax.axis("off")
         plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
     @staticmethod
-    def plot_original_image(ax, original_img: Optional[np.ndarray]) -> None:
-        """绘制原始图像"""
+    def plot_original_image(ax, original_img: Optional[np.ndarray], prompt_info: Optional[Dict] = None) -> None:
+        """绘制原始图像，可选择叠加prompt信息"""
         if original_img is not None:
             ax.imshow(original_img)
+            
+            # 如果有prompt信息，在图像上叠加显示
+            if prompt_info is not None:
+                VisualizationUtils._overlay_prompts_on_image(ax, prompt_info, original_img.shape)
+            
             ax.set_title("Original Image")
             ax.axis("off")
         else:
             ax.text(0.5, 0.5, "No Image\nAvailable", ha="center", va="center", transform=ax.transAxes, fontsize=12)
             ax.set_title("Original Image")
             ax.axis("off")
+    
+    @staticmethod
+    def _overlay_prompts_on_image(ax, prompt_info: Dict, img_shape: Tuple) -> None:
+        """在图像上叠加显示prompt信息
+        
+        Args:
+            ax: matplotlib axis对象
+            prompt_info: 包含point_coords和point_labels的字典
+            img_shape: 图像shape (H, W, C)
+        """
+        import torch
+        import logging
+        
+        # 提取点坐标和标签
+        point_coords = prompt_info.get("point_coords", None)
+        point_labels = prompt_info.get("point_labels", None)
+        
+        if point_coords is None or point_labels is None:
+            return
+        
+        # 将tensor转换为numpy
+        if isinstance(point_coords, torch.Tensor):
+            point_coords = point_coords.detach().cpu().numpy()
+        if isinstance(point_labels, torch.Tensor):
+            point_labels = point_labels.detach().cpu().numpy()
+        
+        # 通常point_coords的shape是[B, P, 2]，我们只取第一个batch
+        if len(point_coords.shape) == 3:
+            point_coords = point_coords[0]  # [P, 2]
+        if len(point_labels.shape) == 2:
+            point_labels = point_labels[0]  # [P]
+        
+        # SAM2坐标缩放：point_coords是在SAM内部坐标系（通常1024x1024）
+        # 需要缩放到实际图像尺寸
+        img_h, img_w = img_shape[:2]
+        
+        # 检测实际的坐标范围
+        max_coord = max(point_coords[:, 0].max(), point_coords[:, 1].max())
+        
+        # 如果坐标值明显大于图像尺寸，说明需要缩放
+        if max_coord > max(img_h, img_w) * 1.5:
+            # 假设SAM内部使用1024作为基准
+            sam_size = 1024.0
+            scale_x = img_w / sam_size
+            scale_y = img_h / sam_size
+            point_coords_scaled = point_coords.copy()
+            point_coords_scaled[:, 0] *= scale_x  # x坐标
+            point_coords_scaled[:, 1] *= scale_y  # y坐标
+        else:
+            point_coords_scaled = point_coords
+        
+        # 统计不同类型的点数量
+        num_pos = sum(1 for l in point_labels if l == 1)
+        num_neg = sum(1 for l in point_labels if l == 0)
+        num_box = sum(1 for l in point_labels if l in [2, 3])
+        
+        # 绘制每个点
+        for i, (coord, label) in enumerate(zip(point_coords_scaled, point_labels)):
+            x, y = coord
+            
+            # 跳过padding点（label=-1）
+            if label == -1:
+                continue
+            
+            # 根据label类型选择颜色和标记
+            if label == 0:
+                color, marker, markersize = 'red', 'x', 12
+            elif label == 1:
+                color, marker, markersize = 'lime', '*', 15
+            elif label in [2, 3]:
+                color, marker, markersize = 'cyan', 's', 10
+            else:
+                color, marker, markersize = 'yellow', 'o', 10
+            
+            # 绘制点
+            ax.plot(x, y, marker=marker, color=color, markersize=markersize,
+                   markeredgewidth=2, markeredgecolor='white')
+        
+        # 如果有box点（label=2和3），绘制矩形框
+        box_points = [coord for coord, label in zip(point_coords_scaled, point_labels) if label in [2, 3]]
+        
+        if len(box_points) == 2:
+            x1, y1 = box_points[0]
+            x2, y2 = box_points[1]
+            from matplotlib.patches import Rectangle
+            rect = Rectangle((min(x1, x2), min(y1, y2)), 
+                           abs(x2 - x1), abs(y2 - y1),
+                           linewidth=2, edgecolor='cyan', facecolor='none',
+                           linestyle='--')
+            ax.add_patch(rect)
+        
+        # 记录绘制的prompt类型
+        prompt_types = []
+        if num_pos > 0:
+            prompt_types.append(f"{num_pos} pos")
+        if num_neg > 0:
+            prompt_types.append(f"{num_neg} neg")
+        if num_box > 0:
+            prompt_types.append(f"1 box")
+        
+        if prompt_types:
+            logging.info(f"Drew prompts on image: {', '.join(prompt_types)}")
 
     @staticmethod
     def normalize_parameters_robust(lambda_img: np.ndarray, k_img: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:

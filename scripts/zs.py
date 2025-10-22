@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +35,18 @@ from zero_shot_multi_dataset_ur_ern import (
 )
 
 matplotlib.use("Agg")  # Use non-interactive backend
+
+
+def _load_eval_json(file_path: Path) -> dict | None:
+    """线程安全的 JSON 文件加载（用于评估结果文件）"""
+    if not file_path.exists():
+        return None
+    try:
+        with open(file_path) as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"Warning: Failed to load {file_path}: {e}")
+        return None
 
 
 def run_comparison_evaluation(
@@ -832,7 +845,11 @@ def create_comprehensive_comparison_plots(
         ])
 
     table = ax9.table(
-        cellText=summary_data, colLabels=["Dataset", "Type", "SAM-2 J&F", "BNDL_AUE J&F", "ΔJ&F", "SAM-2 J", "BNDL_AUE J", "ΔJ", "SAM-2 F", "BNDL_AUE F", "ΔF"], cellLoc="center", loc="center", bbox=None
+        cellText=summary_data, 
+        colLabels=["Dataset", "Type", "SAM-2 J&F", "BNDL_AUE J&F", "ΔJ&F", "SAM-2 J", "BNDL_AUE J", "ΔJ", "SAM-2 F", "BNDL_AUE F", "ΔF"], 
+        cellLoc="center", 
+        loc="center", 
+        bbox=None
     )
     table.auto_set_font_size(False)
     table.set_fontsize(8)
@@ -1103,144 +1120,143 @@ def create_ua_shift_analysis_plots(
     # === ROW 1: ALL ΔPCC PLOTS TOGETHER ===
     # Load per-dataset PCC and NLL data for SAM-2, BNDL, UCTTA, UR-ERN
     
-    # SAM-2 per-dataset NLL (baseline)
-    sam2_nll_data: dict[str, float] = {}
+    # === 并行加载所有评估结果文件 ===
+    print(f"Loading evaluation results for {len(bndl_datasets_list)} datasets across multiple methods...")
+
+    # 构建所有需要加载的文件路径
+    files_to_load = []
+
+    # SAM-2 files
     sam2_root = sam2_root_override if sam2_root_override is not None else (output_path / "sam2_results")
     for dataset_name in bndl_datasets_list:
-        eval_json = (sam2_root
-                     / f"{dataset_name.lower()}_sam2_eval"
-                     / f"{dataset_name.lower()}_zeroshot_results.json")
-        if not eval_json.exists():
-            continue
-        with open(eval_json) as f:
-            eval_data = json.load(f)
-        # Extract NLL mean value
-        if isinstance(eval_data, dict) and "NLL" in eval_data:
-            nll_info = eval_data["NLL"]
-            if isinstance(nll_info, dict) and "metric_mean" in nll_info:
-                sam2_nll_data[dataset_name] = float(nll_info["metric_mean"])
-    
-    # BNDL per-dataset PCC and NLL
-    bndl_root = bndl_root_override if bndl_root_override is not None else (output_path / "bndl_results")
-    accuracy_pcc_map: dict[str, float] = {}
-    bndl_nll_data: dict[str, float] = {}
-    for dataset_name in bndl_datasets_list:
-        # evaluator results are saved by run_single_dataset_with_bndl at:
-        #   <bndl_root>/<dataset>_bndl_eval/<dataset>_zeroshot_results.json
-        eval_json = (bndl_root
-                     / f"{dataset_name.lower()}_bndl_eval"
-                     / f"{dataset_name.lower()}_zeroshot_results.json")
-        if not eval_json.exists():
-            continue
-        with open(eval_json) as f:
-            eval_data = json.load(f)
-        if isinstance(eval_data, dict) and "Accuracy" in eval_data:
-            acc_info = eval_data["Accuracy"]
-            if isinstance(acc_info, dict) and "correlation" in acc_info:
-                corr_val = acc_info["correlation"]
-                # Skip NaN correlations
-                if corr_val == "NaN" or (isinstance(corr_val, float) and np.isnan(corr_val)):
-                    print(f"Warning: BNDL {dataset_name} has NaN correlation")
-                else:
-                    accuracy_pcc_map[dataset_name] = float(corr_val)
-        
-        # Extract NLL mean value
-        if isinstance(eval_data, dict) and "NLL" in eval_data:
-            nll_info = eval_data["NLL"]
-            if isinstance(nll_info, dict) and "metric_mean" in nll_info:
-                bndl_nll_data[dataset_name] = float(nll_info["metric_mean"])
+        path = sam2_root / f"{dataset_name.lower()}_sam2_eval" / f"{dataset_name.lower()}_zeroshot_results.json"
+        files_to_load.append(('sam2', dataset_name, path))
 
-    # UCTTA per-dataset PCC and NLL (optional)
-    uctta_accuracy_pcc_map: dict[str, float] = {}
-    uctta_nll_data: dict[str, float] = {}
+    # BNDL files  
+    bndl_root = bndl_root_override if bndl_root_override is not None else (output_path / "bndl_results")
+    for dataset_name in bndl_datasets_list:
+        path = bndl_root / f"{dataset_name.lower()}_bndl_eval" / f"{dataset_name.lower()}_zeroshot_results.json"
+        files_to_load.append(('bndl', dataset_name, path))
+
+    # UCTTA files
     uctta_root = uctta_root_override if uctta_root_override is not None else (output_path / "sam2_uctta_results")
     for dataset_name in bndl_datasets_list:
-        eval_json = (uctta_root
-                     / f"{dataset_name.lower()}_uctta_eval"
-                     / f"{dataset_name.lower()}_uctta_results.json")
-        if not eval_json.exists():
-            continue
-        with open(eval_json) as f:
-            eval_data = json.load(f)
-        if isinstance(eval_data, dict) and "Accuracy" in eval_data:
-            acc_info = eval_data["Accuracy"]
-            if isinstance(acc_info, dict) and "correlation" in acc_info:
-                corr_val = acc_info["correlation"]
-                # Skip NaN correlations
-                if corr_val == "NaN" or (isinstance(corr_val, float) and np.isnan(corr_val)):
-                    print(f"Warning: UCTTA {dataset_name} has NaN correlation")
-                else:
-                    uctta_accuracy_pcc_map[dataset_name] = float(corr_val)
-        
-        # Extract NLL mean value
-        if isinstance(eval_data, dict) and "NLL" in eval_data:
-            nll_info = eval_data["NLL"]
-            if isinstance(nll_info, dict) and "metric_mean" in nll_info:
-                uctta_nll_data[dataset_name] = float(nll_info["metric_mean"])
+        path = uctta_root / f"{dataset_name.lower()}_uctta_eval" / f"{dataset_name.lower()}_uctta_results.json"
+        files_to_load.append(('uctta', dataset_name, path))
 
-    # UR-ERN per-dataset PCC, uncertainty, and NLL (optional)
-    ur_ern_accuracy_pcc_map: dict[str, float] = {}
-    ur_ern_nll_data: dict[str, float] = {}
+    # UR-ERN files
     ur_ern_root = ur_ern_root_override if ur_ern_root_override is not None else (output_path / "sam2_ur_ern_results")
     for dataset_name in bndl_datasets_list:
-        eval_json = (ur_ern_root
-                     / f"{dataset_name.lower()}_ur_ern_eval"
-                     / f"{dataset_name.lower()}_ur_ern_results.json")
-        if not eval_json.exists():
-            continue
-        with open(eval_json) as f:
-            eval_data = json.load(f)
-        if isinstance(eval_data, dict) and "Accuracy" in eval_data:
-            acc_info = eval_data["Accuracy"]
+        path = ur_ern_root / f"{dataset_name.lower()}_ur_ern_eval" / f"{dataset_name.lower()}_ur_ern_results.json"
+        files_to_load.append(('ur_ern', dataset_name, path))
+
+    # BNDL pure files (optional)
+    if bndl_pure_statistics or bndl_pure_root_override:
+        bndl_pure_root = bndl_pure_root_override if bndl_pure_root_override is not None else (output_path / "bndl_results")
+        for dataset_name in bndl_datasets_list:
+            path = bndl_pure_root / f"{dataset_name.lower()}_bndl_eval" / f"{dataset_name.lower()}_zeroshot_results.json"
+            files_to_load.append(('bndl_pure', dataset_name, path))
+
+    # 并行加载所有文件
+    loaded_data = {}
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        future_to_info = {
+            executor.submit(_load_eval_json, path): (method, dataset, path)
+            for method, dataset, path in files_to_load
+        }
+        
+        for future in as_completed(future_to_info):
+            method, dataset, path = future_to_info[future]
+            data = future.result()
+            if data is not None:
+                if method not in loaded_data:
+                    loaded_data[method] = {}
+                loaded_data[method][dataset] = data
+
+    print(f"Successfully loaded {sum(len(v) for v in loaded_data.values())} evaluation files")
+
+    # 从加载的数据中提取指标
+    sam2_nll_data: dict[str, float] = {}
+    for dataset, data in loaded_data.get('sam2', {}).items():
+        if isinstance(data, dict) and "NLL" in data:
+            nll_info = data["NLL"]
+            if isinstance(nll_info, dict) and "metric_mean" in nll_info:
+                sam2_nll_data[dataset] = float(nll_info["metric_mean"])
+
+    accuracy_pcc_map: dict[str, float] = {}
+    bndl_nll_data: dict[str, float] = {}
+    for dataset, data in loaded_data.get('bndl', {}).items():
+        if isinstance(data, dict) and "Accuracy" in data:
+            acc_info = data["Accuracy"]
             if isinstance(acc_info, dict) and "correlation" in acc_info:
                 corr_val = acc_info["correlation"]
-                # Skip NaN correlations (happens when uncertainty_std == 0)
-                if corr_val == "NaN" or (isinstance(corr_val, float) and np.isnan(corr_val)):
-                    print(f"Warning: UR-ERN {dataset_name} has NaN correlation (likely constant uncertainty)")
+                if corr_val != "NaN" and not (isinstance(corr_val, float) and np.isnan(corr_val)):
+                    accuracy_pcc_map[dataset] = float(corr_val)
                 else:
-                    ur_ern_accuracy_pcc_map[dataset_name] = float(corr_val)
-            # Also extract UR-ERN uncertainty mean
-            if "uncertainty_mean" in acc_info:
-                ur_ern_uncertainty_data[dataset_name] = float(acc_info["uncertainty_mean"])
+                    print(f"Warning: BNDL {dataset} has NaN correlation")
         
-        # Extract NLL mean value
-        if isinstance(eval_data, dict) and "NLL" in eval_data:
-            nll_info = eval_data["NLL"]
+        if isinstance(data, dict) and "NLL" in data:
+            nll_info = data["NLL"]
             if isinstance(nll_info, dict) and "metric_mean" in nll_info:
-                ur_ern_nll_data[dataset_name] = float(nll_info["metric_mean"])
+                bndl_nll_data[dataset] = float(nll_info["metric_mean"])
+
+    uctta_accuracy_pcc_map: dict[str, float] = {}
+    uctta_nll_data: dict[str, float] = {}
+    for dataset, data in loaded_data.get('uctta', {}).items():
+        if isinstance(data, dict) and "Accuracy" in data:
+            acc_info = data["Accuracy"]
+            if isinstance(acc_info, dict) and "correlation" in acc_info:
+                corr_val = acc_info["correlation"]
+                if corr_val != "NaN" and not (isinstance(corr_val, float) and np.isnan(corr_val)):
+                    uctta_accuracy_pcc_map[dataset] = float(corr_val)
+                else:
+                    print(f"Warning: UCTTA {dataset} has NaN correlation")
+        
+        if isinstance(data, dict) and "NLL" in data:
+            nll_info = data["NLL"]
+            if isinstance(nll_info, dict) and "metric_mean" in nll_info:
+                uctta_nll_data[dataset] = float(nll_info["metric_mean"])
+
+    ur_ern_accuracy_pcc_map: dict[str, float] = {}
+    ur_ern_nll_data: dict[str, float] = {}
+    for dataset, data in loaded_data.get('ur_ern', {}).items():
+        if isinstance(data, dict) and "Accuracy" in data:
+            acc_info = data["Accuracy"]
+            if isinstance(acc_info, dict):
+                if "correlation" in acc_info:
+                    corr_val = acc_info["correlation"]
+                    if corr_val != "NaN" and not (isinstance(corr_val, float) and np.isnan(corr_val)):
+                        ur_ern_accuracy_pcc_map[dataset] = float(corr_val)
+                    else:
+                        print(f"Warning: UR-ERN {dataset} has NaN correlation (likely constant uncertainty)")
+                if "uncertainty_mean" in acc_info:
+                    ur_ern_uncertainty_data[dataset] = float(acc_info["uncertainty_mean"])
+        
+        if isinstance(data, dict) and "NLL" in data:
+            nll_info = data["NLL"]
+            if isinstance(nll_info, dict) and "metric_mean" in nll_info:
+                ur_ern_nll_data[dataset] = float(nll_info["metric_mean"])
 
     has_ur_ern = len(ur_ern_accuracy_pcc_map) > 0
     if has_ur_ern:
         print(f"Including UR-ERN data for {len(ur_ern_accuracy_pcc_map)} datasets in UA analysis")
 
-    # BNDL (pure) per-dataset PCC and NLL (optional)
     bndl_pure_accuracy_pcc_map: dict[str, float] = {}
     bndl_pure_nll_data: dict[str, float] = {}
-    if bndl_pure_statistics or bndl_pure_root_override:
-        bndl_pure_root = bndl_pure_root_override if bndl_pure_root_override is not None else (output_path / "bndl_results")
-        for dataset_name in bndl_datasets_list:
-            eval_json = (bndl_pure_root
-                         / f"{dataset_name.lower()}_bndl_eval"
-                         / f"{dataset_name.lower()}_zeroshot_results.json")
-            if not eval_json.exists():
-                continue
-            with open(eval_json) as f:
-                eval_data = json.load(f)
-            if isinstance(eval_data, dict) and "Accuracy" in eval_data:
-                acc_info = eval_data["Accuracy"]
-                if isinstance(acc_info, dict) and "correlation" in acc_info:
-                    corr_val = acc_info["correlation"]
-                    # Skip NaN correlations
-                    if corr_val == "NaN" or (isinstance(corr_val, float) and np.isnan(corr_val)):
-                        print(f"Warning: BNDL (pure) {dataset_name} has NaN correlation")
-                    else:
-                        bndl_pure_accuracy_pcc_map[dataset_name] = float(corr_val)
-            
-            # Extract NLL mean value
-            if isinstance(eval_data, dict) and "NLL" in eval_data:
-                nll_info = eval_data["NLL"]
-                if isinstance(nll_info, dict) and "metric_mean" in nll_info:
-                    bndl_pure_nll_data[dataset_name] = float(nll_info["metric_mean"])
+    for dataset, data in loaded_data.get('bndl_pure', {}).items():
+        if isinstance(data, dict) and "Accuracy" in data:
+            acc_info = data["Accuracy"]
+            if isinstance(acc_info, dict) and "correlation" in acc_info:
+                corr_val = acc_info["correlation"]
+                if corr_val != "NaN" and not (isinstance(corr_val, float) and np.isnan(corr_val)):
+                    bndl_pure_accuracy_pcc_map[dataset] = float(corr_val)
+                else:
+                    print(f"Warning: BNDL (pure) {dataset} has NaN correlation")
+        
+        if isinstance(data, dict) and "NLL" in data:
+            nll_info = data["NLL"]
+            if isinstance(nll_info, dict) and "metric_mean" in nll_info:
+                bndl_pure_nll_data[dataset] = float(nll_info["metric_mean"])
 
     has_bndl_pure = len(bndl_pure_accuracy_pcc_map) > 0
     if has_bndl_pure:
@@ -1872,7 +1888,7 @@ def _plot_pavpu_hexbin(methods_with_pavpu: dict, output_path: Path):
         all_uncertainty = []
         all_accuracy = []
         
-        for method, method_data in methods_with_pavpu.items():
+        for _, method_data in methods_with_pavpu.items():
             if dataset not in method_data:
                 continue
             
@@ -2085,13 +2101,17 @@ def parse_args():
     p.add_argument("--save_vis", action="store_true", default=False, help="Save visualizations")
     p.add_argument("--collect_bndl_stats", action="store_true", default=True, help="Collect BNDL statistics")
     # Click protocol options
-    p.add_argument("--click_protocol", type=str, default="3click", choices=["1click", "3click", "5click"], help="Interaction protocol for first frame")
+    p.add_argument("--click_protocol", type=str, default="3click", 
+                   choices=["1click", "3click", "5click"], 
+                   help="Interaction protocol for first frame")
     p.add_argument("--min_click_dist", type=float, default=12.0, help="Minimum distance between clicks for 5-click protocol")
     p.add_argument("--seed", type=int, default=0, help="Random seed for 'random' point initialization")
 
     # Cached results options
-    p.add_argument("--load_detailed_json", type=str, default=None, help="Path to a previously saved detailed_results.json to render plots and summaries without re-running")
-    p.add_argument("--plot_only", action="store_true", default=False, help="Only generate plots from existing detailed_results.json (requires --load_detailed_json or existing results in output_path)")
+    p.add_argument("--load_detailed_json", type=str, default=None, 
+                   help="Path to a previously saved detailed_results.json to render plots and summaries without re-running")
+    p.add_argument("--plot_only", action="store_true", default=False, 
+                   help="Only generate plots from existing detailed_results.json (requires --load_detailed_json or existing results in output_path)")
     # Method toggles
     p.add_argument("--run_sam", action="store_true", default=False, help="Run baseline SAM-2 branch")
     p.add_argument("--run_uctta", action="store_true", default=False, help="Run SAM-2 + UCTTA branch")

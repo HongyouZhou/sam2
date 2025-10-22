@@ -1,3 +1,4 @@
+import logging
 import torch
 import torch.nn as nn
 
@@ -19,6 +20,7 @@ class CombinedSAMBNDLLoss(nn.Module):
         self.bndl_weight = bndl_weight
         self.ur_ern_weight = ur_ern_weight
         self.aue_weight = aue_weight
+        self._dbg_once = False
 
     def forward(self, outs_batch: list[dict], targets_batch: torch.Tensor):
         # compute sam loss (always required)

@@ -58,7 +58,8 @@ def _dilate_mask(mask: torch.Tensor, kernel_size: int = 10) -> torch.Tensor:
 class DistributedDatasetEvaluator:
     
     def __init__(self, save_dir: str, distributed: bool = False, rank: int = 0, world_size: int = 1,
-                 foreground_dilation: int = 10, per_pixel_statistics: bool = True):
+                 foreground_dilation: int = 0, per_pixel_statistics: bool = True, 
+                 use_full_image: bool = True):
         """
         初始化分布式数据集评估器
 
@@ -67,8 +68,9 @@ class DistributedDatasetEvaluator:
             distributed: 是否启用分布式训练
             rank: 当前进程的rank
             world_size: 总进程数
-            foreground_dilation: 前景区域膨胀半径（像素），0表示不膨胀
+            foreground_dilation: 前景区域膨胀半径（像素），0表示不膨胀（仅在use_full_image=False时使用）
             per_pixel_statistics: 是否使用像素级统计（vs 图片级）
+            use_full_image: 是否统计全图像素（True=全图[默认], False=仅前景）
         """
         self.save_dir = save_dir
         self.distributed = distributed
@@ -77,6 +79,7 @@ class DistributedDatasetEvaluator:
         self.is_main_process = rank == 0
         self.foreground_dilation = foreground_dilation
         self.per_pixel_statistics = per_pixel_statistics
+        self.use_full_image = use_full_image
 
         self.metric_calculator = MetricCalculator()
         self.viz_utils = VisualizationUtils()
@@ -106,7 +109,8 @@ class DistributedDatasetEvaluator:
         # 只在主进程创建保存目录
         if self.is_main_process:
             os.makedirs(save_dir, exist_ok=True)
-            logging.info(f"Dataset evaluator initialized: per_pixel={per_pixel_statistics}, dilation={foreground_dilation}")
+            mode_str = "full_image" if use_full_image else f"foreground (dilation={foreground_dilation})"
+            logging.info(f"Dataset evaluator initialized: per_pixel={per_pixel_statistics}, mode={mode_str}")
     
     def _setup_distributed(self):
         """设置分布式训练相关配置"""
@@ -336,7 +340,9 @@ class DistributedDatasetEvaluator:
     def _calculate_pixel_wise_metrics(self, uncertainty: torch.Tensor, pred_logits: torch.Tensor,
                                       gt_masks: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        计算像素级指标，返回前景扩展区域内每个像素的值
+        计算per-channel像素级指标，返回选定区域内每个像素每个通道的值
+        
+        每个像素产生K个独立样本（每个通道一个），避免跨通道聚合导致的相关性问题
 
         Args:
             uncertainty: [H, W, K] or [H, W] 不确定性
@@ -344,77 +350,81 @@ class DistributedDatasetEvaluator:
             gt_masks: [H, W, K] GT masks
 
         Returns:
-            pixel_uncertainties: [N] 前景区域像素的uncertainty
-            pixel_accuracies: [N] 前景区域像素的accuracy（使用原始logits，范围-∞到+∞）
-            pixel_ious: [N] 前景区域像素的IoU贡献
-            pixel_dices: [N] 前景区域像素的DICE贡献
-            pixel_nlls: [N] 前景区域像素的NLL值
+            pixel_uncertainties: [N*K] 选定区域每个像素每个通道的uncertainty
+            pixel_accuracies: [N*K] 选定区域每个像素每个通道的accuracy（概率，范围0-1）
+            pixel_ious: [N*K] 选定区域每个像素每个通道的IoU（二值正确性，0或1）
+            pixel_dices: [N*K] 选定区域每个像素每个通道的DICE（概率版本，范围0-1）
+            pixel_nlls: [N*K] 选定区域每个像素每个通道的NLL值
         """
         try:
-            # 1. 构建前景mask并膨胀
-            fg_mask = (gt_masks > 0)
-            if fg_mask.ndim == 3:
-                fg_mask = fg_mask.any(dim=-1)  # [H, W]
-
-            # 膨胀前景区域
-            if self.foreground_dilation > 0:
-                fg_mask_expanded = _dilate_mask(fg_mask, kernel_size=self.foreground_dilation)
+            # 1. 构建统计区域mask
+            if self.use_full_image:
+                # 统计全图：创建全True的mask
+                H, W = gt_masks.shape[:2]
+                fg_mask_expanded = torch.ones(H, W, dtype=torch.bool, device=gt_masks.device)
             else:
-                fg_mask_expanded = fg_mask
+                # 统计前景：构建前景mask并膨胀
+                fg_mask = (gt_masks > 0)
+                if fg_mask.ndim == 3:
+                    fg_mask = fg_mask.any(dim=-1)  # [H, W]
 
-            # 2. 处理uncertainty到[H, W]
-            if uncertainty.ndim == 3:
-                pixel_uncertainty = uncertainty.mean(dim=-1)  # [H, W]
+                # 膨胀前景区域
+                if self.foreground_dilation > 0:
+                    fg_mask_expanded = _dilate_mask(fg_mask, kernel_size=self.foreground_dilation)
+                else:
+                    fg_mask_expanded = fg_mask
+
+            # 2. 确保uncertainty是[H, W, K]形状（per-channel统计）
+            if uncertainty.ndim == 2:
+                # 如果是[H, W]，扩展到[H, W, K]以匹配pred_logits
+                K = pred_logits.shape[-1]
+                pixel_uncertainty = uncertainty.unsqueeze(-1).expand(-1, -1, K)  # [H, W, K]
             else:
-                pixel_uncertainty = uncertainty
+                pixel_uncertainty = uncertainty  # [H, W, K]
             pixel_uncertainty = pixel_uncertainty.float()
 
-            # 3. 计算像素级accuracy（使用原始logits保留置信度信息）
-            # 对每个通道独立计算：当gt=1时用logits，当gt=0时用-logits
-            gt_binary_bool = (gt_masks > 0)  # [H, W, K] - keep as bool for IoU/DICE
-            pred_binary_bool = (pred_logits > 0)  # [H, W, K] - keep as bool for IoU/DICE
+            # 3. 计算per-channel accuracy（使用概率，范围0-1）
+            gt_binary_bool = (gt_masks > 0)  # [H, W, K]
+            pred_binary_bool = (pred_logits > 0)  # [H, W, K]
             gt_binary = gt_binary_bool.float()  # [H, W, K]
+            pred_probs = torch.sigmoid(pred_logits)  # [H, W, K]
             
-            # 对每个通道计算带符号的logits准确率
-            # gt=1: 正logits表示准确； gt=0: 负logits表示准确
+            # Per-channel accuracy: 当gt=1时用prob，当gt=0时用1-prob
             pixel_accuracy_per_channel = torch.where(
                 gt_binary > 0.5,
-                pred_logits,           # 真值=1：高logits → 高准确率
-                -pred_logits           # 真值=0：低logits → 高准确率（翻转符号）
-            )  # [H, W, K], range (-∞, +∞)
-            
-            # 跨通道聚合：使用均值（也可以考虑min/max）
-            pixel_correct = pixel_accuracy_per_channel.mean(dim=-1)  # [H, W]
+                pred_probs,           # 真值=1：高概率 → 高准确率
+                1.0 - pred_probs      # 真值=0：低概率 → 高准确率
+            )  # [H, W, K], range [0, 1]
 
-            # 4. 计算像素级IoU贡献（intersection / union per pixel across channels）
-            intersection = (pred_binary_bool & gt_binary_bool).float().sum(dim=-1)  # [H, W]
-            union = (pred_binary_bool | gt_binary_bool).float().sum(dim=-1)  # [H, W]
-            pixel_iou = intersection / (union + 1e-8)  # [H, W]
-            pixel_iou = torch.clamp(pixel_iou, 0.0, 1.0)
+            # 4. 计算per-channel IoU（binary correctness）
+            pixel_iou_per_channel = (pred_binary_bool == gt_binary_bool).float()  # [H, W, K]
 
-            # 5. 计算像素级DICE贡献
-            pred_probs = torch.sigmoid(pred_logits)  # [H, W, K]
-            numerator = 2 * (pred_probs * gt_binary).sum(dim=-1)  # [H, W]
-            denominator = pred_probs.sum(dim=-1) + gt_binary.sum(dim=-1)  # [H, W]
-            pixel_dice = numerator / (denominator + 1e-8)
-            pixel_dice = torch.clamp(pixel_dice, 0.0, 1.0)
+            # 5. 计算per-channel DICE（使用概率版本）
+            numerator = 2 * pred_probs * gt_binary  # [H, W, K]
+            denominator = pred_probs + gt_binary  # [H, W, K]
+            pixel_dice_per_channel = numerator / (denominator + 1e-8)
+            pixel_dice_per_channel = torch.clamp(pixel_dice_per_channel, 0.0, 1.0)
 
-            # 6. 计算像素级NLL（使用logits和gt的交叉熵）
-            # 对每个像素的K个通道计算平均NLL
+            # 6. 计算per-channel NLL
             pred_probs_safe = torch.clamp(pred_probs, 1e-7, 1 - 1e-7)
             pixel_nll_per_channel = - (gt_binary * torch.log(pred_probs_safe) +
                                        (1 - gt_binary) * torch.log(1 - pred_probs_safe))  # [H, W, K]
-            pixel_nll = pixel_nll_per_channel.mean(dim=-1)  # [H, W]
 
-            # 7. 提取前景扩展区域的像素
+            # 7. 提取选定区域的像素，并展平通道维度
+            # 每个像素产生K个样本
             if fg_mask_expanded.any():
-                extracted_uncertainty = pixel_uncertainty[fg_mask_expanded]
-                extracted_accuracy = pixel_correct[fg_mask_expanded]
-                extracted_iou = pixel_iou[fg_mask_expanded]
-                extracted_dice = pixel_dice[fg_mask_expanded]
-                extracted_nll = pixel_nll[fg_mask_expanded]
+                # 扩展mask到[H, W, K]
+                K = pixel_uncertainty.shape[-1]
+                fg_mask_expanded_K = fg_mask_expanded.unsqueeze(-1).expand(-1, -1, K)
+                
+                # 提取并展平：[H, W, K] -> [N*K]
+                extracted_uncertainty = pixel_uncertainty[fg_mask_expanded_K]
+                extracted_accuracy = pixel_accuracy_per_channel[fg_mask_expanded_K]
+                extracted_iou = pixel_iou_per_channel[fg_mask_expanded_K]
+                extracted_dice = pixel_dice_per_channel[fg_mask_expanded_K]
+                extracted_nll = pixel_nll_per_channel[fg_mask_expanded_K]
             else:
-                # 如果没有前景，返回空张量
+                # 如果mask为空，返回空张量
                 extracted_uncertainty = torch.tensor([], dtype=torch.float32)
                 extracted_accuracy = torch.tensor([], dtype=torch.float32)
                 extracted_iou = torch.tensor([], dtype=torch.float32)

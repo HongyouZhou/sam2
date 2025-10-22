@@ -8,14 +8,8 @@ import logging
 
 import numpy as np
 import torch
-import torch.distributed
 from sam2.modeling.sam2_base import SAM2Base
-from sam2.modeling.sam2_utils import (
-    get_1d_sine_pe,
-    get_next_point,
-    sample_box_points,
-    select_closest_cond_frames,
-)
+from sam2.modeling.sam2_utils import sample_box_points, get_next_point
 
 from sam2.utils.misc import concat_points
 
@@ -381,6 +375,7 @@ class SAM2Train(SAM2Base):
             num_frames,
             track_in_reverse,
             prev_sam_mask_logits,
+            pixel_gt_for_aue=gt_masks,
         )
 
         if len(sam_outputs) == 8:  # 包含辅助输出（BNDL/UR-ERN等）
@@ -526,6 +521,7 @@ class SAM2Train(SAM2Base):
                     mask_inputs=mask_inputs,
                     high_res_features=high_res_features,
                     multimask_output=multimask_output,
+                    pixel_gt_for_aue=gt_masks,
                     use_reentrant=False,
                 )
             else:
@@ -535,6 +531,7 @@ class SAM2Train(SAM2Base):
                     mask_inputs=mask_inputs,
                     high_res_features=high_res_features,
                     multimask_output=multimask_output,
+                    pixel_gt_for_aue=gt_masks,
                 )
 
             # Unpack sam_outputs: check if aux_outputs is present (8 elements) or not (7 elements)

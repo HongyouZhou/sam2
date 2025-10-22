@@ -11,7 +11,8 @@ import gc
 import json
 import pickle
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Optional
+import re
 
 import numpy as np
 import torch
@@ -57,6 +58,39 @@ class CheckpointManager:
         
         # Ensure output directory exists
         self.output_dir.mkdir(parents=True, exist_ok=True)
+    
+    def _checkpoint_glob_patterns(self) -> list[str]:
+        """Return filename glob patterns for this manager's checkpoints."""
+        # Support both numpy and pickle for eval, and json for stats
+        base = f".{self.checkpoint_type}_checkpoint_{self.dataset_name}_*."
+        if self.checkpoint_type == "stats":
+            return [base + "json"]
+        return [base + "npz", base + "pkl"]
+
+    def discover_existing_checkpoints(self) -> None:
+        """Discover leftover checkpoint files on disk and register them.
+
+        Useful for resumable runs or when this object is created fresh and
+        needs to merge previously saved shards.
+        """
+        discovered: list[Path] = []
+        for pattern in self._checkpoint_glob_patterns():
+            discovered.extend(sorted(self.output_dir.glob(pattern)))
+
+        # Merge with any already-tracked files, de-duplicate
+        existing = set(p.resolve() for p in self.checkpoint_files)
+        all_files = existing.union(p.resolve() for p in discovered)
+
+        # Sort by trailing numeric index if present
+        def _index_key(p: Path) -> int:
+            # Examples: .eval_checkpoint_MOSE_train_0010.npz
+            m = re.search(r"_(\d{3,6})\.[^.]+$", p.name)
+            try:
+                return int(m.group(1)) if m else 0
+            except Exception:
+                return 0
+
+        self.checkpoint_files = sorted([Path(x) for x in all_files], key=_index_key)
     
     def should_checkpoint(self, video_idx: int) -> bool:
         """Check if we should save a checkpoint at this video index.
@@ -153,6 +187,9 @@ class CheckpointManager:
             Merged data dictionary
         """
         if not self.checkpoint_files:
+            # Try to discover leftover shards on disk
+            self.discover_existing_checkpoints()
+        if not self.checkpoint_files:
             return {}
         
         print(f"🔄 Merging {len(self.checkpoint_files)} checkpoint files...")
@@ -180,6 +217,8 @@ class CheckpointManager:
                 
                 # Clean up checkpoint file
                 checkpoint_file.unlink()
+                # Aggressive memory cleanup between shards
+                self.force_memory_cleanup()
                 
             except Exception as e:
                 print(f"Warning: Failed to merge checkpoint {checkpoint_file}: {e}")
@@ -190,6 +229,37 @@ class CheckpointManager:
         
         print(f"✓ Merged all checkpoints")
         return merged_data
+
+    def merge_checkpoints_streaming(self, on_data: Callable[[dict[str, Any]], None]) -> None:
+        """Stream-merge checkpoints by processing each shard via a callback.
+
+        This avoids materializing the fully merged dictionary in memory.
+
+        Args:
+            on_data: Function called with the loaded dict for each shard.
+        """
+        if not self.checkpoint_files:
+            # Try to discover leftover shards on disk
+            self.discover_existing_checkpoints()
+        if not self.checkpoint_files:
+            return
+
+        print(f"🔄 Merging {len(self.checkpoint_files)} checkpoint files...")
+        for checkpoint_file in self.checkpoint_files:
+            try:
+                checkpoint_data = self.load_checkpoint(checkpoint_file)
+                # Process this shard
+                on_data(checkpoint_data)
+                # Remove shard after successful processing
+                checkpoint_file.unlink()
+            except Exception as e:
+                print(f"Warning: Failed to process checkpoint {checkpoint_file}: {e}")
+            finally:
+                # Free memory between shards
+                self.force_memory_cleanup()
+
+        self.checkpoint_files.clear()
+        print("✓ Merged all checkpoints")
     
     def cleanup(self) -> None:
         """Clean up any remaining checkpoint files."""

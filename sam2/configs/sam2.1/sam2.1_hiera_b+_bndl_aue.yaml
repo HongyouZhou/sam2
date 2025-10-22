@@ -124,12 +124,12 @@ model:
   # AUE (Adversarial Uncertainty Estimation) options
   use_aue: true
   aue_adversarial_image_size: 512
-  aue_num_adversarial_samples: 64
+  aue_num_adversarial_samples: 1
   aue_use_uncertainty: false
   # UQ-aware AUE controls
   aue_uncertainty_mask_threshold: 0.4
-  aue_diversity_loss_weight: 0.05
-  aue_tv_loss_weight: 0.05
+  aue_diversity_loss_weight: 0.0  # Diversity regularization weight
+  aue_constraint_loss_weight: 0.1  # Constraint regularization weight
 
   # ROI sharing
   share_roi_views: true

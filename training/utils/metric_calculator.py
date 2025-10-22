@@ -106,6 +106,10 @@ class MetricCalculator:
                     )
                     uncertainty = uncertainty_resized.permute(0, 2, 3, 1)
                     logging.info(f"Resized uncertainty from {H_unc}x{W_unc} to {target_h}x{target_w}")
+                # 处理通道维度：如果 uncertainty 只有1个通道，扩展到 K_pred
+                if uncertainty.shape[-1] == 1 and K_pred > 1:
+                    uncertainty = uncertainty.expand(-1, -1, -1, K_pred).contiguous()
+                    logging.info(f"Expanded uncertainty from 1 to {K_pred} channels")
             elif len(uncertainty.shape) == 3:  # [B, H, W]
                 B_unc, H_unc, W_unc = uncertainty.shape
                 if (H_unc, W_unc) != (target_h, target_w):
@@ -115,13 +119,30 @@ class MetricCalculator:
                     )
                     uncertainty = uncertainty_resized.squeeze(1)
                     logging.info(f"Resized uncertainty from {H_unc}x{W_unc} to {target_h}x{target_w}")
+                # 如果是 [B, H, W]，需要扩展到 [B, H, W, K]
+                if K_pred > 1:
+                    uncertainty = uncertainty.unsqueeze(-1).expand(-1, -1, -1, K_pred).contiguous()
+                    logging.info(f"Expanded uncertainty from [B, H, W] to [B, H, W, {K_pred}]")
             
             # 处理通道维度不匹配
             if gt_masks.shape[-1] != pred_logits.shape[-1]:
-                K_min = min(gt_masks.shape[-1], pred_logits.shape[-1])
-                gt_masks = gt_masks[..., :K_min]
-                pred_logits = pred_logits[..., :K_min]
-                logging.info(f"Truncated to {K_min} channels for consistency")
+                # 如果 gt_masks 通道数少于 pred_logits，扩展 gt_masks
+                # 这样可以支持每个K都有独立的不确定性估计
+                if gt_masks.shape[-1] == 1 and pred_logits.shape[-1] > 1:
+                    K_pred = pred_logits.shape[-1]
+                    gt_masks = gt_masks.expand(-1, -1, -1, K_pred).contiguous()
+                    logging.info(f"Expanded gt_masks from 1 to {K_pred} channels")
+                # 如果 gt_masks 通道数多于 pred_logits，截断 gt_masks
+                elif gt_masks.shape[-1] > pred_logits.shape[-1]:
+                    K_pred = pred_logits.shape[-1]
+                    gt_masks = gt_masks[..., :K_pred]
+                    logging.info(f"Truncated gt_masks to {K_pred} channels")
+                # 其他情况：使用最小值截断（保持原有逻辑）
+                else:
+                    K_min = min(gt_masks.shape[-1], pred_logits.shape[-1])
+                    gt_masks = gt_masks[..., :K_min]
+                    pred_logits = pred_logits[..., :K_min]
+                    logging.info(f"Truncated to {K_min} channels for consistency")
             
             return pred_logits, gt_masks, uncertainty
             
