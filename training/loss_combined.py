@@ -10,7 +10,18 @@ class CombinedSAMBNDLLoss(nn.Module):
     combine sam and bndl loss
     """
 
-    def __init__(self, sam_loss, bndl_loss, ur_ern_loss=None, aue_loss=None, sam_weight=1.0, bndl_weight=1.0, ur_ern_weight=1.0, aue_weight=1.0):
+    def __init__(
+        self,
+        sam_loss,
+        bndl_loss,
+        ur_ern_loss=None,
+        aue_loss=None,
+        sam_weight=1.0,
+        bndl_weight=1.0,
+        ur_ern_weight=1.0,
+        aue_weight=1.0,
+        weight_schedule: list[dict] | None = None,
+    ):
         super().__init__()
         self.sam_loss = sam_loss
         self.bndl_loss = bndl_loss
@@ -21,6 +32,49 @@ class CombinedSAMBNDLLoss(nn.Module):
         self.ur_ern_weight = ur_ern_weight
         self.aue_weight = aue_weight
         self._dbg_once = False
+        self._initial_weights = {
+            "sam_weight": sam_weight,
+            "bndl_weight": bndl_weight,
+            "ur_ern_weight": ur_ern_weight,
+            "aue_weight": aue_weight,
+        }
+        self._weight_schedule = self._prepare_weight_schedule(weight_schedule)
+        if self._weight_schedule:
+            # Ensure weights match the first stage for epoch 0
+            self.apply_schedule(0)
+
+    def _prepare_weight_schedule(self, schedule_cfg: list[dict] | None) -> list[dict]:
+        if not schedule_cfg:
+            return []
+        prepared = []
+        for stage in schedule_cfg:
+            if not isinstance(stage, dict):
+                raise TypeError(f"weight_schedule stage must be a dict, got {type(stage)}")
+            stage_copy = dict(stage)
+            until_epoch = stage_copy.pop("until_epoch", None)
+            if until_epoch is not None:
+                until_epoch = int(until_epoch)
+            stage_copy["until_epoch"] = until_epoch
+            prepared.append(stage_copy)
+        prepared.sort(key=lambda s: float("inf") if s["until_epoch"] is None else s["until_epoch"])
+        return prepared
+
+    def _apply_stage_weights(self, stage: dict) -> None:
+        self.sam_weight = stage.get("sam_weight", self._initial_weights["sam_weight"])
+        self.bndl_weight = stage.get("bndl_weight", self._initial_weights["bndl_weight"])
+        self.ur_ern_weight = stage.get("ur_ern_weight", self._initial_weights["ur_ern_weight"])
+        self.aue_weight = stage.get("aue_weight", self._initial_weights["aue_weight"])
+
+    def apply_schedule(self, epoch: int) -> None:
+        if not self._weight_schedule:
+            return
+        for stage in self._weight_schedule:
+            limit = stage.get("until_epoch")
+            if limit is None or epoch <= limit:
+                self._apply_stage_weights(stage)
+                return
+        # If all stages had a finite limit smaller than epoch, fall back to the last stage
+        self._apply_stage_weights(self._weight_schedule[-1])
 
     def forward(self, outs_batch: list[dict], targets_batch: torch.Tensor):
         # compute sam loss (always required)

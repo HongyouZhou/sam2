@@ -794,6 +794,11 @@ class Trainer:
 
         iters_per_epoch = len(train_loader)
 
+        if "all" in self.loss:
+            loss_all = self.loss["all"]
+            if hasattr(loss_all, "apply_schedule"):
+                loss_all.apply_schedule(self.epoch)
+
         loss_names = []
         for batch_key in self.loss.keys():
             loss_names.append(f"Losses/{phase}_{batch_key}_loss")
@@ -859,6 +864,10 @@ class Trainer:
                 # applied if the gradients are infinite
                 self.scaler.step(self.optim.optimizer)
                 self.scaler.update()
+                
+                # Apply hard constraints to AUE adversarial samples after optimizer step
+                # This enforces L_infty projection and boundary band constraints
+                unwrap_ddp_if_wrapped(self.model).apply_aue_hard_constraints()
 
                 # measure elapsed time
                 batch_time_meter.update(time.time() - end)
@@ -1270,6 +1279,22 @@ class Trainer:
             k_w_mean = (1.0 / (bndl_outputs["inv_k_w"] + 1e-6)).mean().detach()
             self.logger.log(f"Stats/{phase}_lambda_w", lambda_w_mean, step)
             self.logger.log(f"Stats/{phase}_k_w", k_w_mean, step)
+
+        # AUE loss components
+        if "aue_loss_dict" in bndl_outputs and bndl_outputs["aue_loss_dict"] is not None:
+            aue_loss_dict = bndl_outputs["aue_loss_dict"]
+            all_aue_loss_keys = [
+                'ratio_pos', 'ratio_adversarial', 'range_penalty', 'zero_escape_loss',
+                'tv_loss', 'h1_loss', 'spectral_loss', 'off_boundary_loss', 
+                'zero_mean_loss', 'diversity_loss', 'constraint_loss', 'prompt_penalty', 'total_loss'
+            ]
+            for key in all_aue_loss_keys:
+                value = aue_loss_dict.get(key, 0.0)
+                if isinstance(value, torch.Tensor):
+                    val = value.item()
+                else:
+                    val = value
+                self.logger.log(f"AUE_Losses/{phase}_{key}", val, step)
 
     def _extract_pixel_bndl_model(self, model):
         """Extract the pixel_bndl model from the main SAM2 model"""

@@ -120,11 +120,12 @@ model:
   bndl_hyper_in_sparse: true
   # Compilation flag
   # compile_image_encoder: False
-
+  
   # AUE (Adversarial Uncertainty Estimation) options
   use_aue: true
   aue_adversarial_image_size: 512
-  aue_num_adversarial_samples: 1
+  aue_num_adversarial_samples: 16
+  aue_init_from_dataset: false
   aue_use_uncertainty: false
   # UQ-aware AUE controls
   aue_uncertainty_mask_threshold: 0.4

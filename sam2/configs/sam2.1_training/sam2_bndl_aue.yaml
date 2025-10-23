@@ -211,19 +211,18 @@ trainer:
     # Compilation flag
     # compile_image_encoder: False
     
-    # Freeze image encoder backbone
     freeze_image_encoder: true
 
     # AUE (Adversarial Uncertainty Estimation) options
     use_aue: true
     aue_adversarial_image_size: 512
-    aue_num_adversarial_samples: 1
-    aue_init_from_dataset: false
+    aue_num_adversarial_samples: 16
+    aue_init_from_dataset: true
     aue_use_uncertainty: false
     # UQ-aware AUE controls
     aue_uncertainty_mask_threshold: 0.4
-    aue_diversity_loss_weight: 0.0  # Diversity regularization weight
-    aue_constraint_loss_weight: 0.1  # Constraint regularization weight
+    aue_diversity_loss_weight: 0.0
+    aue_constraint_loss_weight: 0.1
 
     # ROI sharing
     share_roi_views: true
@@ -438,13 +437,26 @@ trainer:
       aue_loss:
         _target_: training.loss_aue.AUELoss
       aue_weight: 0.1     # 保持AUE权重
+      weight_schedule:
+        - until_epoch: 1
+          sam_weight: 0.3
+          bndl_weight: 0.5
+          aue_weight: 0.01  # 给AUE一个小的初始权重
+        - until_epoch: 3
+          sam_weight: 0.7
+          bndl_weight: 0.3
+          aue_weight: 0.05
+        - until_epoch: null
+          sam_weight: 1.0
+          bndl_weight: 0.25
+          aue_weight: 0.05
     # val:
     #   _target_: training.loss_combined.CombinedSAMBNDLLoss
     #   sam_loss: ${trainer.loss.all.sam_loss}
     #   bndl_loss: ${trainer.loss.all.bndl_loss}
     #   sam_weight: ${trainer.loss.all.sam_weight}
     #   bndl_weight: ${trainer.loss.all.bndl_weight}
-    val:                                                # NEW – identical settings
+    val:
       _target_: training.loss_fns.MultiStepMultiMasksAndIous
       weight_dict: ${trainer.loss.all.sam_loss.weight_dict}
       supervise_all_iou: ${trainer.loss.all.sam_loss.supervise_all_iou}
@@ -501,7 +513,7 @@ trainer:
 launcher:
   num_nodes: 1
   gpus_per_node: 8
-  experiment_log_dir: /home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_aue_012_09 # Path to log directory, defaults to ./sam2_logs/${config_name}
+  experiment_log_dir: /home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_aue_012_11 # Path to log directory, defaults to ./sam2_logs/${config_name}
 
 # SLURM args if running on a cluster
 submitit:
@@ -513,4 +525,3 @@ submitit:
   timeout_hour: 24
   name: null
   port_range: [10000, 65000]
-
