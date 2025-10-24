@@ -215,7 +215,6 @@ trainer:
 
     # AUE (Adversarial Uncertainty Estimation) options
     use_aue: true
-    aue_adversarial_image_size: 512
     aue_num_adversarial_samples: 16
     aue_init_from_dataset: true
     aue_use_uncertainty: false
@@ -386,6 +385,7 @@ trainer:
             - 'sam_mask_decoder.pixel_bndl.*'
 
         # ④ 解码器其他部分：极小 LR（避免破坏 SAM）
+        # Note: conv_s0 and conv_s1 are frozen by AUE (deterministic projection layers)
         - scheduler:
             _target_: fvcore.common.param_scheduler.CosineParamScheduler
             start_value: 1.0e-7
@@ -395,8 +395,6 @@ trainer:
             - 'sam_mask_decoder.iou_token.*'
             - 'sam_mask_decoder.obj_score_token.*'
             - 'sam_mask_decoder.output_upscaling.*'
-            - 'sam_mask_decoder.conv_s0.*'
-            - 'sam_mask_decoder.conv_s1.*'
             - 'sam_mask_decoder.output_hypernetworks_mlps.*'
             - 'sam_mask_decoder.iou_prediction_head.*'
             - 'sam_mask_decoder.pred_obj_score_head.*'
@@ -441,11 +439,11 @@ trainer:
         - until_epoch: 1
           sam_weight: 0.3
           bndl_weight: 0.5
-          aue_weight: 0.01  # 给AUE一个小的初始权重
+          aue_weight: 0.05  # 给AUE一个小的初始权重
         - until_epoch: 3
           sam_weight: 0.7
           bndl_weight: 0.3
-          aue_weight: 0.05
+          aue_weight: 0.1
         - until_epoch: null
           sam_weight: 1.0
           bndl_weight: 0.25
@@ -513,7 +511,7 @@ trainer:
 launcher:
   num_nodes: 1
   gpus_per_node: 8
-  experiment_log_dir: /home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_aue_012_11 # Path to log directory, defaults to ./sam2_logs/${config_name}
+  experiment_log_dir: /home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_aue_015_01 # Path to log directory, defaults to ./sam2_logs/${config_name}
 
 # SLURM args if running on a cluster
 submitit:

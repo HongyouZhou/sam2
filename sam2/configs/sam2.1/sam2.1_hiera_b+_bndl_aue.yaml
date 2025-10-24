@@ -123,7 +123,6 @@ model:
   
   # AUE (Adversarial Uncertainty Estimation) options
   use_aue: true
-  aue_adversarial_image_size: 512
   aue_num_adversarial_samples: 16
   aue_init_from_dataset: false
   aue_use_uncertainty: false

@@ -547,9 +547,9 @@ class Trainer:
 
     def _setup_dataloaders(self):
         # Initialize if not already done by _setup_components for AUE
-        if not hasattr(self, 'train_dataset'):
+        if not hasattr(self, "train_dataset"):
             self.train_dataset = None
-        if not hasattr(self, 'val_dataset'):
+        if not hasattr(self, "val_dataset"):
             self.val_dataset = None
 
         if self.mode in ["train", "val"]:
@@ -723,7 +723,7 @@ class Trainer:
                         else:
                             current_frame_targets = batch.masks[0] if batch.masks.shape[0] > 0 else batch.masks
                         bndl_outputs = self._calculate_uncertainty_for_bndl(bndl_outputs, batch, current_frame_targets)
-                        
+
                         vis_dir = os.path.join(self.logging_conf.log_dir, "bndl_visualizations", phase)
                         makedir(vis_dir)
                         # Create full visualization with uncertainty and PAvPU overlays
@@ -736,7 +736,9 @@ class Trainer:
                 and hasattr(unwrap_ddp_if_wrapped(self.model), "use_aue")
                 and unwrap_ddp_if_wrapped(self.model).use_aue
             ):
-                self._visualize_aue_adversarials(phase, data_iter)
+                # Visualization disabled for feature-space AUE
+                # self._visualize_aue_adversarials(phase, data_iter)
+                pass
 
             if data_iter % 10 == 0:
                 dist.barrier()
@@ -864,7 +866,7 @@ class Trainer:
                 # applied if the gradients are infinite
                 self.scaler.step(self.optim.optimizer)
                 self.scaler.update()
-                
+
                 # Apply hard constraints to AUE adversarial samples after optimizer step
                 # This enforces L_infty projection and boundary band constraints
                 unwrap_ddp_if_wrapped(self.model).apply_aue_hard_constraints()
@@ -1143,22 +1145,20 @@ class Trainer:
         self.logger = Logger(self.logging_conf)
 
         self.model = instantiate(self.model_conf, _convert_="all")
-        
+
         if hasattr(self.model, "use_aue") and self.model.use_aue:
             # 根据配置决定是否从数据集初始化对抗样本
             if self.model_conf.get("aue_init_from_dataset", True):
-                if not hasattr(self, 'train_dataset'):
+                if not hasattr(self, "train_dataset"):
                     self.train_dataset = None
                     # Try to setup train dataset for AUE initialization (only in train modes)
                     if self.mode in ["train", "train_only"]:
                         self._setup_dataloaders_early()
-                
+
                 if self.train_dataset is not None:
-                    logging.info("Initializing AUE adversarial samples from dataset...")
+                    logging.info("Initializing AUE adversarial feature bank from dataset (AdCo method)...")
                     # Use multiprocessing with 'spawn' context (safe even when CUDA initialized)
-                    self.model.init_aue_adversarials_from_dataset(
-                        self.train_dataset, num_workers=4
-                    )
+                    self.model.init_aue_adversarials_from_dataset_featurespace(self.train_dataset, num_workers=4)
                 else:
                     logging.info("Skipping AUE adversarial samples initialization (train_dataset not available in val-only mode)")
             else:
@@ -1183,15 +1183,11 @@ class Trainer:
             enabled=self.optim_conf.amp.enabled if self.optim_conf else False,
         )
 
-        self.gradient_clipper = (
-            instantiate(self.optim_conf.gradient_clip) if self.optim_conf else None
-        )
-        self.gradient_logger = (
-            instantiate(self.optim_conf.gradient_logger) if self.optim_conf else None
-        )
+        self.gradient_clipper = instantiate(self.optim_conf.gradient_clip) if self.optim_conf else None
+        self.gradient_logger = instantiate(self.optim_conf.gradient_logger) if self.optim_conf else None
 
         logging.info("Finished setting up components: Model, loss, optim, meters etc.")
-        
+
     def _setup_evaluators(self):
         """Setup separate evaluators for training and validation phases"""
         # Get configuration
@@ -1284,9 +1280,11 @@ class Trainer:
         if "aue_loss_dict" in bndl_outputs and bndl_outputs["aue_loss_dict"] is not None:
             aue_loss_dict = bndl_outputs["aue_loss_dict"]
             all_aue_loss_keys = [
-                'ratio_pos', 'ratio_adversarial', 'range_penalty', 'zero_escape_loss',
-                'tv_loss', 'h1_loss', 'spectral_loss', 'off_boundary_loss', 
-                'zero_mean_loss', 'diversity_loss', 'constraint_loss', 'prompt_penalty', 'total_loss'
+                "ratio_pos",
+                "ratio_adversarial",
+                "range_penalty",
+                "diversity_loss",
+                "total_loss",
             ]
             for key in all_aue_loss_keys:
                 value = aue_loss_dict.get(key, 0.0)
@@ -1403,9 +1401,7 @@ class Trainer:
                     S = self.logging_conf.uncertainty_sample_num
                     sampled_logits = torch.zeros(B, H, W, S, device=pixel_feat.device, dtype=pixel_feat.dtype)
                     for i in range(S):
-                        out_i, *_ = pixel_bndl_model(
-                            pixel_feat, force_sample=True, external_pre_out_w=single_channel_w
-                        )  # [B,H,W,1]
+                        out_i, *_ = pixel_bndl_model(pixel_feat, force_sample=True, external_pre_out_w=single_channel_w)  # [B,H,W,1]
                         sampled_logits[..., i] = out_i[..., 0]
                     # probs per sample
                     probs = torch.sigmoid(sampled_logits)  # [B,H,W,S]
@@ -1470,9 +1466,7 @@ class Trainer:
             if mean_pixel_logits is None:
                 # Get one deterministic forward for logits on the chosen channel(s)
                 if single_channel_w is not None:
-                    det_out, *_ = pixel_bndl_model(
-                        pixel_feat, force_sample=False, external_pre_out_w=single_channel_w
-                    )  # [B,H,W,1]
+                    det_out, *_ = pixel_bndl_model(pixel_feat, force_sample=False, external_pre_out_w=single_channel_w)  # [B,H,W,1]
                     mean_pixel_logits = det_out
                 else:
                     _, mean_pixel_logits = pixel_uncertain_sampling(
@@ -1551,72 +1545,75 @@ class Trainer:
 
     def _extract_mask_prompt_info(self, outputs_for_vis, step_index=0):
         """从 mask_inputs 提取边界框或轮廓点用于可视化
-        
+
         Args:
             outputs_for_vis: 模型输出列表
             step_index: 帧索引
-            
+
         Returns:
             prompt_info 字典（包含 mask 的 bounding box）或 None
         """
         try:
             if outputs_for_vis is None or not isinstance(outputs_for_vis, list) or len(outputs_for_vis) == 0:
                 return None
-            
+
             if step_index >= len(outputs_for_vis):
                 step_index = 0
-            
+
             step_output = outputs_for_vis[step_index]
             if not isinstance(step_output, dict):
                 return None
-            
+
             # 提取 mask_inputs
             mask_inputs = step_output.get("mask_inputs", None)
             if mask_inputs is None:
                 return None
-            
+
             # mask_inputs 通常是 [B, 1, H, W] 格式
-            if hasattr(mask_inputs, 'shape') and len(mask_inputs.shape) >= 3:
+            if hasattr(mask_inputs, "shape") and len(mask_inputs.shape) >= 3:
                 mask = mask_inputs[0, 0] if len(mask_inputs.shape) == 4 else mask_inputs[0]  # [H, W]
-                
+
                 # 转换为 numpy
-                if hasattr(mask, 'cpu'):
+                if hasattr(mask, "cpu"):
                     mask_np = mask.cpu().numpy()
                 else:
                     mask_np = mask
-                
+
                 # 计算 mask 的 bounding box
                 fg_coords = np.argwhere(mask_np > 0.5)  # [[y, x], ...]
                 if len(fg_coords) == 0:
                     return None
-                
+
                 # 获取边界框
                 y_min, x_min = fg_coords.min(axis=0)
                 y_max, x_max = fg_coords.max(axis=0)
-                
+
                 # 构造边界框的两个角点（SAM 使用 box corners）
-                box_coords = torch.tensor([
-                    [x_min, y_min],  # 左上角
-                    [x_max, y_max]   # 右下角
-                ], dtype=torch.float32).unsqueeze(0)  # [1, 2, 2]
-                
+                box_coords = torch.tensor(
+                    [
+                        [x_min, y_min],  # 左上角
+                        [x_max, y_max],  # 右下角
+                    ],
+                    dtype=torch.float32,
+                ).unsqueeze(0)  # [1, 2, 2]
+
                 box_labels = torch.tensor([[2, 3]], dtype=torch.int32)  # SAM box 标签
-                
+
                 prompt_info = {
-                    'point_coords': box_coords,
-                    'point_labels': box_labels,
-                    'is_box': True  # 标记这是 box prompt
+                    "point_coords": box_coords,
+                    "point_labels": box_labels,
+                    "is_box": True,  # 标记这是 box prompt
                 }
-                
+
                 logging.info(f"✓ Extracted bounding box from mask_inputs for visualization")
                 return prompt_info
-            
+
             return None
-            
+
         except Exception as e:
             logging.warning(f"Failed to extract mask prompt info: {e}")
             return None
-    
+
     def _extract_prompt_info(self, outputs_for_vis, step_index=0):
         """从模型输出中提取prompt信息（优先从第一帧）
 
@@ -1647,13 +1644,13 @@ class Trainer:
                     # 取第一步的 point inputs（初始 prompts，不是 correction points）
                     if point_inputs_list[0] is not None and isinstance(point_inputs_list[0], dict):
                         final_point_inputs = point_inputs_list[0]
-            
+
             # 如果 multistep_point_inputs 没有有效数据，尝试使用顶层的 point_inputs
             if final_point_inputs is None and "point_inputs" in step_output:
                 top_level_pi = step_output["point_inputs"]
                 if top_level_pi is not None and isinstance(top_level_pi, dict):
                     final_point_inputs = top_level_pi
-            
+
             if final_point_inputs is None:
                 return None
 
@@ -1744,7 +1741,7 @@ class Trainer:
 
         # 提取prompt信息 - 总是从第一帧（frame 0）提取，因为第一帧是 init_cond_frame，有初始 prompts
         prompt_info = self._extract_prompt_info(outputs_for_vis, step_index=0)
-        
+
         # 如果没有 point prompts，尝试从 mask_inputs 提取轮廓用于可视化
         if prompt_info is None:
             prompt_info = self._extract_mask_prompt_info(outputs_for_vis, step_index=0)

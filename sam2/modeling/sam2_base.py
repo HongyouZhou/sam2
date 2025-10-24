@@ -16,6 +16,7 @@ from torch.nn.init import trunc_normal_
 
 from BNDL.BNDL_upload.ViT_Sparse.utils.bndl import (
     pixel_uncertain_sampling,
+    pixel_entropy_uncertainty,
 )
 from sam2.modeling.aue_utils import sample_adversarials_from_dataset
 from sam2.modeling.sam.mask_decoder import MaskDecoder
@@ -110,8 +111,6 @@ class SAM2Base(torch.nn.Module):
         compile_image_encoder: bool = False,
         # AUE options (Adversarial Uncertainty Estimation)
         use_aue: bool = False,
-        # AUE adversarial image bank resolution (for memory safety)
-        aue_adversarial_image_size: int = 128,
         # Number of adversarial samples in the bank
         aue_num_adversarial_samples: int = 32,
         # Whether to initialize adversarial samples from dataset
@@ -221,7 +220,6 @@ class SAM2Base(torch.nn.Module):
 
         # AUE components
         self.use_aue = bool(use_aue)
-        self.aue_adversarial_image_size = int(aue_adversarial_image_size)
         self.aue_num_adversarial_samples = int(aue_num_adversarial_samples)
         self.aue_init_from_dataset = bool(aue_init_from_dataset)
         self.aue_use_uncertainty = bool(aue_use_uncertainty)
@@ -248,35 +246,43 @@ class SAM2Base(torch.nn.Module):
             )
 
     def _build_aue_components(self) -> None:
-        """Build adversarial image bank for AUE."""
-        # Learnable adversarial image bank for AUE (sample → encode → BNDL)
-        # Store at a reduced resolution for memory safety; upsample on use.
-        # Shape: [K_eff, 3, H_adv, W_adv]
-        H_adv = int(self.aue_adversarial_image_size)
-        W_adv = int(self.aue_adversarial_image_size)
+        """Build adversarial feature bank for AUE (feature space)."""
+        # Freeze conv_s0 and conv_s1 to keep them as deterministic projection layers
+        # This ensures adversarial training only affects the stored features, not the projections
+        if self.use_high_res_features_in_sam:
+            for param in self.sam_mask_decoder.conv_s0.parameters():
+                param.requires_grad = False
+            for param in self.sam_mask_decoder.conv_s1.parameters():
+                param.requires_grad = False
+            logging.info(
+                "AUE: Frozen sam_mask_decoder.conv_s0 and conv_s1 (deterministic projection layers)"
+            )
+        
+        # Learnable adversarial feature bank for AUE (feature → BNDL)
+        # Store backbone_fpn[0] BEFORE conv_s0 projection (256×256, 256 channels)
+        # From this we can derive all needed features:
+        #   - backbone_features via downsampling
+        #   - high_res feat_s0 via conv_s0 projection
+        #   - high_res feat_s1 via downsample + conv_s1 projection
+        # Shape: [K_eff, C_feat, H_feat, W_feat]
         K_eff = int(self.aue_num_adversarial_samples)
+        # Store unprojected FPN features: transformer_dim = 256 channels
+        C_feat = self.hidden_dim  # 256 channels (before projection)
+        # backbone_fpn[0] is 256×256 (stride 4, before projection)
+        H_feat = W_feat = self.sam_image_embedding_size * 4  # 256 for standard config (1024/16*4)
         
         # Save config parameters for dataset initialization
         self.aue_K_eff = K_eff
-        self.aue_H_adv = H_adv
-        self.aue_W_adv = W_adv
+        self.aue_C_feat = C_feat
+        self.aue_H_feat = H_feat
+        self.aue_W_feat = W_feat
         
-        # Hardcoded constraint parameters (not exposed in config yet)
-        # Hard constraints
-        self.aue_epsilon = 2.0 / 255.0  # L_infty bound on perturbation
-        self.aue_boundary_radius = 4    # boundary band radius (pixels)
-        # Soft regularizers
-        self.aue_tv_weight = 0.02  # TV regularization weight
-        self.aue_h1_weight = 0.002  # H1/Sobolev regularization weight
-        self.aue_spectral_weight = 0.01  # Spectral (high-freq penalty) weight
-        self.aue_off_boundary_weight = 0.1  # Off-boundary suppression weight
-        self.aue_zero_mean_weight = 0.1  # Zero-mean constraint weight
+        # Feature space constraint parameters (minimal - rely on hard constraints)
+        self.aue_diversity_weight = self.aue_diversity_loss_weight  # Optional diversity loss
         
-        # For FGSM (K=1), zero initialization is preferred as it starts from clean images
-        # For multi-step attacks, random initialization might be better
-        # Use zero initialization by default for FGSM compatibility
-        adv_images = torch.zeros(K_eff, 3, H_adv, W_adv)
-        self.aue_adversarials = torch.nn.Parameter(adv_images)
+        # Initialize adversarial features with zeros (will be initialized from dataset)
+        adv_features = torch.zeros(K_eff, C_feat, H_feat, W_feat)
+        self.aue_adversarials = torch.nn.Parameter(adv_features)
         # Gradient reversal on adversarials to approximate adversarial ascent
         # Use fixed gradient reversal scale (standard GRL implementation)
         self.aue_adversarials.register_hook(lambda g: (-1.0 * g) if g is not None else g)
@@ -285,68 +291,90 @@ class SAM2Base(torch.nn.Module):
         # This will be called after optimizer.step() to enforce hard constraints
         self.register_buffer('_aue_projection_enabled', torch.tensor(True))
         
-        # Initialize prompts and GT as parameters
-        # adv_prompts: Learnable with gradient reversal (adversarial prompts move to hard positions)
-        # adv_gt: Fixed (ground truth should not change - it defines the task)
+        # Initialize prompts and GT as parameters (kept in image space)
+        # adv_prompts: Fixed prompts (no gradient)
+        # adv_gt: Fixed ground truth masks (no gradient)
         
         # Initialize adv_prompts with full image bounding boxes [x1, y1, x2, y2]
-        # Full image means: x1=0, y1=0, x2=W, y2=H
+        # Use model's image_size (e.g., 1024×1024)
+        H_img = self.image_size
+        W_img = self.image_size
         adv_prompts = torch.zeros(K_eff, 4)
         adv_prompts[:, 0] = 0.0      # x1 = 0
         adv_prompts[:, 1] = 0.0      # y1 = 0  
-        adv_prompts[:, 2] = W_adv    # x2 = W
-        adv_prompts[:, 3] = H_adv    # y2 = H
+        adv_prompts[:, 2] = W_img    # x2 = W
+        adv_prompts[:, 3] = H_img    # y2 = H
         self.adv_prompts = torch.nn.Parameter(adv_prompts, requires_grad=False)
-        # Apply gradient reversal to prompts (like adv_images)
-        # self.adv_prompts.register_hook(lambda g: (-1.0 * g) if g is not None else g)
         
         # Initialize adv_gt with full image masks (all pixels = 1)
         # This represents the entire image as foreground
         self.adv_gt = torch.nn.Parameter(
-            torch.ones(K_eff, H_adv, W_adv), requires_grad=False  # ← 保持 False
+            torch.ones(K_eff, H_img, W_img), requires_grad=False
         )
         
-        # Store initial adversarial images for constraint loss
+        # Store initial adversarial features for constraint loss
         self.aue_adversarials_initial = torch.nn.Parameter(
-            torch.zeros_like(adv_images), requires_grad=False
+            torch.zeros_like(adv_features), requires_grad=False
         )
 
     @torch.no_grad()
     def apply_aue_hard_constraints(self):
         """
-        Apply hard constraints to adversarial samples after optimizer step:
-        1. L_infty projection: δ ← clip(δ, -ε, ε)
-        2. Boundary band constraint: δ ← δ ⊙ M_band
-        3. Valid range: ensure final images stay in [0, 1]
+        Apply hard constraints to adversarial features after optimizer step:
+        1. Feature norm bound: limit perturbation magnitude in feature space
         
         This should be called after optimizer.step() in the training loop.
         """
         if not self.use_aue or not hasattr(self, 'aue_adversarials'):
             return
         
+        K = self.aue_adversarials.size(0)
+        
         # Compute perturbation relative to initial
-        delta = self.aue_adversarials.data - self.aue_adversarials_initial.data  # [K, 3, H, W]
+        delta = self.aue_adversarials.data - self.aue_adversarials_initial.data  # [K, C, H, W]
         
-        # 1. L_infty projection: clip perturbation magnitude
-        delta = delta.clamp(-self.aue_epsilon, self.aue_epsilon)
+        # Feature norm constraint: limit perturbation magnitude relative to initial feature norm
+        # Flatten spatial dimensions for per-sample norm computation
+        delta_flat = delta.view(K, -1)  # [K, C*H*W]
+        delta_norm = delta_flat.norm(dim=1, keepdim=True)  # [K, 1]
         
-        # 2. Boundary band constraint: only allow perturbations in boundary regions
-        # Compute boundary band masks for all samples in the bank
-        M_band = self._compute_boundary_band_mask(
-            self.adv_gt.data,  # [K, H, W]
-            radius=self.aue_boundary_radius
-        )  # [K, 1, H, W]
+        # Adaptive clipping based on initial feature magnitude
+        init_flat = self.aue_adversarials_initial.data.view(K, -1)  # [K, C*H*W]
+        init_norm = init_flat.norm(dim=1, keepdim=True)  # [K, 1]
         
-        # Apply mask: zero out perturbations outside boundary band
-        delta = delta * M_band  # [K, 3, H, W]
+        # Allow 20% perturbation relative to initial feature norm
+        max_delta_norm = init_norm * 0.2 + 1e-8  # Add epsilon to avoid division by zero
         
-        # 3. Apply projected perturbation and ensure valid range
-        self.aue_adversarials.data = (self.aue_adversarials_initial.data + delta).clamp(0.0, 1.0)
+        # Scale down if perturbation exceeds limit
+        scale_factor = torch.clamp(max_delta_norm / (delta_norm + 1e-8), max=1.0)  # [K, 1]
+        delta_clipped = delta * scale_factor.view(K, 1, 1, 1)  # [K, C, H, W]
+        
+        # Apply clipped perturbation
+        self.aue_adversarials.data = self.aue_adversarials_initial.data + delta_clipped
 
     @torch.no_grad()
     def init_aue_adversarials_from_dataset(self, dataset, num_samples: int = None, num_workers: int = 4):
         """
-        从训练数据集随机采样初始化 AUE 对抗样本库。
+        从训练数据集随机采样初始化 AUE 对抗样本库 (旧版本 - image space)。
+        已废弃，请使用 init_aue_adversarials_from_dataset_featurespace。
+        
+        Args:
+            dataset: 训练数据集 (TorchTrainMixedDataset 或 VOSDataset)
+            num_samples: 采样数量，默认使用 self.aue_K_eff
+            num_workers: DataLoader worker数量 (在CPU上初始化时可以安全使用多进程)
+        """
+        logging.warning(
+            "init_aue_adversarials_from_dataset is deprecated for feature space AUE. "
+            "Redirecting to init_aue_adversarials_from_dataset_featurespace."
+        )
+        self.init_aue_adversarials_from_dataset_featurespace(dataset, num_samples, num_workers)
+    
+    @torch.no_grad()
+    def init_aue_adversarials_from_dataset_featurespace(self, dataset, num_samples: int = None, num_workers: int = 4):
+        """
+        从训练数据集随机采样并编码初始化 AUE 对抗 feature bank (AdCo 方法)。
+        
+        在 DDP 环境下，只在 rank 0 初始化，然后广播到其他 ranks。
         
         Args:
             dataset: 训练数据集 (TorchTrainMixedDataset 或 VOSDataset)
@@ -357,23 +385,82 @@ class SAM2Base(torch.nn.Module):
             return
         
         K_eff = num_samples if num_samples is not None else self.aue_K_eff
-        H_adv, W_adv = self.aue_H_adv, self.aue_W_adv
-        # Always load data on CPU (will be moved to GPU later by trainer._move_to_device)
-        device = torch.device('cpu')
+        model_device = next(self.parameters()).device
         
-        # 使用工具函数从数据集采样
-        adv_images, adv_boxes, adv_masks = sample_adversarials_from_dataset(
-            dataset, K_eff, H_adv, W_adv, device, num_workers=num_workers
+        # During initialization (before DDP wrapping), each rank independently initializes
+        # This is safe because DDP will sync all parameters when it's created
+        # We don't use broadcast here because:
+        # 1. It's called before DDP wrapping (model.parameters() not yet synced across ranks)
+        # 2. Initialization only happens once, so the cost is acceptable
+        
+        rank_id = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        logging.info(f"AUE initialization: Rank {rank_id} sampling and encoding features...")
+        
+        # Step 1: Sample images from dataset
+        cpu_device = torch.device('cpu')
+        images_list, boxes_list, masks_list = sample_adversarials_from_dataset(
+            dataset, K_eff, cpu_device, num_workers=num_workers
         )
         
-        # 更新参数
-        # aue_adversarials: 保持梯度反转钩子
-        self.aue_adversarials.data.copy_(adv_images)
-        # 保存初始对抗图片用于约束损失
-        self.aue_adversarials_initial.data.copy_(adv_images)
-        # adv_prompts 和 adv_gt: 作为 requires_grad=False 的参数，无梯度
-        self.adv_prompts.data.copy_(adv_boxes)
-        self.adv_gt.data.copy_(adv_masks)
+        logging.info(f"Rank {rank_id}: Sampled {len(images_list)} images with shapes: {[img.shape for img in images_list[:3]]}...")
+        logging.info(f"Rank {rank_id}: Encoding {K_eff} adversarial samples into feature space...")
+        
+        # Step 2: Batch encode images to features (for efficiency)
+        adv_features_list = []
+        
+        # Process images in batches for better efficiency
+        batch_size = 4  # Adjust based on GPU memory
+        for i in range(0, len(images_list), batch_size):
+            batch_imgs = images_list[i:i + batch_size]
+            
+            # Stack images if they have the same size, otherwise process individually
+            if len(set(img.shape for img in batch_imgs)) == 1:
+                # Same size - can batch
+                img_batch = torch.stack(batch_imgs).to(model_device)  # [B, 3, H, W]
+                backbone_out = self.image_encoder(img_batch)
+                # Extract backbone_fpn[0] for all images in batch
+                fpn_feats = backbone_out["backbone_fpn"][0]  # [B, 256, 256, 256]
+                adv_features_list.extend([feat for feat in fpn_feats])
+            else:
+                # Different sizes - process individually
+                for img in batch_imgs:
+                    img_batch = img.unsqueeze(0).to(model_device)  # [1, 3, H, W]
+                    backbone_out = self.image_encoder(img_batch)
+                    fpn_feat = backbone_out["backbone_fpn"][0][0]  # [256, 256, 256]
+                    adv_features_list.append(fpn_feat)
+        
+        # Stack all features
+        adv_features = torch.stack(adv_features_list)  # [K, C, H_feat, W_feat] on GPU
+        
+        logging.info(
+            f"Rank {rank_id}: Encoded features shape: {tuple(adv_features.shape)} "
+            f"(K={K_eff}, C={adv_features.shape[1]}, H×W={adv_features.shape[2]}×{adv_features.shape[3]}) "
+            f"- Stored backbone_fpn[0] BEFORE conv_s0/s1 projection"
+        )
+        
+        # Step 3: Update parameters on all ranks
+        self.aue_adversarials.data.copy_(adv_features)
+        self.aue_adversarials_initial.data.copy_(adv_features)
+        
+        # Use full-image prompts and GT for maximum adversarial challenge
+        # Get image space dimensions from config
+        H_img = self.image_size  # 1024
+        W_img = self.image_size  # 1024
+        
+        # Full-image bounding boxes: [0, 0, W, H]
+        full_boxes = torch.zeros(K_eff, 4, device=model_device)
+        full_boxes[:, 2] = W_img  # x2 = W
+        full_boxes[:, 3] = H_img  # y2 = H
+        self.adv_prompts.data.copy_(full_boxes)
+        
+        # Full-image masks: all pixels = 1 (foreground), at image resolution
+        full_masks = torch.ones(K_eff, H_img, W_img, device=model_device)
+        self.adv_gt.data.copy_(full_masks)
+        
+        logging.info(
+            f"Rank {rank_id}: AUE adversarial feature bank initialized from dataset (AdCo method). "
+            "Using full-image prompts and GT for maximum adversarial challenge."
+        )
 
     @torch.no_grad()
     def _aue_roi_view(
@@ -434,170 +521,7 @@ class SAM2Base(torch.nn.Module):
 
         return z, roi_weight
 
-    @torch.no_grad()
-    def _compute_boundary_band_mask(
-        self,
-        gt_masks: torch.Tensor,  # [M, H, W]
-        radius: int = 4,
-    ) -> torch.Tensor:
-        """
-        计算 GT 边界 ±r 像素的带状掩码。
-        使用形态学操作：M_band = dilate(GT, r) - erode(GT, r)
-        
-        Args:
-            gt_masks: [M, H, W] - ground truth masks (0/1 or float)
-            radius: boundary band radius in pixels
-        
-        Returns:
-            M_band: [M, 1, H, W] - boundary band mask (0/1)
-        """
-        M, H, W = gt_masks.shape
-        
-        # Binarize masks
-        masks_binary = (gt_masks > 0.5).float()  # [M, H, W]
-        masks_4d = masks_binary.unsqueeze(1)  # [M, 1, H, W]
-        
-        # Use max_pool2d for dilation and -max_pool2d(-x) for erosion
-        kernel_size = 2 * radius + 1
-        padding = radius
-        
-        # Dilation: max pooling
-        dilated = F.max_pool2d(
-            masks_4d,
-            kernel_size=kernel_size,
-            stride=1,
-            padding=padding
-        )  # [M, 1, H, W]
-        
-        # Erosion: -max_pool2d(-x)
-        eroded = -F.max_pool2d(
-            -masks_4d,
-            kernel_size=kernel_size,
-            stride=1,
-            padding=padding
-        )  # [M, 1, H, W]
-        
-        # Boundary band = dilated - eroded
-        M_band = (dilated - eroded).clamp(0.0, 1.0)  # [M, 1, H, W]
-        
-        return M_band
-
-    def _compute_tv_loss(self, delta: torch.Tensor) -> torch.Tensor:
-        """
-        Total Variation regularization: sum(|∇_x δ| + |∇_y δ|)
-        Encourages spatial smoothness and suppresses salt-and-pepper noise.
-        
-        Args:
-            delta: [M, C, H, W] - perturbation tensor
-        
-        Returns:
-            tv_loss: scalar
-        """
-        # Compute gradients
-        diff_x = delta[..., 1:, :] - delta[..., :-1, :]  # [M, C, H, W-1]
-        diff_y = delta[..., :, 1:] - delta[..., :, :-1]  # [M, C, H-1, W]
-        
-        # L1 norm of gradients
-        tv_loss = diff_x.abs().mean() + diff_y.abs().mean()
-        
-        return tv_loss
-
-    def _compute_h1_loss(self, delta: torch.Tensor) -> torch.Tensor:
-        """
-        H1/Sobolev regularization: sum(|∇_x δ|² + |∇_y δ|²)
-        Stronger smoothness constraint than TV.
-        
-        Args:
-            delta: [M, C, H, W] - perturbation tensor
-        
-        Returns:
-            h1_loss: scalar
-        """
-        # Compute gradients
-        diff_x = delta[..., 1:, :] - delta[..., :-1, :]  # [M, C, H, W-1]
-        diff_y = delta[..., :, 1:] - delta[..., :, :-1]  # [M, C, H-1, W]
-        
-        # L2 norm of gradients
-        h1_loss = diff_x.pow(2).mean() + diff_y.pow(2).mean()
-        
-        return h1_loss
-
-    def _compute_spectral_loss(
-        self,
-        delta: torch.Tensor,
-        cutoff: float = 0.3
-    ) -> torch.Tensor:
-        """
-        频域高频惩罚：|F(δ) ⊙ H_high|²
-        Penalizes high-frequency components to simulate realistic imaging perturbations.
-        
-        Args:
-            delta: [M, C, H, W] - perturbation tensor
-            cutoff: high-frequency cutoff (fraction of Nyquist frequency)
-        
-        Returns:
-            spectral_loss: scalar
-        """
-        M, C, H, W = delta.shape
-        
-        # FFT (real input)
-        delta_fft = torch.fft.rfft2(delta, dim=(-2, -1), norm='ortho')  # [M, C, H, W//2+1]
-        
-        # Create high-frequency mask (radial distance from DC)
-        freq_h = torch.fft.fftfreq(H, d=1.0, device=delta.device)  # [H]
-        freq_w = torch.fft.rfftfreq(W, d=1.0, device=delta.device)  # [W//2+1]
-        
-        # Meshgrid for radial distance
-        grid_h, grid_w = torch.meshgrid(freq_h, freq_w, indexing='ij')  # [H, W//2+1]
-        radial_freq = torch.sqrt(grid_h**2 + grid_w**2)  # [H, W//2+1]
-        
-        # High-pass filter: keep frequencies > cutoff
-        H_high = (radial_freq > cutoff).float()  # [H, W//2+1]
-        
-        # Apply mask and compute energy
-        delta_fft_high = delta_fft * H_high.unsqueeze(0).unsqueeze(0)  # [M, C, H, W//2+1]
-        spectral_loss = (delta_fft_high.abs() ** 2).mean()
-        
-        return spectral_loss
-
-    def _compute_off_boundary_loss(
-        self,
-        delta: torch.Tensor,  # [M, C, H, W]
-        M_band: torch.Tensor  # [M, 1, H, W]
-    ) -> torch.Tensor:
-        """
-        非边界抑制：|(1 - M_band) ⊙ δ|²
-        Penalizes perturbations outside the boundary band.
-        
-        Args:
-            delta: [M, C, H, W] - perturbation tensor
-            M_band: [M, 1, H, W] - boundary band mask
-        
-        Returns:
-            off_boundary_loss: scalar
-        """
-        # Perturbations outside boundary band
-        off_band_delta = delta * (1.0 - M_band)  # [M, C, H, W]
-        off_boundary_loss = (off_band_delta ** 2).mean()
-        
-        return off_boundary_loss
-
-    def _compute_zero_mean_loss(self, delta: torch.Tensor) -> torch.Tensor:
-        """
-        零均值约束：|mean(δ)|²
-        Prevents global brightness/color drift.
-        
-        Args:
-            delta: [M, C, H, W] - perturbation tensor
-        
-        Returns:
-            zero_mean_loss: scalar
-        """
-        # Compute mean across spatial dimensions (keep batch and channel dims)
-        spatial_mean = delta.mean(dim=(-1, -2), keepdim=True)  # [M, C, 1, 1]
-        zero_mean_loss = spatial_mean.pow(2).mean()
-        
-        return zero_mean_loss
+    # Image-space constraint methods removed (not needed for feature-space AUE)
 
     def compute_aue_loss(
         self,
@@ -642,10 +566,11 @@ class SAM2Base(torch.nn.Module):
             dtype=dtype,
         )
  
-        adv_images, adv_gts, adv_prompts, adv_indices = self._aue_sample_adversarial_images(adversarial_sample_M)
+        # Feature space AUE: sample adversarial features directly (skip encoder forward pass)
+        adv_features, adv_gts, adv_prompts, adv_indices = self._aue_sample_adversarial_features(adversarial_sample_M)
         ratio_adversarial = torch.tensor(0.0, device=device, dtype=dtype, requires_grad=True)
          
-        if adv_images is not None:
+        if adv_features is not None:
             # Decide whether to disable gradients on adversarial branch based on trainer phase
             # When trainer sets `_aue_phase == 'main'`, we compute the adversarial branch under no_grad
             # to avoid building two large graphs simultaneously.
@@ -653,45 +578,38 @@ class SAM2Base(torch.nn.Module):
             adv_grad_ctx = nullcontext() if phase == "adv" else torch.no_grad()
 
             with adv_grad_ctx:
-                M = adv_images.shape[0]
+                M = adv_features.shape[0]
                 
-                # Skip normalization for zero-initialized adversarial samples
-                # (normalization would just produce constants: -mean/std)
-                adv_images_in = adv_images.clamp(0.0, 1.0)
-                backbone_out = self.forward_image(adv_images_in)
-                adv_backbone_feat = backbone_out["vision_features"]  # Will be 32×32 for 512 input
+                # Stored features are backbone_fpn[0] BEFORE projection: 256-ch, 256×256
+                # Derive all needed features from this single source
                 
-                # Upsample features to SAM's expected embedding size (64×64)
-                # This is memory-efficient: only upsample compact features, not full images
-                expected_size = self.sam_image_embedding_size  # 64
-                if adv_backbone_feat.size(2) != expected_size or adv_backbone_feat.size(3) != expected_size:
-                    adv_backbone_feat = F.interpolate(
-                        adv_backbone_feat,
-                        size=(expected_size, expected_size),
+                # 1. Generate backbone_features by downsampling to 64×64
+                adv_backbone_feat = F.interpolate(
+                    adv_features,
+                    size=(self.sam_image_embedding_size, self.sam_image_embedding_size),  # 64×64
+                    mode='bilinear',
+                    align_corners=False
+                )  # [M, 256, 64, 64]
+                
+                # 2. Generate high_res_features via conv projections
+                high_res_features = None
+                if self.use_high_res_features_in_sam:
+                    # Apply conv_s0 projection directly (256 -> 32 channels, keeps 256×256)
+                    feat_s0 = self.sam_mask_decoder.conv_s0(adv_features)  # [M, 32, 256, 256]
+                    
+                    # Downsample to 128×128 then apply conv_s1 projection (256 -> 64 channels)
+                    feat_s1_input = F.interpolate(
+                        adv_features,
+                        size=(self.sam_image_embedding_size * 2, self.sam_image_embedding_size * 2),  # 128×128
                         mode='bilinear',
                         align_corners=False
                     )
+                    feat_s1 = self.sam_mask_decoder.conv_s1(feat_s1_input)  # [M, 64, 128, 128]
+                    
+                    high_res_features = [feat_s0, feat_s1]  # [32-ch 256×256, 64-ch 128×128]
                 
-                # Prepare high_res_features (if enabled) - upsample FPN features if needed
-                high_res_features = None
-                if self.use_high_res_features_in_sam:
-                    fpn = backbone_out.get("backbone_fpn", None)
-                    if fpn is not None and len(fpn) >= 2:
-                        # SAM decoder expects: feat_s0 at 256×256, feat_s1 at 128×128
-                        feat_s0_target = expected_size * 4  # 256
-                        feat_s1_target = expected_size * 2  # 128
-                        
-                        # Only interpolate if sizes don't match (avoid unnecessary ops when using 1024 resolution)
-                        feat_s0 = fpn[0] if fpn[0].shape[2] == feat_s0_target else \
-                                  F.interpolate(fpn[0], size=(feat_s0_target, feat_s0_target), mode='bilinear', align_corners=False)
-                        feat_s1 = fpn[1] if fpn[1].shape[2] == feat_s1_target else \
-                                  F.interpolate(fpn[1], size=(feat_s1_target, feat_s1_target), mode='bilinear', align_corners=False)
-                        high_res_features = [feat_s0, feat_s1]
-                
-                # Scale prompts from stored resolution (512) to SAM coordinate space (1024)
-                adv_img_size = adv_images.shape[2]  # 512
-                scale_factor = self.image_size / adv_img_size  # 1024 / 512 = 2.0
-                adv_prompts_scaled = adv_prompts * scale_factor
+                # Prompts are already in correct image_size space (e.g., 1024×1024), no scaling needed
+                adv_prompts_scaled = adv_prompts
                 
                 adv_box_coords = torch.stack([adv_prompts_scaled[:, :2], adv_prompts_scaled[:, 2:]], dim=1)
                 adv_point_inputs = {
@@ -728,11 +646,15 @@ class SAM2Base(torch.nn.Module):
                 )
 
             # Compute uncertainty via sampling (no gradients)
+            # Use entropy-based uncertainty for smoother gradients in adversarial training
             with torch.no_grad():
-                adv_uq_pval, adv_logits_sample = pixel_uncertain_sampling(
+                adv_uq = pixel_entropy_uncertainty(
+                    pixel_bndl_model, adv_pixel_feat, adv_external_w, uq_sample_num, per_channel=False
+                )
+                # Also get sampled logits for ratio computation
+                _, adv_logits_sample = pixel_uncertain_sampling(
                     pixel_bndl_model, adv_pixel_feat, adv_external_w, uq_sample_num
                 )
-                adv_uq = 1.0 - adv_uq_pval
             
             # Resize GT to match logits (logits are at feature map resolution)
             adv_logits_for_ratio = adv_logits_grad if adv_logits_grad is not None else adv_logits_sample
@@ -750,11 +672,8 @@ class SAM2Base(torch.nn.Module):
                 dtype=dtype,
             )
             
-            if self.aue_diversity_loss_weight > 0:
-                self._aue_last_adv_feat = adv_pixel_feat.detach()
-            
             # Clean up intermediate tensors to save memory
-            del adv_backbone_feat, adv_bndl, adv_aux_outputs
+            del adv_bndl, adv_aux_outputs
             
         # Initialize loss dictionary for detailed logging
         loss_dict = {}
@@ -765,107 +684,29 @@ class SAM2Base(torch.nn.Module):
         
         loss = ratio_pos + ratio_adversarial
         
-        # Additional lightweight losses that ALWAYS run to maintain gradient flow
-        # These are cheap to compute but keep gradients flowing to adversarial samples
-        if adv_images is not None:
-            
-            # Compute perturbation delta (relative to initial)
+        # Feature-space constraints (minimal - rely mainly on hard constraints)
+        if adv_features is not None:
+            # Monitor: Track feature bank update magnitude (debug mode)
             if adv_indices is not None:
                 initial_sampled = self.aue_adversarials_initial.index_select(0, adv_indices)
             else:
-                initial_sampled = self.aue_adversarials_initial[:adv_images.shape[0]]
-            delta = adv_images - initial_sampled  # [M, 3, H, W]
+                initial_sampled = self.aue_adversarials_initial[:adv_features.shape[0]]
             
-            # Compute boundary band mask for ROI constraints
-            M_band = self._compute_boundary_band_mask(
-                adv_gts, radius=self.aue_boundary_radius
-            )  # [M, 1, H, W]
+            # Compute relative change from initial features
+            delta_norm = (adv_features - initial_sampled).view(adv_features.size(0), -1).norm(dim=1).mean()
+            initial_norm = initial_sampled.view(initial_sampled.size(0), -1).norm(dim=1).mean()
+            relative_change = delta_norm / (initial_norm + 1e-8)
+            loss_dict['bank_relative_change'] = relative_change.detach()  # Track update magnitude
             
-            # Range penalty: keep pixel values in valid range
-            range_penalty = F.relu(adv_images - 1.0).mean() + F.relu(-1.0 - adv_images).mean()
-            loss_dict['range_penalty'] = range_penalty
-            # Subtract range penalty so reversed gradients push values back into [−1,1] pre-norm (or [0,1] after clamp)
-            loss = loss - range_penalty
-            
-            # For FGSM with zero initialization, add a small loss to break symmetry
-            # This ensures gradients can flow even when starting from zero images
-            if torch.allclose(adv_images, torch.zeros_like(adv_images), atol=1e-6):
-                # Add a very small random target to create initial gradient direction
-                # This is essential for FGSM to work with zero initialization
-                target = torch.randn_like(adv_images) * 0.001  # Very small to avoid noise
-                zero_escape_loss = F.mse_loss(adv_images, target) * 0.1
-                loss_dict['zero_escape_loss'] = zero_escape_loss
-                loss = loss + zero_escape_loss
-            
-            
-            # ========== NEW: Soft Regularizers ==========
-            
-            # 1. TV (Total Variation) regularization - suppress salt-and-pepper noise
-            if self.aue_tv_weight > 0:
-                tv_loss = self._compute_tv_loss(delta)
-                loss_dict['tv_loss'] = tv_loss
-                loss = loss + self.aue_tv_weight * tv_loss
-            
-            # 2. H1/Sobolev regularization - stronger smoothness constraint
-            if self.aue_h1_weight > 0:
-                h1_loss = self._compute_h1_loss(delta)
-                loss_dict['h1_loss'] = h1_loss
-                loss = loss + self.aue_h1_weight * h1_loss
-            
-            # 3. Spectral regularization - penalize high-frequency components
-            if self.aue_spectral_weight > 0:
-                spectral_loss = self._compute_spectral_loss(delta, cutoff=0.3)
-                loss_dict['spectral_loss'] = spectral_loss
-                loss = loss + self.aue_spectral_weight * spectral_loss
-            
-            # 4. Off-boundary suppression - push perturbations back to boundary band
-            if self.aue_off_boundary_weight > 0:
-                off_boundary_loss = self._compute_off_boundary_loss(delta, M_band)
-                loss_dict['off_boundary_loss'] = off_boundary_loss
-                loss = loss + self.aue_off_boundary_weight * off_boundary_loss
-            
-            # 5. Zero-mean constraint - prevent global color drift
-            if self.aue_zero_mean_weight > 0:
-                zero_mean_loss = self._compute_zero_mean_loss(delta)
-                loss_dict['zero_mean_loss'] = zero_mean_loss
-                loss = loss + self.aue_zero_mean_weight * zero_mean_loss
-            
-            # ========== Existing Regularizers ==========
-            
-            # Diversity loss: prevent mode collapse in adversarial bank
-            if self.aue_diversity_loss_weight > 0:
+            # Optional: diversity loss to prevent mode collapse (enable only if observed)
+            # All other constraints are handled by apply_aue_hard_constraints()
+            if self.aue_diversity_weight > 0:
                 diversity_loss = self._compute_adversarial_diversity_loss()
                 loss_dict['diversity_loss'] = diversity_loss
-                loss = loss + self.aue_diversity_loss_weight * diversity_loss
-            
-            # Constraint loss: keep adversarial images close to initial values
-            if self.aue_constraint_loss_weight > 0:
-                constraint_loss = torch.abs(delta).mean()
-                loss_dict['constraint_loss'] = constraint_loss
-                loss = loss + self.aue_constraint_loss_weight * constraint_loss
-        
-        # Constraint on adversarial prompts (if they have gradients)
-        if adv_prompts is not None and self.adv_prompts.requires_grad:
-            # Ensure prompts stay within valid range and maintain box validity
-            # This prevents prompts from "cheating" by moving to meaningless positions
-            H, W = adv_images.shape[2:] if adv_images is not None else (self.aue_H_adv, self.aue_W_adv)
-            
-            # Sample current prompts from bank to apply constraints
-            M_sample = min(4, self.aue_K_eff)  # Check a few samples
-            check_idx = torch.randint(0, self.aue_K_eff, (M_sample,), device=device)
-            check_prompts = self.adv_prompts[check_idx]
-            
-            # Box validity constraints (soft penalties)
-            prompt_penalty = (
-                F.relu(-check_prompts[:, 0]).mean() +  # x1 >= 0
-                F.relu(-check_prompts[:, 1]).mean() +  # y1 >= 0
-                F.relu(check_prompts[:, 2] - W).mean() +  # x2 <= W
-                F.relu(check_prompts[:, 3] - H).mean() +  # y2 <= H
-                F.relu(check_prompts[:, 0] - check_prompts[:, 2] + 5).mean() +  # x2 > x1 + 5
-                F.relu(check_prompts[:, 1] - check_prompts[:, 3] + 5).mean()    # y2 > y1 + 5
-            )
-            loss_dict['prompt_penalty'] = prompt_penalty
-            loss = loss + 0.1 * prompt_penalty
+                loss = loss + self.aue_diversity_weight * diversity_loss
+            else:
+                # Placeholder for logging
+                loss_dict['diversity_loss'] = torch.tensor(0.0, device=device, dtype=dtype)
 
         loss_dict['total_loss'] = loss
 
@@ -1022,6 +863,51 @@ class SAM2Base(torch.nn.Module):
             self.adv_prompts.index_select(0, idx),  # 已设置 requires_grad=False
             idx,  # 返回采样索引
         )
+    
+    def _aue_sample_adversarial_features(self, M: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | tuple[None, None, None, None]:
+        """Sample M features from adversarial feature bank along with their GT masks and prompts.
+
+        Returns:
+            adv_features: [M, C, H_feat, W_feat] - adversarial features
+            adv_gts: [M, Himg, Wimg] - ground truth masks (in image space)
+            adv_prompts: [M, 4] - bounding box prompts (in image space)
+            adv_indices: [M] - indices of sampled features in the bank, or None if all samples used
+            
+        Returns (None, None, None, None) if the bank is not properly initialized.
+        """
+        if not hasattr(self, 'aue_adversarials') or self.aue_adversarials is None:
+            return None, None, None, None
+        
+        adv = self.aue_adversarials
+        if adv.ndim != 4:
+            return None, None, None, None
+        if self.adv_gt is None or self.adv_prompts is None:
+            return None, None, None, None
+        
+        K = adv.shape[0]
+        device = adv.device
+        
+        if M <= 0:
+            return None, None, None, None
+        
+        # Sample indices (with replacement if M > K)
+        if M >= K:
+            # Use all samples, no indices needed
+            return (
+                adv,
+                self.adv_gt,
+                self.adv_prompts,
+                None,
+            )
+        else:
+            # Random sampling without replacement
+            idx = torch.randperm(K, device=device)[:M]
+            return (
+                adv.index_select(0, idx),
+                self.adv_gt.index_select(0, idx),
+                self.adv_prompts.index_select(0, idx),
+                idx,
+        )
 
     def _aue_compute_conf_from_logits_tensor(self, logits: torch.Tensor, tau_conf: float = 2.0) -> torch.Tensor:
         """Compute confidence from logits tensor [*, H, W, K] -> [*, H, W] via sigmoid(max(|logit|)/tau)."""
@@ -1031,13 +917,10 @@ class SAM2Base(torch.nn.Module):
         return torch.sigmoid(mag / float(tau_conf)).to(mag.dtype)
     
     def _compute_adversarial_diversity_loss(self) -> torch.Tensor:
-        """Compute diversity regularization loss to prevent mode collapse in adversarial samples.
+        """Compute diversity regularization loss to prevent mode collapse in adversarial feature bank.
         
-        This encourages the adversarial samples in the bank to be different from each other,
-        preventing them from converging to the same adversarial pattern.
-        
-        Method: Compute negative pairwise cosine similarity of adversarial features.
-        Higher diversity → lower similarity → larger negative value → smaller loss.
+        Encourages features in the bank to be different from each other.
+        Method: Minimize pairwise cosine similarity.
         
         Returns:
             Diversity loss scalar (minimize to encourage diversity).
@@ -1045,36 +928,32 @@ class SAM2Base(torch.nn.Module):
         if not hasattr(self, 'aue_adversarials') or self.aue_adversarials is None:
             return torch.tensor(0.0, device='cuda' if torch.cuda.is_available() else 'cpu')
         
-        # Get adversarial images from bank
-        adv_images = self.aue_adversarials  # [K, 3, H, W]
-        K = adv_images.shape[0]
+        # Get adversarial features from bank
+        adv_features = self.aue_adversarials  # [K, C, H, W]
+        K = adv_features.shape[0]
         
         if K < 2:
-            # Need at least 2 samples for diversity
-            return torch.tensor(0.0, device=adv_images.device, dtype=adv_images.dtype)
+            return torch.tensor(0.0, device=adv_features.device, dtype=adv_features.dtype)
         
-        # Flatten spatial dimensions for feature comparison
-        adv_flat = adv_images.view(K, -1)  # [K, 3*H*W]
+        # Flatten spatial dimensions
+        adv_flat = adv_features.view(K, -1)  # [K, C*H*W]
         
-        # Normalize features for cosine similarity
+        # Normalize for cosine similarity
         adv_norm = F.normalize(adv_flat, dim=1, p=2)  # [K, D]
         
-        # Compute pairwise cosine similarity matrix
+        # Pairwise cosine similarity
         similarity_matrix = torch.mm(adv_norm, adv_norm.t())  # [K, K]
         
-        # Mask out diagonal (self-similarity)
-        mask = torch.eye(K, device=adv_images.device, dtype=torch.bool)
+        # Mask diagonal (self-similarity)
+        mask = torch.eye(K, device=adv_features.device, dtype=torch.bool)
         similarity_matrix = similarity_matrix.masked_fill(mask, 0.0)
         
-        # Average pairwise similarity (excluding diagonal)
-        # Higher similarity = less diversity = higher loss
+        # Average pairwise similarity
         num_pairs = K * (K - 1)
         avg_similarity = similarity_matrix.sum() / num_pairs
         
-        # Return positive loss value: minimize similarity to maximize diversity
-        diversity_loss = avg_similarity
-        
-        return diversity_loss
+        # Minimize similarity to maximize diversity
+        return avg_similarity
 
     def forward(self, *args, **kwargs):
         raise NotImplementedError(
