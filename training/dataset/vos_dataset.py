@@ -129,7 +129,8 @@ class VOSDataset(VisionDataset):
         )
 
     def __getitem__(self, idx):
-        return self._get_datapoint(idx)
+        datapoint = self._get_datapoint(idx)
+        return datapoint
 
     def __len__(self):
         return len(self.video_dataset)

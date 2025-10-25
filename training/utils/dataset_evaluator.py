@@ -4,6 +4,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib
 matplotlib.use('Agg')  # 使用非交互式后端
@@ -86,11 +87,15 @@ class DistributedDatasetEvaluator:
 
         if per_pixel_statistics:
             # 存储每个像素的指标值（每个数据点代表一个像素）
-            self.pixel_uncertainties = []  # 存储前景区域每个像素的uncertainty值
-            self.pixel_ious = []          # 存储前景区域每个像素的准确性值
-            self.pixel_dices = []         # 存储前景区域每个像素的DICE相关值
-            self.pixel_accuracies = []    # 存储前景区域每个像素的accuracy值
-            self.pixel_nlls = []          # 存储前景区域每个像素的NLL值
+            # 🎯 优化: 使用Pandas DataFrame替代Python list，大幅降低内存使用并支持高效降采样
+            self.pixel_data = pd.DataFrame({
+                'uncertainties': pd.Series(dtype='float32'),
+                'ious': pd.Series(dtype='float32'),
+                'dices': pd.Series(dtype='float32'),
+                'accuracies': pd.Series(dtype='float32'),
+                'nlls': pd.Series(dtype='float32')
+            })
+            self.max_samples = 100000  # 最大样本数
         else:
             # 向后兼容：存储每张图片的标量指标值
             self.image_uncertainties = []  # 存储每张图片的平均uncertainty值
@@ -111,6 +116,12 @@ class DistributedDatasetEvaluator:
             os.makedirs(save_dir, exist_ok=True)
             mode_str = "full_image" if use_full_image else f"foreground (dilation={foreground_dilation})"
             logging.info(f"Dataset evaluator initialized: per_pixel={per_pixel_statistics}, mode={mode_str}")
+    
+    def _downsample_if_needed(self):
+        """当数据超过最大样本数时进行降采样"""
+        if len(self.pixel_data) > self.max_samples:
+            self.pixel_data = self.pixel_data.sample(n=self.max_samples, random_state=42).reset_index(drop=True)
+            print(f"  🔄 降采样: → {self.max_samples} 样本")
     
     def _setup_distributed(self):
         """设置分布式训练相关配置"""
@@ -171,14 +182,28 @@ class DistributedDatasetEvaluator:
                     pixel_unc, pixel_acc, pixel_iou, pixel_dice, pixel_nll = \
                         self._calculate_pixel_wise_metrics(single_uncertainty, single_pred, single_gt)
 
-                    # 存储所有前景区域像素（转换为CPU并转为list以节省内存）
+                    # 存储所有前景区域像素（使用Pandas DataFrame，支持高效降采样）
                     if pixel_unc.numel() > 0:
-                        self.pixel_uncertainties.extend(pixel_unc.detach().cpu().tolist())
-                        self.pixel_accuracies.extend(pixel_acc.detach().cpu().tolist())
-                        self.pixel_ious.extend(pixel_iou.detach().cpu().tolist())
-                        self.pixel_dices.extend(pixel_dice.detach().cpu().tolist())
-                        self.pixel_nlls.extend(pixel_nll.detach().cpu().tolist())
-                        total_pixels += pixel_unc.numel()
+                        n_pixels = pixel_unc.numel()
+                        
+                        # 创建新的数据行（直接使用Pandas，避免numpy转换）
+                        new_data = pd.DataFrame({
+                            'uncertainties': pixel_unc.detach().cpu().numpy().flatten(),
+                            'accuracies': pixel_acc.detach().cpu().numpy().flatten(),
+                            'ious': pixel_iou.detach().cpu().numpy().flatten(),
+                            'dices': pixel_dice.detach().cpu().numpy().flatten(),
+                            'nlls': pixel_nll.detach().cpu().numpy().flatten()
+                        })
+                        
+                        # 添加到现有数据
+                        self.pixel_data = pd.concat([self.pixel_data, new_data], ignore_index=True)
+                        
+                        # 如果超过最大样本数，进行降采样
+                        if len(self.pixel_data) > self.max_samples:
+                            self.pixel_data = self.pixel_data.sample(n=self.max_samples, random_state=42).reset_index(drop=True)
+                            print(f"  🔄 自动降采样: {len(self.pixel_data) + self.max_samples} → {self.max_samples} 样本")
+                        
+                        total_pixels += n_pixels
 
                 if self.rank == 0:  # 只在主进程记录日志
                     logging.info(f"Added {B} images ({total_pixels} foreground pixels) to evaluation data")
@@ -445,9 +470,12 @@ class DistributedDatasetEvaluator:
         """收集所有GPU进程的数据（使用NCCL-safe all_gather + padding）"""
         if not self.distributed or not dist.is_initialized():
             if self.per_pixel_statistics:
-                # 像素级统计：直接返回列表
-                return (self.pixel_uncertainties, self.pixel_ious,
-                        self.pixel_dices, self.pixel_accuracies, self.pixel_nlls)
+                # 像素级统计：返回Pandas DataFrame的列
+                return (self.pixel_data['uncertainties'].tolist(),
+                        self.pixel_data['ious'].tolist(),
+                        self.pixel_data['dices'].tolist(),
+                        self.pixel_data['accuracies'].tolist(),
+                        self.pixel_data['nlls'].tolist())
             else:
                 # 图片级统计：将张量转为标量列表
                 return (
@@ -489,12 +517,12 @@ class DistributedDatasetEvaluator:
             return out
 
         if self.per_pixel_statistics:
-            # 像素级统计：直接聚合float列表
-            all_uncertainties = gather_float_list(self.pixel_uncertainties)
-            all_ious = gather_float_list(self.pixel_ious)
-            all_dices = gather_float_list(self.pixel_dices)
-            all_accuracies = gather_float_list(self.pixel_accuracies)
-            all_nlls = gather_float_list(self.pixel_nlls)
+            # 像素级统计：从Pandas DataFrame获取数据
+            all_uncertainties = gather_float_list(self.pixel_data['uncertainties'].tolist())
+            all_ious = gather_float_list(self.pixel_data['ious'].tolist())
+            all_dices = gather_float_list(self.pixel_data['dices'].tolist())
+            all_accuracies = gather_float_list(self.pixel_data['accuracies'].tolist())
+            all_nlls = gather_float_list(self.pixel_data['nlls'].tolist())
         else:
             # 图片级统计：先转换再聚合
             all_uncertainties = gather_float_list([t.item() if hasattr(t, 'item') else float(t) for t in self.image_uncertainties])
@@ -577,7 +605,7 @@ class DistributedDatasetEvaluator:
         """评估整个数据集的指标与不确定性相关性"""
         try:
             # 检查是否有数据
-            data_source = self.pixel_uncertainties if self.per_pixel_statistics else self.image_uncertainties
+            data_source = self.pixel_data['uncertainties'].tolist() if self.per_pixel_statistics else self.image_uncertainties
             if not data_source:
                 logging.warning("No data available for evaluation")
                 return {}
@@ -771,7 +799,7 @@ class DistributedDatasetEvaluator:
                 return {}
             
             # Use the correct data source based on mode
-            data_source = self.pixel_uncertainties if self.per_pixel_statistics else self.image_uncertainties
+            data_source = self.pixel_data['uncertainties'].tolist() if self.per_pixel_statistics else self.image_uncertainties
             
             summary = {
                 'total_batches': len(data_source),
@@ -815,11 +843,8 @@ class DistributedDatasetEvaluator:
     def reset(self) -> None:
         """重置评估器状态，清除所有数据"""
         if self.per_pixel_statistics:
-            self.pixel_uncertainties.clear()
-            self.pixel_ious.clear()
-            self.pixel_dices.clear()
-            self.pixel_accuracies.clear()
-            self.pixel_nlls.clear()
+            # 重置Pandas DataFrame
+            self.pixel_data = self.pixel_data.iloc[0:0]  # 清空但保持结构
         else:
             self.image_uncertainties.clear()
             self.image_ious.clear()
@@ -836,7 +861,7 @@ class DistributedDatasetEvaluator:
     def __len__(self) -> int:
         """返回当前进程已添加的数据点数（图片数或像素数）"""
         if self.per_pixel_statistics:
-            return len(self.pixel_uncertainties)
+            return len(self.pixel_data)  # 返回DataFrame的行数
         else:
             return len(self.image_uncertainties)
 

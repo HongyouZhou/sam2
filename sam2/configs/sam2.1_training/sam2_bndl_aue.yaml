@@ -184,7 +184,7 @@ trainer:
     # use high-resolution feature map in the SAM mask decoder
     use_high_res_features_in_sam: true
     # output 3 masks on the first click on initial conditioning frames
-    multimask_output_in_sam: true
+    multimask_output_in_sam: false
     # SAM heads
     iou_prediction_use_sigmoid: True
     # cross-attend to object pointers from other frames (based on SAM output tokens) in the encoder
@@ -213,16 +213,17 @@ trainer:
     
     freeze_image_encoder: true
 
-    # AUE (Adversarial Uncertainty Estimation) options
+    # AUE (Adversarial Uncertainty Estimation) with Style-based augmentation
     use_aue: true
-    aue_adversarial_image_size: 512
-    aue_num_adversarial_samples: 16
-    aue_init_from_dataset: true
     aue_use_uncertainty: false
-    # UQ-aware AUE controls
     aue_uncertainty_mask_threshold: 0.4
-    aue_diversity_loss_weight: 0.0
-    aue_constraint_loss_weight: 0.1
+    
+    # Style-based AUE parameters
+    use_style_aug: true
+    style_aug_pgd_steps: 1
+    style_aug_pgd_step_size: 0.1
+    style_aug_pgd_epsilon: 2.0
+    style_aug_apply_at_layer: 0
 
     # ROI sharing
     share_roi_views: true
@@ -364,20 +365,13 @@ trainer:
 
     options:
       lr:
-        # ① AUE对抗变量：最高LR（内环优化）
-        - scheduler:
-            _target_: fvcore.common.param_scheduler.ConstantParamScheduler
-            value: 1.0e-2
-          param_names:
-            - '*aue_adversarials*'
-        
-        # ② 默认组（未被下面命中者）
+        # ① 默认组（未被下面命中者）
         - scheduler:
             _target_: fvcore.common.param_scheduler.CosineParamScheduler
             start_value: 1.0e-5
             end_value: 5.0e-6
 
-        # ③ BNDL 头：高 LR
+        # ② BNDL 头：高 LR
         - scheduler:
             _target_: fvcore.common.param_scheduler.CosineParamScheduler
             start_value: 2.0e-4
@@ -385,7 +379,7 @@ trainer:
           param_names:
             - 'sam_mask_decoder.pixel_bndl.*'
 
-        # ④ 解码器其他部分：极小 LR（避免破坏 SAM）
+        # ③ 解码器其他部分：极小 LR（避免破坏 SAM）
         - scheduler:
             _target_: fvcore.common.param_scheduler.CosineParamScheduler
             start_value: 1.0e-7
@@ -402,14 +396,7 @@ trainer:
             - 'sam_mask_decoder.pred_obj_score_head.*'
 
       weight_decay:
-        # AUE对抗变量：无正则化（内环优化）
-        - scheduler:
-            _target_: fvcore.common.param_scheduler.ConstantParamScheduler
-            value: 0.0
-          param_names:
-            - '*aue_adversarials*'
-        
-        # 其余参数默认正则
+        # 默认正则化
         - scheduler:
             _target_: fvcore.common.param_scheduler.ConstantParamScheduler
             value: 0.01
@@ -480,6 +467,8 @@ trainer:
     log_scalar_frequency: 100
     log_visual_frequency: 20
     visualize_bndl: true
+    visualize_style_aue: true
+    style_aue_visual_frequency: 100  # 降低到50步一次，更容易看到可视化
     uncertainty_metric: ["entropy", "nll"]
     visualize_pavpu_overlay: true
     uncertainty_sample_num: 50
@@ -498,9 +487,6 @@ trainer:
       strict: False
       ignore_missing_keys: [
           "sam_mask_decoder.pixel_bndl.*",
-          "aue_adversarials",
-          "adv_gt",
-          "adv_prompts",
       ]
       ignore_unexpected_keys: [
           # "sam_mask_decoder.pixel_bndl.*",
@@ -513,7 +499,7 @@ trainer:
 launcher:
   num_nodes: 1
   gpus_per_node: 8
-  experiment_log_dir: /home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_aue_012_11 # Path to log directory, defaults to ./sam2_logs/${config_name}
+  experiment_log_dir: /home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_aue_016_01 # Path to log directory, defaults to ./sam2_logs/${config_name}
 
 # SLURM args if running on a cluster
 submitit:

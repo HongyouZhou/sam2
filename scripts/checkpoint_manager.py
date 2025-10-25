@@ -10,9 +10,10 @@ from __future__ import annotations
 import gc
 import json
 import pickle
-from pathlib import Path
-from typing import Any, Callable, Optional
 import re
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -27,9 +28,11 @@ class CheckpointManager:
     3. Merging all checkpoints at the end
     
     Performance optimizations:
-    - Reduced checkpoint frequency (default: 10 videos vs previous 2)
+    - Reduced checkpoint frequency (default: 50 videos, further increased from 10)
     - Faster serialization using numpy.savez_compressed
     - Automatic cleanup of checkpoint files
+    - Progress tracking during merge to monitor for hangs
+    - Memory monitoring to prevent OOM errors
     """
     
     def __init__(
@@ -37,7 +40,7 @@ class CheckpointManager:
         output_dir: Path,
         dataset_name: str,
         checkpoint_type: str = "eval",
-        interval: int = 10,
+        interval: int = 50,
         use_numpy: bool = True,
     ):
         """Initialize checkpoint manager.
@@ -46,7 +49,7 @@ class CheckpointManager:
             output_dir: Directory to save checkpoints
             dataset_name: Name of dataset (for checkpoint naming)
             checkpoint_type: Type of checkpoint ('eval' or 'stats')
-            interval: Number of videos between checkpoints (default: 10)
+            interval: Number of videos between checkpoints (default: 50, increased from 10 to reduce memory pressure)
             use_numpy: Use numpy.savez instead of pickle (faster, default: True)
         """
         self.output_dir = Path(output_dir)
@@ -192,11 +195,12 @@ class CheckpointManager:
         if not self.checkpoint_files:
             return {}
         
-        print(f"🔄 Merging {len(self.checkpoint_files)} checkpoint files...")
+        total_files = len(self.checkpoint_files)
+        print(f"🔄 Merging {total_files} checkpoint files...")
         
         merged_data = {}
         
-        for checkpoint_file in self.checkpoint_files:
+        for idx, checkpoint_file in enumerate(self.checkpoint_files, 1):
             try:
                 checkpoint_data = self.load_checkpoint(checkpoint_file)
                 
@@ -215,19 +219,29 @@ class CheckpointManager:
                     else:
                         merged_data[key].append(value)
                 
+                # Explicitly delete checkpoint data
+                del checkpoint_data
+                
                 # Clean up checkpoint file
                 checkpoint_file.unlink()
-                # Aggressive memory cleanup between shards
-                self.force_memory_cleanup()
+                
+                # Progress update and memory monitoring every 10 files or at the end
+                if idx % 10 == 0 or idx == total_files:
+                    print(f"  ├─ Processed {idx}/{total_files} checkpoint files")
+                    # Show memory usage every 10 files
+                    self.force_memory_cleanup(verbose=True)
+                else:
+                    # Silent cleanup for other files
+                    self.force_memory_cleanup(verbose=False)
                 
             except Exception as e:
-                print(f"Warning: Failed to merge checkpoint {checkpoint_file}: {e}")
+                print(f"⚠️  Warning: Failed to merge checkpoint {checkpoint_file}: {e}")
                 continue
         
         # Clear checkpoint list
         self.checkpoint_files.clear()
         
-        print(f"✓ Merged all checkpoints")
+        print("✓ Merged all checkpoints")
         return merged_data
 
     def merge_checkpoints_streaming(self, on_data: Callable[[dict[str, Any]], None]) -> None:
@@ -244,19 +258,36 @@ class CheckpointManager:
         if not self.checkpoint_files:
             return
 
-        print(f"🔄 Merging {len(self.checkpoint_files)} checkpoint files...")
-        for checkpoint_file in self.checkpoint_files:
+        total_files = len(self.checkpoint_files)
+        print(f"🔄 Merging {total_files} checkpoint files...")
+        
+        # Process checkpoints with progress tracking
+        for idx, checkpoint_file in enumerate(self.checkpoint_files, 1):
             try:
+                # Load checkpoint data
                 checkpoint_data = self.load_checkpoint(checkpoint_file)
+                
                 # Process this shard
                 on_data(checkpoint_data)
+                
+                # Explicitly delete the data to free memory immediately
+                del checkpoint_data
+                
                 # Remove shard after successful processing
                 checkpoint_file.unlink()
+                
+                # Progress update and memory monitoring every 10 files or at the end
+                if idx % 10 == 0 or idx == total_files:
+                    print(f"  ├─ Processed {idx}/{total_files} checkpoint files")
+                    # Show memory usage every 10 files
+                    self.force_memory_cleanup(verbose=True)
+                else:
+                    # Silent cleanup for other files
+                    self.force_memory_cleanup(verbose=False)
+                    
             except Exception as e:
-                print(f"Warning: Failed to process checkpoint {checkpoint_file}: {e}")
-            finally:
-                # Free memory between shards
-                self.force_memory_cleanup()
+                print(f"⚠️  Warning: Failed to process checkpoint {checkpoint_file}: {e}")
+                continue
 
         self.checkpoint_files.clear()
         print("✓ Merged all checkpoints")
@@ -304,23 +335,62 @@ class CheckpointManager:
         return numpy_data
     
     @staticmethod
-    def force_memory_cleanup() -> None:
-        """Force aggressive memory cleanup (garbage collection + CUDA cache clear)."""
+    def get_memory_info() -> dict[str, float]:
+        """Get current memory usage information.
+        
+        Returns:
+            Dictionary with memory usage in GB (system RAM and GPU memory)
+        """
+        import psutil
+        
+        mem_info = {
+            'system_used_gb': psutil.virtual_memory().used / (1024**3),
+            'system_available_gb': psutil.virtual_memory().available / (1024**3),
+            'system_percent': psutil.virtual_memory().percent,
+        }
+        
+        if torch.cuda.is_available():
+            mem_info['gpu_allocated_gb'] = torch.cuda.memory_allocated() / (1024**3)
+            mem_info['gpu_reserved_gb'] = torch.cuda.memory_reserved() / (1024**3)
+        
+        return mem_info
+    
+    @staticmethod
+    def force_memory_cleanup(verbose: bool = False) -> None:
+        """Force aggressive memory cleanup (garbage collection + CUDA cache clear).
+        
+        Args:
+            verbose: If True, print memory usage before and after cleanup
+        """
+        if verbose:
+            mem_before = CheckpointManager.get_memory_info()
+            print(f"  ├─ Memory before cleanup: System {mem_before['system_used_gb']:.1f}GB used ({mem_before['system_percent']:.1f}%)", end='')
+            if 'gpu_allocated_gb' in mem_before:
+                print(f", GPU {mem_before['gpu_allocated_gb']:.1f}GB allocated", end='')
+            print()
+        
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        
+        if verbose:
+            mem_after = CheckpointManager.get_memory_info()
+            print(f"  ├─ Memory after cleanup: System {mem_after['system_used_gb']:.1f}GB used ({mem_after['system_percent']:.1f}%)", end='')
+            if 'gpu_allocated_gb' in mem_after:
+                print(f", GPU {mem_after['gpu_allocated_gb']:.1f}GB allocated", end='')
+            print()
 
 
 class StatisticsCheckpointManager(CheckpointManager):
     """Specialized checkpoint manager for JSON-serializable statistics."""
     
-    def __init__(self, output_dir: Path, dataset_name: str, interval: int = 10):
+    def __init__(self, output_dir: Path, dataset_name: str, interval: int = 50):
         """Initialize statistics checkpoint manager.
         
         Args:
             output_dir: Directory to save checkpoints
             dataset_name: Name of dataset
-            interval: Checkpoint interval (default: 10 videos)
+            interval: Checkpoint interval (default: 50 videos, increased from 10)
         """
         super().__init__(
             output_dir=output_dir,
@@ -360,7 +430,7 @@ class StatisticsCheckpointManager(CheckpointManager):
         Returns:
             Statistics dictionary
         """
-        with open(checkpoint_file, "r") as f:
+        with open(checkpoint_file) as f:
             return json.load(f)
     
     def merge_checkpoints(self) -> dict[str, Any]:
@@ -385,7 +455,14 @@ class StatisticsCheckpointManager(CheckpointManager):
                 print(f"Warning: Failed to merge statistics checkpoint {checkpoint_file}: {e}")
         
         self.checkpoint_files.clear()
-        print(f"✓ Merged all statistics checkpoints")
+        print("✓ Merged all statistics checkpoints")
+        
+        # 🎯 关键修复: 合并后立即降采样，防止内存爆炸
+        from downsampling_utils import downsample_statistics_pavpu
+        if merged_stats:
+            _, n_orig, n_down = downsample_statistics_pavpu(merged_stats, max_samples=100000)
+            if n_down < n_orig:
+                print(f"  💾 合并后降采样: {n_orig:,} → {n_down:,} PAvPU样本 ({n_down/n_orig*100:.1f}%)")
         
         return merged_stats
 

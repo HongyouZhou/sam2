@@ -151,6 +151,8 @@ class LoggingConf:
     log_batch_stats: bool = False
     visualize_bndl: bool = False
     bndl_vis_sample_rate: float = 0.05  # Probability of saving BNDL visualization for each validation batch (0.05 = 5%)
+    visualize_style_aue: bool = False  # Enable Style AUE visualization (original vs adversarial images)
+    style_aue_visual_frequency: int = 100  # Log Style AUE visualization every N steps
     uncertainty_metric: set = field(default_factory=lambda: {"entropy"})  # Options: {"entropy"}, {"nll"}, {"sampling"}, {"entropy", "nll"}, {"entropy", "nll", "sampling"}, etc.
     visualize_pavpu_overlay: bool = True  # Enable PAvPU overlay visualization on original images
     uncertainty_sample_num: int = 50
@@ -467,6 +469,15 @@ class Trainer:
         model: nn.Module,
         phase: str,
     ):
+        # Enable style visualization periodically BEFORE forward pass
+        _model = unwrap_ddp_if_wrapped(self.model)
+        style_aue_freq = getattr(self.logging_conf, 'style_aue_visual_frequency', 100)
+        enable_vis = (phase == "train" and self.steps[phase] % style_aue_freq == 0)
+        _model._enable_style_visualization = enable_vis
+        
+        if enable_vis and self.distributed_rank == 0:
+            logging.info(f"Style AUE visualization enabled at step {self.steps[phase]}")
+        
         outputs = model(batch)
         targets = batch.masks
         batch_size = len(batch.img_batch)
@@ -479,9 +490,8 @@ class Trainer:
 
         # loss contains multiple sub-components we wish to log
         step_losses = {}
-
+        
         # Log BNDL statistics from model outputs if available (only if BNDL is enabled)
-        _model = unwrap_ddp_if_wrapped(self.model)
         if getattr(_model, "use_bndl_for_pixels", False):
             bndl_outputs, step_index, frame_index = self._extract_bndl_outputs(outputs)
             if bndl_outputs is not None:
@@ -500,6 +510,13 @@ class Trainer:
 
                 # Log BNDL statistics for both train and val
                 self._log_bndl_statistics(bndl_outputs, self.steps[phase], phase)
+        
+        # Log Style AUE visualization if available and enabled
+        if (phase == "train" and 
+            getattr(self.logging_conf, 'visualize_style_aue', False) and
+            hasattr(_model, 'use_style_aug') and _model.use_style_aug and
+            _model._enable_style_visualization):
+            self._log_style_aue_visualization(outputs, self.steps[phase])
 
         if isinstance(loss, dict):
             step_losses.update({f"Losses/{phase}_{key}_{k}": v for k, v in loss.items()})
@@ -547,20 +564,15 @@ class Trainer:
 
     def _setup_dataloaders(self):
         # Initialize if not already done by _setup_components for AUE
-        if not hasattr(self, 'train_dataset'):
+        if not hasattr(self, "train_dataset"):
             self.train_dataset = None
-        if not hasattr(self, 'val_dataset'):
+        if not hasattr(self, "val_dataset"):
             self.val_dataset = None
 
         if self.mode in ["train", "val"]:
             self.val_dataset = instantiate(self.data_conf.get(Phase.VAL, None))
 
         if self.mode in ["train", "train_only"] and self.train_dataset is None:
-            self.train_dataset = instantiate(self.data_conf.train)
-
-    def _setup_dataloaders_early(self):
-        """Setup train dataset early for AUE initialization (before moving model to GPU)"""
-        if self.mode in ["train", "train_only"]:
             self.train_dataset = instantiate(self.data_conf.train)
 
     def run_train(self):
@@ -723,7 +735,7 @@ class Trainer:
                         else:
                             current_frame_targets = batch.masks[0] if batch.masks.shape[0] > 0 else batch.masks
                         bndl_outputs = self._calculate_uncertainty_for_bndl(bndl_outputs, batch, current_frame_targets)
-                        
+
                         vis_dir = os.path.join(self.logging_conf.log_dir, "bndl_visualizations", phase)
                         makedir(vis_dir)
                         # Create full visualization with uncertainty and PAvPU overlays
@@ -736,7 +748,9 @@ class Trainer:
                 and hasattr(unwrap_ddp_if_wrapped(self.model), "use_aue")
                 and unwrap_ddp_if_wrapped(self.model).use_aue
             ):
-                self._visualize_aue_adversarials(phase, data_iter)
+                # Visualization disabled for feature-space AUE
+                # self._visualize_aue_adversarials(phase, data_iter)
+                pass
 
             if data_iter % 10 == 0:
                 dist.barrier()
@@ -864,10 +878,6 @@ class Trainer:
                 # applied if the gradients are infinite
                 self.scaler.step(self.optim.optimizer)
                 self.scaler.update()
-                
-                # Apply hard constraints to AUE adversarial samples after optimizer step
-                # This enforces L_infty projection and boundary band constraints
-                unwrap_ddp_if_wrapped(self.model).apply_aue_hard_constraints()
 
                 # measure elapsed time
                 batch_time_meter.update(time.time() - end)
@@ -887,8 +897,6 @@ class Trainer:
                             progress_meter.val,
                             self.steps[phase],
                         )
-
-                # (train) BNDL visualization disabled during training to avoid overhead
 
             # Catching NaN/Inf errors in the loss
             except FloatingPointError as e:
@@ -931,125 +939,40 @@ class Trainer:
         """
         Run the forward / backward
         """
+
         # it's important to set grads to None, especially with Adam since 0
         # grads will also update a model even if the step doesn't produce
         # gradients
         self.optim.zero_grad(set_to_none=True)
+        with torch.cuda.amp.autocast(
+            enabled=self.optim_conf.amp.enabled,
+            dtype=get_amp_type(self.optim_conf.amp.amp_dtype),
+        ):
+            loss_dict, batch_size, extra_losses = self._step(
+                batch,
+                self.model,
+                phase,
+            )
 
-        ab_conf = getattr(self.train_strategy, "alternating_backward", AlternatingBackwardConf())
+        assert len(loss_dict) == 1
+        loss_key, loss = loss_dict.popitem()
 
-        def _get_component(loss_map: Dict[str, torch.Tensor], suffix: str) -> torch.Tensor:
-            for k, v in loss_map.items():
-                if k.endswith("_" + suffix):
-                    return v
-            return torch.tensor(0.0, device=self.device)
+        if not math.isfinite(loss.item()):
+            error_msg = f"Loss is {loss.item()}, attempting to stop training"
+            logging.error(error_msg)
+            if raise_on_error:
+                raise FloatingPointError(error_msg)
+            else:
+                return
 
-        if not ab_conf.enabled:
-            with torch.cuda.amp.autocast(
-                enabled=self.optim_conf.amp.enabled,
-                dtype=get_amp_type(self.optim_conf.amp.amp_dtype),
-            ):
-                loss_dict, batch_size, extra_losses = self._step(
-                    batch,
-                    self.model,
-                    phase,
+        self.scaler.scale(loss).backward()
+        loss_mts[loss_key].update(loss.item(), batch_size)
+        for extra_loss_key, extra_loss in extra_losses.items():
+            if extra_loss_key not in extra_loss_mts:
+                extra_loss_mts[extra_loss_key] = AverageMeter(
+                    extra_loss_key, self.device, ":.2e"
                 )
-
-            assert len(loss_dict) == 1
-            loss_key, loss = loss_dict.popitem()
-
-            if not math.isfinite(loss.item()):
-                error_msg = f"Loss is {loss.item()}, attempting to stop training"
-                logging.error(error_msg)
-                if raise_on_error:
-                    raise FloatingPointError(error_msg)
-                else:
-                    return
-
-            self.scaler.scale(loss).backward()
-            loss_mts[loss_key].update(loss.item(), batch_size)
-            for extra_loss_key, extra_loss in extra_losses.items():
-                if extra_loss_key not in extra_loss_mts:
-                    extra_loss_mts[extra_loss_key] = AverageMeter(extra_loss_key, self.device, ":.2e")
-                extra_loss_mts[extra_loss_key].update(extra_loss.item(), batch_size)
-            return
-
-        # Alternating two-phase backward within a single optimizer step
-        ddp_no_sync = ab_conf.ddp_no_sync and isinstance(self.model, torch.nn.parallel.DistributedDataParallel)
-        ddp_ctx = self.model.no_sync() if ddp_no_sync else nullcontext()
-
-        # Wrap both phases in the same no_sync context to ensure proper gradient accumulation
-        with ddp_ctx:
-            # Phase 1: Main
-            unwrap_ddp_if_wrapped(self.model).__setattr__("_aue_phase", "main")
-            with torch.cuda.amp.autocast(
-                enabled=self.optim_conf.amp.enabled,
-                dtype=get_amp_type(self.optim_conf.amp.amp_dtype),
-            ):
-                loss_dict_main, batch_size_main, extra_losses_main = self._step(
-                    batch,
-                    self.model,
-                    phase,
-                )
-
-            assert len(loss_dict_main) == 1
-            loss_key, _ = loss_dict_main.popitem()
-
-            sam_core = _get_component(extra_losses_main, "sam_core_loss")
-            bndl_core = _get_component(extra_losses_main, "bndl_core_loss")
-            ur_core = _get_component(extra_losses_main, "ur_ern_core_loss")
-            aue_core_main = _get_component(extra_losses_main, "aue_core_loss")
-            coef = 0.5 if ab_conf.symmetric_average else 1.0
-            loss_main_adjusted = sam_core + bndl_core + ur_core + coef * aue_core_main
-
-            if not math.isfinite(loss_main_adjusted.item()):
-                error_msg = f"Adjusted main loss is {loss_main_adjusted.item()}, attempting to stop training"
-                logging.error(error_msg)
-                if raise_on_error:
-                    raise FloatingPointError(error_msg)
-                else:
-                    return
-
-            self.scaler.scale(loss_main_adjusted).backward()
-            for extra_loss_key, extra_loss in extra_losses_main.items():
-                if extra_loss_key not in extra_loss_mts:
-                    extra_loss_mts[extra_loss_key] = AverageMeter(extra_loss_key, self.device, ":.2e")
-                extra_loss_mts[extra_loss_key].update(extra_loss.item(), batch_size_main)
-
-            # Phase 2: Adv
-            unwrap_ddp_if_wrapped(self.model).__setattr__("_aue_phase", "adv")
-            with torch.cuda.amp.autocast(
-                enabled=self.optim_conf.amp.enabled,
-                dtype=get_amp_type(self.optim_conf.amp.amp_dtype),
-            ):
-                loss_dict_adv, batch_size_adv, extra_losses_adv = self._step(
-                    batch,
-                    self.model,
-                    phase,
-                )
-
-            aue_core_adv = _get_component(extra_losses_adv, "aue_core_loss")
-            coef = 0.5 if ab_conf.symmetric_average else 1.0
-            loss_adv_adjusted = coef * aue_core_adv
-
-            if not math.isfinite(loss_adv_adjusted.item()):
-                error_msg = f"Adjusted adv loss is {loss_adv_adjusted.item()}, attempting to stop training"
-                logging.error(error_msg)
-                if raise_on_error:
-                    raise FloatingPointError(error_msg)
-                else:
-                    return
-
-            self.scaler.scale(loss_adv_adjusted).backward()
-            for extra_loss_key, extra_loss in extra_losses_adv.items():
-                if extra_loss_key not in extra_loss_mts:
-                    extra_loss_mts[extra_loss_key] = AverageMeter(extra_loss_key, self.device, ":.2e")
-                extra_loss_mts[extra_loss_key].update(extra_loss.item(), batch_size_adv)
-
-        total_loss = (loss_main_adjusted + loss_adv_adjusted).detach()
-        loss_mts[loss_key].update(total_loss.item(), batch_size_main)
-
-        unwrap_ddp_if_wrapped(self.model).__setattr__("_aue_phase", None)
+            extra_loss_mts[extra_loss_key].update(extra_loss.item(), batch_size)
 
     def _log_meters_and_save_best_ckpts(self, phases: List[str]):
         logging.info("Synchronizing meters")
@@ -1143,26 +1066,9 @@ class Trainer:
         self.logger = Logger(self.logging_conf)
 
         self.model = instantiate(self.model_conf, _convert_="all")
+
+        # Style-based AUE: no initialization needed (styles extracted on-the-fly)
         
-        if hasattr(self.model, "use_aue") and self.model.use_aue:
-            # 根据配置决定是否从数据集初始化对抗样本
-            if self.model_conf.get("aue_init_from_dataset", True):
-                if not hasattr(self, 'train_dataset'):
-                    self.train_dataset = None
-                    # Try to setup train dataset for AUE initialization (only in train modes)
-                    if self.mode in ["train", "train_only"]:
-                        self._setup_dataloaders_early()
-                
-                if self.train_dataset is not None:
-                    logging.info("Initializing AUE adversarial samples from dataset...")
-                    # Use multiprocessing with 'spawn' context (safe even when CUDA initialized)
-                    self.model.init_aue_adversarials_from_dataset(
-                        self.train_dataset, num_workers=4
-                    )
-                else:
-                    logging.info("Skipping AUE adversarial samples initialization (train_dataset not available in val-only mode)")
-            else:
-                logging.info("AUE adversarial samples initialized with random values (aue_init_from_dataset=False)")
         print_model_summary(self.model)
 
         self.loss = None
@@ -1183,15 +1089,11 @@ class Trainer:
             enabled=self.optim_conf.amp.enabled if self.optim_conf else False,
         )
 
-        self.gradient_clipper = (
-            instantiate(self.optim_conf.gradient_clip) if self.optim_conf else None
-        )
-        self.gradient_logger = (
-            instantiate(self.optim_conf.gradient_logger) if self.optim_conf else None
-        )
+        self.gradient_clipper = instantiate(self.optim_conf.gradient_clip) if self.optim_conf else None
+        self.gradient_logger = instantiate(self.optim_conf.gradient_logger) if self.optim_conf else None
 
         logging.info("Finished setting up components: Model, loss, optim, meters etc.")
-        
+
     def _setup_evaluators(self):
         """Setup separate evaluators for training and validation phases"""
         # Get configuration
@@ -1284,9 +1186,11 @@ class Trainer:
         if "aue_loss_dict" in bndl_outputs and bndl_outputs["aue_loss_dict"] is not None:
             aue_loss_dict = bndl_outputs["aue_loss_dict"]
             all_aue_loss_keys = [
-                'ratio_pos', 'ratio_adversarial', 'range_penalty', 'zero_escape_loss',
-                'tv_loss', 'h1_loss', 'spectral_loss', 'off_boundary_loss', 
-                'zero_mean_loss', 'diversity_loss', 'constraint_loss', 'prompt_penalty', 'total_loss'
+                "ratio_pos",
+                "ratio_adversarial",
+                "range_penalty",
+                "diversity_loss",
+                "total_loss",
             ]
             for key in all_aue_loss_keys:
                 value = aue_loss_dict.get(key, 0.0)
@@ -1295,6 +1199,165 @@ class Trainer:
                 else:
                     val = value
                 self.logger.log(f"AUE_Losses/{phase}_{key}", val, step)
+
+    def _log_style_aue_visualization(self, outputs, step):
+        """Log Style AUE visualization: original vs adversarial images with style statistics"""
+        logging.info(f"_log_style_aue_visualization called at step {step}")
+        
+        # Normalize outputs to an iterable
+        if isinstance(outputs, dict):
+            outputs_iter = [outputs]
+        else:
+            outputs_iter = outputs
+        
+        # Extract visualization data from outputs
+        for outs in outputs_iter:
+            if "multistep_aux_outputs" in outs:
+                aux_list = outs["multistep_aux_outputs"]
+                for aux in reversed(aux_list):
+                    if aux is not None and isinstance(aux, dict):
+                        bndl_outputs = aux.get("bndl", None)
+                        if bndl_outputs is not None:
+                            logging.info(f"bndl_outputs keys: {list(bndl_outputs.keys())}")
+                            if "aue_loss_dict" in bndl_outputs:
+                                aue_loss_dict = bndl_outputs["aue_loss_dict"]
+                                logging.info(f"aue_loss_dict keys: {list(aue_loss_dict.keys())}")
+                                vis_data = aue_loss_dict.get("style_aue_visualization", None)
+                                
+                                has_images = vis_data and 'original_images' in vis_data if vis_data else False
+                                logging.info(
+                                    f"Found vis_data: {vis_data is not None}, "
+                                    f"type: {type(vis_data) if vis_data is not None else 'None'}, "
+                                    f"has images: {has_images}"
+                                )
+                                
+                                if vis_data and "original_images" in vis_data and "adversarial_images" in vis_data:
+                                    original_imgs = vis_data["original_images"]  # [N, 3, H, W], normalized
+                                    adv_imgs = vis_data["adversarial_images"]      # [N, 3, H, W], normalized
+                                    
+                                    # Extract style statistics for visualization
+                                    from sam2.modeling.style_utils import extract_style_statistics
+                                    original_styles = extract_style_statistics(original_imgs)  # [N, 6]
+                                    adv_styles = extract_style_statistics(adv_imgs)  # [N, 6]
+                                    
+                                    # Denormalize images for visualization (ImageNet normalization)
+                                    mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+                                    std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+                                    
+                                    original_denorm = original_imgs * std + mean
+                                    adv_denorm = adv_imgs * std + mean
+                                    
+                                    # Clamp to [0, 1]
+                                    original_denorm = torch.clamp(original_denorm, 0, 1)
+                                    adv_denorm = torch.clamp(adv_denorm, 0, 1)
+                                    
+                                    # Log each sample with style statistics overlay
+                                    num_samples = min(3, original_denorm.shape[0])  # Limit to 3 samples
+                                    for i in range(num_samples):
+                                        # Create visualization with style statistics
+                                        self._log_style_statistics_overlay(
+                                            original_denorm[i],
+                                            adv_denorm[i],
+                                            original_styles[i],
+                                            adv_styles[i],
+                                            i,
+                                            step
+                                        )
+                                    
+                                    # Also log separately
+                                    if num_samples > 0 and self.logger.tb_logger and self.logger.tb_logger._writer:
+                                        self.logger.tb_logger._writer.add_image(
+                                            "StyleAUE/original_images",
+                                            torch.cat([original_denorm[i] for i in range(num_samples)], dim=2),
+                                            step
+                                        )
+                                        self.logger.tb_logger._writer.add_image(
+                                            "StyleAUE/adversarial_images",
+                                            torch.cat([adv_denorm[i] for i in range(num_samples)], dim=2),
+                                            step
+                                        )
+                                    
+                                    # Log style perturbation magnitude
+                                    style_diff = (adv_styles - original_styles).abs().mean(dim=0)  # [6]
+                                    for j, channel in enumerate(['R_mean', 'G_mean', 'B_mean', 'R_std', 'G_std', 'B_std']):
+                                        self.logger.log(f"StyleAUE/perturbation_{channel}", style_diff[j].item(), step)
+                                
+                                return  # Only log once
+    
+    def _log_style_statistics_overlay(self, original_img, adv_img, original_style, adv_style, sample_id, step):
+        """Create visualization with style statistics overlaid on images"""
+        import matplotlib.pyplot as plt
+        import numpy as np
+        
+        # Convert tensors to numpy
+        orig_np = original_img.cpu().numpy().transpose(1, 2, 0)  # [H, W, 3]
+        adv_np = adv_img.cpu().numpy().transpose(1, 2, 0)
+        orig_style_np = original_style.cpu().numpy()  # [6]
+        adv_style_np = adv_style.cpu().numpy()
+        
+        # Create figure with images and style statistics
+        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+        
+        # Row 1: Original image and its styles
+        axes[0, 0].imshow(orig_np)
+        axes[0, 0].set_title('Original Image', fontsize=12, fontweight='bold')
+        axes[0, 0].axis('off')
+        
+        # Original style - means
+        axes[0, 1].bar(['R', 'G', 'B'], orig_style_np[:3], color=['red', 'green', 'blue'], alpha=0.7)
+        axes[0, 1].set_title('Original Mean (per channel)', fontsize=10)
+        axes[0, 1].set_ylabel('Mean Value')
+        axes[0, 1].set_ylim([orig_style_np[:3].min() - 0.1, orig_style_np[:3].max() + 0.1])
+        axes[0, 1].grid(True, alpha=0.3)
+        
+        # Original style - stds
+        axes[0, 2].bar(['R', 'G', 'B'], orig_style_np[3:], color=['red', 'green', 'blue'], alpha=0.7)
+        axes[0, 2].set_title('Original Std (per channel)', fontsize=10)
+        axes[0, 2].set_ylabel('Std Value')
+        axes[0, 2].set_ylim([orig_style_np[3:].min() - 0.05, orig_style_np[3:].max() + 0.05])
+        axes[0, 2].grid(True, alpha=0.3)
+        
+        # Row 2: Adversarial image and its styles
+        axes[1, 0].imshow(adv_np)
+        axes[1, 0].set_title('Adversarial Image', fontsize=12, fontweight='bold')
+        axes[1, 0].axis('off')
+        
+        # Adversarial style - means
+        axes[1, 1].bar(['R', 'G', 'B'], adv_style_np[:3], color=['red', 'green', 'blue'], alpha=0.7)
+        axes[1, 1].set_title('Adversarial Mean (per channel)', fontsize=10)
+        axes[1, 1].set_ylabel('Mean Value')
+        axes[1, 1].set_ylim([adv_style_np[:3].min() - 0.1, adv_style_np[:3].max() + 0.1])
+        axes[1, 1].grid(True, alpha=0.3)
+        
+        # Adversarial style - stds
+        axes[1, 2].bar(['R', 'G', 'B'], adv_style_np[3:], color=['red', 'green', 'blue'], alpha=0.7)
+        axes[1, 2].set_title('Adversarial Std (per channel)', fontsize=10)
+        axes[1, 2].set_ylabel('Std Value')
+        axes[1, 2].set_ylim([adv_style_np[3:].min() - 0.05, adv_style_np[3:].max() + 0.05])
+        axes[1, 2].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        
+        # Convert figure to image and log
+        fig.canvas.draw()
+        # Use buffer_rgba() for newer matplotlib versions
+        width, height = fig.canvas.get_width_height()
+        img_array = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+        img_array = img_array.reshape(height, width, 4)  # RGBA format
+        img_array = img_array[:, :, :3]  # Convert RGBA to RGB by dropping alpha channel
+        
+        # Convert to torch tensor [3, H, W] and normalize to [0, 1]
+        img_tensor = torch.from_numpy(img_array).permute(2, 0, 1).float() / 255.0
+        
+        # Log to TensorBoard using the underlying writer
+        if self.logger.tb_logger and self.logger.tb_logger._writer:
+            self.logger.tb_logger._writer.add_image(
+                f"StyleAUE/sample_{sample_id}_with_statistics",
+                img_tensor,
+                step
+            )
+        
+        plt.close(fig)
 
     def _extract_pixel_bndl_model(self, model):
         """Extract the pixel_bndl model from the main SAM2 model"""
@@ -1403,9 +1466,7 @@ class Trainer:
                     S = self.logging_conf.uncertainty_sample_num
                     sampled_logits = torch.zeros(B, H, W, S, device=pixel_feat.device, dtype=pixel_feat.dtype)
                     for i in range(S):
-                        out_i, *_ = pixel_bndl_model(
-                            pixel_feat, force_sample=True, external_pre_out_w=single_channel_w
-                        )  # [B,H,W,1]
+                        out_i, *_ = pixel_bndl_model(pixel_feat, force_sample=True, external_pre_out_w=single_channel_w)  # [B,H,W,1]
                         sampled_logits[..., i] = out_i[..., 0]
                     # probs per sample
                     probs = torch.sigmoid(sampled_logits)  # [B,H,W,S]
@@ -1470,9 +1531,7 @@ class Trainer:
             if mean_pixel_logits is None:
                 # Get one deterministic forward for logits on the chosen channel(s)
                 if single_channel_w is not None:
-                    det_out, *_ = pixel_bndl_model(
-                        pixel_feat, force_sample=False, external_pre_out_w=single_channel_w
-                    )  # [B,H,W,1]
+                    det_out, *_ = pixel_bndl_model(pixel_feat, force_sample=False, external_pre_out_w=single_channel_w)  # [B,H,W,1]
                     mean_pixel_logits = det_out
                 else:
                     _, mean_pixel_logits = pixel_uncertain_sampling(
@@ -1551,72 +1610,75 @@ class Trainer:
 
     def _extract_mask_prompt_info(self, outputs_for_vis, step_index=0):
         """从 mask_inputs 提取边界框或轮廓点用于可视化
-        
+
         Args:
             outputs_for_vis: 模型输出列表
             step_index: 帧索引
-            
+
         Returns:
             prompt_info 字典（包含 mask 的 bounding box）或 None
         """
         try:
             if outputs_for_vis is None or not isinstance(outputs_for_vis, list) or len(outputs_for_vis) == 0:
                 return None
-            
+
             if step_index >= len(outputs_for_vis):
                 step_index = 0
-            
+
             step_output = outputs_for_vis[step_index]
             if not isinstance(step_output, dict):
                 return None
-            
+
             # 提取 mask_inputs
             mask_inputs = step_output.get("mask_inputs", None)
             if mask_inputs is None:
                 return None
-            
+
             # mask_inputs 通常是 [B, 1, H, W] 格式
-            if hasattr(mask_inputs, 'shape') and len(mask_inputs.shape) >= 3:
+            if hasattr(mask_inputs, "shape") and len(mask_inputs.shape) >= 3:
                 mask = mask_inputs[0, 0] if len(mask_inputs.shape) == 4 else mask_inputs[0]  # [H, W]
-                
+
                 # 转换为 numpy
-                if hasattr(mask, 'cpu'):
+                if hasattr(mask, "cpu"):
                     mask_np = mask.cpu().numpy()
                 else:
                     mask_np = mask
-                
+
                 # 计算 mask 的 bounding box
                 fg_coords = np.argwhere(mask_np > 0.5)  # [[y, x], ...]
                 if len(fg_coords) == 0:
                     return None
-                
+
                 # 获取边界框
                 y_min, x_min = fg_coords.min(axis=0)
                 y_max, x_max = fg_coords.max(axis=0)
-                
+
                 # 构造边界框的两个角点（SAM 使用 box corners）
-                box_coords = torch.tensor([
-                    [x_min, y_min],  # 左上角
-                    [x_max, y_max]   # 右下角
-                ], dtype=torch.float32).unsqueeze(0)  # [1, 2, 2]
-                
+                box_coords = torch.tensor(
+                    [
+                        [x_min, y_min],  # 左上角
+                        [x_max, y_max],  # 右下角
+                    ],
+                    dtype=torch.float32,
+                ).unsqueeze(0)  # [1, 2, 2]
+
                 box_labels = torch.tensor([[2, 3]], dtype=torch.int32)  # SAM box 标签
-                
+
                 prompt_info = {
-                    'point_coords': box_coords,
-                    'point_labels': box_labels,
-                    'is_box': True  # 标记这是 box prompt
+                    "point_coords": box_coords,
+                    "point_labels": box_labels,
+                    "is_box": True,  # 标记这是 box prompt
                 }
-                
+
                 logging.info(f"✓ Extracted bounding box from mask_inputs for visualization")
                 return prompt_info
-            
+
             return None
-            
+
         except Exception as e:
             logging.warning(f"Failed to extract mask prompt info: {e}")
             return None
-    
+
     def _extract_prompt_info(self, outputs_for_vis, step_index=0):
         """从模型输出中提取prompt信息（优先从第一帧）
 
@@ -1647,13 +1709,13 @@ class Trainer:
                     # 取第一步的 point inputs（初始 prompts，不是 correction points）
                     if point_inputs_list[0] is not None and isinstance(point_inputs_list[0], dict):
                         final_point_inputs = point_inputs_list[0]
-            
+
             # 如果 multistep_point_inputs 没有有效数据，尝试使用顶层的 point_inputs
             if final_point_inputs is None and "point_inputs" in step_output:
                 top_level_pi = step_output["point_inputs"]
                 if top_level_pi is not None and isinstance(top_level_pi, dict):
                     final_point_inputs = top_level_pi
-            
+
             if final_point_inputs is None:
                 return None
 
@@ -1744,7 +1806,7 @@ class Trainer:
 
         # 提取prompt信息 - 总是从第一帧（frame 0）提取，因为第一帧是 init_cond_frame，有初始 prompts
         prompt_info = self._extract_prompt_info(outputs_for_vis, step_index=0)
-        
+
         # 如果没有 point prompts，尝试从 mask_inputs 提取轮廓用于可视化
         if prompt_info is None:
             prompt_info = self._extract_mask_prompt_info(outputs_for_vis, step_index=0)

@@ -44,6 +44,7 @@ from zero_shot_utils import (
 )
 from checkpoint_manager import CheckpointManager
 from evaluation_pipeline import run_benchmark_evaluation
+from downsampling_utils import smart_downsample_samples, downsample_checkpoint_data
 
 # Add path for visualization utils
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "training", "utils"))
@@ -225,6 +226,7 @@ def inference_with_ur_ern(
     click_protocol: str = "3click",
     min_click_dist: float = 12.0,
     seed: int | None = 0,
+    downsample_max_samples: int = 100000,
 ):
     """Inference with UR-ERN uncertainty estimation"""
     if video_names is None:
@@ -442,12 +444,28 @@ def inference_with_ur_ern(
         
         # Incremental checkpoint: save evaluator data periodically to prevent OOM
         if checkpoint_mgr and dataset_eval is not None and checkpoint_mgr.should_checkpoint(v_idx):
-            checkpoint_data = {
-                'pixel_uncertainties': dataset_eval.pixel_uncertainties.copy() if hasattr(dataset_eval, 'pixel_uncertainties') else [],
-                'pixel_ious': dataset_eval.pixel_ious.copy() if hasattr(dataset_eval, 'pixel_ious') else [],
-                'pixel_dices': dataset_eval.pixel_dices.copy() if hasattr(dataset_eval, 'pixel_dices') else [],
-                'pixel_accuracies': dataset_eval.pixel_accuracies.copy() if hasattr(dataset_eval, 'pixel_accuracies') else [],
-            }
+            if dataset_eval.per_pixel_statistics:
+                checkpoint_data = {
+                    'pixel_uncertainties': dataset_eval.pixel_data['uncertainties'].tolist(),
+                    'pixel_ious': dataset_eval.pixel_data['ious'].tolist(),
+                    'pixel_dices': dataset_eval.pixel_data['dices'].tolist(),
+                    'pixel_accuracies': dataset_eval.pixel_data['accuracies'].tolist(),
+                    'pixel_nlls': dataset_eval.pixel_data['nlls'].tolist(),
+                }
+            else:
+                checkpoint_data = {
+                    'pixel_uncertainties': [],
+                    'pixel_ious': [],
+                    'pixel_dices': [],
+                    'pixel_accuracies': [],
+                    'pixel_nlls': [],
+                }
+            
+            # 🎯 保存checkpoint前降采样（加速merge）
+            downsampled, n_orig, n_down = downsample_checkpoint_data(checkpoint_data, max_samples=downsample_max_samples)
+            if downsampled:
+                print(f"  💾 降采样: {n_orig:,} → {n_down:,} 样本 ({n_down / n_orig * 100:.1f}%)")
+            
             checkpoint_file = checkpoint_mgr.save_checkpoint(checkpoint_data, v_idx)
             print(f"💾 UR-ERN: Saved checkpoint ({v_idx}/{len(video_names)} videos) to {checkpoint_file.name}")
             
@@ -458,24 +476,16 @@ def inference_with_ur_ern(
 
     # Merge checkpoint files back into evaluator (streaming to reduce memory peak)
     if checkpoint_mgr and dataset_eval is not None:
-        def _append_shard_to_eval(shard_data):
-            if not shard_data:
-                return
-            u = shard_data.get('pixel_uncertainties')
-            if u:
-                dataset_eval.pixel_uncertainties.extend(u)
-            ious = shard_data.get('pixel_ious')
-            if ious:
-                dataset_eval.pixel_ious.extend(ious)
-            dices = shard_data.get('pixel_dices')
-            if dices:
-                dataset_eval.pixel_dices.extend(dices)
-            accs = shard_data.get('pixel_accuracies')
-            if accs:
-                dataset_eval.pixel_accuracies.extend(accs)
-            CheckpointManager.force_memory_cleanup()
+        # Use shared callback to eliminate duplication
+        _append_shard_to_eval = create_append_shard_to_eval_callback(dataset_eval, downsample_max_samples)
 
         checkpoint_mgr.merge_checkpoints_streaming(_append_shard_to_eval)
+        
+        # 🎯 关键优化: 合并后降采样evaluator数据（防止可视化/分析太慢）
+        n_orig = len(dataset_eval.pixel_data)
+        if n_orig > downsample_max_samples:
+            dataset_eval.pixel_data = dataset_eval.pixel_data.sample(n=downsample_max_samples, random_state=42).reset_index(drop=True)
+            print(f"  💾 合并后降采样evaluator: {n_orig:,} → {len(dataset_eval.pixel_data):,} 样本 ({len(dataset_eval.pixel_data) / n_orig * 100:.1f}%)")
     
     # Finalize dataset correlation visualization/results
     if dataset_eval is not None and len(dataset_eval) > 0:
@@ -490,10 +500,16 @@ def inference_with_ur_ern(
         
         # Extract and return statistics
         # Use the correct data source based on whether we're using pixel-level or image-level stats
-        data_source = dataset_eval.pixel_uncertainties if dataset_eval.per_pixel_statistics else dataset_eval.image_uncertainties
-        iou_source = dataset_eval.pixel_ious if dataset_eval.per_pixel_statistics else dataset_eval.image_ious
-        dice_source = dataset_eval.pixel_dices if dataset_eval.per_pixel_statistics else dataset_eval.image_dices
-        accuracy_source = dataset_eval.pixel_accuracies if dataset_eval.per_pixel_statistics else dataset_eval.image_accuracies
+        if dataset_eval.per_pixel_statistics:
+            data_source = dataset_eval.pixel_data['uncertainties'].tolist()
+            iou_source = dataset_eval.pixel_data['ious'].tolist()
+            dice_source = dataset_eval.pixel_data['dices'].tolist()
+            accuracy_source = dataset_eval.pixel_data['accuracies'].tolist()
+        else:
+            data_source = dataset_eval.image_uncertainties
+            iou_source = dataset_eval.image_ious
+            dice_source = dataset_eval.image_dices
+            accuracy_source = dataset_eval.image_accuracies
         
         # Sample raw data for PAvPU scatter plot (no thresholds)
         max_samples = 10000
@@ -532,13 +548,27 @@ def inference_with_ur_ern(
             # Sample count
             'num_samples': len(data_source),
             
-            # Raw PAvPU samples for true scatter plot (no thresholds)
-            'eval_pavpu_uncertainty_samples': uncertainty_samples,
-            'eval_pavpu_accuracy_samples': accuracy_samples,
+            # Raw PAvPU samples for true scatter plot (with smart downsampling)
+            # 🎯 只调用一次降采样函数，避免重复计算
+            'eval_pavpu_uncertainty_samples': [],  # 临时占位
+            'eval_pavpu_accuracy_samples': [],  # 临时占位
         }
         
-        print(f"UR-ERN statistics collected: {ur_ern_statistics['num_samples']} samples, "
-              f"mean uncertainty: {ur_ern_statistics['pixel_uncertainty_mean']:.4f}")
+        # 🎯 降采样（只调用一次）
+        n_pavpu_original = len(uncertainty_samples)
+        unc_down, acc_down = smart_downsample_samples(uncertainty_samples, accuracy_samples, max_samples=downsample_max_samples)
+        ur_ern_statistics['eval_pavpu_uncertainty_samples'] = unc_down
+        ur_ern_statistics['eval_pavpu_accuracy_samples'] = acc_down
+        n_pavpu_stored = len(unc_down)
+        
+        # 记录降采样信息
+        if n_pavpu_stored < n_pavpu_original:
+            print(f"UR-ERN statistics collected: {ur_ern_statistics['num_samples']} samples, "
+                  f"mean uncertainty: {ur_ern_statistics['pixel_uncertainty_mean']:.4f}, "
+                  f"PAvPU samples: {n_pavpu_original:,} → {n_pavpu_stored:,} ({n_pavpu_stored/n_pavpu_original*100:.1f}%)")
+        else:
+            print(f"UR-ERN statistics collected: {ur_ern_statistics['num_samples']} samples, "
+                  f"mean uncertainty: {ur_ern_statistics['pixel_uncertainty_mean']:.4f}")
         
         return ur_ern_statistics
     
@@ -562,6 +592,7 @@ def run_single_dataset_with_ur_ern(
     click_protocol: str = "3click",
     min_click_dist: float = 12.0,
     seed: int = 0,
+    downsample_max_samples: int = 100000,
 ) -> tuple[float, float, float, dict[str, Any] | None]:
     """Run evaluation on a single dataset using UR-ERN and return J&F/J/F and statistics.
 
@@ -624,6 +655,7 @@ def run_single_dataset_with_ur_ern(
         click_protocol=click_protocol,
         min_click_dist=min_click_dist,
         seed=seed,
+        downsample_max_samples=downsample_max_samples,
     )
     t_infer = time.time() - t0
 
@@ -654,23 +686,8 @@ def run_single_dataset_with_ur_ern(
     return j_f_val, j_val, f_val, ur_ern_stats
 
 
-def build_predictor_with_overrides(cfg_file: str, ckpt: str, device: str = "cuda", multimask: bool = True, min_pts: int = 1, max_pts: int = 2, for_tracking: bool = False):
-    hydra_overrides_extra = []
-    if multimask:
-        hydra_overrides_extra += [
-            "++model.multimask_output_in_sam=true",
-            f"++model.multimask_min_pt_num={min_pts}",
-            f"++model.multimask_max_pt_num={max_pts}",
-        ]
-        if for_tracking:
-            hydra_overrides_extra += ["++model.multimask_output_for_tracking=true"]
-    predictor = build_sam2_video_predictor(
-        config_file=cfg_file,
-        ckpt_path=ckpt,
-        device=device,
-        hydra_overrides_extra=hydra_overrides_extra,
-    )
-    return predictor
+# Moved to shared_evaluation_utils.py to eliminate duplication
+from shared_evaluation_utils import build_predictor_with_overrides, create_append_shard_to_eval_callback
 
 
 def parse_args():
@@ -699,6 +716,9 @@ def parse_args():
     parser.add_argument("--click_protocol", default="3click", choices=["1click", "3click", "5click"])
     parser.add_argument("--min_click_dist", type=float, default=12.0)
     parser.add_argument("--seed", type=int, default=0)
+    
+    # Downsampling parameters
+    parser.add_argument("--downsample_max_samples", type=int, default=100000, help="Maximum number of samples to keep after downsampling (default: 100000)")
     
     # Output
     parser.add_argument("--output_path", type=Path, default=Path("./outputs/ur_ern_evaluation"))
@@ -749,6 +769,7 @@ def main():
             click_protocol=args.click_protocol,
             min_click_dist=args.min_click_dist,
             seed=args.seed,
+            downsample_max_samples=args.downsample_max_samples,
         )
         
         all_results[dataset_name] = (j_f, j, f)

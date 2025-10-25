@@ -87,6 +87,8 @@ def run_comparison_evaluation(
     uctta_fisher_alpha: float = 2000.0,
     uctta_entropy_th: float = 0.4,
     uctta_selection_p: float = 0.1,
+    # Downsampling parameters
+    downsample_max_samples: int = 100000,
 ) -> tuple[
     dict[str, tuple[float, float, float]],  # sam2_results
     dict[str, tuple[float, float, float]],  # bndl_aue_results
@@ -123,21 +125,16 @@ def run_comparison_evaluation(
         ur_ern_output.mkdir(parents=True, exist_ok=True)
 
     # Build both predictors with identical Hydra overrides to ensure strict consistency
-    hydra_overrides_extra = [
-        "++model.multimask_output_in_sam=true",
-        "++model.multimask_min_pt_num=1",
-        "++model.multimask_max_pt_num=2",
-    ]
+    from shared_evaluation_utils import build_predictor_with_overrides
 
     # Load SAM-2 predictor (original) with the same overrides (optional)
     sam2_predictor = None
     if run_sam or run_uctta:  # UCTTA needs SAM-2 predictor
         print("\nLoading SAM-2 checkpoint...")
-        sam2_predictor = build_sam2_video_predictor(
-            config_file=sam2_cfg,
-            ckpt_path=sam2_checkpoint,
+        sam2_predictor = build_predictor_with_overrides(
+            cfg_file=sam2_cfg,
+            ckpt=sam2_checkpoint,
             device=device,
-            hydra_overrides_extra=hydra_overrides_extra,
         )
         print("SAM-2 loaded successfully!")
 
@@ -147,11 +144,10 @@ def run_comparison_evaluation(
         if bndl_cfg is None or bndl_checkpoint is None:
             raise ValueError("BNDL requires both bndl_cfg and bndl_checkpoint to be specified")
         print("\nLoading BNDL checkpoint...")
-        bndl_predictor = build_sam2_video_predictor(
-            config_file=bndl_cfg,
-            ckpt_path=bndl_checkpoint,
+        bndl_predictor = build_predictor_with_overrides(
+            cfg_file=bndl_cfg,
+            ckpt=bndl_checkpoint,
             device=device,
-            hydra_overrides_extra=hydra_overrides_extra,
         )
         print("BNDL loaded successfully!")
 
@@ -159,11 +155,10 @@ def run_comparison_evaluation(
     bndl_aue_predictor = None
     if run_bndl_aue:
         print("\nLoading BNDL_AUE checkpoint...")
-        bndl_aue_predictor = build_sam2_video_predictor(
-            config_file=bndl_aue_cfg,
-            ckpt_path=bndl_aue_checkpoint,
+        bndl_aue_predictor = build_predictor_with_overrides(
+            cfg_file=bndl_aue_cfg,
+            ckpt=bndl_aue_checkpoint,
             device=device,
-            hydra_overrides_extra=hydra_overrides_extra,
         )
         print("BNDL_AUE loaded successfully!")
 
@@ -173,11 +168,10 @@ def run_comparison_evaluation(
         if ur_ern_cfg is None or ur_ern_checkpoint is None:
             raise ValueError("UR-ERN requires both ur_ern_cfg and ur_ern_checkpoint to be specified")
         print("\nLoading SAM-2+UR-ERN checkpoint...")
-        ur_ern_predictor = build_sam2_video_predictor(
-            config_file=ur_ern_cfg,
-            ckpt_path=ur_ern_checkpoint,
+        ur_ern_predictor = build_predictor_with_overrides(
+            cfg_file=ur_ern_cfg,
+            ckpt=ur_ern_checkpoint,
             device=device,
-            hydra_overrides_extra=hydra_overrides_extra,
         )
         print("SAM-2+UR-ERN loaded successfully!")
 
@@ -280,6 +274,7 @@ def run_comparison_evaluation(
                     fisher_alpha=uctta_fisher_alpha,
                     entropy_threshold=uctta_entropy_th,
                     selection_p=uctta_selection_p,
+                    downsample_max_samples=downsample_max_samples,
                 )
                 uctta_time = time.time() - uctta_start
                 print(f"SAM-2+UCTTA @ {th:.2f} - J&F: {j_f_uctta:.2f}, J: {j_uctta:.2f}, F: {f_uctta:.2f} (Time: {uctta_time:.2f}s)")
@@ -314,6 +309,7 @@ def run_comparison_evaluation(
                     click_protocol=click_protocol,
                     min_click_dist=min_click_dist,
                     seed=seed,
+                    downsample_max_samples=downsample_max_samples,
                 )
                 bndl_time = time.time() - bndl_start
                 bndl_per_thresh.append((th, j_f_bndl, j_bndl, f_bndl))
@@ -341,6 +337,7 @@ def run_comparison_evaluation(
                     click_protocol=click_protocol,
                     min_click_dist=min_click_dist,
                     seed=seed,
+                    downsample_max_samples=downsample_max_samples,
                 )
                 bndl_aue_time = time.time() - bndl_aue_start
                 bndl_aue_per_thresh.append((th, j_f_bndl_aue, j_bndl_aue, f_bndl_aue))
@@ -368,6 +365,7 @@ def run_comparison_evaluation(
                     click_protocol=click_protocol,
                     min_click_dist=min_click_dist,
                     seed=seed,
+                    downsample_max_samples=downsample_max_samples,
                 )
                 ur_ern_time = time.time() - ur_ern_start
                 if dataset_name not in ur_ern_results:
@@ -2106,6 +2104,10 @@ def parse_args():
                    help="Interaction protocol for first frame")
     p.add_argument("--min_click_dist", type=float, default=12.0, help="Minimum distance between clicks for 5-click protocol")
     p.add_argument("--seed", type=int, default=0, help="Random seed for 'random' point initialization")
+    
+    # Downsampling parameters
+    p.add_argument("--downsample_max_samples", type=int, default=100000, 
+                   help="Maximum number of samples to keep after downsampling (default: 100000)")
 
     # Cached results options
     p.add_argument("--load_detailed_json", type=str, default=None, 
@@ -2216,6 +2218,7 @@ def main():
             uctta_fisher_alpha=args.uctta_fisher_alpha,
             uctta_entropy_th=args.uctta_entropy_th,
             uctta_selection_p=args.uctta_selection_p,
+            downsample_max_samples=args.downsample_max_samples,
         )
 
     # Save detailed results JSON (needed for parallel_compare.py) - skip if plot_only mode

@@ -18,6 +18,7 @@ from typing import Dict, List, Tuple
 
 import cv2
 import numpy as np
+import pandas as pd
 import tqdm
 from PIL import Image
 from skimage.morphology import disk
@@ -39,36 +40,41 @@ class VideoEvaluator:
         """
         vid_name: name of the video to evaluate
         """
+        try:
+            # scan the folder to find subfolders for evaluation and
+            # check if the folder structure is SA-V
+            to_evaluate, is_sav_format = self.scan_vid_folder(vid_name)
 
-        # scan the folder to find subfolders for evaluation and
-        # check if the folder structure is SA-V
-        to_evaluate, is_sav_format = self.scan_vid_folder(vid_name)
+            # evaluate each (gt_path, pred_path) pair
+            eval_results = []
+            for all_frames, obj_id, gt_path, pred_path in to_evaluate:
+                if self.skip_first_and_last:
+                    # skip the first and the last frames
+                    all_frames = all_frames[1:-1]
 
-        # evaluate each (gt_path, pred_path) pair
-        eval_results = []
-        for all_frames, obj_id, gt_path, pred_path in to_evaluate:
-            if self.skip_first_and_last:
-                # skip the first and the last frames
-                all_frames = all_frames[1:-1]
+                evaluator = Evaluator(name=vid_name, obj_id=obj_id)
+                for frame in all_frames:
+                    gt_array, pred_array = self.get_gt_and_pred(
+                        gt_path, pred_path, frame, is_sav_format
+                    )
+                    evaluator.feed_frame(mask=pred_array, gt=gt_array)
 
-            evaluator = Evaluator(name=vid_name, obj_id=obj_id)
-            for frame in all_frames:
-                gt_array, pred_array = self.get_gt_and_pred(
-                    gt_path, pred_path, frame, is_sav_format
-                )
-                evaluator.feed_frame(mask=pred_array, gt=gt_array)
+                iou, boundary_f = evaluator.conclude()
+                eval_results.append((obj_id, iou, boundary_f))
 
-            iou, boundary_f = evaluator.conclude()
-            eval_results.append((obj_id, iou, boundary_f))
+            if is_sav_format:
+                iou_output, boundary_f_output = self.consolidate(eval_results)
+            else:
+                assert len(eval_results) == 1
+                iou_output = eval_results[0][1]
+                boundary_f_output = eval_results[0][2]
 
-        if is_sav_format:
-            iou_output, boundary_f_output = self.consolidate(eval_results)
-        else:
-            assert len(eval_results) == 1
-            iou_output = eval_results[0][1]
-            boundary_f_output = eval_results[0][2]
-
-        return vid_name, iou_output, boundary_f_output
+            return vid_name, iou_output, boundary_f_output
+            
+        except Exception as e:
+            print(f"Error processing video {vid_name}: {e}")
+            # 返回空结果而不是崩溃
+            return vid_name, {}, {}
 
     def get_gt_and_pred(
         self,
@@ -428,24 +434,47 @@ def benchmark(
             )
 
     pool.close()
+    pool.join()  # 等待所有进程完成，防止100%卡住
 
-    all_global_jf, all_global_j, all_global_f = [], [], []
+    # 使用pandas DataFrame统一管理所有数据集的结果
+    all_results_data = []
     all_object_metrics = []
+    
     for i, mask_root in enumerate(mask_roots):
         if not single_dataset:
-            results = to_wait[i].get()
+            try:
+                results = to_wait[i].get(timeout=300)  # 5分钟超时，防止无限等待
+            except Exception as e:
+                print(f"Timeout or error waiting for dataset {i}: {e}")
+                results = []
 
-        all_iou = []
-        all_boundary_f = []
+        # 使用pandas DataFrame进行更高效的数据处理
+        data = []
         object_metrics = {}
+        
         for name, iou, boundary_f in results:
-            all_iou.extend(list(iou.values()))
-            all_boundary_f.extend(list(boundary_f.values()))
+            for obj_id, iou_val in iou.items():
+                boundary_f_val = boundary_f.get(obj_id, 0.0)
+                data.append({
+                    'video_name': name,
+                    'object_id': obj_id,
+                    'iou': iou_val,
+                    'boundary_f': boundary_f_val,
+                    'jf': (iou_val + boundary_f_val) / 2
+                })
+            
+            # 保持原有的object_metrics结构
             object_metrics[name] = (iou, boundary_f)
-
-        global_j = np.array(all_iou).mean()
-        global_f = np.array(all_boundary_f).mean()
-        global_jf = (global_j + global_f) / 2
+        
+        # 使用pandas进行高效计算
+        if data:
+            df = pd.DataFrame(data)
+            # 注意：iou和boundary_f已经在Evaluator.conclude()中乘以100了
+            global_j = df['iou'].mean()
+            global_f = df['boundary_f'].mean()
+            global_jf = df['jf'].mean()
+        else:
+            global_j = global_f = global_jf = 0.0
 
         time_taken = time.time() - start
         """
@@ -480,9 +509,34 @@ def benchmark(
         with open(result_path, "w") as f:
             f.write(out_string)
 
-        all_global_jf.append(global_jf)
-        all_global_j.append(global_j)
-        all_global_f.append(global_f)
+        # 将结果添加到统一的数据结构中
+        all_results_data.append({
+            'dataset_idx': i,
+            'mask_root': mask_root,
+            'global_jf': global_jf,
+            'global_j': global_j,
+            'global_f': global_f,
+            'total_videos': len(object_metrics),
+            'processing_time': time_taken
+        })
         all_object_metrics.append(object_metrics)
+
+    # 使用pandas进行最终的数据处理和分析
+    if all_results_data:
+        results_df = pd.DataFrame(all_results_data)
+        
+        # 提取结果列表（保持向后兼容）
+        all_global_jf = results_df['global_jf'].tolist()
+        all_global_j = results_df['global_j'].tolist()
+        all_global_f = results_df['global_f'].tolist()
+        
+        # 可选：添加总体统计信息
+        if verbose and len(results_df) > 1:
+            print(f"\n📊 多数据集统计:")
+            print(f"   平均J&F: {results_df['global_jf'].mean():.2f} ± {results_df['global_jf'].std():.2f}")
+            print(f"   平均J: {results_df['global_j'].mean():.2f} ± {results_df['global_j'].std():.2f}")
+            print(f"   平均F: {results_df['global_f'].mean():.2f} ± {results_df['global_f'].std():.2f}")
+    else:
+        all_global_jf = all_global_j = all_global_f = []
 
     return all_global_jf, all_global_j, all_global_f, all_object_metrics

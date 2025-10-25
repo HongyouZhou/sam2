@@ -354,6 +354,10 @@ def build_task_command(
     if method in ["BNDL", "BNDL_AUE", "UR-ERN"] and args.collect_bndl_stats:
         cmd.append("--collect_bndl_stats")
     
+    # 降采样参数（所有方法）
+    if hasattr(args, 'downsample_max_samples'):
+        cmd.extend(["--downsample_max_samples", str(args.downsample_max_samples)])
+    
     return cmd
 
 
@@ -812,24 +816,33 @@ def schedule_tasks_on_gpus(
     return results, total_time
 
 
-def parse_results_from_output(output_dir: Path, method: str, dataset: str) -> dict:
-    """从输出目录解析结果
+def parse_results_from_output(output_dir: Path, method: str, dataset: str, json_cache: dict = None) -> dict:
+    """从输出目录解析结果（支持缓存）
     
     Args:
         output_dir: 输出目录
         method: 方法名称
         dataset: 数据集名称
+        json_cache: JSON数据缓存字典（避免重复读取）
     
     Returns:
         结果字典 {dataset: {J&F, J, F}}
     """
     json_files = list(output_dir.glob("**/detailed_results.json"))
     if not json_files:
-        print(f"⚠️  [{method}@{dataset}] No detailed_results.json found")
+        # 不打印警告，避免刷屏（在merge阶段批量打印）
         return {}
     
-    with open(json_files[0]) as f:
-        data = json.load(f)
+    json_path = json_files[0]
+    
+    # 使用缓存避免重复读取
+    if json_cache is not None and json_path in json_cache:
+        data = json_cache[json_path]
+    else:
+        with open(json_path) as f:
+            data = json.load(f)
+        if json_cache is not None:
+            json_cache[json_path] = data
     
     json_key = METHOD_RESULT_KEYS.get(method)
     if not json_key or json_key not in data:
@@ -851,14 +864,22 @@ def parse_results_from_output(output_dir: Path, method: str, dataset: str) -> di
     return {}
 
 
-def parse_statistics_from_output(output_dir: Path, method: str) -> dict[str, Any]:
-    """从输出目录解析统计数据"""
+def parse_statistics_from_output(output_dir: Path, method: str, json_cache: dict = None) -> dict[str, Any]:
+    """从输出目录解析统计数据（支持缓存）"""
     json_files = list(output_dir.glob("**/detailed_results.json"))
     if not json_files:
         return {}
     
-    with open(json_files[0]) as f:
-        data = json.load(f)
+    json_path = json_files[0]
+    
+    # 使用缓存避免重复读取
+    if json_cache is not None and json_path in json_cache:
+        data = json_cache[json_path]
+    else:
+        with open(json_path) as f:
+            data = json.load(f)
+        if json_cache is not None:
+            json_cache[json_path] = data
     
     stats_key = METHOD_STATS_KEYS.get(method)
     return data.get(stats_key, {}) if stats_key else {}
@@ -869,7 +890,7 @@ def merge_results_by_method(
     output_base: Path,
     method_versions: dict[str, str],
 ) -> tuple[dict[str, dict], dict[str, dict], dict[str, float]]:
-    """合并所有任务结果，按方法组织
+    """合并所有任务结果，按方法组织（带缓存和进度提示）
     
     Args:
         task_results: 任务结果字典
@@ -882,11 +903,20 @@ def merge_results_by_method(
         - all_statistics: {method: {dataset: stats}}
         - times: {(dataset, method): elapsed_time}
     """
+    print("\n" + "=" * 80)
+    print("📊 阶段 1/3: 合并任务结果...")
+    print("=" * 80)
+    
     all_results = {method: {} for method in ALL_METHODS}
     all_statistics = {method: {} for method in ALL_METHODS}
     times = {}
     
-    for (dataset, method), result in task_results.items():
+    # 创建JSON缓存，避免重复读取同一个文件
+    json_cache = {}
+    
+    total_tasks = len(task_results)
+    
+    for completed_tasks, ((dataset, method), result) in enumerate(task_results.items(), 1):
         output_dir = result["output_dir"]
         returncode = result["returncode"]
         elapsed = result["elapsed"]
@@ -894,16 +924,22 @@ def merge_results_by_method(
         times[(dataset, method)] = elapsed
         
         if returncode == 0:
-            # 解析结果
-            method_results = parse_results_from_output(output_dir, method, dataset)
+            # 解析结果（使用缓存）
+            method_results = parse_results_from_output(output_dir, method, dataset, json_cache)
             if method_results:
                 all_results[method].update(method_results)
+            else:
+                print(f"  ⚠️  [{method}@{dataset}] 无法解析结果")
             
-            # 解析统计数据
-            method_statistics = parse_statistics_from_output(output_dir, method)
+            # 解析统计数据（使用缓存）
+            method_statistics = parse_statistics_from_output(output_dir, method, json_cache)
             if method_statistics and dataset in method_statistics:
                 all_statistics[method][dataset] = method_statistics[dataset]
+        
+        if completed_tasks % 5 == 0 or completed_tasks == total_tasks:
+            print(f"  进度: {completed_tasks}/{total_tasks} ({completed_tasks / total_tasks * 100:.1f}%)")
     
+    print(f"✓ 结果合并完成！共缓存 {len(json_cache)} 个JSON文件")
     return all_results, all_statistics, times
 
 
@@ -930,6 +966,8 @@ def create_comprehensive_summary(
         method_versions: 方法版本映射（用于显示版本信息）
     """
     print("\n" + "=" * 80)
+    print("📊 阶段 2/3: 生成汇总报告...")
+    print("=" * 80)
     print("智能并行评估结果汇总")
     if method_versions:
         print("方法版本: " + ", ".join([f"{m}_{method_versions[m]}" for m in methods if m in method_versions]))
@@ -1055,16 +1093,29 @@ def merge_detailed_results(
     all_statistics: dict[str, dict],
     output_path: Path,
     method_to_output: dict[tuple[str, str], Path],
+    skip_plots: bool = False,
 ):
-    """合并所有详细结果到单个JSON文件
+    """合并所有详细结果并生成可视化
     
     Args:
         all_results: 所有方法的结果
         all_statistics: 所有统计数据
         output_path: 输出路径
         method_to_output: (dataset, method) -> output_dir映射
+        skip_plots: 是否跳过可视化生成（加速完成）
     """
+    print("\n" + "=" * 80)
+    print("🎨 阶段 3/3: 生成可视化...")
+    print("=" * 80)
+    
+    if skip_plots:
+        print("⏭️  跳过可视化生成（--skip_plots 已启用）")
+        print("   提示: 如需生成图表，可稍后运行 zs.py --plot_only")
+        return
+    
     # 转换结果格式为zs.py期望的格式
+    print("  • 转换结果格式...")
+    
     def convert_results(method: str) -> dict:
         if method not in all_results:
             return {}
@@ -1084,10 +1135,19 @@ def merge_detailed_results(
     bndl_aue_statistics = all_statistics.get("BNDL_AUE", {})
     bndl_statistics = all_statistics.get("BNDL", {})
     
-    # 生成可视化
+    # 生成可视化（带详细进度）
+    plot_count = 0
+    total_plots = 0
+    if sam_results and bndl_aue_results:
+        total_plots += 1
+    if bndl_aue_statistics and bndl_aue_results and sam_results:
+        total_plots += 1
+    
     if sam_results and bndl_aue_results:
         try:
-            print("\n生成综合对比图...")
+            plot_count += 1
+            print(f"\n  [{plot_count}/{total_plots}] 生成综合对比图...")
+            print("    正在绘制多方法性能对比（可能需要30-60秒）...")
             create_comprehensive_comparison_plots(
                 sam2_results=sam_results,
                 bndl_results=bndl_aue_results,
@@ -1096,14 +1156,17 @@ def merge_detailed_results(
                 uctta_results=uctta_results or None,
                 uctta_statistics=uctta_statistics or None,
             )
-            print("✓ 综合对比图已生成")
+            print("    ✓ 综合对比图已生成")
         except Exception as e:
-            print(f"警告: 无法生成综合对比图: {e}")
+            print(f"    ⚠️  警告: 无法生成综合对比图: {e}")
     
     # 生成UA shift分析
     if bndl_aue_statistics and bndl_aue_results and sam_results:
         try:
-            print("\n生成UA shift分析...")
+            plot_count += 1
+            print(f"\n  [{plot_count}/{total_plots}] 生成UA shift分析图...")
+            print("    正在分析不确定性和准确度关系（可能需要30-60秒）...")
+            
             # 智能选择源域
             available_datasets = list(bndl_aue_results.keys())
             source_domain = "MOSE_train" if "MOSE_train" in available_datasets else (
@@ -1151,11 +1214,14 @@ def merge_detailed_results(
                 ur_ern_root_override=ur_ern_root,
                 bndl_pure_root_override=bndl_root,
             )
-            print("✓ UA shift分析图已生成")
+            print("    ✓ UA shift分析图已生成")
         except Exception as e:
-            print(f"警告: 无法生成UA shift分析: {e}")
+            print(f"    ⚠️  警告: 无法生成UA shift分析: {e}")
             import traceback
             traceback.print_exc()
+    
+    if total_plots > 0:
+        print(f"\n✓ 所有可视化完成！共生成 {total_plots} 组图表")
 
 
 def main():
@@ -1196,7 +1262,7 @@ def main():
     
     # BNDL+AUE配置
     parser.add_argument("--bndl_aue_cfg", default="configs/sam2.1/sam2.1_hiera_b+_bndl_aue.yaml")
-    parser.add_argument("--bndl_aue_checkpoint", default="/home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_aue_012_10/checkpoints/checkpoint.pt")
+    parser.add_argument("--bndl_aue_checkpoint", default="/home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_aue_016_01/checkpoints/checkpoint.pt")
     
     # BNDL (pure)配置
     parser.add_argument("--bndl_cfg", default="configs/sam2.1/sam2.1_hiera_b+_bndl.yaml")
@@ -1224,13 +1290,21 @@ def main():
     # BNDL参数
     parser.add_argument("--collect_bndl_stats", action="store_true", default=True)
     
+    # 降采样参数
+    parser.add_argument(
+        "--downsample_max_samples",
+        type=int,
+        default=1000000,
+        help="PAvPU样本降采样的最大数量（默认: 1000000）。增大可保留更多数据点，减小可加速checkpoint合并"
+    )
+    
     # 输出
     parser.add_argument("--output_path", type=Path, default=Path("./outputs/parallel_smart"))
     
     # 版本号配置
     parser.add_argument("--sam_version", type=str, default="001_01")
     parser.add_argument("--uctta_version", type=str, default="001_01")
-    parser.add_argument("--bndl_aue_version", type=str, default="012_10")
+    parser.add_argument("--bndl_aue_version", type=str, default="016_01")
     parser.add_argument("--bndl_version", type=str, default="013_01")
     parser.add_argument("--ur_ern_version", type=str, default="001_01")
     
@@ -1240,6 +1314,14 @@ def main():
         action="store_true", 
         default=False,
         help="智能续跑模式：自动检测并跳过已完成的(方法,数据集)组合，中途中断后可续跑"
+    )
+    
+    # 可视化控制
+    parser.add_argument(
+        "--skip_plots",
+        action="store_true",
+        default=False,
+        help="跳过可视化生成（加快完成速度）。可稍后运行 zs.py --plot_only 单独生成图表"
     )
     
     args = parser.parse_args()
@@ -1275,6 +1357,7 @@ def main():
     print(f"输出目录: {args.output_path}")
     print(f"模式: {'仅第一帧' if args.first_frame_only else '完整视频'}")
     print(f"智能续跑: {'启用 - 将跳过已完成任务' if args.reuse_cached else '禁用 - 将运行所有任务'}")
+    print(f"可视化: {'跳过 - 仅生成CSV汇总' if args.skip_plots else '启用 - 将生成所有图表'}")
     print("=" * 80 + "\n")
     
     # 生成所有任务
@@ -1336,10 +1419,18 @@ def main():
             all_statistics,
             args.output_path,
             method_to_output,
+            skip_plots=args.skip_plots,
         )
     
-    print(f"\n所有输出保存到: {args.output_path}")
-    print("✓ 智能并行评估完成！")
+    print("\n" + "=" * 80)
+    print("✅ 智能并行评估完成！")
+    print("=" * 80)
+    print(f"📁 所有输出保存到: {args.output_path}")
+    print(f"📊 汇总文件: {args.output_path / 'parallel_results_summary.csv'}")
+    if args.skip_plots:
+        print("\n💡 提示: 使用 --skip_plots 跳过了可视化")
+        print("   如需生成图表，可运行: python sam2/scripts/zs.py --plot_only --output_path <path>")
+    print("=" * 80)
 
 
 if __name__ == "__main__":

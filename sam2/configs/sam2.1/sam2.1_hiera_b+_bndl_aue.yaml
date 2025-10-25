@@ -121,16 +121,17 @@ model:
   # Compilation flag
   # compile_image_encoder: False
   
-  # AUE (Adversarial Uncertainty Estimation) options
+  # AUE (Adversarial Uncertainty Estimation) with Style-based augmentation
   use_aue: true
-  aue_adversarial_image_size: 512
-  aue_num_adversarial_samples: 16
-  aue_init_from_dataset: false
   aue_use_uncertainty: false
-  # UQ-aware AUE controls
   aue_uncertainty_mask_threshold: 0.4
-  aue_diversity_loss_weight: 0.0  # Diversity regularization weight
-  aue_constraint_loss_weight: 0.1  # Constraint regularization weight
+  
+  # Style-based AUE parameters
+  use_style_aug: true
+  style_aug_pgd_steps: 1
+  style_aug_pgd_step_size: 0.1
+  style_aug_pgd_epsilon: 2.0
+  style_aug_apply_at_layer: 0
 
   # ROI sharing
   share_roi_views: true

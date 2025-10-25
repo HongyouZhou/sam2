@@ -10,6 +10,7 @@ from typing import Any
 import cv2
 import matplotlib
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn.functional as F
 from PIL import Image
@@ -20,7 +21,6 @@ import os
 import time
 
 import matplotlib.pyplot as plt
-import pandas as pd
 import seaborn as sns
 
 # ----------  Tools -----------
@@ -47,6 +47,7 @@ from zero_shot_utils import (
 )
 from checkpoint_manager import CheckpointManager, StatisticsCheckpointManager
 from evaluation_pipeline import run_benchmark_evaluation
+from downsampling_utils import downsample_statistics_pavpu
 
 # ----------  Import refactored visualization modules (lazy import inside function) ----------
 import sys
@@ -489,16 +490,16 @@ def log_bndl_statistics(bndl_outputs, step, phase, dataset_name, statistics_dict
             except Exception as e:
                 logger.warning(f"Failed to log pixel_entropy: {e}")
 
-        # Store raw PAvPU samples for true scatter plot (no thresholds)
+        # Store raw PAvPU samples for true scatter plot (NO downsampling here - will downsample when saving checkpoint)
         if "pavpu_uncertainty_samples" in bndl_outputs and "pavpu_accuracy_samples" in bndl_outputs:
             uncertainty_samples = bndl_outputs["pavpu_uncertainty_samples"]
             accuracy_samples = bndl_outputs["pavpu_accuracy_samples"]
             
-            # Store raw samples in statistics dict
+            # Store raw samples WITHOUT downsampling (will be downsampled before saving checkpoint)
             statistics_dict[f"{key_prefix}_pavpu_uncertainty_samples"] = uncertainty_samples.tolist() if hasattr(uncertainty_samples, "tolist") else list(uncertainty_samples)
             statistics_dict[f"{key_prefix}_pavpu_accuracy_samples"] = accuracy_samples.tolist() if hasattr(accuracy_samples, "tolist") else list(accuracy_samples)
             
-            logger.info(f"BNDL Stats - {key_prefix}: stored {len(uncertainty_samples)} PAvPU samples for true scatter plot")
+            logger.info(f"BNDL Stats - {key_prefix}: stored {len(uncertainty_samples)} PAvPU samples")
 
     # Global w statistics (original BNDL)
     if "wei_lambda_w" in bndl_outputs and "inv_k_w" in bndl_outputs and bndl_outputs["wei_lambda_w"] is not None and bndl_outputs["inv_k_w"] is not None:
@@ -752,6 +753,7 @@ def inference_with_bndl(
     click_protocol: str = "3click",
     min_click_dist: float = 12.0,
     seed: int | None = 0,
+    downsample_max_samples: int = 100000,
 ):
     """
     3-click interactive inference with BNDL UQ analysis:
@@ -1109,6 +1111,11 @@ def inference_with_bndl(
             
             # Incremental save: periodically save statistics and clear memory to prevent OOM
             if stats_checkpoint_mgr and stats_checkpoint_mgr.should_checkpoint(v_idx):
+                # 🎯 保存checkpoint前降采样PAvPU样本
+                _, n_orig, n_down = downsample_statistics_pavpu(dataset_statistics, max_samples=downsample_max_samples)
+                if n_down < n_orig:
+                    print(f"  💾 降采样: {n_orig:,} → {n_down:,} PAvPU样本 ({n_down / n_orig * 100:.1f}%)")
+                
                 checkpoint_file = stats_checkpoint_mgr.save_checkpoint(dataset_statistics, v_idx)
                 print(f"💾 Saved statistics checkpoint ({v_idx}/{len(video_names)} videos) to {checkpoint_file.name}")
                 
@@ -1118,12 +1125,22 @@ def inference_with_bndl(
                 
                 # Also checkpoint dataset_evaluator to prevent OOM from pixel-level data accumulation
                 if eval_checkpoint_mgr and dataset_evaluator is not None and len(dataset_evaluator) > 0:
-                    eval_checkpoint_data = {
-                        'pixel_uncertainties': dataset_evaluator.pixel_uncertainties.copy() if hasattr(dataset_evaluator, 'pixel_uncertainties') else [],
-                        'pixel_ious': dataset_evaluator.pixel_ious.copy() if hasattr(dataset_evaluator, 'pixel_ious') else [],
-                        'pixel_dices': dataset_evaluator.pixel_dices.copy() if hasattr(dataset_evaluator, 'pixel_dices') else [],
-                        'pixel_accuracies': dataset_evaluator.pixel_accuracies.copy() if hasattr(dataset_evaluator, 'pixel_accuracies') else [],
-                    }
+                    if dataset_evaluator.per_pixel_statistics:
+                        eval_checkpoint_data = {
+                            'pixel_uncertainties': dataset_evaluator.pixel_data['uncertainties'].tolist(),
+                            'pixel_ious': dataset_evaluator.pixel_data['ious'].tolist(),
+                            'pixel_dices': dataset_evaluator.pixel_data['dices'].tolist(),
+                            'pixel_accuracies': dataset_evaluator.pixel_data['accuracies'].tolist(),
+                            'pixel_nlls': dataset_evaluator.pixel_data['nlls'].tolist(),
+                        }
+                    else:
+                        eval_checkpoint_data = {
+                            'pixel_uncertainties': [],
+                            'pixel_ious': [],
+                            'pixel_dices': [],
+                            'pixel_accuracies': [],
+                            'pixel_nlls': [],
+                        }
                     eval_checkpoint_file = eval_checkpoint_mgr.save_checkpoint(eval_checkpoint_data, v_idx)
                     print(f"💾 Saved evaluator checkpoint ({v_idx}/{len(video_names)} videos) to {eval_checkpoint_file.name}")
                     
@@ -1137,6 +1154,11 @@ def inference_with_bndl(
     
     # Save any remaining statistics after the last video
     if stats_checkpoint_mgr and dataset_statistics and len(dataset_statistics) > 0:
+        # 🎯 保存最终checkpoint前降采样PAvPU样本
+        _, n_orig, n_down = downsample_statistics_pavpu(dataset_statistics, max_samples=downsample_max_samples)
+        if n_down < n_orig:
+            print(f"  💾 降采样: {n_orig:,} → {n_down:,} PAvPU样本 ({n_down / n_orig * 100:.1f}%)")
+        
         checkpoint_file = stats_checkpoint_mgr.save_checkpoint(dataset_statistics, len(video_names))
         print(f"💾 Saved final statistics checkpoint to {checkpoint_file.name}")
         dataset_statistics.clear()
@@ -1149,18 +1171,32 @@ def inference_with_bndl(
         def _append_shard_to_evaluator(shard_data):
             if not shard_data:
                 return
-            pixel_uncertainties = shard_data.get('pixel_uncertainties')
-            if pixel_uncertainties:
-                dataset_evaluator.pixel_uncertainties.extend(pixel_uncertainties)
-            pixel_ious = shard_data.get('pixel_ious')
-            if pixel_ious:
-                dataset_evaluator.pixel_ious.extend(pixel_ious)
-            pixel_dices = shard_data.get('pixel_dices')
-            if pixel_dices:
-                dataset_evaluator.pixel_dices.extend(pixel_dices)
-            pixel_accuracies = shard_data.get('pixel_accuracies')
-            if pixel_accuracies:
-                dataset_evaluator.pixel_accuracies.extend(pixel_accuracies)
+            
+            # Collect all data
+            data_dict = {}
+            if shard_data.get('pixel_uncertainties'):
+                data_dict['uncertainties'] = shard_data['pixel_uncertainties']
+            if shard_data.get('pixel_accuracies'):
+                data_dict['accuracies'] = shard_data['pixel_accuracies']
+            if shard_data.get('pixel_ious'):
+                data_dict['ious'] = shard_data['pixel_ious']
+            if shard_data.get('pixel_dices'):
+                data_dict['dices'] = shard_data['pixel_dices']
+            if shard_data.get('pixel_nlls'):
+                data_dict['nlls'] = shard_data['pixel_nlls']
+            
+            if data_dict:
+                # Create new DataFrame
+                new_data = pd.DataFrame(data_dict)
+                
+                # Add to existing data
+                dataset_evaluator.pixel_data = pd.concat([dataset_evaluator.pixel_data, new_data], ignore_index=True)
+                
+                # If exceeding max samples, perform downsampling
+                if len(dataset_evaluator.pixel_data) > downsample_max_samples:
+                    dataset_evaluator.pixel_data = dataset_evaluator.pixel_data.sample(n=downsample_max_samples, random_state=42).reset_index(drop=True)
+                    print(f"  🔄 中间降采样: → {downsample_max_samples:,} 样本")
+            
             CheckpointManager.force_memory_cleanup()
 
         eval_checkpoint_mgr.merge_checkpoints_streaming(_append_shard_to_evaluator)
@@ -1199,6 +1235,11 @@ def inference_with_bndl(
         if dataset_statistics is None:
             dataset_statistics = {}
         dataset_statistics.update(merged_stats)
+        
+        # 🎯 关键优化: 合并后再次降采样（防止多个checkpoint累积太多样本）
+        _, n_orig, n_down = downsample_statistics_pavpu(dataset_statistics, max_samples=downsample_max_samples)
+        if n_down < n_orig:
+            print(f"  💾 合并后降采样: {n_orig:,} → {n_down:,} PAvPU样本 ({n_down/n_orig*100:.1f}%)")
     
 
     if collect_statistics and dataset_statistics:
@@ -1213,7 +1254,7 @@ def inference_with_bndl(
         for key, values in statistics_items:
             if isinstance(values, int | float):
                 avg_stats[key] = values
-            elif isinstance(values, list) and len(values) > 0:
+            elif isinstance(values, list) and len(values) > 0 and not key.endswith("_pavpu_uncertainty_samples") and not key.endswith("_pavpu_accuracy_samples"):
                 avg_stats[key] = sum(values) / len(values)
 
         if avg_stats:
@@ -1244,6 +1285,7 @@ def run_single_dataset_with_bndl(
     click_protocol: str = "3click",
     min_click_dist: float = 12.0,
     seed: int = 0,
+    downsample_max_samples: int = 100000,
 ) -> tuple[float, float, float, dict]:
     """Run evaluation on a single dataset with BNDL UQ analysis and return metrics"""
 
@@ -1335,6 +1377,7 @@ def run_single_dataset_with_bndl(
             click_protocol=click_protocol,
             min_click_dist=min_click_dist,
             seed=seed,
+            downsample_max_samples=downsample_max_samples,
         )
     except Exception as e:
         print(f"Error during inference for {dataset_name}: {e}")
@@ -1556,6 +1599,9 @@ def parse_args():
     # Reuse prompts from first model outputs
     p.add_argument("--reuse_prompts_root", type=str, default=None, help="Root dir of first-run outputs to reuse prompts (expects {dataset}_pred/*/query_prompts.json)")
 
+    # Downsampling parameters
+    p.add_argument("--downsample_max_samples", type=int, default=100000, help="Maximum number of samples to keep after downsampling (default: 100000)")
+
     return p.parse_args()
 
 
@@ -1568,23 +1614,16 @@ def main():
 
     # Load SAM-2 predictor
     print("Loading SAM-2 checkpoint...")
-    hydra_overrides_extra = []
-    if args.enable_multimask:
-        hydra_overrides_extra += [
-            "++model.multimask_output_in_sam=true",
-            f"++model.multimask_min_pt_num={args.multimask_min_pts}",
-            f"++model.multimask_max_pt_num={args.multimask_max_pts}",
-        ]
-        if args.multimask_for_tracking:
-            hydra_overrides_extra += [
-                "++model.multimask_output_for_tracking=true",
-            ]
-
-    predictor = build_sam2_video_predictor(
-        config_file=args.sam2_cfg,
-        ckpt_path=args.sam2_checkpoint,
+    from shared_evaluation_utils import build_predictor_with_overrides
+    
+    predictor = build_predictor_with_overrides(
+        cfg_file=args.sam2_cfg,
+        ckpt=args.sam2_checkpoint,
         device=args.device,
-        hydra_overrides_extra=hydra_overrides_extra,
+        multimask=args.enable_multimask,
+        min_pts=args.multimask_min_pts,
+        max_pts=args.multimask_max_pts,
+        for_tracking=args.multimask_for_tracking,
     )
     print("SAM-2 loaded successfully!")
 
@@ -1630,6 +1669,7 @@ def main():
                 max_objects=args.max_objects,
                 collect_statistics=args.collect_statistics,
                 reuse_prompts_root=Path(args.reuse_prompts_root) if args.reuse_prompts_root else None,
+                downsample_max_samples=args.downsample_max_samples,
             )
 
             results[dataset_name] = (j_f, j, f)

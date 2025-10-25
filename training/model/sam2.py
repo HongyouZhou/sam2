@@ -307,6 +307,14 @@ class SAM2Train(SAM2Base):
                 )
 
             # Get output masks based on this frame's prompts and previous memory
+            # Extract current frame's image for style-based AUE
+            if img_feats_already_computed:
+                # If features already computed, we have all images in flat_img_batch
+                current_img_batch = input.flat_img_batch[img_ids] if hasattr(input, 'flat_img_batch') else None
+            else:
+                # Images were computed on-the-fly in _prepare_backbone_features_per_frame
+                current_img_batch = None  # Would need to store from earlier, skip for now
+            
             current_out = self.track_step(
                 frame_idx=stage_id,
                 is_init_cond_frame=stage_id in init_cond_frames,
@@ -319,6 +327,7 @@ class SAM2Train(SAM2Base):
                 frames_to_add_correction_pt=frames_to_add_correction_pt,
                 output_dict=output_dict,
                 num_frames=num_frames,
+                current_img_batch=current_img_batch,
             )
             # Append the output, depending on whether it's a conditioning frame
             add_output_as_cond_frame = stage_id in init_cond_frames or (
@@ -360,6 +369,7 @@ class SAM2Train(SAM2Base):
         prev_sam_mask_logits=None,  # The previously predicted SAM mask logits.
         frames_to_add_correction_pt=None,
         gt_masks=None,
+        current_img_batch=None,  # Current frame images for style-based AUE
     ):
         if frames_to_add_correction_pt is None:
             frames_to_add_correction_pt = []
@@ -376,6 +386,7 @@ class SAM2Train(SAM2Base):
             track_in_reverse,
             prev_sam_mask_logits,
             pixel_gt_for_aue=gt_masks,
+            current_img_batch=current_img_batch,
         )
 
         if len(sam_outputs) == 8:  # 包含辅助输出（BNDL/UR-ERN等）
@@ -434,6 +445,7 @@ class SAM2Train(SAM2Base):
                 high_res_masks,
                 object_score_logits,
                 current_out,
+                img_batch_for_aue=current_img_batch,
             )
             (
                 _,
@@ -478,6 +490,7 @@ class SAM2Train(SAM2Base):
         high_res_masks,
         object_score_logits,
         current_out,
+        img_batch_for_aue=None,
     ):
 
         assert gt_masks is not None
@@ -522,6 +535,7 @@ class SAM2Train(SAM2Base):
                     high_res_features=high_res_features,
                     multimask_output=multimask_output,
                     pixel_gt_for_aue=gt_masks,
+                    img_batch_for_style_aue=img_batch_for_aue,
                     use_reentrant=False,
                 )
             else:
@@ -532,6 +546,7 @@ class SAM2Train(SAM2Base):
                     high_res_features=high_res_features,
                     multimask_output=multimask_output,
                     pixel_gt_for_aue=gt_masks,
+                    img_batch_for_style_aue=img_batch_for_aue,
                 )
 
             # Unpack sam_outputs: check if aux_outputs is present (8 elements) or not (7 elements)

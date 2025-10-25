@@ -186,6 +186,31 @@ class MaskDecoder(nn.Module):
             # are always the single mask token (and we'll let it be the object-memory token).
             sam_tokens_out = mask_tokens_out[:, 0:1]  # [b, 1, c] shape
 
+        # Apply the same multimask selection logic to BNDL mask-related outputs
+        if bndl_outputs is not None and "bndl" in bndl_outputs:
+            bndl_data = bndl_outputs["bndl"]
+            
+            # Only process mask-related outputs that have channel dimension
+            mask_related_keys = ["pixel_logits", "masks_bndl_raw", "masks_bndl", "wei_lambda_w", "inv_k_w"]
+            
+            for key in mask_related_keys:
+                if key in bndl_data and bndl_data[key] is not None:
+                    if key == "masks_bndl":  # [B, K, H, W] format
+                        if multimask_output:
+                            bndl_data[key] = bndl_data[key][:, 1:, :, :]  # [B, K-1, H, W]
+                        else:
+                            bndl_data[key] = bndl_data[key][:, 0:1, :, :]  # [B, 1, H, W]
+                    elif key in ["wei_lambda_w", "inv_k_w"]:  # [C', K] format
+                        if multimask_output:
+                            bndl_data[key] = bndl_data[key][:, 1:]  # [C', K-1]
+                        else:
+                            bndl_data[key] = bndl_data[key][:, 0:1]  # [C', 1]
+                    else:  # [B, H, W, K] format for pixel_logits and masks_bndl_raw
+                        if multimask_output:
+                            bndl_data[key] = bndl_data[key][:, :, :, 1:]  # [B, H, W, K-1]
+                        else:
+                            bndl_data[key] = bndl_data[key][:, :, :, 0:1]  # [B, H, W, 1]
+
         # Prepare output
         return masks, iou_pred, sam_tokens_out, object_score_logits, bndl_outputs
 
