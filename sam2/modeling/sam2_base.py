@@ -128,6 +128,9 @@ class SAM2Base(torch.nn.Module):
         style_aug_pgd_step_size: float = 0.1,
         style_aug_pgd_epsilon: float = 2.0,
         style_aug_apply_at_layer: int = 0,  # Which backbone layer to apply AdaIN (0 = first FPN level)
+        # Patch-based MMD configuration for AUE calibration loss
+        aue_use_patch_mmd: bool = True,  # Enable patch-based MMD (better local distribution matching)
+        aue_patch_size: int = 16,  # Patch size for patch-based MMD
     ):
         super().__init__()
 
@@ -229,6 +232,9 @@ class SAM2Base(torch.nn.Module):
         self.aue_uncertainty_mask_threshold = aue_uncertainty_mask_threshold
         self.aue_diversity_loss_weight = float(aue_diversity_loss_weight)
         self.aue_constraint_loss_weight = float(aue_constraint_loss_weight)
+        # Patch-based MMD configuration
+        self.aue_use_patch_mmd = aue_use_patch_mmd  # Enable patch-based MMD
+        self.aue_patch_size = aue_patch_size  # Patch size for patch-based MMD
         if self.use_aue:
             self._build_aue_components()
 
@@ -308,7 +314,9 @@ class SAM2Base(torch.nn.Module):
             focal_alpha_obj_score=-1.0,  # Not relevant when pred_obj_scores=False
         )
         
-        logging.info("Style-based AUE enabled with SAM loss for PGD attacks (matching training config)")
+        mmd_type = "patch-based" if self.aue_use_patch_mmd else "global"
+        logging.info(f"Style-based AUE enabled with SAM loss for PGD attacks (matching training config)")
+        logging.info(f"AUE calibration loss: {mmd_type} MMD (patch_size={self.aue_patch_size if self.aue_use_patch_mmd else 'N/A'})")
 
     @torch.no_grad()
     def _aue_roi_view(
@@ -406,7 +414,7 @@ class SAM2Base(torch.nn.Module):
                 raise ValueError(f"AUE expects pixel_gt of shape [B,1,H,W], got {tuple(pixel_gt.shape)}")
             pixel_gt_resized = F.interpolate(pixel_gt.float(), size=(H_feat, W_feat), mode='nearest').squeeze(1)
 
-        ratio_pos = self._compute_pos_ratios(
+        calibration_loss_clean = self._compute_uncertainty_calibration_loss(
             pixel_logits=pixel_logits,
             pixel_uncertainty=pixel_uncertainty,
             pixel_gt=pixel_gt_resized,
@@ -423,7 +431,9 @@ class SAM2Base(torch.nn.Module):
             return torch.tensor(0.0, device=device, dtype=dtype), {}
         
         adv_images, adv_gts, adv_prompts = self._generate_style_based_adversarial_images(
-            img_batch, pixel_gt, adversarial_sample_M
+            img_batch, pixel_gt, adversarial_sample_M,
+            pixel_bndl_model=pixel_bndl_model,
+            uq_sample_num=uq_sample_num,
         )
         
         # Store images for visualization (detached, no gradients)
@@ -436,7 +446,7 @@ class SAM2Base(torch.nn.Module):
             vis_data['adversarial_images'] = adv_images[:num_vis_samples].detach().cpu()
             logging.info(f"Style AUE: Saved {num_vis_samples} samples for visualization, vis_data keys: {list(vis_data.keys())}")
         
-        ratio_adversarial = torch.tensor(0.0, device=device, dtype=dtype, requires_grad=True)
+        calibration_loss_adv = torch.tensor(0.0, device=device, dtype=dtype, requires_grad=True)
          
         if adv_images is not None:
             M = adv_images.shape[0]
@@ -504,11 +514,19 @@ class SAM2Base(torch.nn.Module):
             
             # Resize GT to match logits (logits are at feature map resolution)
             adv_logits_for_ratio = adv_logits_grad if adv_logits_grad is not None else adv_logits_sample
+            
+            # Sanitize logits: replace NaN/Inf with safe values
+            if not torch.isfinite(adv_logits_for_ratio).all():
+                num_nan = (~torch.isfinite(adv_logits_for_ratio)).sum().item()
+                logging.warning(f"[Style AUE] adv_logits contains {num_nan}/{adv_logits_for_ratio.numel()} NaN/Inf, sanitizing...")
+                adv_logits_for_ratio = torch.nan_to_num(adv_logits_for_ratio, nan=0.0, posinf=20.0, neginf=-20.0)
+                adv_logits_for_ratio = torch.clamp(adv_logits_for_ratio, min=-50.0, max=50.0)
+            
             H_feat, W_feat = adv_logits_for_ratio.shape[1:3]
             adv_gts_resized = F.interpolate(adv_gts.unsqueeze(1).float(), size=(H_feat, W_feat), mode='nearest')
             
-            # Compute ratio
-            ratio_adversarial = self._compute_pos_ratios(
+            # Compute calibration loss
+            calibration_loss_adv = self._compute_uncertainty_calibration_loss(
                 pixel_logits=adv_logits_for_ratio,
                 pixel_uncertainty=adv_uq,
                 pixel_gt=adv_gts_resized,
@@ -525,10 +543,10 @@ class SAM2Base(torch.nn.Module):
         loss_dict = {}
         
         # Main losses
-        loss_dict['ratio_pos'] = ratio_pos
-        loss_dict['ratio_adversarial'] = ratio_adversarial
+        loss_dict['calibration_loss_clean'] = calibration_loss_clean
+        loss_dict['calibration_loss_adv'] = calibration_loss_adv
         
-        loss = ratio_pos + ratio_adversarial
+        loss = calibration_loss_clean + calibration_loss_adv
         loss_dict['total_loss'] = loss
         
         # Add visualization data if available (check for keys, not truthiness)
@@ -542,6 +560,8 @@ class SAM2Base(torch.nn.Module):
         img_batch: torch.Tensor,
         pixel_gt: torch.Tensor | None,
         sample_M: int,
+        pixel_bndl_model=None,
+        uq_sample_num: int = 8,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
         """
         Generate adversarial images using PGD + AdaIN in style space.
@@ -550,6 +570,8 @@ class SAM2Base(torch.nn.Module):
             img_batch: [B, 3, H, W] input images (normalized)
             pixel_gt: [B, 1, H, W] ground truth masks (optional)
             sample_M: number of adversarial samples to generate
+            pixel_bndl_model: BNDL model for computing uncertainty
+            uq_sample_num: number of samples for uncertainty estimation
         
         Returns:
             adv_images: [M, 3, H, W] adversarial images with style perturbation
@@ -569,7 +591,9 @@ class SAM2Base(torch.nn.Module):
             pixel_gt=pixel_gt,
             num_steps=self.style_aug_pgd_steps,
             step_size=self.style_aug_pgd_step_size,
-            epsilon=self.style_aug_pgd_epsilon
+            epsilon=self.style_aug_pgd_epsilon,
+            pixel_bndl_model=pixel_bndl_model,
+            uq_sample_num=uq_sample_num,
         )
         
         # 3. Apply adversarial styles to images using AdaIN
@@ -643,51 +667,53 @@ class SAM2Base(torch.nn.Module):
         num_steps: int = 5,
         step_size: float = 0.1,
         epsilon: float = 2.0,
+        pixel_bndl_model=None,
+        uq_sample_num: int = 20,
     ) -> torch.Tensor:
         """
-        Use PGD to find adversarial styles in style space.
-        
-        Goal: Maximize segmentation loss.
+        Performs PGD to find adversarial style statistics that maximize the AUE calibration loss.
+        Goal: Maximize uncertainty calibration loss (MMD + MSE between U and Error).
         
         Args:
-            img_batch: [B, 3, H, W] input images
-            original_styles: [B, 6] original style statistics
-            pixel_gt: [B, 1, H, W] ground truth masks
+            img_batch: [B, 3, H, W] original image batch
+            original_styles: [B, 6] original style statistics (means[:3], stds[3:])
+            pixel_gt: [B, H, W] ground truth masks
             num_steps: number of PGD iterations
-            step_size: PGD step size
-            epsilon: maximum perturbation magnitude
+            step_size: step size for each PGD iteration
+            epsilon: L_inf perturbation budget
+            pixel_bndl_model: BNDL model for computing uncertainty
+            uq_sample_num: number of samples for uncertainty estimation
         
         Returns:
             adv_styles: [B, 6] adversarial style statistics
         """
         adv_styles = original_styles.clone().detach()
- 
-        for _ in range(num_steps):
+        
+        for step in range(num_steps):
             adv_styles.requires_grad = True
             
+            # 1. Apply style and forward through model
             styled_images = self._apply_style_to_images(img_batch, adv_styles)
             adv_backbone_out = self.forward_image(styled_images)
+            adv_backbone_feat = adv_backbone_out['backbone_fpn'][-1]
 
-            adv_backbone_feat = adv_backbone_out['backbone_fpn'][-1]  # [B, 256, 64, 64] - last FPN level
-            
-            # 2. Extract high_res_features (already processed by forward_image)
+            # 2. Extract high_res_features if needed
             high_res_features = None
             if self.use_high_res_features_in_sam:
-                # forward_image already processed these with conv_s0 and conv_s1
                 high_res_features = [
-                    adv_backbone_out['backbone_fpn'][0],  # [B, 32, 256, 256] - conv_s0 processed
-                    adv_backbone_out['backbone_fpn'][1]   # [B, 64, 128, 128] - conv_s1 processed
+                    adv_backbone_out['backbone_fpn'][0],
+                    adv_backbone_out['backbone_fpn'][1]
                 ]
             
-            # 3. Generate prompts from ground truth (bounding boxes)
-            adv_prompts = self._generate_bbox_prompts_from_gt(pixel_gt)  # [B, 4]
+            # 3. Generate prompts from GT
+            adv_prompts = self._generate_bbox_prompts_from_gt(pixel_gt)
             adv_box_coords = torch.stack([adv_prompts[:, :2], adv_prompts[:, 2:]], dim=1)
             adv_point_inputs = {
                 "point_coords": adv_box_coords,
                 "point_labels": torch.tensor([[2, 3]], dtype=torch.int32, device=img_batch.device).expand(img_batch.shape[0], 2),
             }
             
-            # 4. Forward through SAM heads to get segmentation results
+            # 4. Forward through SAM heads to get BNDL outputs
             prev_suppress = getattr(self, "_suppress_nested_aue", False)
             self._suppress_nested_aue = True
             try:
@@ -701,41 +727,66 @@ class SAM2Base(torch.nn.Module):
             finally:
                 self._suppress_nested_aue = prev_suppress
             
-            # 5. Extract segmentation logits and compute loss
+            # 5. Extract BNDL outputs
             adv_bndl = adv_aux_outputs.get("bndl", {})
-            adv_logits = adv_bndl.get("pixel_logits", adv_bndl.get("masks_bndl_raw", None))
+            adv_pixel_feat = adv_bndl.get("pixel_feat_grad", adv_bndl.get("pixel_feat"))
             
-            if adv_logits is None:
-                logging.warning("PGD: Failed to extract segmentation logits, stopping early")
+            if adv_pixel_feat is None:
+                logging.warning("PGD: Failed to extract pixel features, stopping early")
                 break
              
-            adv_logits_bndl = adv_logits.permute(0, 3, 1, 2)  # [B, H, W, K] -> [B, K, H, W]
-            B, K, H_feat, W_feat = adv_logits_bndl.shape
-            pixel_gt_resized = F.interpolate(pixel_gt.float(), size=(H_feat, W_feat), mode='nearest').squeeze(1)
-             
-            # Create outputs in the format expected by SAM loss function
-            adv_outputs = {
-                'multistep_pred_multimasks_high_res': [adv_logits_bndl],  # List of [B, 1, H, W]
-                'multistep_pred_ious': [torch.zeros(B, 1, device=adv_logits.device)],  # List of [B, 1]
-                'multistep_object_score_logits': [torch.zeros(B, 1, device=adv_logits.device)],  # List of [B, 1]
-            }
+            # 6. Get hyperparameters for BNDL
+            adv_external_w = None
+            if pixel_bndl_model is not None and not pixel_bndl_model.enable_global_sparse:
+                adv_hyper_in = adv_bndl.get("hyper_in")
+                adv_external_w = adv_hyper_in if adv_hyper_in is not None else pixel_bndl_model.linear.weight.unsqueeze(0).expand(adv_pixel_feat.shape[0], -1, -1)
             
-            # Compute SAM loss using the configured loss function
-            # targets should be [B, H, W] - loss function will unsqueeze(1) internally
-            sam_losses = self.sam_loss_fn._forward(adv_outputs, pixel_gt_resized, B)
+            # 7. Compute logits with gradients
+            adv_logits_grad = adv_bndl.get("pixel_logits", adv_bndl.get("masks_bndl_raw", None))
+            if adv_logits_grad is None and pixel_bndl_model is not None:
+                adv_logits_grad, *_ = pixel_bndl_model(
+                    adv_pixel_feat, force_sample=False, external_pre_out_w=adv_external_w
+                )
             
-            # Only use segmentation losses for adversarial attacks
-            # loss_iou and loss_class are disabled (weights = 0.0)
-            loss = sam_losses['loss_mask'] + sam_losses['loss_dice']
+            if adv_logits_grad is None:
+                logging.warning("PGD: Failed to extract logits, stopping early")
+                break
             
-            # 7. Gradient ascent
-            grad = torch.autograd.grad(loss, adv_styles, create_graph=False)[0]
+            # 8. Compute uncertainty (no gradients to avoid nested grads)
+            with torch.no_grad():
+                adv_uq = pixel_entropy_uncertainty(
+                    pixel_bndl_model, adv_pixel_feat, adv_external_w, uq_sample_num, per_channel=False
+                )
+            
+            # Sanitize logits before computing calibration loss
+            if not torch.isfinite(adv_logits_grad).all():
+                num_nan = (~torch.isfinite(adv_logits_grad)).sum().item()
+                logging.warning(f"[PGD Step {step}] adv_logits contains {num_nan}/{adv_logits_grad.numel()} NaN/Inf, sanitizing...")
+                adv_logits_grad = torch.nan_to_num(adv_logits_grad, nan=0.0, posinf=20.0, neginf=-20.0)
+                adv_logits_grad = torch.clamp(adv_logits_grad, min=-50.0, max=50.0)
+            
+            # 9. Compute calibration loss (maximize to find adversarial styles)
+            H_feat, W_feat = adv_logits_grad.shape[1:3]
+            adv_gts_resized = F.interpolate(pixel_gt.float(), size=(H_feat, W_feat), mode='nearest')
+            
+            calibration_loss_adv = self._compute_uncertainty_calibration_loss(
+                pixel_logits=adv_logits_grad,
+                pixel_uncertainty=adv_uq,
+                pixel_gt=adv_gts_resized,
+                spatial_hw=(H_feat, W_feat),
+                batch_size=adv_logits_grad.shape[0],
+                device=adv_logits_grad.device,
+                dtype=adv_logits_grad.dtype,
+            )
+            
+            # 10. Gradient ascent (maximize calibration loss to create hard samples)
+            grad = torch.autograd.grad(calibration_loss_adv, adv_styles, create_graph=False)[0]
             
             with torch.no_grad():
-                # Gradient ascent step (FGSM-style with sign)
+                # Gradient ascent step
                 adv_styles = adv_styles.detach() + step_size * grad.sign()
                 
-                # Project to epsilon ball around original styles
+                # Project to epsilon ball
                 delta = adv_styles - original_styles
                 delta = torch.clamp(delta, -epsilon, epsilon)
                 adv_styles = original_styles + delta
@@ -785,7 +836,7 @@ class SAM2Base(torch.nn.Module):
         return next(self.parameters()).device
 
     # --------------------------- AUE helpers ---------------------------
-    def _compute_pos_ratios(
+    def _compute_uncertainty_calibration_loss(
         self,
         pixel_logits: torch.Tensor | None,
         pixel_uncertainty: torch.Tensor | None,
@@ -795,39 +846,388 @@ class SAM2Base(torch.nn.Module):
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        """Compute global uncertainty-confidence ratio.
+        """Compute uncertainty calibration loss via distribution matching.
         
-        With GT-aligned confidence, we no longer need separate TP/FP masks:
-        - TP regions: confidence naturally high → ratio low
-        - FP regions: confidence naturally low → ratio high
+        Theory: For zero-shot robustness, uncertainty distribution should match
+        error distribution using Maximum Mean Discrepancy (MMD).
         
-        Simply minimize global uncertainty/confidence ratio = maximize confidence globally.
+        Loss = MMD(P_U, P_Error) + 0.3 * MSE(U, Error)
+        
+        References:
+        - Gretton et al. (2012): "A Kernel Two-Sample Test"
+        - Long et al. (2015): "Learning Transferable Features with DAN"
         
         Returns:
-            global_ratio: mean(uncertainty/confidence) over all pixels
+            calibration_loss: MMD-based distribution matching loss
         """
         if pixel_logits is None:
             return torch.tensor(0.0, device=device, dtype=dtype, requires_grad=True)
         
-        # Compute GT-aligned confidence (automatically handles TP/FP/TN/FN)
-        confidence = self._aue_compute_confidence(
+        # 1. Compute prediction error [B, H, W] in [0, 1]
+        error = self._compute_prediction_error(
             pixel_logits=pixel_logits,
             pixel_gt=pixel_gt,
         )
         
-        uncertainty_p = pixel_uncertainty if pixel_uncertainty is not None else (1.0 - confidence)
-        uncertainty_p = uncertainty_p.clamp(0.0, 1.0)
+        # Debug: Check error for NaN
+        if not torch.isfinite(error).all():
+            import logging
+            num_nan = (~torch.isfinite(error)).sum().item()
+            total = error.numel()
+            logging.error(f"[AUE Debug] Error contains {num_nan}/{total} NaN/Inf values!")
+            logging.error(f"[AUE Debug] Error stats: min={error[torch.isfinite(error)].min():.4f}, "
+                         f"max={error[torch.isfinite(error)].max():.4f}, mean={error[torch.isfinite(error)].mean():.4f}")
+            # Check logits
+            if not torch.isfinite(pixel_logits).all():
+                num_nan_logits = (~torch.isfinite(pixel_logits)).sum().item()
+                logging.error(f"[AUE Debug] pixel_logits contains {num_nan_logits}/{pixel_logits.numel()} NaN/Inf!")
         
-        # Global optimization: minimize uncertainty/confidence
-        # - TP regions (high conf) → small ratio → small loss ✓
-        # - FP regions (low conf) → large ratio → large loss (automatic penalty) ✓
-        # - No need for separate masks!
-        eps = 1e-6
-        ratio = uncertainty_p / (confidence + eps)  # [B, H, W]
-        # Clamp ratio to prevent gradient explosion from very low confidence pixels
-        # This stabilizes training while still penalizing low confidence regions
-        ratio = ratio.clamp(max=10.0)  # 限制 ratio 最大值，防止梯度爆炸
-        return ratio.mean()  # Simple global mean
+        # 2. Get uncertainty [B, H, W] in [0, 1]
+        if pixel_uncertainty is not None:
+            # Debug: Check uncertainty before clamping
+            if not torch.isfinite(pixel_uncertainty).all():
+                import logging
+                num_nan = (~torch.isfinite(pixel_uncertainty)).sum().item()
+                total = pixel_uncertainty.numel()
+                logging.error(f"[AUE Debug] Uncertainty (before clamp) contains {num_nan}/{total} NaN/Inf values!")
+                if torch.isfinite(pixel_uncertainty).any():
+                    logging.error(f"[AUE Debug] Uncertainty stats: min={pixel_uncertainty[torch.isfinite(pixel_uncertainty)].min():.4f}, "
+                                 f"max={pixel_uncertainty[torch.isfinite(pixel_uncertainty)].max():.4f}")
+            
+            uncertainty = pixel_uncertainty.clamp(0.0, 1.0)
+            
+            # Debug: Check uncertainty after clamping
+            if not torch.isfinite(uncertainty).all():
+                import logging
+                num_nan = (~torch.isfinite(uncertainty)).sum().item()
+                total = uncertainty.numel()
+                logging.error(f"[AUE Debug] Uncertainty (after clamp) still contains {num_nan}/{total} NaN/Inf values!")
+        else:
+            # Fallback: use 1 - confidence
+            confidence = self._aue_compute_confidence(pixel_logits, pixel_gt)
+            
+            # Debug: Check confidence
+            if not torch.isfinite(confidence).all():
+                import logging
+                num_nan = (~torch.isfinite(confidence)).sum().item()
+                logging.error(f"[AUE Debug] Confidence contains {num_nan}/{confidence.numel()} NaN/Inf values!")
+            
+            uncertainty = (1.0 - confidence).clamp(0.0, 1.0)
+        
+        # Input validation: check for NaN/Inf
+        if not torch.isfinite(uncertainty).all() or not torch.isfinite(error).all():
+            import logging
+            logging.warning("[AUE] Uncertainty or Error contains NaN/Inf after processing, skipping calibration loss")
+            return torch.tensor(0.0, device=device, dtype=dtype, requires_grad=True)
+        
+        # 3. MMD loss (primary: distribution matching)
+        # Choose between patch-based or global MMD
+        if getattr(self, 'aue_use_patch_mmd', True):
+            # Patch-based MMD for better local distribution matching
+            mmd_loss = self._compute_patch_based_mmd(
+                uncertainty.detach(),  # [B, H, W]
+                error,                 # [B, H, W]
+                patch_size=getattr(self, 'aue_patch_size', 16),
+                kernel='rbf',
+                bandwidth=0.1,
+            )
+        else:
+            # Global MMD (original approach)
+            mmd_loss = self._compute_mmd(
+                uncertainty.detach().flatten().unsqueeze(-1),  # [N, 1]
+                error.flatten().unsqueeze(-1),                 # [N, 1]
+                kernel='rbf',
+                bandwidth=0.1,
+            )
+        
+        # 4. MSE loss (regularization: point-wise alignment)
+        # Detach uncertainty to ensure gradients only flow through error
+        mse_loss = F.mse_loss(uncertainty.detach(), error, reduction='mean')
+        
+        # 5. Combine losses
+        total_loss = 1.0 * mmd_loss + 0.3 * mse_loss
+        
+        return total_loss
+    
+    def _compute_prediction_error(
+        self,
+        pixel_logits: torch.Tensor,
+        pixel_gt: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute per-pixel prediction error in [0, 1].
+        
+        Error = |sigmoid(logits) - GT|
+        
+        Args:
+            pixel_logits: [B, H, W, K] or [B, H, W] logits
+            pixel_gt: [B, H, W] or [B, 1, H, W] ground truth
+        
+        Returns:
+            error: [B, H, W] in [0, 1], where 0=perfect, 1=wrong
+        """
+        # Sanitize input logits to prevent NaN propagation
+        if not torch.isfinite(pixel_logits).all():
+            num_nan = (~torch.isfinite(pixel_logits)).sum().item()
+            logging.error(f"[Error Computation] Input logits contain {num_nan}/{pixel_logits.numel()} NaN/Inf values! Sanitizing...")
+            pixel_logits = torch.nan_to_num(pixel_logits, nan=0.0, posinf=20.0, neginf=-20.0)
+            pixel_logits = torch.clamp(pixel_logits, min=-50.0, max=50.0)
+        
+        # Extract logits value
+        if pixel_logits.ndim == 4 and pixel_logits.shape[-1] >= 1:
+            logits_val = pixel_logits.max(dim=-1).values  # [B, H, W]
+        elif pixel_logits.ndim == 3:
+            logits_val = pixel_logits
+        elif pixel_logits.ndim == 4 and pixel_logits.shape[1] == 1:
+            logits_val = pixel_logits[:, 0]
+        else:
+            B, H, W = pixel_logits.shape[:3]
+            logits_val = pixel_logits.view(B, H, W, -1).max(dim=-1).values
+        
+        # Extract GT mask [B, H, W]
+        H, W = logits_val.shape[1], logits_val.shape[2]
+        B = logits_val.shape[0]
+        gt_mask = self._extract_mask_from_gt(
+            pixel_gt=pixel_gt,
+            spatial_hw=(H, W),
+            batch_size=B,
+            device=logits_val.device,
+        )
+        
+        # Compute prediction probability
+        pred_prob = torch.sigmoid(logits_val)  # [B, H, W] in [0, 1]
+        
+        # Compute absolute error
+        gt_float = gt_mask.float()  # [B, H, W] in {0, 1}
+        error = torch.abs(pred_prob - gt_float)  # [B, H, W] in [0, 1]
+        
+        return error
+    
+    def _compute_patch_based_mmd(
+        self,
+        uncertainty: torch.Tensor,  # [B, H, W]
+        error: torch.Tensor,        # [B, H, W]
+        patch_size: int = 16,
+        kernel: str = 'rbf',
+        bandwidth: float = 0.1,
+    ) -> torch.Tensor:
+        """Compute patch-based MMD for local distribution matching.
+        
+        Instead of flattening all pixels, we:
+        1. Extract patches from uncertainty and error maps
+        2. Compute patch-level statistics (mean, std, etc.)
+        3. Apply MMD on patch statistics for better local alignment
+        
+        This approach:
+        - Preserves spatial locality
+        - Reduces computational cost (fewer samples)
+        - Better captures local uncertainty-error relationships
+        
+        Args:
+            uncertainty: [B, H, W] uncertainty map
+            error: [B, H, W] error map
+            patch_size: size of square patches (default 16)
+            kernel: kernel type for MMD
+            bandwidth: kernel bandwidth
+        
+        Returns:
+            mmd_loss: scalar MMD value
+        """
+        B, H, W = uncertainty.shape
+        device = uncertainty.device
+        dtype = uncertainty.dtype
+        
+        # Calculate number of patches
+        n_patches_h = H // patch_size
+        n_patches_w = W // patch_size
+        
+        # Handle case where image size is not divisible by patch_size
+        if n_patches_h == 0 or n_patches_w == 0:
+            # Fallback to global MMD if patches are too large
+            return self._compute_mmd(
+                uncertainty.flatten().unsqueeze(-1),
+                error.flatten().unsqueeze(-1),
+                kernel=kernel,
+                bandwidth=bandwidth,
+            )
+        
+        # Crop to make divisible by patch_size
+        H_crop = n_patches_h * patch_size
+        W_crop = n_patches_w * patch_size
+        uncertainty_crop = uncertainty[:, :H_crop, :W_crop]
+        error_crop = error[:, :H_crop, :W_crop]
+        
+        # Reshape to patches: [B, n_patches_h, patch_size, n_patches_w, patch_size]
+        uncertainty_patches = uncertainty_crop.reshape(
+            B, n_patches_h, patch_size, n_patches_w, patch_size
+        )
+        error_patches = error_crop.reshape(
+            B, n_patches_h, patch_size, n_patches_w, patch_size
+        )
+        
+        # Rearrange to [B, n_patches_h, n_patches_w, patch_size, patch_size]
+        uncertainty_patches = uncertainty_patches.permute(0, 1, 3, 2, 4)
+        error_patches = error_patches.permute(0, 1, 3, 2, 4)
+        
+        # Flatten to [B * n_patches_h * n_patches_w, patch_size * patch_size]
+        n_total_patches = B * n_patches_h * n_patches_w
+        uncertainty_patches = uncertainty_patches.reshape(n_total_patches, patch_size * patch_size)
+        error_patches = error_patches.reshape(n_total_patches, patch_size * patch_size)
+        
+        # Compute patch-level statistics as features
+        # Using mean and std to capture distribution within each patch
+        u_mean = uncertainty_patches.mean(dim=1, keepdim=True)  # [N, 1]
+        u_std = uncertainty_patches.std(dim=1, keepdim=True)    # [N, 1]
+        e_mean = error_patches.mean(dim=1, keepdim=True)        # [N, 1]
+        e_std = error_patches.std(dim=1, keepdim=True)          # [N, 1]
+        
+        # Concatenate statistics as patch features
+        uncertainty_features = torch.cat([u_mean, u_std], dim=1)  # [N, 2]
+        error_features = torch.cat([e_mean, e_std], dim=1)        # [N, 2]
+        
+        # Compute MMD on patch features
+        mmd_loss = self._compute_mmd(
+            uncertainty_features,
+            error_features,
+            kernel=kernel,
+            bandwidth=bandwidth,
+            batch_size=min(256, n_total_patches // 2),  # Adaptive batch size
+            n_batches=10,
+        )
+        
+        return mmd_loss
+    
+    def _compute_mmd(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        kernel: str = 'rbf',
+        bandwidth: float = 0.1,
+        batch_size: int = 256,  # Mini-batch size for memory efficiency
+        n_batches: int = 10,    # Number of mini-batches to average
+    ) -> torch.Tensor:
+        """Compute Maximum Mean Discrepancy using mini-batch estimation.
+        
+        MMD²(P, Q) = E[k(x,x')] + E[k(y,y')] - 2E[k(x,y)]
+        
+        Uses mini-batch sampling to avoid OOM while maintaining unbiased estimation.
+        Memory: O(batch_size²) instead of O(N²)
+        
+        Theory: MMD is a kernel-based distribution distance metric proven
+        to be robust for domain adaptation tasks (Long et al. 2015, Gretton et al. 2012).
+        
+        Args:
+            x: [N, D] samples from distribution P (uncertainty)
+            y: [M, D] samples from distribution Q (error)
+            kernel: 'rbf' (Gaussian kernel, recommended)
+            bandwidth: kernel bandwidth (σ in RBF kernel)
+            batch_size: size of mini-batch for each iteration (default 256)
+            n_batches: number of mini-batches to average (default 10)
+        
+        Returns:
+            mmd: scalar MMD value (≥0)
+        
+        References:
+            - Gretton et al. (2012): "A Kernel Two-Sample Test"
+            - Long et al. (2015): "Learning Transferable Features with DAN"
+        """
+        N, M = x.shape[0], y.shape[0]
+        
+        # Safety check: need at least 2 samples
+        if N < 2 or M < 2:
+            return torch.tensor(0.0, device=x.device, dtype=x.dtype)
+        
+        # Adjust batch_size if dataset is smaller (need at least 2 for unbiased estimator)
+        actual_batch_size = max(2, min(batch_size, N, M))
+        
+        # RBF kernel using mathematical expansion (memory-efficient)
+        # k(x, y) = exp(-||x-y||² / (2*σ²))
+        def rbf_kernel_efficient(x1, x2, sigma):
+            """
+            Compute RBF kernel without using cdist (memory-efficient).
+            
+            Args:
+                x1: [B, D]
+                x2: [B, D]
+                sigma: bandwidth
+            
+            Returns:
+                kernel_matrix: [B, B]
+            """
+            # Clamp inputs to reasonable range to prevent overflow in squaring
+            # (uncertainty and error should be in [0,1], but allow margin for safety)
+            x1 = torch.clamp(x1, min=-10.0, max=10.0)
+            x2 = torch.clamp(x2, min=-10.0, max=10.0)
+            
+            # Compute squared norms
+            x1_norm_sq = torch.sum(x1 ** 2, dim=1, keepdim=True)  # [B, 1]
+            x2_norm_sq = torch.sum(x2 ** 2, dim=1, keepdim=True)  # [B, 1]
+            
+            # Compute inner product
+            inner_prod = torch.mm(x1, x2.t())  # [B, B]
+            
+            # Compute squared distances: ||x-y||² = ||x||² + ||y||² - 2<x,y>
+            dist_sq = x1_norm_sq + x2_norm_sq.t() - 2 * inner_prod  # [B, B]
+            
+            # Clamp to avoid negative values due to numerical errors
+            dist_sq = torch.clamp(dist_sq, min=0.0)
+            
+            # RBF kernel with numerical stability
+            # Add epsilon to avoid division issues
+            sigma_sq = sigma ** 2 + 1e-8
+            
+            # Clamp exponent to avoid overflow/underflow
+            exponent = -dist_sq / (2 * sigma_sq)
+            exponent = torch.clamp(exponent, min=-50.0, max=50.0)
+            
+            return torch.exp(exponent)
+        
+        # Mini-batch MMD estimation
+        mmd_sum = 0.0
+        
+        for _ in range(n_batches):
+            # Randomly sample mini-batches
+            idx_x = torch.randperm(N, device=x.device)[:actual_batch_size]
+            idx_y = torch.randperm(M, device=y.device)[:actual_batch_size]
+            
+            x_batch = x[idx_x]
+            y_batch = y[idx_y]
+            
+            # Compute kernel matrices for this mini-batch
+            k_xx = rbf_kernel_efficient(x_batch, x_batch, bandwidth)  # [B, B]
+            k_yy = rbf_kernel_efficient(y_batch, y_batch, bandwidth)  # [B, B]
+            k_xy = rbf_kernel_efficient(x_batch, y_batch, bandwidth)  # [B, B]
+            
+            # Unbiased MMD estimator: exclude diagonal terms
+            b = k_xx.shape[0]
+            
+            # Safety check: should never happen due to actual_batch_size >= 2
+            assert b >= 2, f"Batch size {b} < 2, this should not happen"
+            
+            # Sum all elements, subtract diagonal, normalize by b(b-1)
+            k_xx_sum = k_xx.sum() - k_xx.diagonal().sum()
+            k_yy_sum = k_yy.sum() - k_yy.diagonal().sum()
+            k_xy_sum = k_xy.sum()
+            
+            # Unbiased estimator for this batch (add epsilon for numerical stability)
+            eps = 1e-8
+            mmd_squared_batch = k_xx_sum / (b * (b - 1) + eps) + k_yy_sum / (b * (b - 1) + eps) - 2 * k_xy_sum / (b * b + eps)
+            
+            # Accumulate (take sqrt later to reduce numerical issues)
+            mmd_sum += mmd_squared_batch
+            
+            # Free memory
+            del k_xx, k_yy, k_xy
+        
+        # Average over batches (add epsilon for numerical stability)
+        mmd_squared_avg = mmd_sum / (n_batches + 1e-8)
+        
+        # Clamp before sqrt (ensure non-negative, allow reasonable upper bound)
+        mmd_squared_avg = torch.clamp(mmd_squared_avg, min=0.0, max=10.0)
+        
+        # Take square root
+        mmd = torch.sqrt(mmd_squared_avg)
+        
+        return mmd
     
     def _extract_mask_from_gt(
         self,

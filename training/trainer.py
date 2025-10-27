@@ -1191,9 +1191,13 @@ class Trainer:
                 "range_penalty",
                 "diversity_loss",
                 "total_loss",
+                "calibration_loss_clean",
+                "calibration_loss_adv",
             ]
             for key in all_aue_loss_keys:
-                value = aue_loss_dict.get(key, 0.0)
+                if key not in aue_loss_dict:
+                    continue  # Skip if key doesn't exist
+                value = aue_loss_dict[key]
                 if isinstance(value, torch.Tensor):
                     val = value.item()
                 else:

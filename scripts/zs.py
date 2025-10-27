@@ -548,8 +548,13 @@ def create_comprehensive_comparison_plots(
     output_path: Path,
     uctta_results: dict[str, tuple[float, float, float]] | None = None,
     uctta_statistics: dict[str, Any] | None = None,
+    aue_version: str | None = None,
 ) -> None:
-    """Create comprehensive comparison plots between SAM-2 and BNDL"""
+    """Create comprehensive comparison plots between SAM-2 and BNDL
+    
+    Args:
+        aue_version: AUE版本标识，用于生成带版本后缀的文件夹名
+    """
 
     print("\nGenerating comprehensive comparison plots...")
 
@@ -868,8 +873,11 @@ def create_comprehensive_comparison_plots(
 
     ax9.set_title("Summary Statistics", fontweight="bold", fontsize=12, pad=20)
 
-    # Save plots
-    plots_dir = output_path / "comparison_plots"
+    # Save plots with AUE version suffix if provided
+    if aue_version:
+        plots_dir = output_path / f"comparison_plots_AUE_{aue_version}"
+    else:
+        plots_dir = output_path / "comparison_plots"
     plots_dir.mkdir(exist_ok=True)
 
     plot_path = plots_dir / "sam2_vs_bndl_comprehensive_comparison.png"
@@ -2108,6 +2116,10 @@ def parse_args():
     # Downsampling parameters
     p.add_argument("--downsample_max_samples", type=int, default=100000, 
                    help="Maximum number of samples to keep after downsampling (default: 100000)")
+    
+    # AUE version suffix for comparison plots folder naming
+    p.add_argument("--aue_version", type=str, default=None,
+                   help="AUE version suffix for comparison plots folder (e.g., '016_02' for comparison_plots_AUE_016_02)")
 
     # Cached results options
     p.add_argument("--load_detailed_json", type=str, default=None, 
@@ -2247,6 +2259,11 @@ def main():
         if sam2_results and bndl_aue_results:
             print("\n🎨 Creating comprehensive comparison plots...")
             try:
+                # 从命令行参数获取AUE版本（parallel_compare.py会传递）
+                aue_version = getattr(args, 'aue_version', None)
+                if aue_version:
+                    print(f"📌 使用AUE版本: {aue_version}")
+                
                 create_comprehensive_comparison_plots(
                     sam2_results=sam2_results,
                     bndl_results=bndl_aue_results,
@@ -2254,6 +2271,7 @@ def main():
                     output_path=output_path,
                     uctta_results=uctta_results,
                     uctta_statistics=uctta_statistics,
+                    aue_version=aue_version,
                 )
                 print("✓ Comprehensive comparison plots generated")
             except Exception as e:

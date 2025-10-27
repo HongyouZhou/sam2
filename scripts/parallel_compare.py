@@ -347,8 +347,10 @@ def build_task_command(
         ])
         if args.uctta_enable_bn:
             cmd.append("--uctta_enable_bn")
-        if args.uctta_fisher_reg:
-            cmd.append("--uctta_fisher_reg")
+    
+    # AUE版本后缀（用于BNDL_AUE方法）
+    if method == "BNDL_AUE" and hasattr(args, 'bndl_aue_version'):
+        cmd.extend(["--aue_version", args.bndl_aue_version])
     
     # BNDL/BNDL_AUE/UR-ERN特定参数
     if method in ["BNDL", "BNDL_AUE", "UR-ERN"] and args.collect_bndl_stats:
@@ -1262,7 +1264,7 @@ def main():
     
     # BNDL+AUE配置
     parser.add_argument("--bndl_aue_cfg", default="configs/sam2.1/sam2.1_hiera_b+_bndl_aue.yaml")
-    parser.add_argument("--bndl_aue_checkpoint", default="/home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_aue_016_01/checkpoints/checkpoint.pt")
+    parser.add_argument("--bndl_aue_checkpoint", default="/home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_aue_016_03/checkpoints/checkpoint.pt")
     
     # BNDL (pure)配置
     parser.add_argument("--bndl_cfg", default="configs/sam2.1/sam2.1_hiera_b+_bndl.yaml")
@@ -1304,7 +1306,7 @@ def main():
     # 版本号配置
     parser.add_argument("--sam_version", type=str, default="001_01")
     parser.add_argument("--uctta_version", type=str, default="001_01")
-    parser.add_argument("--bndl_aue_version", type=str, default="016_01")
+    parser.add_argument("--bndl_aue_version", type=str, default="016_03")
     parser.add_argument("--bndl_version", type=str, default="013_01")
     parser.add_argument("--ur_ern_version", type=str, default="001_01")
     

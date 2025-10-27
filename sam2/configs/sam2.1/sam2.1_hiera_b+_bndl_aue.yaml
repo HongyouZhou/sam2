@@ -132,6 +132,10 @@ model:
   style_aug_pgd_step_size: 0.1
   style_aug_pgd_epsilon: 2.0
   style_aug_apply_at_layer: 0
+  
+  # Patch-based MMD configuration for AUE calibration loss
+  aue_use_patch_mmd: true  # Enable patch-based MMD (better local distribution matching)
+  aue_patch_size: 16       # Patch size for patch-based MMD (16x16 patches)
 
   # ROI sharing
   share_roi_views: true

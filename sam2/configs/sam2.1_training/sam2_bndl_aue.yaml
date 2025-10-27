@@ -224,6 +224,10 @@ trainer:
     style_aug_pgd_step_size: 0.1
     style_aug_pgd_epsilon: 2.0
     style_aug_apply_at_layer: 0
+    
+    # Patch-based MMD configuration for AUE calibration loss
+    aue_use_patch_mmd: true  # Enable patch-based MMD (better local distribution matching)
+    aue_patch_size: 16       # Patch size for patch-based MMD (16x16 patches)
 
     # ROI sharing
     share_roi_views: true
@@ -425,18 +429,18 @@ trainer:
         _target_: training.loss_aue.AUELoss
       aue_weight: 0.1     # 保持AUE权重
       weight_schedule:
-        - until_epoch: 1
-          sam_weight: 0.3
-          bndl_weight: 0.5
-          aue_weight: 0.01  # 给AUE一个小的初始权重
-        - until_epoch: 3
-          sam_weight: 0.7
-          bndl_weight: 0.3
-          aue_weight: 0.05
         - until_epoch: null
           sam_weight: 1.0
-          bndl_weight: 0.25
-          aue_weight: 0.05
+          bndl_weight: 0.5
+          aue_weight: 0.1  # 给AUE一个小的初始权重
+        # - until_epoch: 2
+        #   sam_weight: 1.0
+        #   bndl_weight: 0.3
+        #   aue_weight: 0.05
+        # - until_epoch: null
+        #   sam_weight: 1.0
+        #   bndl_weight: 0.25
+        #   aue_weight: 0.05
     # val:
     #   _target_: training.loss_combined.CombinedSAMBNDLLoss
     #   sam_loss: ${trainer.loss.all.sam_loss}
@@ -499,7 +503,7 @@ trainer:
 launcher:
   num_nodes: 1
   gpus_per_node: 8
-  experiment_log_dir: /home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_aue_016_01 # Path to log directory, defaults to ./sam2_logs/${config_name}
+  experiment_log_dir: /home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_aue_016_03 # Path to log directory, defaults to ./sam2_logs/${config_name}
 
 # SLURM args if running on a cluster
 submitit:
