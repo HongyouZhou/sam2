@@ -1239,6 +1239,10 @@ class Trainer:
                                     original_imgs = vis_data["original_images"]  # [N, 3, H, W], normalized
                                     adv_imgs = vis_data["adversarial_images"]      # [N, 3, H, W], normalized
                                     
+                                    # Extract bbox and GT masks if available
+                                    bboxes = vis_data.get("bboxes", None)  # [N, 4] format: [x1, y1, x2, y2]
+                                    gt_masks = vis_data.get("gt_masks", None)  # [N, 1, H, W]
+                                    
                                     # Extract style statistics for visualization
                                     from sam2.modeling.style_utils import extract_style_statistics
                                     original_styles = extract_style_statistics(original_imgs)  # [N, 6]
@@ -1258,6 +1262,10 @@ class Trainer:
                                     # Log each sample with style statistics overlay
                                     num_samples = min(3, original_denorm.shape[0])  # Limit to 3 samples
                                     for i in range(num_samples):
+                                        # Extract bbox for this sample if available
+                                        bbox_i = bboxes[i] if bboxes is not None else None
+                                        gt_mask_i = gt_masks[i] if gt_masks is not None else None
+                                        
                                         # Create visualization with style statistics
                                         self._log_style_statistics_overlay(
                                             original_denorm[i],
@@ -1265,7 +1273,9 @@ class Trainer:
                                             original_styles[i],
                                             adv_styles[i],
                                             i,
-                                            step
+                                            step,
+                                            bbox=bbox_i,
+                                            gt_mask=gt_mask_i
                                         )
                                     
                                     # Also log separately
@@ -1280,6 +1290,59 @@ class Trainer:
                                             torch.cat([adv_denorm[i] for i in range(num_samples)], dim=2),
                                             step
                                         )
+                                        
+                                        # Also log images with bbox overlay for easy comparison
+                                        if bboxes is not None:
+                                            import matplotlib.pyplot as plt
+                                            import matplotlib.patches as patches
+                                            import numpy as np
+                                            
+                                            for i in range(num_samples):
+                                                # Create side-by-side comparison with bbox
+                                                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
+                                                
+                                                # Original with bbox
+                                                orig_np = original_denorm[i].cpu().numpy().transpose(1, 2, 0)
+                                                ax1.imshow(orig_np)
+                                                ax1.set_title('Original Image', fontsize=14, fontweight='bold')
+                                                ax1.axis('off')
+                                                
+                                                bbox_np = bboxes[i].cpu().numpy()
+                                                x1, y1, x2, y2 = bbox_np
+                                                rect1 = patches.Rectangle(
+                                                    (x1, y1), x2 - x1, y2 - y1,
+                                                    linewidth=3, edgecolor='red', facecolor='none'
+                                                )
+                                                ax1.add_patch(rect1)
+                                                
+                                                # Adversarial with bbox
+                                                adv_np = adv_denorm[i].cpu().numpy().transpose(1, 2, 0)
+                                                ax2.imshow(adv_np)
+                                                ax2.set_title('Adversarial Image (ε=5.0)', fontsize=14, fontweight='bold')
+                                                ax2.axis('off')
+                                                
+                                                rect2 = patches.Rectangle(
+                                                    (x1, y1), x2 - x1, y2 - y1,
+                                                    linewidth=3, edgecolor='lime', facecolor='none'
+                                                )
+                                                ax2.add_patch(rect2)
+                                                
+                                                plt.tight_layout()
+                                                
+                                                # Convert to tensor and log
+                                                fig.canvas.draw()
+                                                width, height = fig.canvas.get_width_height()
+                                                img_array = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+                                                img_array = img_array.reshape(height, width, 4)[:, :, :3]
+                                                img_tensor = torch.from_numpy(img_array).permute(2, 0, 1).float() / 255.0
+                                                
+                                                self.logger.tb_logger._writer.add_image(
+                                                    f"StyleAUE/bbox_comparison_sample_{i}",
+                                                    img_tensor,
+                                                    step
+                                                )
+                                                
+                                                plt.close(fig)
                                     
                                     # Log style perturbation magnitude
                                     style_diff = (adv_styles - original_styles).abs().mean(dim=0)  # [6]
@@ -1288,9 +1351,21 @@ class Trainer:
                                 
                                 return  # Only log once
     
-    def _log_style_statistics_overlay(self, original_img, adv_img, original_style, adv_style, sample_id, step):
-        """Create visualization with style statistics overlaid on images"""
+    def _log_style_statistics_overlay(self, original_img, adv_img, original_style, adv_style, sample_id, step, bbox=None, gt_mask=None):
+        """Create visualization with style statistics overlaid on images
+        
+        Args:
+            original_img: [3, H, W] original image tensor
+            adv_img: [3, H, W] adversarial image tensor
+            original_style: [6] original style statistics
+            adv_style: [6] adversarial style statistics
+            sample_id: sample index
+            step: training step
+            bbox: [4] bounding box in [x1, y1, x2, y2] format (optional)
+            gt_mask: [1, H, W] or [H, W] ground truth mask (optional)
+        """
         import matplotlib.pyplot as plt
+        import matplotlib.patches as patches
         import numpy as np
         
         # Convert tensors to numpy
@@ -1306,6 +1381,21 @@ class Trainer:
         axes[0, 0].imshow(orig_np)
         axes[0, 0].set_title('Original Image', fontsize=12, fontweight='bold')
         axes[0, 0].axis('off')
+        
+        # Draw bbox on original image if available
+        if bbox is not None:
+            bbox_np = bbox.cpu().numpy() if hasattr(bbox, 'cpu') else bbox
+            x1, y1, x2, y2 = bbox_np
+            rect = patches.Rectangle(
+                (x1, y1), x2 - x1, y2 - y1,
+                linewidth=3, edgecolor='red', facecolor='none', linestyle='-'
+            )
+            axes[0, 0].add_patch(rect)
+            axes[0, 0].text(
+                x1, y1 - 5, 'Attack Region',
+                color='red', fontsize=10, fontweight='bold',
+                bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.7)
+            )
         
         # Original style - means
         axes[0, 1].bar(['R', 'G', 'B'], orig_style_np[:3], color=['red', 'green', 'blue'], alpha=0.7)
@@ -1323,8 +1413,23 @@ class Trainer:
         
         # Row 2: Adversarial image and its styles
         axes[1, 0].imshow(adv_np)
-        axes[1, 0].set_title('Adversarial Image', fontsize=12, fontweight='bold')
+        axes[1, 0].set_title('Adversarial Image (Style-Augmented)', fontsize=12, fontweight='bold')
         axes[1, 0].axis('off')
+        
+        # Draw bbox on adversarial image if available
+        if bbox is not None:
+            bbox_np = bbox.cpu().numpy() if hasattr(bbox, 'cpu') else bbox
+            x1, y1, x2, y2 = bbox_np
+            rect = patches.Rectangle(
+                (x1, y1), x2 - x1, y2 - y1,
+                linewidth=3, edgecolor='lime', facecolor='none', linestyle='-'
+            )
+            axes[1, 0].add_patch(rect)
+            axes[1, 0].text(
+                x1, y1 - 5, 'Attack Region (Styled)',
+                color='lime', fontsize=10, fontweight='bold',
+                bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.7)
+            )
         
         # Adversarial style - means
         axes[1, 1].bar(['R', 'G', 'B'], adv_style_np[:3], color=['red', 'green', 'blue'], alpha=0.7)

@@ -939,6 +939,7 @@ def create_ua_shift_analysis_plots(
     uctta_root_override: Path | None = None,
     ur_ern_root_override: Path | None = None,
     bndl_pure_root_override: Path | None = None,
+    aue_version: str | None = None,
 ) -> None:
     """Create UA (Uncertainty-Accuracy) shift analysis plots
     
@@ -1593,8 +1594,11 @@ def create_ua_shift_analysis_plots(
     
     ax9.set_title('UA Summary Statistics', fontweight='bold', fontsize=12, pad=20)
     
-    # Save plots
-    plots_dir = output_path / "comparison_plots"
+    # Save plots with AUE version suffix if provided
+    if aue_version:
+        plots_dir = output_path / f"comparison_plots_AUE_{aue_version}"
+    else:
+        plots_dir = output_path / "comparison_plots"
     plots_dir.mkdir(exist_ok=True)
     
     ua_plot_path = plots_dir / "ua_shift_analysis.png"

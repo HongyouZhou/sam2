@@ -132,6 +132,7 @@ model:
   style_aug_pgd_step_size: 0.1
   style_aug_pgd_epsilon: 2.0
   style_aug_apply_at_layer: 0
+  style_aug_use_gt_region_style: true  # Extract style from GT region only (new feature)
   
   # Patch-based MMD configuration for AUE calibration loss
   aue_use_patch_mmd: true  # Enable patch-based MMD (better local distribution matching)

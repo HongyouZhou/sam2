@@ -1096,6 +1096,7 @@ def merge_detailed_results(
     output_path: Path,
     method_to_output: dict[tuple[str, str], Path],
     skip_plots: bool = False,
+    method_versions: dict[str, str] = None,
 ):
     """合并所有详细结果并生成可视化
     
@@ -1105,6 +1106,7 @@ def merge_detailed_results(
         output_path: 输出路径
         method_to_output: (dataset, method) -> output_dir映射
         skip_plots: 是否跳过可视化生成（加速完成）
+        method_versions: 方法版本映射，用于生成带版本后缀的文件名
     """
     print("\n" + "=" * 80)
     print("🎨 阶段 3/3: 生成可视化...")
@@ -1150,6 +1152,10 @@ def merge_detailed_results(
             plot_count += 1
             print(f"\n  [{plot_count}/{total_plots}] 生成综合对比图...")
             print("    正在绘制多方法性能对比（可能需要30-60秒）...")
+            # 从method_versions获取AUE版本号用于文件名后缀
+            aue_version_suffix = None
+            if method_versions and "BNDL_AUE" in method_versions:
+                aue_version_suffix = method_versions["BNDL_AUE"]
             create_comprehensive_comparison_plots(
                 sam2_results=sam_results,
                 bndl_results=bndl_aue_results,
@@ -1157,6 +1163,7 @@ def merge_detailed_results(
                 output_path=output_path,
                 uctta_results=uctta_results or None,
                 uctta_statistics=uctta_statistics or None,
+                aue_version=aue_version_suffix,
             )
             print("    ✓ 综合对比图已生成")
         except Exception as e:
@@ -1199,6 +1206,11 @@ def merge_detailed_results(
                 elif method == "BNDL":
                     bndl_root = output_dir / "bndl_results"
             
+            # 获取AUE版本号
+            aue_version_suffix = None
+            if method_versions and "BNDL_AUE" in method_versions:
+                aue_version_suffix = method_versions["BNDL_AUE"]
+            
             create_ua_shift_analysis_plots(
                 bndl_statistics=bndl_aue_statistics,
                 sam2_results=sam_results,
@@ -1215,6 +1227,7 @@ def merge_detailed_results(
                 uctta_root_override=uctta_root,
                 ur_ern_root_override=ur_ern_root,
                 bndl_pure_root_override=bndl_root,
+                aue_version=aue_version_suffix,
             )
             print("    ✓ UA shift分析图已生成")
         except Exception as e:
@@ -1264,7 +1277,7 @@ def main():
     
     # BNDL+AUE配置
     parser.add_argument("--bndl_aue_cfg", default="configs/sam2.1/sam2.1_hiera_b+_bndl_aue.yaml")
-    parser.add_argument("--bndl_aue_checkpoint", default="/home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_aue_016_03/checkpoints/checkpoint.pt")
+    parser.add_argument("--bndl_aue_checkpoint", default="/home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_aue_017_02/checkpoints/checkpoint_4.pt")
     
     # BNDL (pure)配置
     parser.add_argument("--bndl_cfg", default="configs/sam2.1/sam2.1_hiera_b+_bndl.yaml")
@@ -1306,7 +1319,7 @@ def main():
     # 版本号配置
     parser.add_argument("--sam_version", type=str, default="001_01")
     parser.add_argument("--uctta_version", type=str, default="001_01")
-    parser.add_argument("--bndl_aue_version", type=str, default="016_03")
+    parser.add_argument("--bndl_aue_version", type=str, default="017_02")
     parser.add_argument("--bndl_version", type=str, default="013_01")
     parser.add_argument("--ur_ern_version", type=str, default="001_01")
     
@@ -1422,6 +1435,7 @@ def main():
             args.output_path,
             method_to_output,
             skip_plots=args.skip_plots,
+            method_versions=method_versions,
         )
     
     print("\n" + "=" * 80)

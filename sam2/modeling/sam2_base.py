@@ -128,6 +128,7 @@ class SAM2Base(torch.nn.Module):
         style_aug_pgd_step_size: float = 0.1,
         style_aug_pgd_epsilon: float = 2.0,
         style_aug_apply_at_layer: int = 0,  # Which backbone layer to apply AdaIN (0 = first FPN level)
+        style_aug_use_gt_region_style: bool = False,  # Extract style only from GT region
         # Patch-based MMD configuration for AUE calibration loss
         aue_use_patch_mmd: bool = True,  # Enable patch-based MMD (better local distribution matching)
         aue_patch_size: int = 16,  # Patch size for patch-based MMD
@@ -244,6 +245,7 @@ class SAM2Base(torch.nn.Module):
         self.style_aug_pgd_step_size = float(style_aug_pgd_step_size)
         self.style_aug_pgd_epsilon = float(style_aug_pgd_epsilon)
         self.style_aug_apply_at_layer = int(style_aug_apply_at_layer)
+        self.style_aug_use_gt_region_style = bool(style_aug_use_gt_region_style)
         if self.use_style_aug:
             self._build_style_aug_components()
 
@@ -444,7 +446,15 @@ class SAM2Base(torch.nn.Module):
             num_vis_samples = min(4, img_batch.shape[0], adv_images.shape[0])
             vis_data['original_images'] = img_batch[:num_vis_samples].detach().cpu()
             vis_data['adversarial_images'] = adv_images[:num_vis_samples].detach().cpu()
-            logging.info(f"Style AUE: Saved {num_vis_samples} samples for visualization, vis_data keys: {list(vis_data.keys())}")
+            
+            # Add bbox information from GT masks
+            if pixel_gt is not None:
+                # Generate bboxes from GT masks (bboxes are in image coordinate space)
+                bboxes = self._generate_bbox_prompts_from_gt(pixel_gt[:num_vis_samples])  # [N, 4]
+                vis_data['bboxes'] = bboxes.detach().cpu()  # [N, 4] format: [x1, y1, x2, y2]
+                vis_data['gt_masks'] = pixel_gt[:num_vis_samples].detach().cpu()  # [N, 1, H, W]
+            
+            logging.info(f"Style AUE: Saved {num_vis_samples} samples for visualization with bbox, vis_data keys: {list(vis_data.keys())}")
         
         calibration_loss_adv = torch.tensor(0.0, device=device, dtype=dtype, requires_grad=True)
          
@@ -581,8 +591,12 @@ class SAM2Base(torch.nn.Module):
         device = img_batch.device
         
         # 1. Extract original styles directly from current images (no bank needed!)
-        from sam2.modeling.style_utils import extract_style_statistics
-        original_styles = extract_style_statistics(img_batch)  # [B, 6]
+        if self.style_aug_use_gt_region_style and pixel_gt is not None:
+            from sam2.modeling.style_utils import extract_gt_region_style
+            original_styles = extract_gt_region_style(img_batch, pixel_gt)  # [B, 6]
+        else:
+            from sam2.modeling.style_utils import extract_style_statistics
+            original_styles = extract_style_statistics(img_batch)  # [B, 6]
         
         # 2. Run PGD to find adversarial styles
         adv_styles = self._pgd_find_adversarial_styles(
@@ -599,7 +613,9 @@ class SAM2Base(torch.nn.Module):
         # 3. Apply adversarial styles to images using AdaIN
         # Note: forward_image_with_style applies AdaIN internally and returns features
         # We need to generate actual styled images, so we apply AdaIN to the input images
-        adv_images = self._apply_style_to_images(img_batch, adv_styles)
+        # If GT region style is enabled, only apply style to GT region (background unchanged)
+        apply_mask = pixel_gt if self.style_aug_use_gt_region_style else None
+        adv_images = self._apply_style_to_images(img_batch, adv_styles, gt_mask=apply_mask)
         
         # 4. Generate prompts from ground truth (bounding boxes)
         if pixel_gt is not None:
@@ -626,7 +642,8 @@ class SAM2Base(torch.nn.Module):
     def _apply_style_to_images(
         self, 
         img_batch: torch.Tensor, 
-        style_stats: torch.Tensor | None
+        style_stats: torch.Tensor | None,
+        gt_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Apply style statistics to images using AdaIN in image space.
@@ -634,6 +651,7 @@ class SAM2Base(torch.nn.Module):
         Args:
             img_batch: [B, 3, H, W] normalized images
             style_stats: [B, 6] style statistics (means[:3], stds[3:]) or None
+            gt_mask: [B, 1, H, W] or [B, H, W] GT mask (optional, if None apply to full image)
         
         Returns:
             styled_images: [B, 3, H, W] styled images (still normalized)
@@ -656,6 +674,28 @@ class SAM2Base(torch.nn.Module):
         # styled = target_std * (input - input_mean) / input_std + target_mean
         normalized = (img_batch - current_means) / (current_stds + 1e-8)
         styled_images = normalized * target_stds + target_means
+        
+        # If GT mask provided, only apply style to GT region (hard boundary)
+        if gt_mask is not None:
+            # Ensure mask is [B, 1, H, W] format
+            if gt_mask.ndim == 3:
+                gt_mask = gt_mask.unsqueeze(1)
+            elif gt_mask.shape[1] != 1:
+                gt_mask = gt_mask[:, :1]
+            
+            # Adjust mask to image size (if needed)
+            if gt_mask.shape[2:] != (H, W):
+                gt_mask = F.interpolate(
+                    gt_mask.float(), 
+                    size=(H, W), 
+                    mode='nearest'
+                )
+            
+            # Ensure mask is float for arithmetic operations (avoid bool tensor issues)
+            gt_mask = gt_mask.float()
+            
+            # Hard boundary fusion: GT region uses styled, background uses original
+            styled_images = gt_mask * styled_images + (1 - gt_mask) * img_batch
         
         return styled_images
 
@@ -693,7 +733,9 @@ class SAM2Base(torch.nn.Module):
             adv_styles.requires_grad = True
             
             # 1. Apply style and forward through model
-            styled_images = self._apply_style_to_images(img_batch, adv_styles)
+            # If GT region style is enabled, only apply to GT region for consistency
+            apply_mask = pixel_gt if self.style_aug_use_gt_region_style else None
+            styled_images = self._apply_style_to_images(img_batch, adv_styles, gt_mask=apply_mask)
             adv_backbone_out = self.forward_image(styled_images)
             adv_backbone_feat = adv_backbone_out['backbone_fpn'][-1]
 

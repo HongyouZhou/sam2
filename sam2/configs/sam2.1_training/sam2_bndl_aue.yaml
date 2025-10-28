@@ -9,7 +9,7 @@ scratch:
   base_lr: 5.0e-6
   vision_lr: 3.0e-06
   phases_per_epoch: 1
-  num_epochs: 12  # 减少到12个epoch，BNDL已快速收敛
+  num_epochs: 6  # 减少到12个epoch，BNDL已快速收敛
 
 dataset:
   # PATHS to Dataset
@@ -220,10 +220,11 @@ trainer:
     
     # Style-based AUE parameters
     use_style_aug: true
-    style_aug_pgd_steps: 1
+    style_aug_pgd_steps: 3
     style_aug_pgd_step_size: 0.1
-    style_aug_pgd_epsilon: 2.0
+    style_aug_pgd_epsilon: 3.0  # 增大epsilon，使GT区域内的风格变换更明显（从2.0提升到5.0）
     style_aug_apply_at_layer: 0
+    style_aug_use_gt_region_style: true  # Extract style from GT region only (new feature)
     
     # Patch-based MMD configuration for AUE calibration loss
     aue_use_patch_mmd: true  # Enable patch-based MMD (better local distribution matching)
@@ -503,7 +504,7 @@ trainer:
 launcher:
   num_nodes: 1
   gpus_per_node: 8
-  experiment_log_dir: /home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_aue_016_03 # Path to log directory, defaults to ./sam2_logs/${config_name}
+  experiment_log_dir: /home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_aue_017_03 # Path to log directory, defaults to ./sam2_logs/${config_name}
 
 # SLURM args if running on a cluster
 submitit:
