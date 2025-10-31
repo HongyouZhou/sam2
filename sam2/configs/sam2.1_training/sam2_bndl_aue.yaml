@@ -225,6 +225,10 @@ trainer:
     style_aug_pgd_epsilon: 2.0  # Local epsilon (reduced from 2.0 to 0.3 for mixed mode)
     style_aug_use_gt_region_style: true  # Extract style from GT region only (new feature)
     
+    # Multi-object style attack control
+    style_aug_use_multi_object: false      # true=attack with all objects in video, false=only current loss object
+    style_aug_enable_background: false     # true=include background as additional object (K+1), false=objects only
+    
     # Global-Local Mixed Style Augmentation (NEW)
     style_aug_use_global_local_mix: false   # Enable global+local mixed style perturbation
     style_aug_global_epsilon: 1.5          # Global style perturbation budget

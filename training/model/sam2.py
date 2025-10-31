@@ -218,10 +218,10 @@ class SAM2Train(SAM2Base):
         
         # Construct multi-object masks grouped by (frame, video) for AUE
         # ============================================================
-        # LOCAL CONTROL: Toggle background mask support
+        # CONTROL: Toggle background mask support (from config)
         # ============================================================
-        # Set ENABLE_BACKGROUND_MASK = True to include background as 11th object
-        # Set ENABLE_BACKGROUND_MASK = False for objects-only (K=10)
+        # Set style_aug_enable_background = True to include background as 11th object
+        # Set style_aug_enable_background = False for objects-only (K=10)
         # 
         # When enabled:
         #   - K = 11 (10 objects + 1 background)
@@ -229,7 +229,7 @@ class SAM2Train(SAM2Base):
         #   - Background participates in style attack
         #   - Visualization shows green dashed bbox for background
         # ============================================================
-        ENABLE_BACKGROUND_MASK = False
+        ENABLE_BACKGROUND_MASK = self.style_aug_enable_background
         
         max_num_objects = 11 if ENABLE_BACKGROUND_MASK else 10
         num_videos = input.num_videos
@@ -448,12 +448,12 @@ class SAM2Train(SAM2Base):
         # Construct multi-object masks: [O_t, K, H, W]
         # Use multi-object masks if available, otherwise use single-object gt_masks
         # ============================================================
-        # CONTROL: Toggle multi-object style attack
+        # CONTROL: Toggle multi-object style attack (from config)
         # ============================================================
-        # Set USE_MULTI_OBJECT_AUE = True to attack with all objects in the video
-        # Set USE_MULTI_OBJECT_AUE = False to attack only the current loss object
+        # Set style_aug_use_multi_object = True to attack with all objects in the video
+        # Set style_aug_use_multi_object = False to attack only the current loss object
         # ============================================================
-        USE_MULTI_OBJECT_AUE = False
+        USE_MULTI_OBJECT_AUE = self.style_aug_use_multi_object
         
         pixel_gt_for_aue = gt_masks
         if USE_MULTI_OBJECT_AUE and gt_masks is not None and hasattr(self, '_current_backbone_out'):

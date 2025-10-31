@@ -128,6 +128,9 @@ class SAM2Base(torch.nn.Module):
         style_aug_pgd_step_size: float = 0.1,
         style_aug_pgd_epsilon: float = 2.0,
         style_aug_use_gt_region_style: bool = False,  # Extract style only from GT region
+        # Multi-object style attack control
+        style_aug_use_multi_object: bool = False,  # true=attack with all objects, false=only current loss object
+        style_aug_enable_background: bool = False,  # true=include background as K+1, false=objects only
         # Global-Local Mixed Style Augmentation
         style_aug_use_global_local_mix: bool = False,  # Enable global+local mixed style perturbation
         style_aug_global_epsilon: float = 1.5,  # Perturbation budget for global style
@@ -248,6 +251,9 @@ class SAM2Base(torch.nn.Module):
         self.style_aug_pgd_step_size = float(style_aug_pgd_step_size)
         self.style_aug_pgd_epsilon = float(style_aug_pgd_epsilon)
         self.style_aug_use_gt_region_style = bool(style_aug_use_gt_region_style)
+        # Multi-object style attack control
+        self.style_aug_use_multi_object = bool(style_aug_use_multi_object)
+        self.style_aug_enable_background = bool(style_aug_enable_background)
         # Global-Local Mixed Style parameters
         self.style_aug_use_global_local_mix = bool(style_aug_use_global_local_mix)
         self.style_aug_global_epsilon = float(style_aug_global_epsilon)
