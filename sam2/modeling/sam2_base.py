@@ -138,6 +138,14 @@ class SAM2Base(torch.nn.Module):
         # Patch-based MMD configuration for AUE calibration loss
         aue_use_patch_mmd: bool = True,  # Enable patch-based MMD (better local distribution matching)
         aue_patch_size: int = 16,  # Patch size for patch-based MMD
+        # GCN-based multi-object style refinement
+        style_aug_use_gcn: bool = False,
+        style_aug_gcn_hidden_dim: int = 32,
+        style_aug_gcn_num_layers: int = 2,
+        style_aug_gcn_lr_ratio: float = 0.1,
+        style_aug_gcn_edge_threshold: float = 0.3,
+        style_aug_gcn_use_semantic_edges: bool = True,
+        style_aug_gcn_use_background_edges: bool = False,
     ):
         super().__init__()
 
@@ -258,6 +266,14 @@ class SAM2Base(torch.nn.Module):
         self.style_aug_use_global_local_mix = bool(style_aug_use_global_local_mix)
         self.style_aug_global_epsilon = float(style_aug_global_epsilon)
         self.style_aug_global_weight = float(style_aug_global_weight)
+        # GCN parameters
+        self.style_aug_use_gcn = bool(style_aug_use_gcn)
+        self.style_aug_gcn_hidden_dim = int(style_aug_gcn_hidden_dim)
+        self.style_aug_gcn_num_layers = int(style_aug_gcn_num_layers)
+        self.style_aug_gcn_lr_ratio = float(style_aug_gcn_lr_ratio)
+        self.style_aug_gcn_edge_threshold = float(style_aug_gcn_edge_threshold)
+        self.style_aug_gcn_use_semantic_edges = bool(style_aug_gcn_use_semantic_edges)
+        self.style_aug_gcn_use_background_edges = bool(style_aug_gcn_use_background_edges)
         if self.use_style_aug:
             self._build_style_aug_components()
 
@@ -290,6 +306,26 @@ class SAM2Base(torch.nn.Module):
         # AdaIN layer for style transfer
         from sam2.modeling.style_utils import AdaIN
         self.adain = AdaIN()
+        
+        # GCN module for multi-object style refinement
+        if self.style_aug_use_gcn:
+            if not self.style_aug_use_multi_object:
+                raise ValueError("GCN requires style_aug_use_multi_object=True")
+            if self.style_aug_use_global_local_mix:
+                raise ValueError("GCN is incompatible with style_aug_use_global_local_mix")
+            
+            from sam2.modeling.style_gcn import AdversarialStyleGCN
+            self.style_gcn = AdversarialStyleGCN(
+                style_dim=6,
+                hidden_dim=self.style_aug_gcn_hidden_dim,
+                num_layers=self.style_aug_gcn_num_layers,
+            )
+            logging.info(
+                f"GCN module built: hidden_dim={self.style_aug_gcn_hidden_dim}, "
+                f"num_layers={self.style_aug_gcn_num_layers}"
+            )
+        else:
+            self.style_gcn = None
         
         logging.info(
             f"Style augmentation components built: "
@@ -688,6 +724,14 @@ class SAM2Base(torch.nn.Module):
             uq_sample_num=uq_sample_num,
         )
         
+        # GCN Pass 2: with gradient for training
+        if self.style_gcn is not None and self.training:
+            delta_detached = (adv_styles - original_styles).detach().requires_grad_(True)
+            edge_index, edge_weight = self._build_style_graph(pixel_gt, img_batch)
+            refined_delta = self.style_gcn(delta_detached, edge_index, edge_weight)
+            refined_delta = torch.clamp(refined_delta, -self.style_aug_pgd_epsilon, self.style_aug_pgd_epsilon)
+            adv_styles = original_styles + refined_delta
+        
         # 3. Apply adversarial styles to all objects (vectorized)
         apply_mask = pixel_gt if self.style_aug_use_gt_region_style else None
         adv_images = self._apply_style_to_images(img_batch, adv_styles, gt_mask=apply_mask)
@@ -968,8 +1012,39 @@ class SAM2Base(torch.nn.Module):
                     # Fallback to uniform epsilon for backward compatibility
                     delta = torch.clamp(delta, -epsilon, epsilon)
                 adv_styles = original_styles + delta
+                
+                # GCN refinement (Pass 1: no grad)
+                if self.style_gcn is not None:
+                    edge_index, edge_weight = self._build_style_graph(pixel_gt, img_batch)
+                    refined_delta = self.style_gcn(delta, edge_index, edge_weight)
+                    refined_delta = torch.clamp(refined_delta, -epsilon, epsilon)
+                    adv_styles = original_styles + refined_delta
 
         return adv_styles.detach()
+    
+    def _build_style_graph(
+        self,
+        pixel_gt: torch.Tensor | None,
+        img_batch: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Build object graph for GCN refinement.
+        
+        Args:
+            pixel_gt: [B, K, H, W] ground truth masks
+            img_batch: [B, 3, H, W] images (for future semantic features)
+        
+        Returns:
+            edge_index: [2, E] edge indices
+            edge_weight: [E] edge weights
+        """
+        from sam2.modeling.style_gcn import build_object_graph
+        return build_object_graph(
+            pixel_gt, img_batch,
+            edge_threshold=self.style_aug_gcn_edge_threshold,
+            use_semantic=self.style_aug_gcn_use_semantic_edges,
+            use_background=self.style_aug_gcn_use_background_edges,
+        )
     
     def _pgd_mixed_global_local_styles(
         self,

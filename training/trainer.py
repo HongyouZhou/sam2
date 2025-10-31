@@ -19,7 +19,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib
 
-matplotlib.use("Agg")  # 使用非交互式后端
+matplotlib.use("Agg")
 import cv2
 
 import torch
@@ -1295,6 +1295,13 @@ class Trainer:
                                     style_diff = (adv_styles - original_styles).abs().mean(dim=0)  # [6]
                                     for j, channel in enumerate(['R_mean', 'G_mean', 'B_mean', 'R_std', 'G_std', 'B_std']):
                                         self.logger.log(f"StyleAUE/perturbation_{channel}", style_diff[j].item(), step)
+                                    
+                                    # Log GCN alpha values if GCN is enabled
+                                    model = self.model.module if hasattr(self.model, 'module') else self.model
+                                    if hasattr(model, 'style_gcn') and model.style_gcn is not None:
+                                        for layer_idx, alpha in enumerate(model.style_gcn.alphas):
+                                            alpha_val = torch.sigmoid(alpha).item()
+                                            self.logger.log(f"GCN/alpha_layer_{layer_idx}", alpha_val, step)
                                 
                                 return  # Only log once
     
