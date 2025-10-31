@@ -127,8 +127,11 @@ class SAM2Base(torch.nn.Module):
         style_aug_pgd_steps: int = 5,
         style_aug_pgd_step_size: float = 0.1,
         style_aug_pgd_epsilon: float = 2.0,
-        style_aug_apply_at_layer: int = 0,  # Which backbone layer to apply AdaIN (0 = first FPN level)
         style_aug_use_gt_region_style: bool = False,  # Extract style only from GT region
+        # Global-Local Mixed Style Augmentation
+        style_aug_use_global_local_mix: bool = False,  # Enable global+local mixed style perturbation
+        style_aug_global_epsilon: float = 1.5,  # Perturbation budget for global style
+        style_aug_global_weight: float = 0.7,  # Weight of global style shift (0=local only, 1=global only)
         # Patch-based MMD configuration for AUE calibration loss
         aue_use_patch_mmd: bool = True,  # Enable patch-based MMD (better local distribution matching)
         aue_patch_size: int = 16,  # Patch size for patch-based MMD
@@ -244,8 +247,11 @@ class SAM2Base(torch.nn.Module):
         self.style_aug_pgd_steps = int(style_aug_pgd_steps)
         self.style_aug_pgd_step_size = float(style_aug_pgd_step_size)
         self.style_aug_pgd_epsilon = float(style_aug_pgd_epsilon)
-        self.style_aug_apply_at_layer = int(style_aug_apply_at_layer)
         self.style_aug_use_gt_region_style = bool(style_aug_use_gt_region_style)
+        # Global-Local Mixed Style parameters
+        self.style_aug_use_global_local_mix = bool(style_aug_use_global_local_mix)
+        self.style_aug_global_epsilon = float(style_aug_global_epsilon)
+        self.style_aug_global_weight = float(style_aug_global_weight)
         if self.use_style_aug:
             self._build_style_aug_components()
 
@@ -282,8 +288,7 @@ class SAM2Base(torch.nn.Module):
         logging.info(
             f"Style augmentation components built: "
             f"pgd_steps={self.style_aug_pgd_steps}, "
-            f"epsilon={self.style_aug_pgd_epsilon}, "
-            f"apply_at_layer={self.style_aug_apply_at_layer}"
+            f"epsilon={self.style_aug_pgd_epsilon}"
         )
     
     def _build_aue_components(self) -> None:
@@ -409,12 +414,22 @@ class SAM2Base(torch.nn.Module):
             raise ValueError(f"AUE expects pixel_logits of shape [B,H,W,K], got {tuple(pixel_logits.shape)}")
         H_feat, W_feat = int(pixel_logits.shape[1]), int(pixel_logits.shape[2])
 
-        # Optional GT: if provided, enforce [B,1,Hg,Wg] and resize; if None, ratio_pos will use default behavior
+        # Optional GT: support both single-object [B,1,H,W] and multi-object [B,K,H,W]
         pixel_gt_resized = None
         if pixel_gt is not None:
-            if not (pixel_gt.ndim == 4 and pixel_gt.shape[1] == 1):
-                raise ValueError(f"AUE expects pixel_gt of shape [B,1,H,W], got {tuple(pixel_gt.shape)}")
-            pixel_gt_resized = F.interpolate(pixel_gt.float(), size=(H_feat, W_feat), mode='nearest').squeeze(1)
+            if not (pixel_gt.ndim == 4 and pixel_gt.shape[1] >= 1):
+                raise ValueError(f"AUE expects pixel_gt of shape [B,K,H,W], got {tuple(pixel_gt.shape)}")
+            
+            # For multi-object (K>1), combine all objects for calibration loss
+            if pixel_gt.shape[1] > 1:
+                # Combine multiple objects into single mask: [B, K, H, W] → [B, 1, H, W]
+                pixel_gt_combined = pixel_gt.sum(dim=1, keepdim=True).clamp(0, 1)
+            else:
+                # Single object: use as is
+                pixel_gt_combined = pixel_gt
+            
+            # Resize to feature map resolution
+            pixel_gt_resized = F.interpolate(pixel_gt_combined.float(), size=(H_feat, W_feat), mode='nearest').squeeze(1)
 
         calibration_loss_clean = self._compute_uncertainty_calibration_loss(
             pixel_logits=pixel_logits,
@@ -433,7 +448,9 @@ class SAM2Base(torch.nn.Module):
             return torch.tensor(0.0, device=device, dtype=dtype), {}
         
         adv_images, adv_gts, adv_prompts = self._generate_style_based_adversarial_images(
-            img_batch, pixel_gt, adversarial_sample_M,
+            img_batch, 
+            pixel_gt,
+            adversarial_sample_M,
             pixel_bndl_model=pixel_bndl_model,
             uq_sample_num=uq_sample_num,
         )
@@ -447,14 +464,55 @@ class SAM2Base(torch.nn.Module):
             vis_data['original_images'] = img_batch[:num_vis_samples].detach().cpu()
             vis_data['adversarial_images'] = adv_images[:num_vis_samples].detach().cpu()
             
-            # Add bbox information from GT masks
+            # Add multi-object mask information
             if pixel_gt is not None:
-                # Generate bboxes from GT masks (bboxes are in image coordinate space)
-                bboxes = self._generate_bbox_prompts_from_gt(pixel_gt[:num_vis_samples])  # [N, 4]
-                vis_data['bboxes'] = bboxes.detach().cpu()  # [N, 4] format: [x1, y1, x2, y2]
-                vis_data['gt_masks'] = pixel_gt[:num_vis_samples].detach().cpu()  # [N, 1, H, W]
-            
-            logging.info(f"Style AUE: Saved {num_vis_samples} samples for visualization with bbox, vis_data keys: {list(vis_data.keys())}")
+                # pixel_gt can be [B, K, H, W] for multi-object or [B, 1, H, W] for single object
+                # Ensure 4D format
+                if pixel_gt.ndim == 3:
+                    pixel_gt_4d = pixel_gt.unsqueeze(1)  # [B, H, W] -> [B, 1, H, W]
+                else:
+                    pixel_gt_4d = pixel_gt  # Already [B, K, H, W]
+                
+                K = pixel_gt_4d.shape[1]
+                vis_data['all_object_masks'] = pixel_gt_4d[:num_vis_samples].detach().cpu()  # [N, K, H, W]
+                
+                # Count actual non-empty masks per sample
+                non_empty_counts = []
+                for i in range(num_vis_samples):
+                    non_empty = (pixel_gt_4d[i].sum(dim=[1, 2]) > 0).sum().item()
+                    non_empty_counts.append(non_empty)
+                vis_data['num_objects'] = max(non_empty_counts) if non_empty_counts else 1
+                
+                # Generate bboxes for all objects
+                all_bboxes = []
+                for i in range(num_vis_samples):
+                    obj_bboxes = []
+                    for k in range(K):
+                        mask_k = pixel_gt_4d[i:i+1, k:k+1]  # [1, 1, H, W]
+                        if mask_k.sum() > 0:  # Only if mask is non-empty
+                            bbox_k = self._generate_bbox_prompts_from_gt(mask_k)[0]  # [4]
+                            obj_bboxes.append(bbox_k)
+                        else:
+                            # Create empty bbox on the same device as the mask
+                            obj_bboxes.append(torch.zeros(4, dtype=pixel_gt_4d.dtype, device=pixel_gt_4d.device))
+                    all_bboxes.append(torch.stack(obj_bboxes))  # [K, 4]
+                vis_data['all_bboxes'] = torch.stack(all_bboxes).detach().cpu()  # [N, K, 4]
+                
+                # The combined mask used for loss computation
+                combined_mask = pixel_gt_4d.sum(dim=1, keepdim=True).clamp(0, 1)  # [B, 1, H, W]
+                vis_data['combined_mask_for_loss'] = combined_mask[:num_vis_samples].detach().cpu()
+                
+                # Calculate and store area ratios and epsilon weights for visualization
+                H_mask, W_mask = pixel_gt_4d.shape[-2:]
+                total_pixels = H_mask * W_mask
+                pixel_counts = pixel_gt_4d[:num_vis_samples].sum(dim=[2, 3])  # [N, K]
+                area_ratios = (pixel_counts / total_pixels).detach().cpu()  # [N, K]
+                epsilon_weights = torch.sqrt(area_ratios.clamp(min=1e-6))  # [N, K]
+                
+                vis_data['area_ratios'] = area_ratios  # [N, K]
+                vis_data['epsilon_weights'] = epsilon_weights  # [N, K]
+                
+                logging.info(f"Style AUE: Saved {num_vis_samples} samples with {K} objects per sample for visualization")
         
         calibration_loss_adv = torch.tensor(0.0, device=device, dtype=dtype, requires_grad=True)
          
@@ -574,11 +632,13 @@ class SAM2Base(torch.nn.Module):
         uq_sample_num: int = 8,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
         """
-        Generate adversarial images using PGD + AdaIN in style space.
+        Generate adversarial images using vectorized multi-object style attack.
+        
+        Supports both single (K=1) and multi-object (K>1) modes automatically.
         
         Args:
             img_batch: [B, 3, H, W] input images (normalized)
-            pixel_gt: [B, 1, H, W] ground truth masks (optional)
+            pixel_gt: [B, K, H, W] ground truth masks (K objects)
             sample_M: number of adversarial samples to generate
             pixel_bndl_model: BNDL model for computing uncertainty
             uq_sample_num: number of samples for uncertainty estimation
@@ -590,15 +650,27 @@ class SAM2Base(torch.nn.Module):
         """
         device = img_batch.device
         
-        # 1. Extract original styles directly from current images (no bank needed!)
-        if self.style_aug_use_gt_region_style and pixel_gt is not None:
+        if pixel_gt is None:
+            logging.warning("No GT available for style-based AUE")
+            return None, None, None
+        
+        # Ensure 4D: [B, K, H, W]
+        if pixel_gt.ndim == 3:
+            pixel_gt = pixel_gt.unsqueeze(1)  # [B, H, W] → [B, 1, H, W]
+        
+        B, K, H, W = pixel_gt.shape
+        
+        # 1. Extract all objects' styles (vectorized): [B, K, 6]
+        if self.style_aug_use_gt_region_style:
             from sam2.modeling.style_utils import extract_gt_region_style
-            original_styles = extract_gt_region_style(img_batch, pixel_gt)  # [B, 6]
+            original_styles = extract_gt_region_style(img_batch, pixel_gt)  # [B, K, 6]
         else:
             from sam2.modeling.style_utils import extract_style_statistics
-            original_styles = extract_style_statistics(img_batch)  # [B, 6]
+            # Global style, replicate K times
+            global_style = extract_style_statistics(img_batch)  # [B, 6]
+            original_styles = global_style.unsqueeze(1).expand(-1, K, -1)  # [B, K, 6]
         
-        # 2. Run PGD to find adversarial styles
+        # 2. PGD attack all objects (vectorized): [B, K, 6]
         adv_styles = self._pgd_find_adversarial_styles(
             img_batch, 
             original_styles,
@@ -610,29 +682,19 @@ class SAM2Base(torch.nn.Module):
             uq_sample_num=uq_sample_num,
         )
         
-        # 3. Apply adversarial styles to images using AdaIN
-        # Note: forward_image_with_style applies AdaIN internally and returns features
-        # We need to generate actual styled images, so we apply AdaIN to the input images
-        # If GT region style is enabled, only apply style to GT region (background unchanged)
+        # 3. Apply adversarial styles to all objects (vectorized)
         apply_mask = pixel_gt if self.style_aug_use_gt_region_style else None
         adv_images = self._apply_style_to_images(img_batch, adv_styles, gt_mask=apply_mask)
         
-        # 4. Generate prompts from ground truth (bounding boxes)
-        if pixel_gt is not None:
-            # Generate bounding box prompts from GT masks
-            adv_prompts = self._generate_bbox_prompts_from_gt(pixel_gt)  # [B, 4]
-            adv_gts = pixel_gt.squeeze(1)  # [B, H, W]
-        else:
-            # If no GT available, cannot generate prompts
-            logging.warning("No GT available for style-based AUE, cannot generate prompts")
-            return None, None, None
+        # 4. Generate prompts (using all objects' combined mask)
+        combined_mask = pixel_gt.sum(dim=1, keepdim=True).clamp(0, 1)  # [B, 1, H, W]
+        adv_prompts = self._generate_bbox_prompts_from_gt(combined_mask)
+        adv_gts = combined_mask.squeeze(1)  # [B, H, W]
         
-        # 5. Sample M instances if needed (for now, just use all B samples)
-        # In the future, we could sample M < B for efficiency
-        M = min(sample_M, img_batch.shape[0])
-        if img_batch.shape[0] > M:
-            # Randomly sample M instances
-            indices = torch.randperm(img_batch.shape[0], device=device)[:M]
+        # 5. Sample M instances if needed
+        M = min(sample_M, B)
+        if B > M:
+            indices = torch.randperm(B, device=device)[:M]
             adv_images = adv_images[indices]
             adv_gts = adv_gts[indices]
             adv_prompts = adv_prompts[indices]
@@ -646,12 +708,12 @@ class SAM2Base(torch.nn.Module):
         gt_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
-        Apply style statistics to images using AdaIN in image space.
+        Apply style statistics to images using AdaIN (vectorized multi-object).
         
         Args:
             img_batch: [B, 3, H, W] normalized images
-            style_stats: [B, 6] style statistics (means[:3], stds[3:]) or None
-            gt_mask: [B, 1, H, W] or [B, H, W] GT mask (optional, if None apply to full image)
+            style_stats: [B, K, 6] or [B, 6] style statistics per object
+            gt_mask: [B, K, H, W] or [B, 1, H, W] GT masks (optional)
         
         Returns:
             styled_images: [B, 3, H, W] styled images (still normalized)
@@ -662,40 +724,52 @@ class SAM2Base(torch.nn.Module):
             
         B, C, H, W = img_batch.shape
         
-        # Extract target means and stds from style_stats
-        target_means = style_stats[:, :3].view(B, 3, 1, 1)  # [B, 3, 1, 1]
-        target_stds = style_stats[:, 3:].view(B, 3, 1, 1)   # [B, 3, 1, 1]
+        # Detect single vs multi-object mode
+        if style_stats.ndim == 2:
+            # [B, 6] single object (backward compatible)
+            style_stats = style_stats.unsqueeze(1)  # [B, 1, 6]
+            if gt_mask is not None and gt_mask.ndim == 4 and gt_mask.shape[1] == 1:
+                # gt_mask already [B, 1, H, W], keep as is
+                pass
         
-        # Compute current image statistics
-        current_means = img_batch.mean(dim=[2, 3], keepdim=True)  # [B, 3, 1, 1]
-        current_stds = img_batch.std(dim=[2, 3], keepdim=True)   # [B, 3, 1, 1]
+        K = style_stats.shape[1]
         
-        # Apply AdaIN: normalize then denormalize with target stats
-        # styled = target_std * (input - input_mean) / input_std + target_mean
-        normalized = (img_batch - current_means) / (current_stds + 1e-8)
-        styled_images = normalized * target_stds + target_means
+        # Current image (accumulate style applications)
+        styled_images = img_batch.clone()
         
-        # If GT mask provided, only apply style to GT region (hard boundary)
-        if gt_mask is not None:
-            # Ensure mask is [B, 1, H, W] format
-            if gt_mask.ndim == 3:
-                gt_mask = gt_mask.unsqueeze(1)
-            elif gt_mask.shape[1] != 1:
-                gt_mask = gt_mask[:, :1]
+        # Apply style for each object (vectorized processing)
+        for k in range(K):
+            object_style = style_stats[:, k]  # [B, 6]
+            object_mask = gt_mask[:, k:k+1] if gt_mask is not None else None  # [B, 1, H, W]
             
-            # Adjust mask to image size (if needed)
-            if gt_mask.shape[2:] != (H, W):
-                gt_mask = F.interpolate(
-                    gt_mask.float(), 
-                    size=(H, W), 
-                    mode='nearest'
-                )
+            # Extract target means and stds
+            target_means = object_style[:, :3].view(B, 3, 1, 1)  # [B, 3, 1, 1]
+            target_stds = object_style[:, 3:].view(B, 3, 1, 1)   # [B, 3, 1, 1]
             
-            # Ensure mask is float for arithmetic operations (avoid bool tensor issues)
-            gt_mask = gt_mask.float()
+            # Compute current image statistics
+            current_means = styled_images.mean(dim=[2, 3], keepdim=True)
+            current_stds = styled_images.std(dim=[2, 3], keepdim=True)
             
-            # Hard boundary fusion: GT region uses styled, background uses original
-            styled_images = gt_mask * styled_images + (1 - gt_mask) * img_batch
+            # Apply AdaIN
+            normalized = (styled_images - current_means) / (current_stds + 1e-8)
+            object_styled = normalized * target_stds + target_means
+            
+            # Apply mask (if provided)
+            if object_mask is not None:
+                # Adjust mask to image size
+                if object_mask.shape[2:] != (H, W):
+                    object_mask = F.interpolate(
+                        object_mask.float(), 
+                        size=(H, W), 
+                        mode='nearest'
+                    )
+                object_mask = object_mask.float()
+                
+                # Only apply style to object region
+                styled_images = object_mask * object_styled + (1 - object_mask) * styled_images
+            else:
+                # Apply to full image
+                styled_images = object_styled
         
         return styled_images
 
@@ -711,23 +785,62 @@ class SAM2Base(torch.nn.Module):
         uq_sample_num: int = 20,
     ) -> torch.Tensor:
         """
-        Performs PGD to find adversarial style statistics that maximize the AUE calibration loss.
+        PGD to find adversarial styles (vectorized for K objects).
         Goal: Maximize uncertainty calibration loss (MMD + MSE between U and Error).
+        
+        Supports two modes:
+        1. Local-only mode (default): Perturb each object's style independently
+        2. Global+Local mixed mode: Add global style drift + local perturbations
         
         Args:
             img_batch: [B, 3, H, W] original image batch
-            original_styles: [B, 6] original style statistics (means[:3], stds[3:])
-            pixel_gt: [B, H, W] ground truth masks
+            original_styles: [B, K, 6] or [B, 6] original style statistics
+            pixel_gt: [B, K, H, W] or [B, 1, H, W] ground truth masks
             num_steps: number of PGD iterations
             step_size: step size for each PGD iteration
-            epsilon: L_inf perturbation budget
+            epsilon: L_inf perturbation budget (for local styles)
             pixel_bndl_model: BNDL model for computing uncertainty
             uq_sample_num: number of samples for uncertainty estimation
         
         Returns:
-            adv_styles: [B, 6] adversarial style statistics
+            adv_styles: [B, K, 6] or [B, 6] adversarial style statistics
         """
+        # Backward compatibility: [B, 6] → [B, 1, 6]
+        if original_styles.ndim == 2:
+            original_styles = original_styles.unsqueeze(1)
+        
+        # Check if using global-local mixed mode
+        if self.style_aug_use_global_local_mix:
+            # Mode: Global+Local Mixed Style Attack
+            return self._pgd_mixed_global_local_styles(
+                img_batch, original_styles, pixel_gt,
+                num_steps, step_size, epsilon,
+                pixel_bndl_model, uq_sample_num
+            )
+        
+        # Mode: Local-only Style Attack (original behavior)
         adv_styles = original_styles.clone().detach()
+        
+        # Compute area-weighted epsilon for each object region
+        epsilon_per_object = None
+        # if pixel_gt is not None and pixel_gt.ndim == 4:
+        #     # pixel_gt: [B, K, H, W]
+        #     B, K, H, W = pixel_gt.shape
+        #     total_pixels = H * W
+            
+        #     # Count pixels per object: [B, K]
+        #     pixel_count = pixel_gt.sum(dim=[2, 3])  # [B, K]
+            
+        #     # Area ratio: [B, K]
+        #     area_ratio = pixel_count / total_pixels
+            
+        #     # Weight epsilon by sqrt(area_ratio) to balance perturbation strength
+        #     # Large regions → larger epsilon, small regions → smaller epsilon
+        #     # Use sqrt to avoid too extreme differences
+        #     epsilon_weight = torch.sqrt(area_ratio.clamp(min=1e-6))  # [B, K]
+            
+        #     # Expand to match style dimensions: [B, K, 6]
+        #     epsilon_per_object = epsilon * epsilon_weight.unsqueeze(-1).expand(-1, -1, 6)
         
         for step in range(num_steps):
             adv_styles.requires_grad = True
@@ -747,8 +860,17 @@ class SAM2Base(torch.nn.Module):
                     adv_backbone_out['backbone_fpn'][1]
                 ]
             
-            # 3. Generate prompts from GT
-            adv_prompts = self._generate_bbox_prompts_from_gt(pixel_gt)
+            # 3. Generate prompts from GT (need combined mask for bbox)
+            if pixel_gt is not None:
+                # Combine all objects for prompt generation
+                if pixel_gt.ndim == 4 and pixel_gt.shape[1] > 1:
+                    combined_gt = pixel_gt.sum(dim=1, keepdim=True).clamp(0, 1)  # [B, 1, H, W]
+                else:
+                    combined_gt = pixel_gt  # Already [B, 1, H, W]
+            else:
+                combined_gt = None
+            
+            adv_prompts = self._generate_bbox_prompts_from_gt(combined_gt)
             adv_box_coords = torch.stack([adv_prompts[:, :2], adv_prompts[:, 2:]], dim=1)
             adv_point_inputs = {
                 "point_coords": adv_box_coords,
@@ -809,7 +931,10 @@ class SAM2Base(torch.nn.Module):
             
             # 9. Compute calibration loss (maximize to find adversarial styles)
             H_feat, W_feat = adv_logits_grad.shape[1:3]
-            adv_gts_resized = F.interpolate(pixel_gt.float(), size=(H_feat, W_feat), mode='nearest')
+            if combined_gt is not None:
+                adv_gts_resized = F.interpolate(combined_gt.float(), size=(H_feat, W_feat), mode='nearest')
+            else:
+                adv_gts_resized = None
             
             calibration_loss_adv = self._compute_uncertainty_calibration_loss(
                 pixel_logits=adv_logits_grad,
@@ -828,12 +953,227 @@ class SAM2Base(torch.nn.Module):
                 # Gradient ascent step
                 adv_styles = adv_styles.detach() + step_size * grad.sign()
                 
-                # Project to epsilon ball
+                # Project to epsilon ball (area-weighted if available)
                 delta = adv_styles - original_styles
-                delta = torch.clamp(delta, -epsilon, epsilon)
+                if epsilon_per_object is not None:
+                    # Use per-object epsilon: [B, K, 6]
+                    delta = torch.clamp(delta, -epsilon_per_object, epsilon_per_object)
+                else:
+                    # Fallback to uniform epsilon for backward compatibility
+                    delta = torch.clamp(delta, -epsilon, epsilon)
                 adv_styles = original_styles + delta
- 
+
         return adv_styles.detach()
+    
+    def _pgd_mixed_global_local_styles(
+        self,
+        img_batch: torch.Tensor,
+        original_local_styles: torch.Tensor,
+        pixel_gt: torch.Tensor | None,
+        num_steps: int,
+        step_size: float,
+        local_epsilon: float,
+        pixel_bndl_model,
+        uq_sample_num: int,
+    ) -> torch.Tensor:
+        """
+        Global+Local mixed style perturbation.
+        Simultaneously optimizes global style drift and local object styles.
+        
+        Strategy:
+        1. All local styles first follow a global drift (consistency)
+        2. Each local style can then deviate slightly from this global base (diversity)
+        
+        Final style = (original_local + global_drift) + (1 - global_weight) * local_deviation
+        
+        Where:
+        - global_drift: adversarial shift applied to all objects uniformly
+        - local_deviation: individual perturbation for each object
+        - global_weight: controls consistency (0.7 means 100% global + 30% local deviation)
+        
+        This ensures all objects maintain global coherence while allowing controlled
+        local variations, making multi-object perturbations look more natural.
+        
+        Args:
+            img_batch: [B, 3, H, W] original images
+            original_local_styles: [B, K, 6] local styles extracted from each object
+            pixel_gt: [B, K, H, W] object masks
+            num_steps: PGD iterations
+            step_size: gradient step size
+            local_epsilon: perturbation budget for local styles
+            pixel_bndl_model: BNDL model
+            uq_sample_num: uncertainty sampling number
+        
+        Returns:
+            combined_styles: [B, K, 6] final adversarial styles (global base + local deviation)
+        """
+        B, K, _ = original_local_styles.shape
+        
+        # Extract global style statistics (for the whole image)
+        from sam2.modeling.style_utils import extract_style_statistics
+        original_global_style = extract_style_statistics(img_batch)  # [B, 6]
+        
+        # Initialize adversarial styles
+        adv_local_styles = original_local_styles.clone().detach()  # [B, K, 6]
+        adv_global_style = original_global_style.clone().detach()  # [B, 6]
+        
+        # Get hyperparameters
+        global_epsilon = self.style_aug_global_epsilon
+        global_weight = self.style_aug_global_weight
+        
+        for step in range(num_steps):
+            adv_local_styles.requires_grad = True
+            adv_global_style.requires_grad = True
+            
+            # 1. Compute combined styles: 
+            # Strategy: All local styles first follow global drift (consistency),
+            # then allow small local deviations (diversity)
+            global_delta = adv_global_style - original_global_style  # [B, 6]
+            global_delta_expanded = global_delta.unsqueeze(1).expand(-1, K, -1)  # [B, K, 6]
+            
+            # Apply global drift to all local styles (base shift)
+            global_base = original_local_styles + global_delta_expanded  # [B, K, 6]
+            
+            # Compute local deviation from original
+            local_delta = adv_local_styles - original_local_styles  # [B, K, 6]
+            
+            # Final style = global base + constrained local deviation
+            # global_weight controls how much we enforce global consistency
+            # e.g., global_weight=0.7 means 100% global drift + 30% local deviation
+            combined_styles = global_base + (1 - global_weight) * local_delta  # [B, K, 6]
+            
+            # 2. Apply combined styles to images
+            apply_mask = pixel_gt if self.style_aug_use_gt_region_style else None
+            styled_images = self._apply_style_to_images(img_batch, combined_styles, gt_mask=apply_mask)
+            
+            # 3. Forward through backbone
+            adv_backbone_out = self.forward_image(styled_images)
+            adv_backbone_feat = adv_backbone_out['backbone_fpn'][-1]
+
+            # 4. Extract high_res_features if needed
+            high_res_features = None
+            if self.use_high_res_features_in_sam:
+                high_res_features = [
+                    adv_backbone_out['backbone_fpn'][0],
+                    adv_backbone_out['backbone_fpn'][1]
+                ]
+            
+            # 5. Generate prompts from GT (need combined mask for bbox)
+            if pixel_gt is not None:
+                # Combine all objects for prompt generation
+                if pixel_gt.ndim == 4 and pixel_gt.shape[1] > 1:
+                    combined_gt = pixel_gt.sum(dim=1, keepdim=True).clamp(0, 1)  # [B, 1, H, W]
+                else:
+                    combined_gt = pixel_gt  # Already [B, 1, H, W]
+            else:
+                combined_gt = None
+            
+            adv_prompts = self._generate_bbox_prompts_from_gt(combined_gt)
+            adv_box_coords = torch.stack([adv_prompts[:, :2], adv_prompts[:, 2:]], dim=1)
+            adv_point_inputs = {
+                "point_coords": adv_box_coords,
+                "point_labels": torch.tensor([[2, 3]], dtype=torch.int32, device=img_batch.device).expand(B, 2),
+            }
+            
+            # 6. Forward through SAM heads to get BNDL outputs
+            prev_suppress = getattr(self, "_suppress_nested_aue", False)
+            self._suppress_nested_aue = True
+            try:
+                *_, adv_aux_outputs = self._forward_sam_heads(
+                    backbone_features=adv_backbone_feat,
+                    point_inputs=adv_point_inputs,
+                    high_res_features=high_res_features,
+                    multimask_output=False,
+                    pixel_gt_for_aue=None,
+                )
+            finally:
+                self._suppress_nested_aue = prev_suppress
+            
+            # 7. Extract BNDL outputs
+            adv_bndl = adv_aux_outputs.get("bndl", {})
+            adv_pixel_feat = adv_bndl.get("pixel_feat_grad", adv_bndl.get("pixel_feat"))
+            
+            if adv_pixel_feat is None:
+                logging.warning("PGD (Mixed): Failed to extract pixel features, stopping early")
+                break
+             
+            # 8. Get hyperparameters for BNDL
+            adv_external_w = None
+            if pixel_bndl_model is not None and not pixel_bndl_model.enable_global_sparse:
+                adv_hyper_in = adv_bndl.get("hyper_in")
+                adv_external_w = adv_hyper_in if adv_hyper_in is not None else pixel_bndl_model.linear.weight.unsqueeze(0).expand(adv_pixel_feat.shape[0], -1, -1)
+            
+            # 9. Compute logits with gradients
+            adv_logits_grad = adv_bndl.get("pixel_logits", adv_bndl.get("masks_bndl_raw", None))
+            if adv_logits_grad is None and pixel_bndl_model is not None:
+                adv_logits_grad, *_ = pixel_bndl_model(
+                    adv_pixel_feat, force_sample=False, external_pre_out_w=adv_external_w
+                )
+            
+            if adv_logits_grad is None:
+                logging.warning("PGD (Mixed): Failed to extract logits, stopping early")
+                break
+            
+            # 10. Compute uncertainty (no gradients to avoid nested grads)
+            with torch.no_grad():
+                adv_uq = pixel_entropy_uncertainty(
+                    pixel_bndl_model, adv_pixel_feat, adv_external_w, uq_sample_num, per_channel=False
+                )
+            
+            # Sanitize logits before computing calibration loss
+            if not torch.isfinite(adv_logits_grad).all():
+                num_nan = (~torch.isfinite(adv_logits_grad)).sum().item()
+                logging.warning(f"[PGD Mixed Step {step}] adv_logits contains {num_nan}/{adv_logits_grad.numel()} NaN/Inf, sanitizing...")
+                adv_logits_grad = torch.nan_to_num(adv_logits_grad, nan=0.0, posinf=20.0, neginf=-20.0)
+                adv_logits_grad = torch.clamp(adv_logits_grad, min=-50.0, max=50.0)
+            
+            # 11. Compute calibration loss (maximize to find adversarial styles)
+            H_feat, W_feat = adv_logits_grad.shape[1:3]
+            if combined_gt is not None:
+                adv_gts_resized = F.interpolate(combined_gt.float(), size=(H_feat, W_feat), mode='nearest')
+            else:
+                adv_gts_resized = None
+            
+            calibration_loss_adv = self._compute_uncertainty_calibration_loss(
+                pixel_logits=adv_logits_grad,
+                pixel_uncertainty=adv_uq,
+                pixel_gt=adv_gts_resized,
+                spatial_hw=(H_feat, W_feat),
+                batch_size=B,
+                device=adv_logits_grad.device,
+                dtype=adv_logits_grad.dtype,
+            )
+            
+            # 12. Gradient ascent (maximize calibration loss to create hard samples)
+            # Compute gradients for both local and global styles
+            grad_local, grad_global = torch.autograd.grad(
+                calibration_loss_adv, 
+                [adv_local_styles, adv_global_style], 
+                create_graph=False
+            )
+            
+            with torch.no_grad():
+                # Update local styles with local epsilon constraint
+                adv_local_styles = adv_local_styles.detach() + step_size * grad_local.sign()
+                delta_local = adv_local_styles - original_local_styles
+                delta_local = torch.clamp(delta_local, -local_epsilon, local_epsilon)
+                adv_local_styles = original_local_styles + delta_local
+                
+                # Update global style with global epsilon constraint
+                adv_global_style = adv_global_style.detach() + step_size * grad_global.sign()
+                delta_global = adv_global_style - original_global_style
+                delta_global = torch.clamp(delta_global, -global_epsilon, global_epsilon)
+                adv_global_style = original_global_style + delta_global
+        
+        # Combine final styles: global_base + constrained local deviation
+        with torch.no_grad():
+            global_delta_final = adv_global_style - original_global_style  # [B, 6]
+            global_delta_expanded = global_delta_final.unsqueeze(1).expand(-1, K, -1)  # [B, K, 6]
+            global_base_final = original_local_styles + global_delta_expanded  # [B, K, 6]
+            local_delta_final = adv_local_styles - original_local_styles  # [B, K, 6]
+            final_combined_styles = global_base_final + (1 - global_weight) * local_delta_final  # [B, K, 6]
+        
+        return final_combined_styles.detach()
 
     def _generate_bbox_prompts_from_gt(self, gt_masks: torch.Tensor) -> torch.Tensor:
         """

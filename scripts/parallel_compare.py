@@ -1277,7 +1277,7 @@ def main():
     
     # BNDL+AUE配置
     parser.add_argument("--bndl_aue_cfg", default="configs/sam2.1/sam2.1_hiera_b+_bndl_aue.yaml")
-    parser.add_argument("--bndl_aue_checkpoint", default="/home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_aue_017_02/checkpoints/checkpoint_4.pt")
+    parser.add_argument("--bndl_aue_checkpoint", default="/home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_aue_017_06/checkpoints/checkpoint_2.pt")
     
     # BNDL (pure)配置
     parser.add_argument("--bndl_cfg", default="configs/sam2.1/sam2.1_hiera_b+_bndl.yaml")
@@ -1319,7 +1319,7 @@ def main():
     # 版本号配置
     parser.add_argument("--sam_version", type=str, default="001_01")
     parser.add_argument("--uctta_version", type=str, default="001_01")
-    parser.add_argument("--bndl_aue_version", type=str, default="017_02")
+    parser.add_argument("--bndl_aue_version", type=str, default="017_06")
     parser.add_argument("--bndl_version", type=str, default="013_01")
     parser.add_argument("--ur_ern_version", type=str, default="001_01")
     

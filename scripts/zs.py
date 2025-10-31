@@ -618,193 +618,31 @@ def create_comprehensive_comparison_plots(
     plt.style.use("default")
     sns.set_palette("husl")
 
-    # Create comprehensive figure with better spacing
-    fig = plt.figure(figsize=(30, 22))
-    gs = fig.add_gridspec(4, 4, hspace=0.6, wspace=0.6)
+    # Compact layout: only Improvement Summary + Summary Statistics
+    fig = plt.figure(figsize=(18, 12))
+    gs = fig.add_gridspec(2, 1, hspace=0.5, wspace=0.4)
 
     # Main title
-    fig.suptitle("SAM-2 vs BNDL_AUE Zero-shot Evaluation Comparison", fontsize=20, fontweight="bold", y=0.95)
+    fig.suptitle("SAM-2 vs BNDL_AUE Zero-shot Evaluation (Compact)", fontsize=18, fontweight="bold", y=0.95)
 
-    # 1. J&F Scores Comparison (top left)
-    ax1 = fig.add_subplot(gs[0, 0])
-    x = np.arange(len(datasets))
-    width = 0.35
-
-    bars1 = ax1.bar(x - width / 2, sam2_jf, width, label="SAM-2", color="#FF6B6B", alpha=0.8)
-    bars2 = ax1.bar(x + width / 2, bndl_jf, width, label="BNDL_AUE", color="#4ECDC4", alpha=0.8)
-
-    ax1.set_title("J&F Scores Comparison", fontweight="bold", fontsize=12)
-    ax1.set_ylabel("J&F Score", fontsize=10)
-    ax1.set_xticks(x)
-    ax1.set_xticklabels(datasets, rotation=45, ha="right", fontsize=9)
-    ax1.legend(fontsize=9)
-    ax1.set_ylim(0, 100)
-    ax1.grid(True, alpha=0.3)
-
-    # Add value labels
-    for bars in [bars1, bars2]:
-        for bar in bars:
-            height = bar.get_height()
-            ax1.text(bar.get_x() + bar.get_width() / 2, height + 1, f"{height:.1f}", ha="center", va="bottom", fontsize=8)
-
-    # 2. J (IoU) Scores Comparison (top center)
-    ax2 = fig.add_subplot(gs[0, 1])
-    bars1 = ax2.bar(x - width / 2, sam2_j, width, label="SAM-2", color="#FF6B6B", alpha=0.8)
-    bars2 = ax2.bar(x + width / 2, bndl_j, width, label="BNDL_AUE", color="#4ECDC4", alpha=0.8)
-
-    ax2.set_title("J (IoU) Scores Comparison", fontweight="bold", fontsize=12)
-    ax2.set_ylabel("J (IoU) Score", fontsize=10)
-    ax2.set_xticks(x)
-    ax2.set_xticklabels(datasets, rotation=45, ha="right", fontsize=9)
-    ax2.legend(fontsize=9)
-    ax2.set_ylim(0, 100)
-    ax2.grid(True, alpha=0.3)
-
-    # Add value labels
-    for bars in [bars1, bars2]:
-        for bar in bars:
-            height = bar.get_height()
-            ax2.text(bar.get_x() + bar.get_width() / 2, height + 1, f"{height:.1f}", ha="center", va="bottom", fontsize=8)
-
-    # 3. F (Boundary) Scores Comparison (top right)
-    ax3 = fig.add_subplot(gs[0, 2])
-    bars1 = ax3.bar(x - width / 2, sam2_f, width, label="SAM-2", color="#FF6B6B", alpha=0.8)
-    bars2 = ax3.bar(x + width / 2, bndl_f, width, label="BNDL_AUE", color="#4ECDC4", alpha=0.8)
-
-    ax3.set_title("F (Boundary) Scores Comparison", fontweight="bold", fontsize=12)
-    ax3.set_ylabel("F (Boundary) Score", fontsize=10)
-    ax3.set_xticks(x)
-    ax3.set_xticklabels(datasets, rotation=45, ha="right", fontsize=9)
-    ax3.legend(fontsize=9)
-    ax3.set_ylim(0, 100)
-    ax3.grid(True, alpha=0.3)
-
-    # Add value labels
-    for bars in [bars1, bars2]:
-        for bar in bars:
-            height = bar.get_height()
-            ax3.text(bar.get_x() + bar.get_width() / 2, height + 1, f"{height:.1f}", ha="center", va="bottom", fontsize=8)
-
-    # 4. Improvement Summary (top far right)
-    ax4 = fig.add_subplot(gs[0, 3])
+    # Improvement Summary (top)
+    ax4 = fig.add_subplot(gs[0, 0])
     improvement_data = [jf_improvements, j_improvements, f_improvements]
     improvement_labels = ["J&F", "J (IoU)", "F (Boundary)"]
-
-    # Create grouped bar chart for improvements
     x_imp = np.arange(len(datasets))
     width_imp = 0.25
-
     for i, (data, label) in enumerate(zip(improvement_data, improvement_labels, strict=True)):
-        ax4.bar(x_imp + i * width_imp, data, width_imp, label=label, alpha=0.8)
-
-    ax4.set_title("Improvement Summary", fontweight="bold", fontsize=12)
-    ax4.set_ylabel("Improvement (BNDL_AUE - SAM-2)", fontsize=10)
+        ax4.bar(x_imp + i * width_imp, data, width_imp, label=label, alpha=0.85)
+    ax4.set_title("Improvement Summary", fontweight="bold", fontsize=14)
+    ax4.set_ylabel("Improvement (BNDL_AUE - SAM-2)", fontsize=11)
     ax4.set_xticks(x_imp + width_imp)
-    ax4.set_xticklabels(datasets, rotation=45, ha="right", fontsize=9)
-    ax4.legend(fontsize=9)
+    ax4.set_xticklabels(datasets, rotation=45, ha="right", fontsize=10)
+    ax4.legend(fontsize=10)
     ax4.axhline(y=0, color="black", linestyle="-", alpha=0.3)
     ax4.grid(True, alpha=0.3)
 
-    # 5. Heatmap Comparison (middle row, spanning 2 columns)
-    ax5 = fig.add_subplot(gs[1, :2])
-    heatmap_data = np.array([sam2_jf, bndl_jf, sam2_j, bndl_j, sam2_f, bndl_f])
-
-    im = ax5.imshow(heatmap_data, cmap="RdYlGn", aspect="auto", vmin=0, vmax=100)
-
-    ax5.set_xticks(range(len(datasets)))
-    ax5.set_xticklabels(datasets, rotation=45, ha="right", fontsize=9)
-    ax5.set_yticks(range(6))
-    ax5.set_yticklabels(["SAM-2 J&F", "BNDL_AUE J&F", "SAM-2 J", "BNDL_AUE J", "SAM-2 F", "BNDL_AUE F"], fontsize=9)
-    ax5.set_title("Performance Heatmap Comparison", fontweight="bold", fontsize=12)
-
-    # Add text annotations
-    for i in range(6):
-        for j in range(len(datasets)):
-            ax5.text(j, i, f"{heatmap_data[i, j]:.1f}", ha="center", va="center", color="black", fontweight="bold", fontsize=8)
-
-    plt.colorbar(im, ax=ax5, label="Score", fraction=0.046, pad=0.04)
-
-    # 6. Detailed Metrics Breakdown (middle right, spanning 2 columns)
-    ax6 = fig.add_subplot(gs[1, 2:])
-    sns.barplot(data=df, x="Dataset", y="Score", hue="Method", ax=ax6)
-    ax6.set_title("Detailed Metrics Breakdown", fontweight="bold", fontsize=12)
-    ax6.set_ylabel("Score", fontsize=10)
-    ax6.set_ylim(0, 100)
-    ax6.grid(True, alpha=0.3)
-
-    # Rotate x-axis labels and adjust legend
-    for label in ax6.get_xticklabels():
-        label.set_rotation(45)
-        label.set_horizontalalignment("right")
-        label.set_fontsize(9)
-
-    # Adjust legend
-    ax6.legend(fontsize=9, loc="upper right")
-
-    # 7. BNDL_AUE Lambda Statistics (bottom left)
-    if bndl_statistics:
-        ax7 = fig.add_subplot(gs[2, 0])
-
-        # Extract BNDL_AUE statistics for plotting
-        lambda_data = []
-
-        for dataset, stats in bndl_statistics.items():
-            if stats:
-                # Get lambda values
-                lambda_keys = [k for k in stats if "lambda_pixel" in k]
-                if lambda_keys:
-                    lambda_values = [stats[k] for k in lambda_keys if isinstance(stats[k], int | float)]
-                    if lambda_values:
-                        lambda_data.extend([(dataset, v) for v in lambda_values])
-
-        if lambda_data:
-            lambda_df = pd.DataFrame(lambda_data)
-            lambda_df.columns = ["Dataset", "Lambda"]
-            sns.boxplot(data=lambda_df, x="Dataset", y="Lambda", ax=ax7)
-            ax7.set_title("BNDL_AUE Lambda (λ) Distribution", fontweight="bold", fontsize=10)
-            ax7.set_ylabel("Lambda Value", fontsize=9)
-            for label in ax7.get_xticklabels():
-                label.set_rotation(45)
-                label.set_horizontalalignment("right")
-                label.set_fontsize(8)
-            ax7.grid(True, alpha=0.3)
-        else:
-            ax7.text(0.5, 0.5, "No Lambda Data", ha="center", va="center", transform=ax7.transAxes, fontsize=9)
-            ax7.set_title("BNDL_AUE Lambda (λ)", fontweight="bold", fontsize=10)
-
-    # 8. BNDL_AUE K Statistics (bottom center-left)
-    if bndl_statistics:
-        ax8 = fig.add_subplot(gs[2, 1])
-
-        # Extract BNDL_AUE statistics for plotting
-        k_data = []
-
-        for dataset, stats in bndl_statistics.items():
-            if stats:
-                # Get k values
-                k_keys = [k for k in stats if "k_pixel" in k]
-                if k_keys:
-                    k_values = [stats[k] for k in k_keys if isinstance(stats[k], int | float)]
-                    if k_values:
-                        k_data.extend([(dataset, v) for v in k_values])
-
-        if k_data:
-            k_df = pd.DataFrame(k_data)
-            k_df.columns = ["Dataset", "K"]
-            sns.boxplot(data=k_df, x="Dataset", y="K", ax=ax8)
-            ax8.set_title("BNDL_AUE K Distribution", fontweight="bold", fontsize=10)
-            ax8.set_ylabel("K Value", fontsize=9)
-            for label in ax8.get_xticklabels():
-                label.set_rotation(45)
-                label.set_horizontalalignment("right")
-                label.set_fontsize(8)
-            ax8.grid(True, alpha=0.3)
-        else:
-            ax8.text(0.5, 0.5, "No K Data", ha="center", va="center", transform=ax8.transAxes, fontsize=9)
-            ax8.set_title("BNDL_AUE K", fontweight="bold", fontsize=10)
-
-    # 9. Summary Statistics Table (bottom right)
-    ax9 = fig.add_subplot(gs[2, 2:])
+    # Summary Statistics (bottom)
+    ax9 = fig.add_subplot(gs[1, 0])
     ax9.axis("off")
 
     # Create summary table

@@ -215,6 +215,73 @@ class SAM2Train(SAM2Base):
         # Prepare mask or point inputs on initial conditioning frames
         backbone_out["mask_inputs_per_frame"] = {}  # {frame_idx: <input_masks>}
         backbone_out["point_inputs_per_frame"] = {}  # {frame_idx: <input_points>}
+        
+        # Construct multi-object masks grouped by (frame, video) for AUE
+        # ============================================================
+        # LOCAL CONTROL: Toggle background mask support
+        # ============================================================
+        # Set ENABLE_BACKGROUND_MASK = True to include background as 11th object
+        # Set ENABLE_BACKGROUND_MASK = False for objects-only (K=10)
+        # 
+        # When enabled:
+        #   - K = 11 (10 objects + 1 background)
+        #   - Background = 1 - union(all objects)
+        #   - Background participates in style attack
+        #   - Visualization shows green dashed bbox for background
+        # ============================================================
+        ENABLE_BACKGROUND_MASK = False
+        
+        max_num_objects = 11 if ENABLE_BACKGROUND_MASK else 10
+        num_videos = input.num_videos
+        H_mask, W_mask = input.masks.shape[-2:]
+        
+        # Initialize: [T, B_videos, K, H, W]
+        mask_all_objs_for_aue = torch.zeros(
+            num_frames, num_videos, max_num_objects, H_mask, W_mask,
+            dtype=input.masks.dtype, 
+            device=input.masks.device
+        )
+        num_objs_per_video_frame = torch.zeros(
+            num_frames, num_videos, 
+            dtype=torch.int32, 
+            device=input.masks.device
+        )
+        
+        # Fill in masks for each (frame, video)
+        for t in range(num_frames):
+            frame_masks = input.masks[t]  # [O_t, H, W]
+            frame_obj_to_img = input.obj_to_frame_idx[t]  # [O_t, 2]
+            
+            for video_idx in range(num_videos):
+                obj_mask = (frame_obj_to_img[:, 1] == video_idx)
+                obj_indices = obj_mask.nonzero(as_tuple=True)[0]
+                K_actual = len(obj_indices)
+                
+                if K_actual > 0:
+                    video_frame_masks = frame_masks[obj_indices]
+                    
+                    if ENABLE_BACKGROUND_MASK:
+                        # Reserve 1 slot for background
+                        K_store = min(K_actual, max_num_objects - 1)
+                        mask_all_objs_for_aue[t, video_idx, :K_store] = video_frame_masks[:K_store]
+                        
+                        # Compute and store background mask at index K_store
+                        union_mask = video_frame_masks[:K_store].sum(dim=0).clamp(0, 1)
+                        background_mask = 1.0 - union_mask
+                        mask_all_objs_for_aue[t, video_idx, K_store] = background_mask
+                        
+                        # Total count = objects + background
+                        num_objs_per_video_frame[t, video_idx] = K_store + 1
+                    else:
+                        # No background: use all available slots for objects
+                        K_store = min(K_actual, max_num_objects)
+                        mask_all_objs_for_aue[t, video_idx, :K_store] = video_frame_masks[:K_store]
+                        
+                        # Total count = objects only
+                        num_objs_per_video_frame[t, video_idx] = K_store
+        
+        backbone_out["mask_all_objs_for_aue"] = mask_all_objs_for_aue
+        backbone_out["num_objs_per_video_frame"] = num_objs_per_video_frame
         for t in init_cond_frames:
             if not use_pt_input:
                 backbone_out["mask_inputs_per_frame"][t] = gt_masks_per_frame[t]
@@ -287,6 +354,10 @@ class SAM2Train(SAM2Base):
             "non_cond_frame_outputs": {},  # dict containing {frame_idx: <out>}
         }
         for stage_id in processing_order:
+            # Save current frame's object mapping information (for track_step)
+            self._current_obj_to_frame_idx = input.obj_to_frame_idx[stage_id]  # [O_t, 2]
+            self._current_backbone_out = backbone_out  # Save backbone_out reference
+            
             # Get the image features for the current frames
             # img_ids = input.find_inputs[stage_id].img_ids
             img_ids = input.flat_obj_to_img_idx[stage_id]
@@ -373,6 +444,44 @@ class SAM2Train(SAM2Base):
     ):
         if frames_to_add_correction_pt is None:
             frames_to_add_correction_pt = []
+        
+        # Construct multi-object masks: [O_t, K, H, W]
+        # Use multi-object masks if available, otherwise use single-object gt_masks
+        # ============================================================
+        # CONTROL: Toggle multi-object style attack
+        # ============================================================
+        # Set USE_MULTI_OBJECT_AUE = True to attack with all objects in the video
+        # Set USE_MULTI_OBJECT_AUE = False to attack only the current loss object
+        # ============================================================
+        USE_MULTI_OBJECT_AUE = False
+        
+        pixel_gt_for_aue = gt_masks
+        if USE_MULTI_OBJECT_AUE and gt_masks is not None and hasattr(self, '_current_backbone_out'):
+            backbone_out = self._current_backbone_out
+            if "mask_all_objs_for_aue" in backbone_out:
+                mask_all_objs = backbone_out["mask_all_objs_for_aue"][frame_idx]  # [B_videos, K, H, W]
+                num_objs = backbone_out["num_objs_per_video_frame"][frame_idx]    # [B_videos]
+                obj_to_frame = self._current_obj_to_frame_idx  # [O_t, 2]
+                
+                # For each object, construct all object masks from its video
+                O_t = len(obj_to_frame)
+                K = mask_all_objs.shape[1]
+                H, W = mask_all_objs.shape[2:]
+                
+                multi_obj_masks = torch.zeros(
+                    O_t, K, H, W,
+                    dtype=mask_all_objs.dtype,
+                    device=mask_all_objs.device
+                )
+                
+                for i in range(O_t):
+                    video_idx = obj_to_frame[i, 1].item()
+                    K_actual = num_objs[video_idx].item()
+                    multi_obj_masks[i, :K_actual] = mask_all_objs[video_idx, :K_actual]
+                
+                # Use multi-object masks
+                pixel_gt_for_aue = multi_obj_masks
+        
         current_out, sam_outputs, high_res_features, pix_feat = self._track_step(
             frame_idx,
             is_init_cond_frame,
@@ -385,7 +494,7 @@ class SAM2Train(SAM2Base):
             num_frames,
             track_in_reverse,
             prev_sam_mask_logits,
-            pixel_gt_for_aue=gt_masks,
+            pixel_gt_for_aue=pixel_gt_for_aue,
             current_img_batch=current_img_batch,
         )
 
@@ -446,6 +555,7 @@ class SAM2Train(SAM2Base):
                 object_score_logits,
                 current_out,
                 img_batch_for_aue=current_img_batch,
+                pixel_gt_for_aue=pixel_gt_for_aue,
             )
             (
                 _,
@@ -491,6 +601,7 @@ class SAM2Train(SAM2Base):
         object_score_logits,
         current_out,
         img_batch_for_aue=None,
+        pixel_gt_for_aue=None,
     ):
 
         assert gt_masks is not None
@@ -534,7 +645,7 @@ class SAM2Train(SAM2Base):
                     mask_inputs=mask_inputs,
                     high_res_features=high_res_features,
                     multimask_output=multimask_output,
-                    pixel_gt_for_aue=gt_masks,
+                    pixel_gt_for_aue=pixel_gt_for_aue,
                     img_batch_for_style_aue=img_batch_for_aue,
                     use_reentrant=False,
                 )
@@ -545,7 +656,7 @@ class SAM2Train(SAM2Base):
                     mask_inputs=mask_inputs,
                     high_res_features=high_res_features,
                     multimask_output=multimask_output,
-                    pixel_gt_for_aue=gt_masks,
+                    pixel_gt_for_aue=pixel_gt_for_aue,
                     img_batch_for_style_aue=img_batch_for_aue,
                 )
 

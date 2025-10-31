@@ -1206,8 +1206,6 @@ class Trainer:
 
     def _log_style_aue_visualization(self, outputs, step):
         """Log Style AUE visualization: original vs adversarial images with style statistics"""
-        logging.info(f"_log_style_aue_visualization called at step {step}")
-        
         # Normalize outputs to an iterable
         if isinstance(outputs, dict):
             outputs_iter = [outputs]
@@ -1222,26 +1220,19 @@ class Trainer:
                     if aux is not None and isinstance(aux, dict):
                         bndl_outputs = aux.get("bndl", None)
                         if bndl_outputs is not None:
-                            logging.info(f"bndl_outputs keys: {list(bndl_outputs.keys())}")
                             if "aue_loss_dict" in bndl_outputs:
                                 aue_loss_dict = bndl_outputs["aue_loss_dict"]
-                                logging.info(f"aue_loss_dict keys: {list(aue_loss_dict.keys())}")
                                 vis_data = aue_loss_dict.get("style_aue_visualization", None)
-                                
-                                has_images = vis_data and 'original_images' in vis_data if vis_data else False
-                                logging.info(
-                                    f"Found vis_data: {vis_data is not None}, "
-                                    f"type: {type(vis_data) if vis_data is not None else 'None'}, "
-                                    f"has images: {has_images}"
-                                )
                                 
                                 if vis_data and "original_images" in vis_data and "adversarial_images" in vis_data:
                                     original_imgs = vis_data["original_images"]  # [N, 3, H, W], normalized
                                     adv_imgs = vis_data["adversarial_images"]      # [N, 3, H, W], normalized
                                     
-                                    # Extract bbox and GT masks if available
-                                    bboxes = vis_data.get("bboxes", None)  # [N, 4] format: [x1, y1, x2, y2]
-                                    gt_masks = vis_data.get("gt_masks", None)  # [N, 1, H, W]
+                                    # Check if we have multi-object masks
+                                    all_object_masks = vis_data.get("all_object_masks", None)  # [N, K, H, W]
+                                    all_bboxes = vis_data.get("all_bboxes", None)  # [N, K, 4]
+                                    combined_mask = vis_data.get("combined_mask_for_loss", None)  # [N, 1, H, W]
+                                    num_objects = vis_data.get("num_objects", 1)
                                     
                                     # Extract style statistics for visualization
                                     from sam2.modeling.style_utils import extract_style_statistics
@@ -1259,14 +1250,28 @@ class Trainer:
                                     original_denorm = torch.clamp(original_denorm, 0, 1)
                                     adv_denorm = torch.clamp(adv_denorm, 0, 1)
                                     
-                                    # Log each sample with style statistics overlay
-                                    num_samples = min(3, original_denorm.shape[0])  # Limit to 3 samples
+                                    # Log each sample with unified visualization (auto-detects single vs multi-object)
+                                    num_samples = min(1, original_denorm.shape[0])  # Limit to 1 sample (reduced to improve performance)
+                                    
+                                    # Extract legacy single-object format if needed
+                                    bboxes = vis_data.get("bboxes", None)  # [N, 4] format: [x1, y1, x2, y2]
+                                    gt_masks = vis_data.get("gt_masks", None)  # [N, 1, H, W]
+                                    
+                                    # Extract area ratios and epsilon weights if available
+                                    all_area_ratios = vis_data.get("area_ratios", None)  # [N, K]
+                                    all_epsilon_weights = vis_data.get("epsilon_weights", None)  # [N, K]
+                                    
                                     for i in range(num_samples):
-                                        # Extract bbox for this sample if available
-                                        bbox_i = bboxes[i] if bboxes is not None else None
-                                        gt_mask_i = gt_masks[i] if gt_masks is not None else None
+                                        # Prepare parameters for unified visualization
+                                        single_bbox = bboxes[i] if bboxes is not None else None
+                                        single_mask = gt_masks[i] if gt_masks is not None else None
+                                        multi_bboxes = all_bboxes[i] if all_bboxes is not None else None
+                                        multi_masks = all_object_masks[i] if all_object_masks is not None else None
+                                        loss_mask = combined_mask[i, 0] if combined_mask is not None else None
+                                        sample_area_ratios = all_area_ratios[i] if all_area_ratios is not None else None
+                                        sample_epsilon_weights = all_epsilon_weights[i] if all_epsilon_weights is not None else None
                                         
-                                        # Create visualization with style statistics
+                                        # Unified visualization call (auto-detects mode)
                                         self._log_style_statistics_overlay(
                                             original_denorm[i],
                                             adv_denorm[i],
@@ -1274,75 +1279,17 @@ class Trainer:
                                             adv_styles[i],
                                             i,
                                             step,
-                                            bbox=bbox_i,
-                                            gt_mask=gt_mask_i
+                                            bbox=single_bbox,
+                                            gt_mask=single_mask,
+                                            all_bboxes=multi_bboxes,
+                                            all_masks=multi_masks,
+                                            combined_mask=loss_mask,
+                                            area_ratios=sample_area_ratios,
+                                            epsilon_weights=sample_epsilon_weights
                                         )
                                     
-                                    # Also log separately
-                                    if num_samples > 0 and self.logger.tb_logger and self.logger.tb_logger._writer:
-                                        self.logger.tb_logger._writer.add_image(
-                                            "StyleAUE/original_images",
-                                            torch.cat([original_denorm[i] for i in range(num_samples)], dim=2),
-                                            step
-                                        )
-                                        self.logger.tb_logger._writer.add_image(
-                                            "StyleAUE/adversarial_images",
-                                            torch.cat([adv_denorm[i] for i in range(num_samples)], dim=2),
-                                            step
-                                        )
-                                        
-                                        # Also log images with bbox overlay for easy comparison
-                                        if bboxes is not None:
-                                            import matplotlib.pyplot as plt
-                                            import matplotlib.patches as patches
-                                            import numpy as np
-                                            
-                                            for i in range(num_samples):
-                                                # Create side-by-side comparison with bbox
-                                                fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
-                                                
-                                                # Original with bbox
-                                                orig_np = original_denorm[i].cpu().numpy().transpose(1, 2, 0)
-                                                ax1.imshow(orig_np)
-                                                ax1.set_title('Original Image', fontsize=14, fontweight='bold')
-                                                ax1.axis('off')
-                                                
-                                                bbox_np = bboxes[i].cpu().numpy()
-                                                x1, y1, x2, y2 = bbox_np
-                                                rect1 = patches.Rectangle(
-                                                    (x1, y1), x2 - x1, y2 - y1,
-                                                    linewidth=3, edgecolor='red', facecolor='none'
-                                                )
-                                                ax1.add_patch(rect1)
-                                                
-                                                # Adversarial with bbox
-                                                adv_np = adv_denorm[i].cpu().numpy().transpose(1, 2, 0)
-                                                ax2.imshow(adv_np)
-                                                ax2.set_title('Adversarial Image (ε=5.0)', fontsize=14, fontweight='bold')
-                                                ax2.axis('off')
-                                                
-                                                rect2 = patches.Rectangle(
-                                                    (x1, y1), x2 - x1, y2 - y1,
-                                                    linewidth=3, edgecolor='lime', facecolor='none'
-                                                )
-                                                ax2.add_patch(rect2)
-                                                
-                                                plt.tight_layout()
-                                                
-                                                # Convert to tensor and log
-                                                fig.canvas.draw()
-                                                width, height = fig.canvas.get_width_height()
-                                                img_array = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
-                                                img_array = img_array.reshape(height, width, 4)[:, :, :3]
-                                                img_tensor = torch.from_numpy(img_array).permute(2, 0, 1).float() / 255.0
-                                                
-                                                self.logger.tb_logger._writer.add_image(
-                                                    f"StyleAUE/bbox_comparison_sample_{i}",
-                                                    img_tensor,
-                                                    step
-                                                )
-                                                
-                                                plt.close(fig)
+                                    # Note: Removed extra logging of original_images, adversarial_images, and bbox_comparison
+                                    # to reduce matplotlib rendering overhead. Only multi_object_sample visualization is kept.
                                     
                                     # Log style perturbation magnitude
                                     style_diff = (adv_styles - original_styles).abs().mean(dim=0)  # [6]
@@ -1351,8 +1298,10 @@ class Trainer:
                                 
                                 return  # Only log once
     
-    def _log_style_statistics_overlay(self, original_img, adv_img, original_style, adv_style, sample_id, step, bbox=None, gt_mask=None):
-        """Create visualization with style statistics overlaid on images
+    def _log_style_statistics_overlay(self, original_img, adv_img, original_style, adv_style, sample_id, step, 
+                                       bbox=None, gt_mask=None, all_bboxes=None, all_masks=None, combined_mask=None,
+                                       area_ratios=None, epsilon_weights=None):
+        """Create visualization with style statistics overlaid on images (supports both single and multi-object)
         
         Args:
             original_img: [3, H, W] original image tensor
@@ -1361,12 +1310,21 @@ class Trainer:
             adv_style: [6] adversarial style statistics
             sample_id: sample index
             step: training step
-            bbox: [4] bounding box in [x1, y1, x2, y2] format (optional)
-            gt_mask: [1, H, W] or [H, W] ground truth mask (optional)
+            bbox: [4] single bbox (for single-object mode, optional)
+            gt_mask: [1, H, W] or [H, W] single mask (for single-object mode, optional)
+            all_bboxes: [K, 4] all bboxes (for multi-object mode, optional)
+            all_masks: [K, H, W] all masks (for multi-object mode, optional)
+            combined_mask: [H, W] combined mask for loss (for multi-object mode, optional)
+            area_ratios: [K] area ratio for each object (for multi-object mode, optional)
+            epsilon_weights: [K] epsilon weight for each object (for multi-object mode, optional)
         """
         import matplotlib.pyplot as plt
         import matplotlib.patches as patches
+        import matplotlib.cm as cm
         import numpy as np
+        
+        # Detect if multi-object mode
+        is_multi_object = all_masks is not None and all_masks.shape[0] > 1
         
         # Convert tensors to numpy
         orig_np = original_img.cpu().numpy().transpose(1, 2, 0)  # [H, W, 3]
@@ -1374,94 +1332,259 @@ class Trainer:
         orig_style_np = original_style.cpu().numpy()  # [6]
         adv_style_np = adv_style.cpu().numpy()
         
-        # Create figure with images and style statistics
-        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-        
-        # Row 1: Original image and its styles
-        axes[0, 0].imshow(orig_np)
-        axes[0, 0].set_title('Original Image', fontsize=12, fontweight='bold')
-        axes[0, 0].axis('off')
-        
-        # Draw bbox on original image if available
-        if bbox is not None:
-            bbox_np = bbox.cpu().numpy() if hasattr(bbox, 'cpu') else bbox
-            x1, y1, x2, y2 = bbox_np
-            rect = patches.Rectangle(
-                (x1, y1), x2 - x1, y2 - y1,
-                linewidth=3, edgecolor='red', facecolor='none', linestyle='-'
-            )
-            axes[0, 0].add_patch(rect)
-            axes[0, 0].text(
-                x1, y1 - 5, 'Attack Region',
-                color='red', fontsize=10, fontweight='bold',
-                bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.7)
-            )
-        
-        # Original style - means
-        axes[0, 1].bar(['R', 'G', 'B'], orig_style_np[:3], color=['red', 'green', 'blue'], alpha=0.7)
-        axes[0, 1].set_title('Original Mean (per channel)', fontsize=10)
-        axes[0, 1].set_ylabel('Mean Value')
-        axes[0, 1].set_ylim([orig_style_np[:3].min() - 0.1, orig_style_np[:3].max() + 0.1])
-        axes[0, 1].grid(True, alpha=0.3)
-        
-        # Original style - stds
-        axes[0, 2].bar(['R', 'G', 'B'], orig_style_np[3:], color=['red', 'green', 'blue'], alpha=0.7)
-        axes[0, 2].set_title('Original Std (per channel)', fontsize=10)
-        axes[0, 2].set_ylabel('Std Value')
-        axes[0, 2].set_ylim([orig_style_np[3:].min() - 0.05, orig_style_np[3:].max() + 0.05])
-        axes[0, 2].grid(True, alpha=0.3)
-        
-        # Row 2: Adversarial image and its styles
-        axes[1, 0].imshow(adv_np)
-        axes[1, 0].set_title('Adversarial Image (Style-Augmented)', fontsize=12, fontweight='bold')
-        axes[1, 0].axis('off')
-        
-        # Draw bbox on adversarial image if available
-        if bbox is not None:
-            bbox_np = bbox.cpu().numpy() if hasattr(bbox, 'cpu') else bbox
-            x1, y1, x2, y2 = bbox_np
-            rect = patches.Rectangle(
-                (x1, y1), x2 - x1, y2 - y1,
-                linewidth=3, edgecolor='lime', facecolor='none', linestyle='-'
-            )
-            axes[1, 0].add_patch(rect)
-            axes[1, 0].text(
-                x1, y1 - 5, 'Attack Region (Styled)',
-                color='lime', fontsize=10, fontweight='bold',
-                bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.7)
-            )
-        
-        # Adversarial style - means
-        axes[1, 1].bar(['R', 'G', 'B'], adv_style_np[:3], color=['red', 'green', 'blue'], alpha=0.7)
-        axes[1, 1].set_title('Adversarial Mean (per channel)', fontsize=10)
-        axes[1, 1].set_ylabel('Mean Value')
-        axes[1, 1].set_ylim([adv_style_np[:3].min() - 0.1, adv_style_np[:3].max() + 0.1])
-        axes[1, 1].grid(True, alpha=0.3)
-        
-        # Adversarial style - stds
-        axes[1, 2].bar(['R', 'G', 'B'], adv_style_np[3:], color=['red', 'green', 'blue'], alpha=0.7)
-        axes[1, 2].set_title('Adversarial Std (per channel)', fontsize=10)
-        axes[1, 2].set_ylabel('Std Value')
-        axes[1, 2].set_ylim([adv_style_np[3:].min() - 0.05, adv_style_np[3:].max() + 0.05])
-        axes[1, 2].grid(True, alpha=0.3)
+        if is_multi_object:
+            # Multi-object visualization with 2x3 layout
+            K = all_masks.shape[0]
+            H, W = all_masks.shape[1:]
+            
+            # Define distinct colors for each object (non-primary: blue, primary for loss: red)
+            colors = cm.get_cmap('tab10', K)
+            object_colors = [colors(i)[:3] for i in range(K)]
+            
+            fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+            
+            # Top-left: Original with all object bboxes (NO mask overlay)
+            axes[0, 0].imshow(orig_np)
+            axes[0, 0].set_title(f'Original Image (Sample {sample_id})', fontsize=12, fontweight='bold')
+            axes[0, 0].axis('off')
+            
+            # Determine which object is used for loss (first non-empty one)
+            primary_obj_idx = 0
+            for k in range(K):
+                mask_k = all_masks[k].cpu().numpy()
+                if mask_k.sum() > 0:
+                    primary_obj_idx = k
+                    break
+            
+            for k in range(K):
+                mask_k = all_masks[k].cpu().numpy()
+                if mask_k.sum() == 0:
+                    continue
+                
+                # Check if this is background mask (last slot in K)
+                is_background = (k == K - 1 and mask_k.sum() > 0)
+                
+                # NO mask overlay - only bboxes
+                
+                # Draw bbox
+                if all_bboxes is not None:
+                    bbox_k = all_bboxes[k].cpu().numpy()
+                    x1, y1, x2, y2 = bbox_k
+                    if x2 > x1 and y2 > y1:
+                        # Get epsilon weight if available (simplified label)
+                        eps_info = ""
+                        if epsilon_weights is not None:
+                            eps_weight = epsilon_weights[k].item()
+                            eps_info = f" ε{eps_weight:.2f}"
+                        
+                        if is_background:
+                            # Background: green dashed bbox
+                            edge_color = 'lime'
+                            linewidth = 2
+                            linestyle = '--'
+                            label = f'BG{eps_info}'
+                            label_color = 'lime'
+                        elif k == primary_obj_idx:
+                            # Primary object (for loss): RED, thick
+                            edge_color = 'red'
+                            linewidth = 4
+                            linestyle = '-'
+                            label = f'O{k+1}*{eps_info}'
+                            label_color = 'red'
+                        else:
+                            # Other objects: cyan, thin
+                            edge_color = 'cyan'
+                            linewidth = 2
+                            linestyle = '-'
+                            label = f'O{k+1}{eps_info}'
+                            label_color = 'cyan'
+                        
+                        rect = patches.Rectangle(
+                            (x1, y1), x2 - x1, y2 - y1,
+                            linewidth=linewidth, edgecolor=edge_color, 
+                            facecolor='none', linestyle=linestyle
+                        )
+                        axes[0, 0].add_patch(rect)
+                        axes[0, 0].text(
+                            x1, y1 - 5, label,
+                            color=label_color, fontsize=9, fontweight='bold',
+                            bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.8)
+                        )
+            
+            # Top-middle: Original style stats
+            axes[0, 1].bar(['R', 'G', 'B'], orig_style_np[:3], color=['red', 'green', 'blue'], alpha=0.7)
+            axes[0, 1].set_title('Original Mean', fontsize=10)
+            axes[0, 1].set_ylabel('Mean Value')
+            axes[0, 1].set_ylim([orig_style_np[:3].min() - 0.1, orig_style_np[:3].max() + 0.1])
+            axes[0, 1].grid(True, alpha=0.3)
+            
+            axes[0, 2].bar(['R', 'G', 'B'], orig_style_np[3:], color=['red', 'green', 'blue'], alpha=0.7)
+            axes[0, 2].set_title('Original Std', fontsize=10)
+            axes[0, 2].set_ylabel('Std Value')
+            axes[0, 2].set_ylim([orig_style_np[3:].min() - 0.05, orig_style_np[3:].max() + 0.05])
+            axes[0, 2].grid(True, alpha=0.3)
+            
+            # Bottom-left: Adversarial with all object bboxes (NO mask overlay)
+            axes[1, 0].imshow(adv_np)
+            axes[1, 0].set_title('Adversarial (Multi-Object Style)', fontsize=12, fontweight='bold')
+            axes[1, 0].axis('off')
+            
+            for k in range(K):
+                mask_k = all_masks[k].cpu().numpy()
+                if mask_k.sum() == 0:
+                    continue
+                
+                # Check if this is background mask (last slot in K)
+                is_background = (k == K - 1 and mask_k.sum() > 0)
+                
+                # NO mask overlay - only bboxes
+                
+                if all_bboxes is not None:
+                    bbox_k = all_bboxes[k].cpu().numpy()
+                    x1, y1, x2, y2 = bbox_k
+                    if x2 > x1 and y2 > y1:
+                        # Get epsilon weight if available (simplified label)
+                        eps_info = ""
+                        if epsilon_weights is not None:
+                            eps_weight = epsilon_weights[k].item()
+                            eps_info = f" ε{eps_weight:.2f}"
+                        
+                        if is_background:
+                            # Background: green dashed bbox
+                            edge_color = 'lime'
+                            linewidth = 2
+                            linestyle = '--'
+                            label = f'BG{eps_info}'
+                            label_color = 'lime'
+                        elif k == primary_obj_idx:
+                            # Primary object (for loss): RED, thick
+                            edge_color = 'red'
+                            linewidth = 4
+                            linestyle = '-'
+                            label = f'O{k+1}*{eps_info}'
+                            label_color = 'red'
+                        else:
+                            # Other objects: cyan, thin
+                            edge_color = 'cyan'
+                            linewidth = 2
+                            linestyle = '-'
+                            label = f'O{k+1}{eps_info}'
+                            label_color = 'cyan'
+                        
+                        rect = patches.Rectangle(
+                            (x1, y1), x2 - x1, y2 - y1,
+                            linewidth=linewidth, edgecolor=edge_color, 
+                            facecolor='none', linestyle=linestyle
+                        )
+                        axes[1, 0].add_patch(rect)
+                        axes[1, 0].text(
+                            x1, y1 - 5, label,
+                            color=label_color, fontsize=9, fontweight='bold',
+                            bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.8)
+                        )
+            
+            # Bottom-middle & right: Adversarial style stats
+            axes[1, 1].bar(['R', 'G', 'B'], adv_style_np[:3], color=['red', 'green', 'blue'], alpha=0.7)
+            axes[1, 1].set_title('Adversarial Mean', fontsize=10)
+            axes[1, 1].set_ylabel('Mean Value')
+            axes[1, 1].set_ylim([adv_style_np[:3].min() - 0.1, adv_style_np[:3].max() + 0.1])
+            axes[1, 1].grid(True, alpha=0.3)
+            
+            axes[1, 2].bar(['R', 'G', 'B'], adv_style_np[3:], color=['red', 'green', 'blue'], alpha=0.7)
+            axes[1, 2].set_title('Adversarial Std', fontsize=10)
+            axes[1, 2].set_ylabel('Std Value')
+            axes[1, 2].set_ylim([adv_style_np[3:].min() - 0.05, adv_style_np[3:].max() + 0.05])
+            axes[1, 2].grid(True, alpha=0.3)
+            
+            # Add overall title
+            fig.suptitle(f'Multi-Object Style Attack ({K} objects)', fontsize=14, fontweight='bold')
+            
+        else:
+            # Single-object visualization (original 2x3 layout)
+            fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+            
+            # Row 1: Original image and its styles
+            axes[0, 0].imshow(orig_np)
+            axes[0, 0].set_title('Original Image', fontsize=12, fontweight='bold')
+            axes[0, 0].axis('off')
+            
+            # Draw bbox on original image if available
+            if bbox is not None:
+                bbox_np = bbox.cpu().numpy() if hasattr(bbox, 'cpu') else bbox
+                x1, y1, x2, y2 = bbox_np
+                rect = patches.Rectangle(
+                    (x1, y1), x2 - x1, y2 - y1,
+                    linewidth=3, edgecolor='red', facecolor='none', linestyle='-'
+                )
+                axes[0, 0].add_patch(rect)
+                axes[0, 0].text(
+                    x1, y1 - 5, 'Attack Region',
+                    color='red', fontsize=10, fontweight='bold',
+                    bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.7)
+                )
+            
+            # Original style - means
+            axes[0, 1].bar(['R', 'G', 'B'], orig_style_np[:3], color=['red', 'green', 'blue'], alpha=0.7)
+            axes[0, 1].set_title('Original Mean (per channel)', fontsize=10)
+            axes[0, 1].set_ylabel('Mean Value')
+            axes[0, 1].set_ylim([orig_style_np[:3].min() - 0.1, orig_style_np[:3].max() + 0.1])
+            axes[0, 1].grid(True, alpha=0.3)
+            
+            # Original style - stds
+            axes[0, 2].bar(['R', 'G', 'B'], orig_style_np[3:], color=['red', 'green', 'blue'], alpha=0.7)
+            axes[0, 2].set_title('Original Std (per channel)', fontsize=10)
+            axes[0, 2].set_ylabel('Std Value')
+            axes[0, 2].set_ylim([orig_style_np[3:].min() - 0.05, orig_style_np[3:].max() + 0.05])
+            axes[0, 2].grid(True, alpha=0.3)
+            
+            # Row 2: Adversarial image and its styles
+            axes[1, 0].imshow(adv_np)
+            axes[1, 0].set_title('Adversarial Image (Style-Augmented)', fontsize=12, fontweight='bold')
+            axes[1, 0].axis('off')
+            
+            # Draw bbox on adversarial image if available
+            if bbox is not None:
+                bbox_np = bbox.cpu().numpy() if hasattr(bbox, 'cpu') else bbox
+                x1, y1, x2, y2 = bbox_np
+                rect = patches.Rectangle(
+                    (x1, y1), x2 - x1, y2 - y1,
+                    linewidth=3, edgecolor='lime', facecolor='none', linestyle='-'
+                )
+                axes[1, 0].add_patch(rect)
+                axes[1, 0].text(
+                    x1, y1 - 5, 'Attack Region (Styled)',
+                    color='lime', fontsize=10, fontweight='bold',
+                    bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.7)
+                )
+            
+            # Adversarial style - means
+            axes[1, 1].bar(['R', 'G', 'B'], adv_style_np[:3], color=['red', 'green', 'blue'], alpha=0.7)
+            axes[1, 1].set_title('Adversarial Mean (per channel)', fontsize=10)
+            axes[1, 1].set_ylabel('Mean Value')
+            axes[1, 1].set_ylim([adv_style_np[:3].min() - 0.1, adv_style_np[:3].max() + 0.1])
+            axes[1, 1].grid(True, alpha=0.3)
+            
+            # Adversarial style - stds
+            axes[1, 2].bar(['R', 'G', 'B'], adv_style_np[3:], color=['red', 'green', 'blue'], alpha=0.7)
+            axes[1, 2].set_title('Adversarial Std (per channel)', fontsize=10)
+            axes[1, 2].set_ylabel('Std Value')
+            axes[1, 2].set_ylim([adv_style_np[3:].min() - 0.05, adv_style_np[3:].max() + 0.05])
+            axes[1, 2].grid(True, alpha=0.3)
         
         plt.tight_layout()
         
         # Convert figure to image and log
         fig.canvas.draw()
-        # Use buffer_rgba() for newer matplotlib versions
         width, height = fig.canvas.get_width_height()
         img_array = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
-        img_array = img_array.reshape(height, width, 4)  # RGBA format
-        img_array = img_array[:, :, :3]  # Convert RGBA to RGB by dropping alpha channel
-        
-        # Convert to torch tensor [3, H, W] and normalize to [0, 1]
+        img_array = img_array.reshape(height, width, 4)[:, :, :3]
         img_tensor = torch.from_numpy(img_array).permute(2, 0, 1).float() / 255.0
         
-        # Log to TensorBoard using the underlying writer
+        # Log to TensorBoard
         if self.logger.tb_logger and self.logger.tb_logger._writer:
+            tag_suffix = "multi_object" if is_multi_object else "single_object"
             self.logger.tb_logger._writer.add_image(
-                f"StyleAUE/sample_{sample_id}_with_statistics",
+                f"StyleAUE/{tag_suffix}_sample_{sample_id}",
                 img_tensor,
                 step
             )

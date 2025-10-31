@@ -47,73 +47,79 @@ def extract_gt_region_style(
     min_pixels: int = 100
 ) -> torch.Tensor:
     """
-    Extract style statistics only from GT (ground truth) region.
+    Extract style statistics from GT (ground truth) regions (supports multi-object).
     
     For small GT regions (< min_pixels), falls back to global statistics
     for numerical stability.
     
     Args:
         images: [B, 3, H, W] normalized RGB images
-        gt_masks: [B, 1, H, W] or [B, H, W] binary ground truth masks
+        gt_masks: [B, K, H, W] ground truth masks for K objects
         min_pixels: minimum pixel count for stable statistics (default: 100)
     
     Returns:
-        styles: [B, 6] tensor (3 channel means + 3 channel stds from GT region)
+        styles: [B, K, 6] style statistics (3 means + 3 stds) per object
     """
-    B, C, H, W = images.shape
+    B, C, H_img, W_img = images.shape
     assert C == 3, f"Only RGB images supported, got {C} channels"
     
-    # Ensure mask is [B, 1, H, W]
+    # Ensure mask is [B, K, H, W]
     if gt_masks.ndim == 3:
         gt_masks = gt_masks.unsqueeze(1)  # [B, H, W] -> [B, 1, H, W]
-    elif gt_masks.shape[1] != 1:
-        gt_masks = gt_masks[:, :1]  # Take first channel only
+    
+    B_mask, K, H_mask, W_mask = gt_masks.shape
+    assert B == B_mask, f"Batch size mismatch: images {B}, masks {B_mask}"
     
     # Resize mask to image size if needed
-    if gt_masks.shape[2:] != (H, W):
+    if (H_mask, W_mask) != (H_img, W_img):
         gt_masks = torch.nn.functional.interpolate(
             gt_masks.float(), 
-            size=(H, W), 
+            size=(H_img, W_img), 
             mode='nearest'
         )
     
-    # Expand mask to 3 channels [B, 3, H, W]
-    mask_3ch = gt_masks.expand(-1, 3, -1, -1).float()
+    # Expand images to match mask: [B, 3, H, W] → [B, K, 3, H, W]
+    images_expanded = images.unsqueeze(1).expand(-1, K, -1, -1, -1)
     
-    # Count valid pixels per channel
-    pixel_count = mask_3ch.sum(dim=[2, 3])  # [B, 3]
+    # Expand masks to 3 channels: [B, K, H, W] → [B, K, 3, H, W]
+    mask_3ch = gt_masks.unsqueeze(2).expand(-1, -1, 3, -1, -1).float()
     
-    # Identify samples with too-small GT regions
-    too_small = (pixel_count < min_pixels).any(dim=1)  # [B]
+    # Count valid pixels per object per channel: [B, K, 3]
+    pixel_count = mask_3ch.sum(dim=[3, 4])
     
-    # Fallback: compute global statistics for comparison
-    global_styles = None
+    # Compute mean: [B, K, 3]
+    masked_sum = (images_expanded * mask_3ch).sum(dim=[3, 4])
+    mean = masked_sum / (pixel_count + 1e-8)
+    
+    # Compute std: [B, K, 3]
+    mean_expanded = mean.unsqueeze(-1).unsqueeze(-1)  # [B, K, 3, 1, 1]
+    centered = (images_expanded - mean_expanded) * mask_3ch
+    variance = (centered ** 2).sum(dim=[3, 4]) / (pixel_count + 1e-8)
+    std = torch.sqrt(variance + 1e-8)
+    
+    # Concatenate: [B, K, 6]
+    styles = torch.cat([mean, std], dim=2)
+    
+    # Fallback for too-small regions: use global statistics
+    too_small = (pixel_count < min_pixels).any(dim=2)  # [B, K]
     if too_small.any():
+        # Compute global statistics: [B, 6]
         global_styles = extract_style_statistics(images)
-    
-    # Compute mean: sum(masked_images) / pixel_count
-    masked_sum = (images * mask_3ch).sum(dim=[2, 3])  # [B, 3]
-    mean = masked_sum / (pixel_count + 1e-8)  # [B, 3]
-    
-    # Compute std: sqrt(sum((x - mean)^2) / pixel_count)
-    mean_expanded = mean.unsqueeze(-1).unsqueeze(-1)  # [B, 3, 1, 1]
-    centered = (images - mean_expanded) * mask_3ch
-    variance = (centered ** 2).sum(dim=[2, 3]) / (pixel_count + 1e-8)
-    std = torch.sqrt(variance + 1e-8)  # [B, 3]
-    
-    # Combine mean and std
-    local_styles = torch.cat([mean, std], dim=1)  # [B, 6]
-    
-    # Replace samples with too-small GT regions with global statistics
-    if too_small.any():
-        local_styles[too_small] = global_styles[too_small]
+        # Expand to [B, K, 6]
+        global_styles_expanded = global_styles.unsqueeze(1).expand(-1, K, -1)
+        # Replace small regions
+        styles = torch.where(
+            too_small.unsqueeze(-1),  # [B, K, 1]
+            global_styles_expanded,
+            styles
+        )
         num_fallback = too_small.sum().item()
         logging.debug(
-            f"GT region style extraction: {num_fallback}/{B} samples "
+            f"GT region style extraction: {num_fallback}/{B*K} objects "
             f"fell back to global statistics (GT region < {min_pixels} pixels)"
         )
     
-    return local_styles
+    return styles  # [B, K, 6]
 
 
 class AdaIN(nn.Module):
