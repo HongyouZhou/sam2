@@ -224,6 +224,26 @@ class MaskDecoder(nn.Module):
         high_res_features: Optional[List[torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Predicts masks. See 'forward' for more details."""
+        # Diagnostic: check all inputs at entry
+        import logging
+        if not torch.isfinite(image_embeddings).all():
+            num_nan = (~torch.isfinite(image_embeddings)).sum().item()
+            logging.error(f"[MaskDecoder] INPUT image_embeddings contains {num_nan}/{image_embeddings.numel()} NaN/Inf!")
+        if not torch.isfinite(image_pe).all():
+            num_nan = (~torch.isfinite(image_pe)).sum().item()
+            logging.error(f"[MaskDecoder] INPUT image_pe contains {num_nan}/{image_pe.numel()} NaN/Inf!")
+        if not torch.isfinite(sparse_prompt_embeddings).all():
+            num_nan = (~torch.isfinite(sparse_prompt_embeddings)).sum().item()
+            logging.error(f"[MaskDecoder] INPUT sparse_prompt_embeddings contains {num_nan}/{sparse_prompt_embeddings.numel()} NaN/Inf!")
+        if not torch.isfinite(dense_prompt_embeddings).all():
+            num_nan = (~torch.isfinite(dense_prompt_embeddings)).sum().item()
+            logging.error(f"[MaskDecoder] INPUT dense_prompt_embeddings contains {num_nan}/{dense_prompt_embeddings.numel()} NaN/Inf!")
+        if high_res_features is not None:
+            for i, feat in enumerate(high_res_features):
+                if not torch.isfinite(feat).all():
+                    num_nan = (~torch.isfinite(feat)).sum().item()
+                    logging.error(f"[MaskDecoder] INPUT high_res_features[{i}] contains {num_nan}/{feat.numel()} NaN/Inf!")
+        
         # Concatenate output tokens
         s = 0
         if self.pred_obj_scores:
@@ -252,6 +272,20 @@ class MaskDecoder(nn.Module):
         pos_src = torch.repeat_interleave(image_pe, tokens.shape[0], dim=0)
         b, c, h, w = src.shape
 
+        # Diagnostic: check inputs before transformer
+        if not torch.isfinite(src).all():
+            import logging
+            num_nan = (~torch.isfinite(src)).sum().item()
+            logging.error(f"[MaskDecoder] src (BEFORE transformer) contains {num_nan}/{src.numel()} NaN/Inf!")
+        if not torch.isfinite(pos_src).all():
+            import logging
+            num_nan = (~torch.isfinite(pos_src)).sum().item()
+            logging.error(f"[MaskDecoder] pos_src (BEFORE transformer) contains {num_nan}/{pos_src.numel()} NaN/Inf!")
+        if not torch.isfinite(tokens).all():
+            import logging
+            num_nan = (~torch.isfinite(tokens)).sum().item()
+            logging.error(f"[MaskDecoder] tokens (BEFORE transformer) contains {num_nan}/{tokens.numel()} NaN/Inf!")
+        
         # Run the transformer
         hs, src = self.transformer(src, pos_src, tokens)
         iou_token_out = hs[:, s, :]
@@ -259,11 +293,29 @@ class MaskDecoder(nn.Module):
 
         # Upscale mask embeddings and predict masks using the mask tokens
         src = src.transpose(1, 2).view(b, c, h, w)
+        
+        # Diagnostic: check src after transformer
+        if not torch.isfinite(src).all():
+            import logging
+            num_nan = (~torch.isfinite(src)).sum().item()
+            logging.error(f"[MaskDecoder] src (AFTER transformer) contains {num_nan}/{src.numel()} NaN/Inf!")
+        
         if not self.use_high_res_features:
             upscaled_embedding = self.output_upscaling(src)
         else:
             dc1, ln1, act1, dc2, act2 = self.output_upscaling
             feat_s0, feat_s1 = high_res_features
+            
+            # Diagnostic: check high_res_features
+            if not torch.isfinite(feat_s0).all():
+                import logging
+                num_nan = (~torch.isfinite(feat_s0)).sum().item()
+                logging.error(f"[MaskDecoder] feat_s0 (high_res) contains {num_nan}/{feat_s0.numel()} NaN/Inf!")
+            if not torch.isfinite(feat_s1).all():
+                import logging
+                num_nan = (~torch.isfinite(feat_s1)).sum().item()
+                logging.error(f"[MaskDecoder] feat_s1 (high_res) contains {num_nan}/{feat_s1.numel()} NaN/Inf!")
+            
             upscaled_embedding = act1(ln1(dc1(src) + feat_s1))
             upscaled_embedding = act2(dc2(upscaled_embedding) + feat_s0)
 
@@ -279,6 +331,15 @@ class MaskDecoder(nn.Module):
         masks = masks_sam
 
         if self.use_bndl_for_pixels:
+            # Diagnostic: check upscaled_embedding before passing to BNDL
+            if not torch.isfinite(upscaled_embedding).all():
+                import logging
+                num_nan = (~torch.isfinite(upscaled_embedding)).sum().item()
+                logging.error(f"[MaskDecoder] upscaled_embedding contains {num_nan}/{upscaled_embedding.numel()} NaN/Inf before BNDL!")
+                if torch.isfinite(upscaled_embedding).any():
+                    finite_vals = upscaled_embedding[torch.isfinite(upscaled_embedding)]
+                    logging.error(f"[MaskDecoder] Finite upscaled_embedding stats: min={finite_vals.min():.6e}, max={finite_vals.max():.6e}")
+            
             pixel_feat = upscaled_embedding.permute(0, 2, 3, 1)  # [B, C, H, W] -> [B, H, W, C]
 
             masks_bndl_raw, z_out, wei_lambda, inv_k, out_w, wei_lambda_w, inv_k_w = self.pixel_bndl(

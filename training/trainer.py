@@ -161,20 +161,6 @@ class LoggingConf:
     correlation_use_full_image: bool = True  # Use full image statistics (True, default) or foreground only (False)
 
 
-@dataclass
-class AlternatingBackwardConf:
-    enabled: bool = False
-    ddp_no_sync: bool = True
-    symmetric_average: bool = True  # 0.5 per phase
-    include_adv_seg: bool = False  # reserved; not used initially
-    sample_adv_every: int = 1  # reserved; not used initially
-
-
-@dataclass
-class TrainStrategyConf:
-    alternating_backward: AlternatingBackwardConf = field(default_factory=AlternatingBackwardConf)
-
-
 class Trainer:
     """
     Trainer supporting the DDP training strategies.
@@ -201,7 +187,7 @@ class Trainer:
         optim_overrides: Optional[List[Dict[str, Any]]] = None,
         meters: Optional[Dict[str, Any]] = None,
         loss: Optional[Dict[str, Any]] = None,
-        train_strategy: Optional[Dict[str, Any]] = None,
+        actual_max_epochs: Optional[int] = None,  # New: actual epochs to train (if different from max_epochs for lr scheduling)
     ):
         self._setup_env_variables(env_variables)
         self._setup_timers()
@@ -211,6 +197,7 @@ class Trainer:
         self.logging_conf = LoggingConf(**logging)
         self.checkpoint_conf = CheckpointConf(**checkpoint).infer_missing()
         self.max_epochs = max_epochs
+        self.actual_max_epochs = actual_max_epochs if actual_max_epochs is not None else max_epochs
         self.mode = mode
         self.val_epoch_freq = val_epoch_freq
         self.optim_conf = OptimConf(**optim) if optim is not None else None
@@ -218,7 +205,6 @@ class Trainer:
         self.loss_conf = loss
         distributed = DistributedConf(**distributed or {})
         cuda = CudaConf(**cuda or {})
-        self.train_strategy = TrainStrategyConf(**(train_strategy or {}))
         self.where = 0.0
 
         self._infer_distributed_backend_if_none(distributed, accelerator)
@@ -461,7 +447,7 @@ class Trainer:
             self.train_dataset.load_checkpoint_state(checkpoint["train_dataset"])
 
     def is_intermediate_val_epoch(self, epoch):
-        return epoch % self.val_epoch_freq == 0 and epoch < self.max_epochs - 1
+        return epoch % self.val_epoch_freq == 0 and epoch < self.actual_max_epochs - 1
 
     def _step(
         self,
@@ -511,8 +497,9 @@ class Trainer:
                 # Log BNDL statistics for both train and val
                 self._log_bndl_statistics(bndl_outputs, self.steps[phase], phase)
         
-        # Log Style AUE visualization if available and enabled
+        # Log Style AUE visualization if available and enabled (only on rank 0)
         if (phase == "train" and 
+            self.distributed_rank == 0 and
             getattr(self.logging_conf, 'visualize_style_aue', False) and
             hasattr(_model, 'use_style_aug') and _model.use_style_aug and
             _model._enable_style_visualization):
@@ -576,7 +563,7 @@ class Trainer:
             self.train_dataset = instantiate(self.data_conf.train)
 
     def run_train(self):
-        while self.epoch < self.max_epochs:
+        while self.epoch < self.actual_max_epochs:
             dataloader = self.train_dataset.get_loader(epoch=int(self.epoch))
             barrier()
             outs = self.train_epoch(dataloader)
@@ -1005,12 +992,12 @@ class Trainer:
 
     def _log_timers(self, phase):
         time_remaining = 0
-        epochs_remaining = self.max_epochs - self.epoch - 1
-        val_epochs_remaining = sum(n % self.val_epoch_freq == 0 for n in range(self.epoch, self.max_epochs))
+        epochs_remaining = self.actual_max_epochs - self.epoch - 1
+        val_epochs_remaining = sum(n % self.val_epoch_freq == 0 for n in range(self.epoch, self.actual_max_epochs))
 
         # Adding the guaranteed val run at the end if val_epoch_freq doesn't coincide with
         # the end epoch.
-        if (self.max_epochs - 1) % self.val_epoch_freq != 0:
+        if (self.actual_max_epochs - 1) % self.val_epoch_freq != 0:
             val_epochs_remaining += 1
 
         # Remove the current val run from estimate
@@ -1206,104 +1193,118 @@ class Trainer:
 
     def _log_style_aue_visualization(self, outputs, step):
         """Log Style AUE visualization: original vs adversarial images with style statistics"""
-        # Normalize outputs to an iterable
-        if isinstance(outputs, dict):
-            outputs_iter = [outputs]
-        else:
-            outputs_iter = outputs
-        
         # Extract visualization data from outputs
+        vis_data = self._extract_vis_data_from_outputs(outputs)
+        if vis_data is None:
+            return
+        
+        # Denormalize images and extract style statistics
+        original_imgs = vis_data["original_images"]  # [N, 3, H, W]
+        adv_imgs = vis_data["adversarial_images"]
+        
+        from sam2.modeling.style_utils import extract_style_statistics
+        original_styles = extract_style_statistics(original_imgs)  # [N, 6]
+        adv_styles = extract_style_statistics(adv_imgs)
+        
+        original_denorm = self._denormalize_images(original_imgs)
+        adv_denorm = self._denormalize_images(adv_imgs)
+        
+        # Visualize first sample only (for performance)
+        self._visualize_single_sample(
+            original_denorm[0],
+            adv_denorm[0],
+            original_styles[0],
+            adv_styles[0],
+            vis_data,
+            sample_idx=0,
+            step=step
+        )
+        
+        # Log style perturbation statistics
+        self._log_style_perturbations(original_styles, adv_styles, step)
+        
+        # Log GCN parameters if available
+        self._log_gcn_parameters(step)
+    
+    def _extract_vis_data_from_outputs(self, outputs):
+        """Extract visualization data from model outputs."""
+        outputs_iter = [outputs] if isinstance(outputs, dict) else outputs
+        
         for outs in outputs_iter:
-            if "multistep_aux_outputs" in outs:
-                aux_list = outs["multistep_aux_outputs"]
-                for aux in reversed(aux_list):
-                    if aux is not None and isinstance(aux, dict):
-                        bndl_outputs = aux.get("bndl", None)
-                        if bndl_outputs is not None:
-                            if "aue_loss_dict" in bndl_outputs:
-                                aue_loss_dict = bndl_outputs["aue_loss_dict"]
-                                vis_data = aue_loss_dict.get("style_aue_visualization", None)
-                                
-                                if vis_data and "original_images" in vis_data and "adversarial_images" in vis_data:
-                                    original_imgs = vis_data["original_images"]  # [N, 3, H, W], normalized
-                                    adv_imgs = vis_data["adversarial_images"]      # [N, 3, H, W], normalized
-                                    
-                                    # Check if we have multi-object masks
-                                    all_object_masks = vis_data.get("all_object_masks", None)  # [N, K, H, W]
-                                    all_bboxes = vis_data.get("all_bboxes", None)  # [N, K, 4]
-                                    combined_mask = vis_data.get("combined_mask_for_loss", None)  # [N, 1, H, W]
-                                    num_objects = vis_data.get("num_objects", 1)
-                                    
-                                    # Extract style statistics for visualization
-                                    from sam2.modeling.style_utils import extract_style_statistics
-                                    original_styles = extract_style_statistics(original_imgs)  # [N, 6]
-                                    adv_styles = extract_style_statistics(adv_imgs)  # [N, 6]
-                                    
-                                    # Denormalize images for visualization (ImageNet normalization)
-                                    mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
-                                    std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
-                                    
-                                    original_denorm = original_imgs * std + mean
-                                    adv_denorm = adv_imgs * std + mean
-                                    
-                                    # Clamp to [0, 1]
-                                    original_denorm = torch.clamp(original_denorm, 0, 1)
-                                    adv_denorm = torch.clamp(adv_denorm, 0, 1)
-                                    
-                                    # Log each sample with unified visualization (auto-detects single vs multi-object)
-                                    num_samples = min(1, original_denorm.shape[0])  # Limit to 1 sample (reduced to improve performance)
-                                    
-                                    # Extract legacy single-object format if needed
-                                    bboxes = vis_data.get("bboxes", None)  # [N, 4] format: [x1, y1, x2, y2]
-                                    gt_masks = vis_data.get("gt_masks", None)  # [N, 1, H, W]
-                                    
-                                    # Extract area ratios and epsilon weights if available
-                                    all_area_ratios = vis_data.get("area_ratios", None)  # [N, K]
-                                    all_epsilon_weights = vis_data.get("epsilon_weights", None)  # [N, K]
-                                    
-                                    for i in range(num_samples):
-                                        # Prepare parameters for unified visualization
-                                        single_bbox = bboxes[i] if bboxes is not None else None
-                                        single_mask = gt_masks[i] if gt_masks is not None else None
-                                        multi_bboxes = all_bboxes[i] if all_bboxes is not None else None
-                                        multi_masks = all_object_masks[i] if all_object_masks is not None else None
-                                        loss_mask = combined_mask[i, 0] if combined_mask is not None else None
-                                        sample_area_ratios = all_area_ratios[i] if all_area_ratios is not None else None
-                                        sample_epsilon_weights = all_epsilon_weights[i] if all_epsilon_weights is not None else None
-                                        
-                                        # Unified visualization call (auto-detects mode)
-                                        self._log_style_statistics_overlay(
-                                            original_denorm[i],
-                                            adv_denorm[i],
-                                            original_styles[i],
-                                            adv_styles[i],
-                                            i,
-                                            step,
-                                            bbox=single_bbox,
-                                            gt_mask=single_mask,
-                                            all_bboxes=multi_bboxes,
-                                            all_masks=multi_masks,
-                                            combined_mask=loss_mask,
-                                            area_ratios=sample_area_ratios,
-                                            epsilon_weights=sample_epsilon_weights
-                                        )
-                                    
-                                    # Note: Removed extra logging of original_images, adversarial_images, and bbox_comparison
-                                    # to reduce matplotlib rendering overhead. Only multi_object_sample visualization is kept.
-                                    
-                                    # Log style perturbation magnitude
-                                    style_diff = (adv_styles - original_styles).abs().mean(dim=0)  # [6]
-                                    for j, channel in enumerate(['R_mean', 'G_mean', 'B_mean', 'R_std', 'G_std', 'B_std']):
-                                        self.logger.log(f"StyleAUE/perturbation_{channel}", style_diff[j].item(), step)
-                                    
-                                    # Log GCN alpha values if GCN is enabled
-                                    model = self.model.module if hasattr(self.model, 'module') else self.model
-                                    if hasattr(model, 'style_gcn') and model.style_gcn is not None:
-                                        for layer_idx, alpha in enumerate(model.style_gcn.alphas):
-                                            alpha_val = torch.sigmoid(alpha).item()
-                                            self.logger.log(f"GCN/alpha_layer_{layer_idx}", alpha_val, step)
-                                
-                                return  # Only log once
+            if "multistep_aux_outputs" not in outs:
+                continue
+            
+            aux_list = outs["multistep_aux_outputs"]
+            for aux in reversed(aux_list):
+                if aux is None or not isinstance(aux, dict):
+                    continue
+                
+                bndl_outputs = aux.get("bndl", None)
+                if bndl_outputs is None or "aue_loss_dict" not in bndl_outputs:
+                    continue
+                
+                aue_loss_dict = bndl_outputs["aue_loss_dict"]
+                vis_data = aue_loss_dict.get("style_aue_visualization", None)
+                
+                if vis_data and "original_images" in vis_data and "adversarial_images" in vis_data:
+                    return vis_data
+        
+        return None
+    
+    def _denormalize_images(self, images):
+        """Denormalize images from ImageNet normalization."""
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        denorm = images * std + mean
+        return torch.clamp(denorm, 0, 1)
+    
+    def _visualize_single_sample(self, original_img, adv_img, original_style, adv_style, vis_data, sample_idx, step):
+        """Visualize a single sample with multi-object support."""
+        # Extract multi-object data from vis_data
+        all_bboxes = vis_data.get("all_bboxes", None)  # [N, K, 4]
+        all_masks = vis_data.get("all_object_masks", None)  # [N, K, H, W]
+        combined_mask = vis_data.get("combined_mask_for_loss", None)  # [N, 1, H, W]
+        area_ratios = vis_data.get("area_ratios", None)  # [N, K]
+        epsilon_weights = vis_data.get("epsilon_weights", None)  # [N, K]
+        
+        # Extract data for this sample
+        sample_bboxes = all_bboxes[sample_idx] if all_bboxes is not None else None
+        sample_masks = all_masks[sample_idx] if all_masks is not None else None
+        sample_combined_mask = combined_mask[sample_idx, 0] if combined_mask is not None else None
+        sample_area_ratios = area_ratios[sample_idx] if area_ratios is not None else None
+        sample_epsilon_weights = epsilon_weights[sample_idx] if epsilon_weights is not None else None
+        
+        # Call unified visualization
+        self._log_style_statistics_overlay(
+            original_img,
+            adv_img,
+            original_style,
+            adv_style,
+            sample_idx,
+            step,
+            bbox=None,  # Legacy single-object, not used
+            gt_mask=None,  # Legacy single-object, not used
+            all_bboxes=sample_bboxes,
+            all_masks=sample_masks,
+            combined_mask=sample_combined_mask,
+            area_ratios=sample_area_ratios,
+            epsilon_weights=sample_epsilon_weights
+        )
+    
+    def _log_style_perturbations(self, original_styles, adv_styles, step):
+        """Log style perturbation statistics."""
+        style_diff = (adv_styles - original_styles).abs().mean(dim=0)  # [6]
+        channels = ['R_mean', 'G_mean', 'B_mean', 'R_std', 'G_std', 'B_std']
+        for j, channel in enumerate(channels):
+            self.logger.log(f"StyleAUE/perturbation_{channel}", style_diff[j].item(), step)
+    
+    def _log_gcn_parameters(self, step):
+        """Log GCN alpha parameters if GCN is enabled."""
+        model = self.model.module if hasattr(self.model, 'module') else self.model
+        if hasattr(model, 'style_gcn') and model.style_gcn is not None:
+            for layer_idx, alpha in enumerate(model.style_gcn.alphas):
+                alpha_val = torch.sigmoid(alpha).item()
+                self.logger.log(f"GCN/alpha_layer_{layer_idx}", alpha_val, step)
     
     def _log_style_statistics_overlay(self, original_img, adv_img, original_style, adv_style, sample_id, step, 
                                        bbox=None, gt_mask=None, all_bboxes=None, all_masks=None, combined_mask=None,

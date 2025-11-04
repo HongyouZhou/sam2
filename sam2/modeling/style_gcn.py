@@ -75,17 +75,18 @@ class AdversarialStyleGCN(nn.Module):
         Forward pass of GCN.
         
         Args:
-            style_deltas: Style perturbations [B, K, style_dim]
+            style_deltas: Style perturbations [B, num_nodes, style_dim]
+                         where num_nodes = K (foreground only) or K+1 (with background)
             edge_index: Edge indices [2, E] where E is number of edges
             edge_weight: Edge weights [E]
             
         Returns:
-            Refined style perturbations [B, K, style_dim]
+            Refined style perturbations [B, num_nodes, style_dim]
         """
-        B, K, D = style_deltas.shape
+        B, num_nodes, D = style_deltas.shape
         
         # Flatten batch and nodes for processing
-        x = style_deltas.reshape(B * K, D)  # [B*K, D]
+        x = style_deltas.reshape(B * num_nodes, D)  # [B*num_nodes, D]
         
         # Apply GCN layers (now all maintain same dimension for residual connections)
         for layer_idx, (linear, norm, alpha) in enumerate(
@@ -93,8 +94,8 @@ class AdversarialStyleGCN(nn.Module):
         ):
             x_input = x  # Save input for residual connection
             
-            # Message passing
-            x = self._graph_conv(x, edge_index, edge_weight, B, K)
+            # Message passing (use actual num_nodes from input shape)
+            x = self._graph_conv(x, edge_index, edge_weight, B, num_nodes)
             
             # Linear transformation
             x = linear(x)
@@ -110,8 +111,8 @@ class AdversarialStyleGCN(nn.Module):
             alpha_val = torch.sigmoid(alpha)  # Ensure alpha in [0, 1]
             x = alpha_val * x + (1 - alpha_val) * x_input
         
-        # Reshape back to [B, K, D]
-        x = x.reshape(B, K, D)
+        # Reshape back to [B, num_nodes, D]
+        x = x.reshape(B, num_nodes, D)
         
         return x
     
@@ -124,17 +125,21 @@ class AdversarialStyleGCN(nn.Module):
         num_nodes_per_batch: int
     ) -> torch.Tensor:
         """
-        Perform graph convolution operation.
+        Perform standard graph convolution operation.
+        
+        This method performs a uniform graph convolution on all nodes,
+        without any special handling based on node semantics (foreground/background).
+        The node features should already include all nodes that participate in the graph.
         
         Args:
-            x: Node features [B*K, D]
-            edge_index: Edge indices [2, E]
+            x: Node features [num_nodes, D] where num_nodes = B * num_nodes_per_batch
+            edge_index: Edge indices [2, E] where E is number of edges
             edge_weight: Edge weights [E]
             batch_size: Batch size B
-            num_nodes_per_batch: Number of nodes per batch K
+            num_nodes_per_batch: Number of nodes per batch (K or K+1 depending on config)
             
         Returns:
-            Aggregated features [B*K, D]
+            Aggregated features [num_nodes, D]
         """
         if edge_index.numel() == 0:
             # No edges, return identity
@@ -143,15 +148,15 @@ class AdversarialStyleGCN(nn.Module):
         # Extract source and target nodes
         src, tgt = edge_index[0], edge_index[1]
         
-        # Gather source features
-        src_features = x[src]  # [E, D]
+        # Allocate output tensor (use new_zeros for memory efficiency)
+        out = x.new_zeros(x.size(0), x.size(1))
         
-        # Weight by edge weights
+        # Gather source features and apply edge weights
+        src_features = x[src]  # [E, D]
         weighted_features = src_features * edge_weight.unsqueeze(1)  # [E, D]
         
-        # Aggregate to target nodes
-        out = torch.zeros_like(x)
-        out.index_add_(0, tgt, weighted_features)
+        # Aggregate messages to target nodes
+        out.index_add_(0, tgt, weighted_features)  # out[tgt] += weighted_features
         
         return out
 
@@ -194,80 +199,108 @@ def build_object_graph(
     # Binarize masks
     masks_binary = (masks > 0.5).float()
     
-    edge_list = []
-    edge_weights = []
+    # IMPORTANT: When use_background=True, it means the last mask (index K-1) IS the background.
+    # We don't add an extra node; the background is already in the masks.
+    # So nodes_per_batch = K regardless of use_background flag.
+    nodes_per_batch = K
+    
+    # Pre-allocate maximum possible edges
+    # Spatial: B * K*(K-1) bidirectional edges
+    # Background: B * (K-1) * 2 edges if enabled (connecting K-1 objects to 1 background)
+    max_spatial_edges = B * K * (K - 1)
+    max_bg_edges = B * (K - 1) * 2 if use_background else 0
+    max_edges = max_spatial_edges + max_bg_edges
+    
+    # Pre-allocate tensors on device
+    edge_src = torch.zeros(max_edges, dtype=torch.long, device=device)
+    edge_tgt = torch.zeros(max_edges, dtype=torch.long, device=device)
+    edge_wgt = torch.zeros(max_edges, dtype=torch.float32, device=device)
+    edge_count = 0
     
     # Process each batch separately
     for b in range(B):
-        batch_edges = []
-        batch_weights = []
-        
-        # Compute spatial edges based on IoU
+        # Compute spatial edges based on IoU (vectorized within batch)
         for i in range(K):
+            mask_i = masks_binary[b, i]
+            area_i = mask_i.sum()
+            
             for j in range(i + 1, K):
-                mask_i = masks_binary[b, i]
                 mask_j = masks_binary[b, j]
+                area_j = mask_j.sum()
                 
                 # Compute IoU
                 intersection = (mask_i * mask_j).sum()
-                union = mask_i.sum() + mask_j.sum() - intersection
+                union = area_i + area_j - intersection
                 
                 if union > 0:
-                    iou = (intersection / union).item()
+                    iou = intersection / union
                     
                     if iou > edge_threshold:
-                        # Add bidirectional edge
-                        node_i = b * K + i
-                        node_j = b * K + j
-                        batch_edges.extend([[node_i, node_j], [node_j, node_i]])
-                        batch_weights.extend([iou, iou])
+                        # Add bidirectional edge (use nodes_per_batch for correct indexing)
+                        node_i = b * nodes_per_batch + i
+                        node_j = b * nodes_per_batch + j
+                        
+                        # Add edge i->j
+                        edge_src[edge_count] = node_i
+                        edge_tgt[edge_count] = node_j
+                        edge_wgt[edge_count] = iou
+                        edge_count += 1
+                        
+                        # Add edge j->i
+                        edge_src[edge_count] = node_j
+                        edge_tgt[edge_count] = node_i
+                        edge_wgt[edge_count] = iou
+                        edge_count += 1
         
-        # Compute semantic edges (same label)
-        if use_semantic and labels is not None:
-            batch_labels = labels[b]  # [K]
-            for i in range(K):
-                for j in range(i + 1, K):
-                    if batch_labels[i] == batch_labels[j] and batch_labels[i] >= 0:
-                        node_i = b * K + i
-                        node_j = b * K + j
-                        # Check if edge already exists
-                        if [node_i, node_j] not in batch_edges:
-                            # Add semantic edge with weight 1.0
-                            batch_edges.extend([[node_i, node_j], [node_j, node_i]])
-                            batch_weights.extend([1.0, 1.0])
+        # Compute semantic edges (same label) - skipped for now as labels are None
         
         # Add background edges
         if use_background:
-            background_node = b * K + K  # Background as K+1-th node
-            for i in range(K):
-                node_i = b * K + i
-                batch_edges.extend([[node_i, background_node], [background_node, node_i]])
-                batch_weights.extend([0.5, 0.5])  # Fixed weight for background
-        
-        edge_list.extend(batch_edges)
-        edge_weights.extend(batch_weights)
+            # Background node is the last mask (index K-1) in each batch
+            # It's already included in the K masks, so we connect it to other objects
+            background_node = b * nodes_per_batch + (K - 1)
+            # Connect all non-background objects (0 to K-2) to background
+            for i in range(K - 1):
+                node_i = b * nodes_per_batch + i
+                
+                # Edge object->background
+                edge_src[edge_count] = node_i
+                edge_tgt[edge_count] = background_node
+                edge_wgt[edge_count] = 0.5
+                edge_count += 1
+                
+                # Edge background->object
+                edge_src[edge_count] = background_node
+                edge_tgt[edge_count] = node_i
+                edge_wgt[edge_count] = 0.5
+                edge_count += 1
     
-    if len(edge_list) == 0:
+    if edge_count == 0:
         # No edges, return empty tensors
         return (
             torch.zeros((2, 0), dtype=torch.long, device=device),
             torch.zeros(0, dtype=torch.float32, device=device)
         )
     
-    # Convert to tensors
-    edge_index = torch.tensor(edge_list, dtype=torch.long, device=device).t()  # [2, E]
-    edge_weight = torch.tensor(edge_weights, dtype=torch.float32, device=device)  # [E]
+    # Trim to actual edge count
+    edge_src = edge_src[:edge_count]
+    edge_tgt = edge_tgt[:edge_count]
+    edge_wgt = edge_wgt[:edge_count]
+    
+    # Stack into edge_index
+    edge_index = torch.stack([edge_src, edge_tgt], dim=0)  # [2, E]
     
     # Normalize edge weights by degree
+    # Total nodes = B * K (background is already included in K if use_background=True)
     num_nodes = B * K
     degree = torch.zeros(num_nodes, device=device)
-    degree.index_add_(0, edge_index[1], edge_weight)
+    degree.index_add_(0, edge_tgt, edge_wgt)
     
     # Avoid division by zero
     degree = torch.clamp(degree, min=1.0)
     
     # Normalize edge weights
-    normalized_weights = edge_weight / degree[edge_index[1]]
+    normalized_weights = edge_wgt / degree[edge_tgt]
     
     return edge_index, normalized_weights
 

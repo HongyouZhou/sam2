@@ -625,91 +625,90 @@ def create_comprehensive_comparison_plots(
     # Main title
     fig.suptitle("SAM-2 vs BNDL_AUE Zero-shot Evaluation (Compact)", fontsize=18, fontweight="bold", y=0.95)
 
-    # Improvement Summary (top)
+    # Improvement Summary (top) - 横坐标为improvement，纵坐标为数据集
     ax4 = fig.add_subplot(gs[0, 0])
     improvement_data = [jf_improvements, j_improvements, f_improvements]
     improvement_labels = ["J&F", "J (IoU)", "F (Boundary)"]
-    x_imp = np.arange(len(datasets))
-    width_imp = 0.25
+    y_imp = np.arange(len(datasets))
+    height_imp = 0.25
+    
+    # 使用水平条形图（barh）
     for i, (data, label) in enumerate(zip(improvement_data, improvement_labels, strict=True)):
-        ax4.bar(x_imp + i * width_imp, data, width_imp, label=label, alpha=0.85)
+        ax4.barh(y_imp + i * height_imp, data, height_imp, label=label, alpha=0.85)
+    
     ax4.set_title("Improvement Summary", fontweight="bold", fontsize=14)
-    ax4.set_ylabel("Improvement (BNDL_AUE - SAM-2)", fontsize=11)
-    ax4.set_xticks(x_imp + width_imp)
-    ax4.set_xticklabels(datasets, rotation=45, ha="right", fontsize=10)
+    ax4.set_xlabel("Improvement (BNDL_AUE - SAM-2)", fontsize=11)
+    ax4.set_ylabel("Dataset", fontsize=11)
+    ax4.set_yticks(y_imp + height_imp)
+    ax4.set_yticklabels(datasets, fontsize=10)
     ax4.legend(fontsize=10)
-    ax4.axhline(y=0, color="black", linestyle="-", alpha=0.3)
-    ax4.grid(True, alpha=0.3)
+    ax4.axvline(x=0, color="black", linestyle="-", alpha=0.3)
+    ax4.grid(True, alpha=0.3, axis='x')
+    # 反转y轴顺序，使第一个数据集在顶部
+    ax4.invert_yaxis()
 
-    # Summary Statistics (bottom)
+    # Summary Statistics (bottom) - 横排为数据集，纵向为方法，只显示ΔJ&F
     ax9 = fig.add_subplot(gs[1, 0])
     ax9.axis("off")
 
-    # Create summary table
-    summary_data = []
-    # Resolve dataset types to human-readable labels
-    dataset_types = []
-    for dataset in datasets:
-        type_key = DATASET_TO_TYPE.get(dataset)
-        type_label = DATASET_TYPE_CATEGORIES.get(type_key, "Unknown") if type_key else "Unknown"
-        dataset_types.append(type_label)
-
-    for i, dataset in enumerate(datasets):
-        summary_data.append([
-            dataset,
-            dataset_types[i],
-            f"{sam2_jf[i]:.2f}",
-            f"{bndl_jf[i]:.2f}",
-            f"{jf_improvements[i]:+.2f}",
-            f"{sam2_j[i]:.2f}",
-            f"{bndl_j[i]:.2f}",
-            f"{j_improvements[i]:+.2f}",
-            f"{sam2_f[i]:.2f}",
-            f"{bndl_f[i]:.2f}",
-            f"{f_improvements[i]:+.2f}",
-        ])
-
-    # 在表格中追加平均行（不含 MOSE_train/val）
+    # Create transposed summary table (methods as rows, datasets as columns)
+    # 表头：Method + 各数据集
+    col_labels = ["Method"] + datasets
+    
+    # 添加平均列（不含MOSE）
     if averages_excl_mose:
-        summary_data.append([
-            "AVG (excl MOSE)",
-            "—",
-            f"{averages_excl_mose['sam2']['jf']:.2f}",
-            f"{averages_excl_mose['bndl']['jf']:.2f}",
-            f"{averages_excl_mose['improvements']['jf']:+.2f}",
-            f"{averages_excl_mose['sam2']['j']:.2f}",
-            f"{averages_excl_mose['bndl']['j']:.2f}",
-            f"{averages_excl_mose['improvements']['j']:+.2f}",
-            f"{averages_excl_mose['sam2']['f']:.2f}",
-            f"{averages_excl_mose['bndl']['f']:.2f}",
-            f"{averages_excl_mose['improvements']['f']:+.2f}",
-        ])
+        col_labels.append("AVG (excl MOSE)")
+    
+    # 表数据：三行（SAM-2, BNDL_AUE, Improvement）
+    summary_data = []
+    
+    # 第一行：SAM-2 J&F
+    row_sam2 = ["SAM-2 J&F"]
+    for i in range(len(datasets)):
+        row_sam2.append(f"{sam2_jf[i]:.2f}")
+    if averages_excl_mose:
+        row_sam2.append(f"{averages_excl_mose['sam2']['jf']:.2f}")
+    summary_data.append(row_sam2)
+    
+    # 第二行：BNDL_AUE J&F
+    row_bndl = ["BNDL_AUE J&F"]
+    for i in range(len(datasets)):
+        row_bndl.append(f"{bndl_jf[i]:.2f}")
+    if averages_excl_mose:
+        row_bndl.append(f"{averages_excl_mose['bndl']['jf']:.2f}")
+    summary_data.append(row_bndl)
+    
+    # 第三行：ΔJ&F (Improvement)
+    row_delta = ["ΔJ&F"]
+    for i in range(len(datasets)):
+        row_delta.append(f"{jf_improvements[i]:+.2f}")
+    if averages_excl_mose:
+        row_delta.append(f"{averages_excl_mose['improvements']['jf']:+.2f}")
+    summary_data.append(row_delta)
 
     table = ax9.table(
         cellText=summary_data, 
-        colLabels=["Dataset", "Type", "SAM-2 J&F", "BNDL_AUE J&F", "ΔJ&F", "SAM-2 J", "BNDL_AUE J", "ΔJ", "SAM-2 F", "BNDL_AUE F", "ΔF"], 
+        colLabels=col_labels, 
         cellLoc="center", 
         loc="center", 
         bbox=None
     )
     table.auto_set_font_size(False)
-    table.set_fontsize(8)
-    table.scale(1, 1.5)
+    table.set_fontsize(9)
+    table.scale(1, 2.0)
 
-    # Color code improvements
-    for i in range(1, len(summary_data) + 1):
-        for j in [4, 7, 10]:  # Improvement columns after adding Type
-            if j < len(summary_data[0]):
-                try:
-                    val = float(summary_data[i - 1][j])
-                    if val > 0:
-                        table[(i, j)].set_facecolor("#90EE90")  # Light green
-                    elif val < 0:
-                        table[(i, j)].set_facecolor("#FFB6C1")  # Light red
-                except (ValueError, IndexError):
-                    pass
+    # Color code improvements in the ΔJ&F row
+    for j in range(1, len(col_labels)):  # Skip first column (Method label)
+        try:
+            val = float(summary_data[2][j])  # Row 2 is ΔJ&F
+            if val > 0:
+                table[(3, j)].set_facecolor("#90EE90")  # Light green (row 3 because header is row 0)
+            elif val < 0:
+                table[(3, j)].set_facecolor("#FFB6C1")  # Light red
+        except (ValueError, IndexError):
+            pass
 
-    ax9.set_title("Summary Statistics", fontweight="bold", fontsize=12, pad=20)
+    ax9.set_title("Summary Statistics (ΔJ&F Focus)", fontweight="bold", fontsize=12, pad=20)
 
     # Save plots with AUE version suffix if provided
     if aue_version:

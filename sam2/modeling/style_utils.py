@@ -58,7 +58,8 @@ def extract_gt_region_style(
         min_pixels: minimum pixel count for stable statistics (default: 100)
     
     Returns:
-        styles: [B, K, 6] style statistics (3 means + 3 stds) per object
+        styles: [B, K, 6] or [B, 6] style statistics (3 means + 3 stds) per object
+                For single-object (K=1), returns [B, 6] for backward compatibility
     """
     B, C, H_img, W_img = images.shape
     assert C == 3, f"Only RGB images supported, got {C} channels"
@@ -119,7 +120,11 @@ def extract_gt_region_style(
             f"fell back to global statistics (GT region < {min_pixels} pixels)"
         )
     
-    return styles  # [B, K, 6]
+    # For single-object case (K=1), squeeze to [B, 6] for backward compatibility with eb03fdb
+    if K == 1:
+        styles = styles.squeeze(1)  # [B, 1, 6] -> [B, 6]
+    
+    return styles  # [B, K, 6] or [B, 6]
 
 
 class AdaIN(nn.Module):

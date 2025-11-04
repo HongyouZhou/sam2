@@ -9,7 +9,7 @@ scratch:
   base_lr: 5.0e-6
   vision_lr: 3.0e-06
   phases_per_epoch: 1
-  num_epochs: 6  # 减少到12个epoch，BNDL已快速收敛
+  num_epochs: 12
 
 dataset:
   # PATHS to Dataset
@@ -79,17 +79,12 @@ trainer:
   _target_: training.trainer.Trainer
   mode: train
   max_epochs: ${times:${scratch.num_epochs},${scratch.phases_per_epoch}}
+  actual_max_epochs: 4
   accelerator: cuda
   seed_value: 123
   cuda:
     allow_tf32: true
     cudnn_benchmark: true
-  train_strategy:
-    alternating_backward:
-      enabled: true          # 开关：关=完全走旧路径
-      ddp_no_sync: true      # 第一相不做 all-reduce，降通信
-      symmetric_average: true # 两相各乘 0.5，数值与单步同时优化等尺度
-      include_adv_seg: false  # 先不加 L_seg_adv
 
   model:
     _target_: training.model.sam2.SAM2Train
@@ -226,13 +221,22 @@ trainer:
     style_aug_use_gt_region_style: true  # Extract style from GT region only (new feature)
     
     # Multi-object style attack control
-    style_aug_use_multi_object: false      # true=attack with all objects in video, false=only current loss object
-    style_aug_enable_background: false     # true=include background as additional object (K+1), false=objects only
+    style_aug_use_multi_object: true       # true=attack with all objects in video, false=only current loss object
+    style_aug_enable_background: true      # true=include background as additional object (K+1), false=objects only
     
     # Global-Local Mixed Style Augmentation (NEW)
     style_aug_use_global_local_mix: false   # Enable global+local mixed style perturbation
     style_aug_global_epsilon: 1.5          # Global style perturbation budget
     style_aug_global_weight: 0.7           # Weight of global drift (0=local only, 1=global only)
+
+    # GCN-based multi-object style refinement (NEW)
+    style_aug_use_gcn: true # style_aug_use_global_local_mix=false
+    style_aug_gcn_hidden_dim: 16  # Reduced from 32 to save memory
+    style_aug_gcn_num_layers: 1  # Reduced from 2 to save memory
+    style_aug_gcn_lr_ratio: 0.1
+    style_aug_gcn_edge_threshold: 0.3
+    style_aug_gcn_use_semantic_edges: true
+    style_aug_gcn_use_background_edges: true
     
     # Patch-based MMD configuration for AUE calibration loss
     aue_use_patch_mmd: true  # Enable patch-based MMD (better local distribution matching)
@@ -512,7 +516,7 @@ trainer:
 launcher:
   num_nodes: 1
   gpus_per_node: 8
-  experiment_log_dir: /home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_aue_017_07 # Path to log directory, defaults to ./sam2_logs/${config_name}
+  experiment_log_dir: /home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_aue_017_11 # Path to log directory, defaults to ./sam2_logs/${config_name}
 
 # SLURM args if running on a cluster
 submitit:

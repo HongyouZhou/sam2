@@ -97,6 +97,10 @@ class SAM2Train(SAM2Base):
         if freeze_image_encoder:
             for p in self.image_encoder.parameters():
                 p.requires_grad = False
+            # Set backbone to eval mode to disable DropPath and other training-only behaviors
+            self.image_encoder.eval()
+            # Prevent backbone from being set back to train mode by model.train()
+            self.image_encoder.train = lambda mode=True: self.image_encoder
 
     def forward(self, input: BatchedVideoDatapoint):
         if self.training or not self.forward_backbone_per_frame_for_eval:
@@ -282,6 +286,7 @@ class SAM2Train(SAM2Base):
         
         backbone_out["mask_all_objs_for_aue"] = mask_all_objs_for_aue
         backbone_out["num_objs_per_video_frame"] = num_objs_per_video_frame
+        
         for t in init_cond_frames:
             if not use_pt_input:
                 backbone_out["mask_inputs_per_frame"][t] = gt_masks_per_frame[t]
@@ -446,17 +451,20 @@ class SAM2Train(SAM2Base):
             frames_to_add_correction_pt = []
         
         # Construct multi-object masks: [O_t, K, H, W]
-        # Use multi-object masks if available, otherwise use single-object gt_masks
+        # IMPORTANT: gt_masks should ONLY be used for prompt sampling (points/boxes)
+        # AUE should use OTHER objects' masks, not the current object's GT
         # ============================================================
         # CONTROL: Toggle multi-object style attack (from config)
         # ============================================================
         # Set style_aug_use_multi_object = True to attack with all objects in the video
-        # Set style_aug_use_multi_object = False to attack only the current loss object
+        # Set style_aug_use_multi_object = False to disable AUE (no pixel_gt_for_aue)
         # ============================================================
         USE_MULTI_OBJECT_AUE = self.style_aug_use_multi_object
         
-        pixel_gt_for_aue = gt_masks
-        if USE_MULTI_OBJECT_AUE and gt_masks is not None and hasattr(self, '_current_backbone_out'):
+        # DO NOT initialize pixel_gt_for_aue with gt_masks!
+        # gt_masks is reserved for prompt sampling only
+        pixel_gt_for_aue = None
+        if USE_MULTI_OBJECT_AUE and hasattr(self, '_current_backbone_out'):
             backbone_out = self._current_backbone_out
             if "mask_all_objs_for_aue" in backbone_out:
                 mask_all_objs = backbone_out["mask_all_objs_for_aue"][frame_idx]  # [B_videos, K, H, W]

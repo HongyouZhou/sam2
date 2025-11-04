@@ -11,6 +11,7 @@ from contextlib import nullcontext
 import torch
 import torch.nn.functional as F
 from torch.nn.init import trunc_normal_
+from torch.utils.checkpoint import checkpoint as checkpoint_fn
 
 from BNDL.BNDL_upload.ViT_Sparse.utils.bndl import (
     pixel_uncertain_sampling,
@@ -428,6 +429,96 @@ class SAM2Base(torch.nn.Module):
 
     # Image-space constraint methods removed (not needed for feature-space AUE)
 
+    def _prepare_aue_visualization_data(
+        self,
+        img_batch: torch.Tensor,
+        adv_images: torch.Tensor,
+        pixel_gt: torch.Tensor | None,
+        num_vis_samples: int,
+    ) -> dict:
+        """
+        Prepare visualization data for Style AUE multi-object training.
+        
+        This method computes all necessary visualization data from masks on-demand,
+        avoiding extra memory overhead during training. Bounding boxes, area ratios,
+        and epsilon weights are computed here only when visualization is enabled.
+        
+        Args:
+            img_batch: [B, 3, H, W] original images (normalized)
+            adv_images: [M, 3, H, W] adversarial images (normalized)
+            pixel_gt: [B, K, H, W] ground truth masks for K objects (optional)
+            num_vis_samples: number of samples to visualize
+        
+        Returns:
+            vis_data: dictionary containing visualization data with keys:
+                - original_images: [N, 3, H, W] CPU tensors
+                - adversarial_images: [N, 3, H, W] CPU tensors
+                - num_objects: int (number of objects K)
+                - all_object_masks: [N, K, H, W] CPU tensors
+                - all_bboxes: [N, K, 4] CPU tensors in (x1, y1, x2, y2) format
+                - area_ratios: [N, K] CPU tensors, area ratio for each object
+                - epsilon_weights: [N, K] CPU tensors, epsilon weights based on area
+                - combined_mask_for_loss: [N, 1, H, W] CPU tensors
+        """
+        from sam2.modeling.aue_utils import masks_to_boxes
+        
+        vis_data = {}
+        
+        # Save images (move to CPU to free GPU memory)
+        vis_data['original_images'] = img_batch[:num_vis_samples].detach().cpu()
+        vis_data['adversarial_images'] = adv_images[:num_vis_samples].detach().cpu()
+        
+        # Add multi-object visualization data (masks and bboxes)
+        if pixel_gt is not None and pixel_gt.ndim == 4:
+            K = pixel_gt.shape[1]
+            vis_data['num_objects'] = K
+            
+            # Save multi-object masks for visualization
+            vis_data['all_object_masks'] = pixel_gt[:num_vis_samples].detach().cpu()  # [N, K, H, W]
+            
+            # Compute bounding boxes from masks (lightweight operation, <1ms per sample)
+            all_bboxes_list = []
+            all_area_ratios_list = []
+            
+            for i in range(num_vis_samples):
+                sample_masks = pixel_gt[i]  # [K, H, W]
+                
+                # Compute bboxes
+                sample_bboxes = masks_to_boxes(sample_masks)  # [K, 4]
+                all_bboxes_list.append(sample_bboxes)
+                
+                # Compute area ratios for each object
+                total_pixels = sample_masks.shape[1] * sample_masks.shape[2]
+                object_areas = sample_masks.sum(dim=[1, 2])  # [K]
+                area_ratios = object_areas.float() / total_pixels  # [K]
+                all_area_ratios_list.append(area_ratios)
+            
+            vis_data['all_bboxes'] = torch.stack(all_bboxes_list).detach().cpu()  # [N, K, 4]
+            vis_data['area_ratios'] = torch.stack(all_area_ratios_list).detach().cpu()  # [N, K]
+            
+            # Compute epsilon weights based on area ratios (larger objects get higher weight)
+            # Normalize area ratios to [0.5, 1.0] range for epsilon weights
+            all_epsilon_weights_list = []
+            for area_ratios in all_area_ratios_list:
+                # Normalize: epsilon_weight = 0.5 + 0.5 * (area_ratio / max_area_ratio)
+                max_area = area_ratios.max()
+                if max_area > 0:
+                    epsilon_weights = 0.5 + 0.5 * (area_ratios / max_area)
+                else:
+                    epsilon_weights = torch.ones_like(area_ratios)
+                all_epsilon_weights_list.append(epsilon_weights)
+            
+            vis_data['epsilon_weights'] = torch.stack(all_epsilon_weights_list).detach().cpu()  # [N, K]
+            
+            # Also save the combined mask used for loss
+            if pixel_gt.shape[1] > 1:
+                combined_mask = pixel_gt.sum(dim=1, keepdim=True).clamp(0, 1)  # [B, 1, H, W]
+            else:
+                combined_mask = pixel_gt
+            vis_data['combined_mask_for_loss'] = combined_mask[:num_vis_samples].detach().cpu()
+        
+        return vis_data
+
     def compute_aue_loss(
         self,
         pixel_feat: torch.Tensor,
@@ -447,6 +538,11 @@ class SAM2Base(torch.nn.Module):
         B, H, W, _ = pixel_feat.shape
         device = pixel_feat.device
         dtype = pixel_feat.dtype
+        
+        # Early exit if no GT is available (AUE requires GT for calibration)
+        if pixel_gt is None:
+            logging.debug("AUE: No pixel_gt provided, skipping AUE loss")
+            return torch.tensor(0.0, device=device, dtype=dtype), {}
 
         # Compute positive sample ratio (strict shape checks; logits must be provided)
         if pixel_logits is None:
@@ -497,64 +593,18 @@ class SAM2Base(torch.nn.Module):
             uq_sample_num=uq_sample_num,
         )
         
-        # Store images for visualization (detached, no gradients)
+        # Prepare visualization data for Style AUE
         vis_data = {}
         enable_vis = getattr(self, '_enable_style_visualization', False)
         if adv_images is not None and enable_vis:
-            # Save first few samples for visualization
             num_vis_samples = min(4, img_batch.shape[0], adv_images.shape[0])
-            vis_data['original_images'] = img_batch[:num_vis_samples].detach().cpu()
-            vis_data['adversarial_images'] = adv_images[:num_vis_samples].detach().cpu()
-            
-            # Add multi-object mask information
-            if pixel_gt is not None:
-                # pixel_gt can be [B, K, H, W] for multi-object or [B, 1, H, W] for single object
-                # Ensure 4D format
-                if pixel_gt.ndim == 3:
-                    pixel_gt_4d = pixel_gt.unsqueeze(1)  # [B, H, W] -> [B, 1, H, W]
-                else:
-                    pixel_gt_4d = pixel_gt  # Already [B, K, H, W]
-                
-                K = pixel_gt_4d.shape[1]
-                vis_data['all_object_masks'] = pixel_gt_4d[:num_vis_samples].detach().cpu()  # [N, K, H, W]
-                
-                # Count actual non-empty masks per sample
-                non_empty_counts = []
-                for i in range(num_vis_samples):
-                    non_empty = (pixel_gt_4d[i].sum(dim=[1, 2]) > 0).sum().item()
-                    non_empty_counts.append(non_empty)
-                vis_data['num_objects'] = max(non_empty_counts) if non_empty_counts else 1
-                
-                # Generate bboxes for all objects
-                all_bboxes = []
-                for i in range(num_vis_samples):
-                    obj_bboxes = []
-                    for k in range(K):
-                        mask_k = pixel_gt_4d[i:i+1, k:k+1]  # [1, 1, H, W]
-                        if mask_k.sum() > 0:  # Only if mask is non-empty
-                            bbox_k = self._generate_bbox_prompts_from_gt(mask_k)[0]  # [4]
-                            obj_bboxes.append(bbox_k)
-                        else:
-                            # Create empty bbox on the same device as the mask
-                            obj_bboxes.append(torch.zeros(4, dtype=pixel_gt_4d.dtype, device=pixel_gt_4d.device))
-                    all_bboxes.append(torch.stack(obj_bboxes))  # [K, 4]
-                vis_data['all_bboxes'] = torch.stack(all_bboxes).detach().cpu()  # [N, K, 4]
-                
-                # The combined mask used for loss computation
-                combined_mask = pixel_gt_4d.sum(dim=1, keepdim=True).clamp(0, 1)  # [B, 1, H, W]
-                vis_data['combined_mask_for_loss'] = combined_mask[:num_vis_samples].detach().cpu()
-                
-                # Calculate and store area ratios and epsilon weights for visualization
-                H_mask, W_mask = pixel_gt_4d.shape[-2:]
-                total_pixels = H_mask * W_mask
-                pixel_counts = pixel_gt_4d[:num_vis_samples].sum(dim=[2, 3])  # [N, K]
-                area_ratios = (pixel_counts / total_pixels).detach().cpu()  # [N, K]
-                epsilon_weights = torch.sqrt(area_ratios.clamp(min=1e-6))  # [N, K]
-                
-                vis_data['area_ratios'] = area_ratios  # [N, K]
-                vis_data['epsilon_weights'] = epsilon_weights  # [N, K]
-                
-                logging.info(f"Style AUE: Saved {num_vis_samples} samples with {K} objects per sample for visualization")
+            vis_data = self._prepare_aue_visualization_data(
+                img_batch=img_batch,
+                adv_images=adv_images,
+                pixel_gt=pixel_gt,
+                num_vis_samples=num_vis_samples,
+            )
+            logging.info(f"Style AUE: Saved {num_vis_samples} samples for visualization with {vis_data.get('num_objects', 1)} objects")
         
         calibration_loss_adv = torch.tensor(0.0, device=device, dtype=dtype, requires_grad=True)
          
@@ -562,7 +612,7 @@ class SAM2Base(torch.nn.Module):
             M = adv_images.shape[0]
             
             # Forward adversarial images through image encoder and get processed features
-            adv_backbone_out = self.forward_image(adv_images)
+            adv_backbone_out = self.forward_image(adv_images, use_checkpoint=True)
             adv_backbone_feat = adv_backbone_out['backbone_fpn'][-1]  # [M, 256, 64, 64] - last FPN level
             
             # Extract high_res_features (already processed by forward_image)
@@ -625,12 +675,10 @@ class SAM2Base(torch.nn.Module):
             # Resize GT to match logits (logits are at feature map resolution)
             adv_logits_for_ratio = adv_logits_grad if adv_logits_grad is not None else adv_logits_sample
             
-            # Sanitize logits: replace NaN/Inf with safe values
+            # Diagnostic check for NaN/Inf (no sanitization - let it fail if NaN occurs)
             if not torch.isfinite(adv_logits_for_ratio).all():
                 num_nan = (~torch.isfinite(adv_logits_for_ratio)).sum().item()
-                logging.warning(f"[Style AUE] adv_logits contains {num_nan}/{adv_logits_for_ratio.numel()} NaN/Inf, sanitizing...")
-                adv_logits_for_ratio = torch.nan_to_num(adv_logits_for_ratio, nan=0.0, posinf=20.0, neginf=-20.0)
-                adv_logits_for_ratio = torch.clamp(adv_logits_for_ratio, min=-50.0, max=50.0)
+                logging.error(f"[Style AUE] adv_logits contains {num_nan}/{adv_logits_for_ratio.numel()} NaN/Inf! Computation will fail.")
             
             H_feat, W_feat = adv_logits_for_ratio.shape[1:3]
             adv_gts_resized = F.interpolate(adv_gts.unsqueeze(1).float(), size=(H_feat, W_feat), mode='nearest')
@@ -725,6 +773,7 @@ class SAM2Base(torch.nn.Module):
         )
         
         # GCN Pass 2: with gradient for training
+        # Note: delta_detached may include background perturbation if style_aug_enable_background=True
         if self.style_gcn is not None and self.training:
             delta_detached = (adv_styles - original_styles).detach().requires_grad_(True)
             edge_index, edge_weight = self._build_style_graph(pixel_gt, img_batch)
@@ -748,6 +797,17 @@ class SAM2Base(torch.nn.Module):
             adv_images = adv_images[indices]
             adv_gts = adv_gts[indices]
             adv_prompts = adv_prompts[indices]
+            # Also sample style statistics for visualization
+            original_styles_sampled = original_styles[indices] if original_styles.ndim > 1 else original_styles
+            adv_styles_sampled = adv_styles[indices] if adv_styles.ndim > 1 else adv_styles
+        else:
+            original_styles_sampled = original_styles
+            adv_styles_sampled = adv_styles
+        
+        # Store actual style statistics for visualization (not computed from images)
+        # This allows logging the actual GT region style perturbations
+        self._vis_original_styles = original_styles_sampled.detach().cpu() if original_styles_sampled is not None else None
+        self._vis_adv_styles = adv_styles_sampled.detach().cpu() if adv_styles_sampled is not None else None
         
         return adv_images, adv_gts, adv_prompts
 
@@ -771,6 +831,28 @@ class SAM2Base(torch.nn.Module):
         # If no style stats provided, return original images
         if style_stats is None:
             return img_batch
+        
+        # Diagnostic: check inputs (only on error)
+        import logging
+        has_nan_img = not torch.isfinite(img_batch).all()
+        has_nan_style = not torch.isfinite(style_stats).all()
+        
+        if has_nan_img:
+            num_nan = (~torch.isfinite(img_batch)).sum().item()
+            logging.error(f"[_apply_style_to_images] INPUT img_batch contains {num_nan}/{img_batch.numel()} NaN/Inf!")
+            if torch.isfinite(img_batch).any():
+                finite_vals = img_batch[torch.isfinite(img_batch)]
+                logging.error(f"  → Finite values: min={finite_vals.min():.4f}, max={finite_vals.max():.4f}, mean={finite_vals.mean():.4f}")
+        
+        if has_nan_style:
+            num_nan = (~torch.isfinite(style_stats)).sum().item()
+            logging.error(f"[_apply_style_to_images] INPUT style_stats contains {num_nan}/{style_stats.numel()} NaN/Inf!")
+            if torch.isfinite(style_stats).any():
+                finite_vals = style_stats[torch.isfinite(style_stats)]
+                logging.error(f"  → Finite values: min={finite_vals.min():.4f}, max={finite_vals.max():.4f}, mean={finite_vals.mean():.4f}")
+            # Show style_stats structure
+            if style_stats.shape[0] > 0:
+                logging.error(f"  → style_stats shape: {style_stats.shape}, sample means: {style_stats[0, 0, :3]}, sample stds: {style_stats[0, 0, 3:]}")
             
         B, C, H, W = img_batch.shape
         
@@ -784,7 +866,33 @@ class SAM2Base(torch.nn.Module):
         
         K = style_stats.shape[1]
         
-        # Current image (accumulate style applications)
+        # CRITICAL FIX: Compute base statistics from ORIGINAL image once
+        # All objects will use this as normalization baseline to avoid cumulative shift
+        base_means = img_batch.mean(dim=[2, 3], keepdim=True)  # [B, 3, 1, 1]
+        base_stds = img_batch.std(dim=[2, 3], keepdim=True)    # [B, 3, 1, 1]
+        
+        # Diagnostic: check base statistics (only on error)
+        has_nan_means = not torch.isfinite(base_means).all()
+        has_nan_stds = not torch.isfinite(base_stds).all()
+        has_small_stds = (base_stds < 1e-6).any()
+        
+        if has_nan_means:
+            num_nan = (~torch.isfinite(base_means)).sum().item()
+            logging.error(f"[_apply_style_to_images] base_means contains {num_nan}/{base_means.numel()} NaN/Inf!")
+        
+        if has_nan_stds:
+            num_nan = (~torch.isfinite(base_stds)).sum().item()
+            logging.error(f"[_apply_style_to_images] base_stds contains {num_nan}/{base_stds.numel()} NaN/Inf!")
+        
+        if has_small_stds:
+            num_small = (base_stds < 1e-6).sum().item()
+            logging.error(f"[_apply_style_to_images] base_stds has {num_small}/{base_stds.numel()} very small values (< 1e-6)!")
+            logging.error(f"  → This will cause very large normalized values! min_std={base_stds.min():.9f}")
+        
+        # Pre-compute normalized images once to avoid repeated work inside the loop
+        normalized = (img_batch - base_means) / (base_stds + 1e-8)
+
+        # Accumulate style applications (start from original)
         styled_images = img_batch.clone()
         
         # Apply style for each object (vectorized processing)
@@ -796,13 +904,35 @@ class SAM2Base(torch.nn.Module):
             target_means = object_style[:, :3].view(B, 3, 1, 1)  # [B, 3, 1, 1]
             target_stds = object_style[:, 3:].view(B, 3, 1, 1)   # [B, 3, 1, 1]
             
-            # Compute current image statistics
-            current_means = styled_images.mean(dim=[2, 3], keepdim=True)
-            current_stds = styled_images.std(dim=[2, 3], keepdim=True)
+            # Diagnostic: check target style parameters (only on error)
+            has_nan_tmeans = not torch.isfinite(target_means).all()
+            has_nan_tstds = not torch.isfinite(target_stds).all()
             
-            # Apply AdaIN
-            normalized = (styled_images - current_means) / (current_stds + 1e-8)
+            if has_nan_tmeans:
+                num_nan = (~torch.isfinite(target_means)).sum().item()
+                logging.error(f"[_apply_style_to_images] Object {k} target_means contains {num_nan}/{target_means.numel()} NaN/Inf!")
+            
+            if has_nan_tstds:
+                num_nan = (~torch.isfinite(target_stds)).sum().item()
+                logging.error(f"[_apply_style_to_images] Object {k} target_stds contains {num_nan}/{target_stds.numel()} NaN/Inf!")
+            
+            # Diagnostic: check normalized values (only on error)
+            has_nan_norm = not torch.isfinite(normalized).all()
+            if has_nan_norm:
+                num_nan = (~torch.isfinite(normalized)).sum().item()
+                logging.error(f"[_apply_style_to_images] Object {k} normalized contains {num_nan}/{normalized.numel()} NaN/Inf!")
+            
             object_styled = normalized * target_stds + target_means
+            
+            # Diagnostic: check styled result (only on error)
+            has_nan_styled = not torch.isfinite(object_styled).all()
+            if has_nan_styled:
+                num_nan = (~torch.isfinite(object_styled)).sum().item()
+                logging.error(f"[_apply_style_to_images] Object {k} object_styled contains {num_nan}/{object_styled.numel()} NaN/Inf!")
+                # Show which step caused the NaN
+                if not has_nan_norm and not has_nan_tmeans and not has_nan_tstds:
+                    logging.error(f"  → NaN appeared in multiplication/addition step!")
+                    logging.error(f"  → target_stds range: [{target_stds.min():.4f}, {target_stds.max():.4f}]")
             
             # Apply mask (if provided)
             if object_mask is not None:
@@ -815,11 +945,25 @@ class SAM2Base(torch.nn.Module):
                     )
                 object_mask = object_mask.float()
                 
-                # Only apply style to object region
-                styled_images = object_mask * object_styled + (1 - object_mask) * styled_images
+                # Only apply style to object region, blend with accumulated result
+                # CRITICAL: Use img_batch (not styled_images) for background in first iteration
+                # to match eb03fdb behavior exactly
+                background = img_batch if k == 0 else styled_images
+                styled_images = object_mask * object_styled + (1 - object_mask) * background
             else:
-                # Apply to full image
+                # Apply to full image (replace entirely)
                 styled_images = object_styled
+        
+        # Diagnostic: check output (only on error)
+        has_nan_output = not torch.isfinite(styled_images).all()
+        if has_nan_output:
+            num_nan = (~torch.isfinite(styled_images)).sum().item()
+            logging.error(f"[_apply_style_to_images] OUTPUT styled_images contains {num_nan}/{styled_images.numel()} NaN/Inf!")
+            # If output has NaN but inputs were fine, it's from style application
+            if not has_nan_img and not has_nan_style:
+                logging.error(f"  → NaN introduced during style application from finite inputs!")
+                logging.error(f"  → Input img range was: [{img_batch.min():.4f}, {img_batch.max():.4f}]")
+                logging.error(f"  → style_stats range was: [{style_stats.min():.4f}, {style_stats.max():.4f}]")
         
         return styled_images
 
@@ -856,51 +1000,91 @@ class SAM2Base(torch.nn.Module):
             adv_styles: [B, K, 6] or [B, 6] adversarial style statistics
         """
         # Backward compatibility: [B, 6] → [B, 1, 6]
+        squeeze_output = False
         if original_styles.ndim == 2:
             original_styles = original_styles.unsqueeze(1)
+            squeeze_output = True  # Remember to squeeze back to [B, 6]
         
         # Check if using global-local mixed mode
         if self.style_aug_use_global_local_mix:
             # Mode: Global+Local Mixed Style Attack
-            return self._pgd_mixed_global_local_styles(
+            result = self._pgd_mixed_global_local_styles(
                 img_batch, original_styles, pixel_gt,
                 num_steps, step_size, epsilon,
                 pixel_bndl_model, uq_sample_num
             )
+            # Restore original shape if input was [B, 6]
+            if squeeze_output:
+                result = result.squeeze(1)  # [B, 1, 6] → [B, 6]
+            return result
         
         # Mode: Local-only Style Attack (original behavior)
         adv_styles = original_styles.clone().detach()
         
-        # Compute area-weighted epsilon for each object region
-        epsilon_per_object = None
-        # if pixel_gt is not None and pixel_gt.ndim == 4:
-        #     # pixel_gt: [B, K, H, W]
-        #     B, K, H, W = pixel_gt.shape
-        #     total_pixels = H * W
-            
-        #     # Count pixels per object: [B, K]
-        #     pixel_count = pixel_gt.sum(dim=[2, 3])  # [B, K]
-            
-        #     # Area ratio: [B, K]
-        #     area_ratio = pixel_count / total_pixels
-            
-        #     # Weight epsilon by sqrt(area_ratio) to balance perturbation strength
-        #     # Large regions → larger epsilon, small regions → smaller epsilon
-        #     # Use sqrt to avoid too extreme differences
-        #     epsilon_weight = torch.sqrt(area_ratio.clamp(min=1e-6))  # [B, K]
-            
-        #     # Expand to match style dimensions: [B, K, 6]
-        #     epsilon_per_object = epsilon * epsilon_weight.unsqueeze(-1).expand(-1, -1, 6)
+        # Diagnostic: check initial inputs (only on error or first call)
+        import logging
+        has_nan_img = not torch.isfinite(img_batch).all()
+        has_nan_styles = not torch.isfinite(original_styles).all()
+        has_nan_gt = pixel_gt is not None and not torch.isfinite(pixel_gt).all()
+        
+        if has_nan_img:
+            num_nan = (~torch.isfinite(img_batch)).sum().item()
+            logging.error(f"[PGD Init] img_batch contains {num_nan}/{img_batch.numel()} NaN/Inf!")
+            if torch.isfinite(img_batch).any():
+                finite_vals = img_batch[torch.isfinite(img_batch)]
+                logging.error(f"  → Finite values: min={finite_vals.min():.4f}, max={finite_vals.max():.4f}, mean={finite_vals.mean():.4f}")
+        
+        if has_nan_styles:
+            num_nan = (~torch.isfinite(original_styles)).sum().item()
+            logging.error(f"[PGD Init] original_styles contains {num_nan}/{original_styles.numel()} NaN/Inf!")
+            if torch.isfinite(original_styles).any():
+                finite_vals = original_styles[torch.isfinite(original_styles)]
+                logging.error(f"  → Finite values: min={finite_vals.min():.4f}, max={finite_vals.max():.4f}, mean={finite_vals.mean():.4f}")
+        
+        if has_nan_gt:
+            num_nan = (~torch.isfinite(pixel_gt)).sum().item()
+            logging.error(f"[PGD Init] pixel_gt contains {num_nan}/{pixel_gt.numel()} NaN/Inf!")
+        
+        # Build graph once (outside PGD loop) since masks don't change
+        # Cache graph structure to avoid rebuilding at every PGD step
+        # Note: If style_aug_enable_background=True, pixel_gt already contains background mask
+        # at index K, and original_styles/adv_styles are already [B, K+1, 6]
+        gcn_edge_index, gcn_edge_weight = None, None
+        if self.style_gcn is not None:
+            with torch.no_grad():
+                gcn_edge_index, gcn_edge_weight = self._build_style_graph(pixel_gt, img_batch)
         
         for step in range(num_steps):
+            # Clear cache at the start of each PGD step to reduce memory fragmentation
+            if step > 0:  # Don't clear on first iteration (graph was just built)
+                torch.cuda.empty_cache()
+            
             adv_styles.requires_grad = True
             
             # 1. Apply style and forward through model
             # If GT region style is enabled, only apply to GT region for consistency
             apply_mask = pixel_gt if self.style_aug_use_gt_region_style else None
             styled_images = self._apply_style_to_images(img_batch, adv_styles, gt_mask=apply_mask)
+            
+            # Diagnostic: check styled images
+            if not torch.isfinite(styled_images).all():
+                import logging
+                num_nan = (~torch.isfinite(styled_images)).sum().item()
+                logging.error(f"[PGD Step {step}] styled_images contains {num_nan}/{styled_images.numel()} NaN/Inf!")
+                if torch.isfinite(adv_styles).all():
+                    logging.error(f"[PGD Step {step}] But adv_styles is finite. NaN from _apply_style_to_images!")
+                else:
+                    num_nan_style = (~torch.isfinite(adv_styles)).sum().item()
+                    logging.error(f"[PGD Step {step}] adv_styles contains {num_nan_style}/{adv_styles.numel()} NaN/Inf!")
+            
             adv_backbone_out = self.forward_image(styled_images)
             adv_backbone_feat = adv_backbone_out['backbone_fpn'][-1]
+            
+            # Diagnostic: check backbone output
+            if not torch.isfinite(adv_backbone_feat).all():
+                import logging
+                num_nan = (~torch.isfinite(adv_backbone_feat)).sum().item()
+                logging.error(f"[PGD Step {step}] adv_backbone_feat contains {num_nan}/{adv_backbone_feat.numel()} NaN/Inf!")
 
             # 2. Extract high_res_features if needed
             high_res_features = None
@@ -909,6 +1093,16 @@ class SAM2Base(torch.nn.Module):
                     adv_backbone_out['backbone_fpn'][0],
                     adv_backbone_out['backbone_fpn'][1]
                 ]
+                
+                # Diagnostic: check high_res_features
+                if not torch.isfinite(high_res_features[0]).all():
+                    import logging
+                    num_nan = (~torch.isfinite(high_res_features[0])).sum().item()
+                    logging.error(f"[PGD Step {step}] high_res_features[0] contains {num_nan}/{high_res_features[0].numel()} NaN/Inf!")
+                if not torch.isfinite(high_res_features[1]).all():
+                    import logging
+                    num_nan = (~torch.isfinite(high_res_features[1])).sum().item()
+                    logging.error(f"[PGD Step {step}] high_res_features[1] contains {num_nan}/{high_res_features[1].numel()} NaN/Inf!")
             
             # 3. Generate prompts from GT (need combined mask for bbox)
             if pixel_gt is not None:
@@ -972,12 +1166,10 @@ class SAM2Base(torch.nn.Module):
                     pixel_bndl_model, adv_pixel_feat, adv_external_w, uq_sample_num, per_channel=False
                 )
             
-            # Sanitize logits before computing calibration loss
+            # Diagnostic check for NaN/Inf (no sanitization - let it fail if NaN occurs)
             if not torch.isfinite(adv_logits_grad).all():
                 num_nan = (~torch.isfinite(adv_logits_grad)).sum().item()
-                logging.warning(f"[PGD Step {step}] adv_logits contains {num_nan}/{adv_logits_grad.numel()} NaN/Inf, sanitizing...")
-                adv_logits_grad = torch.nan_to_num(adv_logits_grad, nan=0.0, posinf=20.0, neginf=-20.0)
-                adv_logits_grad = torch.clamp(adv_logits_grad, min=-50.0, max=50.0)
+                logging.error(f"[PGD Step {step}] adv_logits contains {num_nan}/{adv_logits_grad.numel()} NaN/Inf! Computation will fail.")
             
             # 9. Compute calibration loss (maximize to find adversarial styles)
             H_feat, W_feat = adv_logits_grad.shape[1:3]
@@ -999,28 +1191,65 @@ class SAM2Base(torch.nn.Module):
             # 10. Gradient ascent (maximize calibration loss to create hard samples)
             grad = torch.autograd.grad(calibration_loss_adv, adv_styles, create_graph=False)[0]
             
+            # Diagnostic: check gradient
+            if not torch.isfinite(grad).all():
+                import logging
+                num_nan = (~torch.isfinite(grad)).sum().item()
+                logging.error(f"[PGD Step {step}] grad contains {num_nan}/{grad.numel()} NaN/Inf!")
+                if torch.isfinite(calibration_loss_adv):
+                    logging.error(f"[PGD Step {step}] But calibration_loss_adv={calibration_loss_adv.item():.6f} is finite!")
+                else:
+                    logging.error(f"[PGD Step {step}] calibration_loss_adv is NaN/Inf!")
+            
             with torch.no_grad():
                 # Gradient ascent step
-                adv_styles = adv_styles.detach() + step_size * grad.sign()
-                
+                adv_styles = adv_styles.detach() + step_size * grad.sign() 
                 # Project to epsilon ball (area-weighted if available)
                 delta = adv_styles - original_styles
-                if epsilon_per_object is not None:
-                    # Use per-object epsilon: [B, K, 6]
-                    delta = torch.clamp(delta, -epsilon_per_object, epsilon_per_object)
-                else:
-                    # Fallback to uniform epsilon for backward compatibility
-                    delta = torch.clamp(delta, -epsilon, epsilon)
+                delta = torch.clamp(delta, -epsilon, epsilon)
                 adv_styles = original_styles + delta
                 
-                # GCN refinement (Pass 1: no grad)
-                if self.style_gcn is not None:
-                    edge_index, edge_weight = self._build_style_graph(pixel_gt, img_batch)
-                    refined_delta = self.style_gcn(delta, edge_index, edge_weight)
-                    refined_delta = torch.clamp(refined_delta, -epsilon, epsilon)
+                # Diagnostic: check updated adv_styles
+                if not torch.isfinite(adv_styles).all():
+                    import logging
+                    num_nan = (~torch.isfinite(adv_styles)).sum().item()
+                    logging.error(f"[PGD Step {step}] adv_styles (after update) contains {num_nan}/{adv_styles.numel()} NaN/Inf!")
+                
+                # GCN refinement (Pass 1: no grad) - use cached graph
+                # Completely detach delta to avoid gradient leakage
+                if self.style_gcn is not None and gcn_edge_index is not None:
+                    # Clear cache before GCN to reduce fragmentation
+                    torch.cuda.empty_cache()
+                    
+                    delta_detached = delta.detach()
+                    refined_delta = self.style_gcn(delta_detached, gcn_edge_index, gcn_edge_weight)
+                    refined_delta = torch.clamp(refined_delta, -epsilon, epsilon).detach()
                     adv_styles = original_styles + refined_delta
+                    
+                    # Aggressive cleanup
+                    del delta_detached, refined_delta
+                    torch.cuda.empty_cache()
+            
+            # Clean up large tensors at end of PGD step to free memory
+            del styled_images, adv_backbone_out, adv_backbone_feat
+            del adv_aux_outputs, adv_bndl, adv_pixel_feat
+            del adv_logits_grad, adv_uq, calibration_loss_adv, grad
+            if 'high_res_features' in locals() and high_res_features is not None:
+                del high_res_features
+            if 'adv_external_w' in locals() and adv_external_w is not None:
+                del adv_external_w
+        
+        # Final cleanup after PGD loop
+        if gcn_edge_index is not None:
+            del gcn_edge_index, gcn_edge_weight
+        torch.cuda.empty_cache()
 
-        return adv_styles.detach()
+        # Restore original shape if input was [B, 6]
+        result = adv_styles.detach()
+        if squeeze_output:
+            result = result.squeeze(1)  # [B, 1, 6] → [B, 6]
+        
+        return result
     
     def _build_style_graph(
         self,
@@ -1128,7 +1357,7 @@ class SAM2Base(torch.nn.Module):
             styled_images = self._apply_style_to_images(img_batch, combined_styles, gt_mask=apply_mask)
             
             # 3. Forward through backbone
-            adv_backbone_out = self.forward_image(styled_images)
+            adv_backbone_out = self.forward_image(styled_images, use_checkpoint=True)
             adv_backbone_feat = adv_backbone_out['backbone_fpn'][-1]
 
             # 4. Extract high_res_features if needed
@@ -1201,12 +1430,10 @@ class SAM2Base(torch.nn.Module):
                     pixel_bndl_model, adv_pixel_feat, adv_external_w, uq_sample_num, per_channel=False
                 )
             
-            # Sanitize logits before computing calibration loss
+            # Diagnostic check for NaN/Inf (no sanitization - let it fail if NaN occurs)
             if not torch.isfinite(adv_logits_grad).all():
                 num_nan = (~torch.isfinite(adv_logits_grad)).sum().item()
-                logging.warning(f"[PGD Mixed Step {step}] adv_logits contains {num_nan}/{adv_logits_grad.numel()} NaN/Inf, sanitizing...")
-                adv_logits_grad = torch.nan_to_num(adv_logits_grad, nan=0.0, posinf=20.0, neginf=-20.0)
-                adv_logits_grad = torch.clamp(adv_logits_grad, min=-50.0, max=50.0)
+                logging.error(f"[PGD Mixed Step {step}] adv_logits contains {num_nan}/{adv_logits_grad.numel()} NaN/Inf! Computation will fail.")
             
             # 11. Compute calibration loss (maximize to find adversarial styles)
             H_feat, W_feat = adv_logits_grad.shape[1:3]
@@ -1428,12 +1655,14 @@ class SAM2Base(torch.nn.Module):
         Returns:
             error: [B, H, W] in [0, 1], where 0=perfect, 1=wrong
         """
-        # Sanitize input logits to prevent NaN propagation
+        # Early diagnosis: check input logits for NaN/Inf
         if not torch.isfinite(pixel_logits).all():
             num_nan = (~torch.isfinite(pixel_logits)).sum().item()
-            logging.error(f"[Error Computation] Input logits contain {num_nan}/{pixel_logits.numel()} NaN/Inf values! Sanitizing...")
-            pixel_logits = torch.nan_to_num(pixel_logits, nan=0.0, posinf=20.0, neginf=-20.0)
-            pixel_logits = torch.clamp(pixel_logits, min=-50.0, max=50.0)
+            total = pixel_logits.numel()
+            logging.error(f"[Error Computation] INPUT pixel_logits contains {num_nan}/{total} NaN/Inf!")
+            if torch.isfinite(pixel_logits).any():
+                finite_vals = pixel_logits[torch.isfinite(pixel_logits)]
+                logging.error(f"[Error Computation] Finite logits stats: min={finite_vals.min():.4f}, max={finite_vals.max():.4f}, mean={finite_vals.mean():.4f}")
         
         # Extract logits value
         if pixel_logits.ndim == 4 and pixel_logits.shape[-1] >= 1:
@@ -1445,6 +1674,11 @@ class SAM2Base(torch.nn.Module):
         else:
             B, H, W = pixel_logits.shape[:3]
             logits_val = pixel_logits.view(B, H, W, -1).max(dim=-1).values
+        
+        # Diagnosis after extraction
+        if not torch.isfinite(logits_val).all():
+            num_nan = (~torch.isfinite(logits_val)).sum().item()
+            logging.error(f"[Error Computation] logits_val (after extraction) contains {num_nan}/{logits_val.numel()} NaN/Inf!")
         
         # Extract GT mask [B, H, W]
         H, W = logits_val.shape[1], logits_val.shape[2]
@@ -1458,6 +1692,11 @@ class SAM2Base(torch.nn.Module):
         
         # Compute prediction probability
         pred_prob = torch.sigmoid(logits_val)  # [B, H, W] in [0, 1]
+        
+        # Diagnosis after sigmoid
+        if not torch.isfinite(pred_prob).all():
+            num_nan = (~torch.isfinite(pred_prob)).sum().item()
+            logging.error(f"[Error Computation] pred_prob (after sigmoid) contains {num_nan}/{pred_prob.numel()} NaN/Inf!")
         
         # Compute absolute error
         gt_float = gt_mask.float()  # [B, H, W] in {0, 1}
@@ -1920,11 +2159,71 @@ class SAM2Base(torch.nn.Module):
             # a learned `no_mask_embed` to indicate no mask input in this case).
             sam_mask_prompt = None
 
+        # Diagnostic: check prompt encoder inputs (only check NaN, compute stats only on error)
+        import logging
+        
+        has_nan_coords = not torch.isfinite(sam_point_coords).all()
+        has_nan_mask = sam_mask_prompt is not None and not torch.isfinite(sam_mask_prompt).all()
+        has_nan_backbone = not torch.isfinite(backbone_features).all()
+        
+        if has_nan_coords:
+            num_nan = (~torch.isfinite(sam_point_coords)).sum().item()
+            logging.error(f"[_forward_sam_heads] sam_point_coords contains {num_nan}/{sam_point_coords.numel()} NaN/Inf!")
+            if torch.isfinite(sam_point_coords).any():
+                finite_vals = sam_point_coords[torch.isfinite(sam_point_coords)]
+                logging.error(f"  → Finite values: min={finite_vals.min():.4f}, max={finite_vals.max():.4f}, mean={finite_vals.mean():.4f}")
+        
+        if has_nan_mask:
+            num_nan = (~torch.isfinite(sam_mask_prompt)).sum().item()
+            logging.error(f"[_forward_sam_heads] sam_mask_prompt contains {num_nan}/{sam_mask_prompt.numel()} NaN/Inf!")
+            if torch.isfinite(sam_mask_prompt).any():
+                finite_vals = sam_mask_prompt[torch.isfinite(sam_mask_prompt)]
+                logging.error(f"  → Finite values: min={finite_vals.min():.4f}, max={finite_vals.max():.4f}, mean={finite_vals.mean():.4f}")
+        
+        if has_nan_backbone:
+            num_nan = (~torch.isfinite(backbone_features)).sum().item()
+            logging.error(f"[_forward_sam_heads] backbone_features contains {num_nan}/{backbone_features.numel()} NaN/Inf before prompt encoder!")
+            if torch.isfinite(backbone_features).any():
+                finite_vals = backbone_features[torch.isfinite(backbone_features)]
+                logging.error(f"  → Finite values: min={finite_vals.min():.6e}, max={finite_vals.max():.6e}, mean={finite_vals.mean():.6e}")
+        
         sparse_embeddings, dense_embeddings = self.sam_prompt_encoder(
             points=(sam_point_coords, sam_point_labels),
             boxes=None,
             masks=sam_mask_prompt,
         )
+        
+        # Diagnostic: check prompt encoder outputs (only on error)
+        has_nan_sparse = not torch.isfinite(sparse_embeddings).all()
+        has_nan_dense = not torch.isfinite(dense_embeddings).all()
+        
+        if has_nan_sparse:
+            num_nan = (~torch.isfinite(sparse_embeddings)).sum().item()
+            logging.error(f"[_forward_sam_heads] sparse_embeddings contains {num_nan}/{sparse_embeddings.numel()} NaN/Inf after prompt encoder!")
+            if torch.isfinite(sparse_embeddings).any():
+                finite_vals = sparse_embeddings[torch.isfinite(sparse_embeddings)]
+                logging.error(f"  → Finite values: min={finite_vals.min():.6e}, max={finite_vals.max():.6e}, mean={finite_vals.mean():.6e}")
+            # Check embedding weights
+            for i, emb in enumerate(self.sam_prompt_encoder.point_embeddings):
+                if not torch.isfinite(emb.weight).all():
+                    logging.error(f"  → point_embeddings[{i}].weight contains NaN!")
+        
+        if has_nan_dense:
+            num_nan = (~torch.isfinite(dense_embeddings)).sum().item()
+            logging.error(f"[_forward_sam_heads] dense_embeddings contains {num_nan}/{dense_embeddings.numel()} NaN/Inf after prompt encoder!")
+            if torch.isfinite(dense_embeddings).any():
+                finite_vals = dense_embeddings[torch.isfinite(dense_embeddings)]
+                logging.error(f"  → Finite values: min={finite_vals.min():.6e}, max={finite_vals.max():.6e}, mean={finite_vals.mean():.6e}")
+            # Check no_mask_embed
+            if not torch.isfinite(self.sam_prompt_encoder.no_mask_embed.weight).all():
+                logging.error(f"  → no_mask_embed.weight contains NaN!")
+        
+        # If embeddings have NaN but inputs were fine, show input info
+        if (has_nan_sparse or has_nan_dense) and not (has_nan_coords or has_nan_backbone):
+            logging.error(f"[_forward_sam_heads] Prompt encoder produced NaN from finite inputs!")
+            logging.error(f"  → point_coords range: [{sam_point_coords.min():.2f}, {sam_point_coords.max():.2f}]")
+            logging.error(f"  → backbone_features range: [{backbone_features.min():.6e}, {backbone_features.max():.6e}]")
+        
         mask_decoder_outputs = self.sam_mask_decoder(
             image_embeddings=backbone_features,
             image_pe=self.sam_prompt_encoder.get_dense_pe(),
@@ -2132,9 +2431,51 @@ class SAM2Base(torch.nn.Module):
             object_score_logits,
         )
 
-    def forward_image(self, img_batch: torch.Tensor):
+    def forward_image(self, img_batch: torch.Tensor, use_checkpoint: bool = False):
         """Get the image feature on the input batch."""
-        backbone_out = self.image_encoder(img_batch)
+        # Diagnostic: check input to backbone (only compute stats if NaN detected)
+        import logging
+        
+        has_nan_input = not torch.isfinite(img_batch).all()
+        
+        if has_nan_input:
+            num_nan = (~torch.isfinite(img_batch)).sum().item()
+            logging.error(f"[forward_image] INPUT img_batch contains {num_nan}/{img_batch.numel()} NaN/Inf BEFORE backbone!")
+            # Only compute expensive stats when error occurs
+            logging.error(f"  → Input shape: {img_batch.shape}")
+            logging.error(f"  → Input stats: min={img_batch.min():.4f}, max={img_batch.max():.4f}, mean={img_batch.mean():.4f}, std={img_batch.std():.4f}")
+            if torch.isfinite(img_batch).any():
+                finite_vals = img_batch[torch.isfinite(img_batch)]
+                logging.error(f"  → Finite values: min={finite_vals.min():.4f}, max={finite_vals.max():.4f}, mean={finite_vals.mean():.4f}")
+        else:
+            # Show input stats only on first call
+            if not hasattr(self, '_forward_image_call_count'):
+                self._forward_image_call_count = 0
+                logging.info(f"[forward_image] First call: img_batch shape={img_batch.shape}, range=[{img_batch.min():.4f}, {img_batch.max():.4f}]")
+                if self.training and not self.image_encoder.training:
+                    logging.info("[forward_image] Backbone is in eval mode (frozen)")
+            self._forward_image_call_count = 1
+        
+        if use_checkpoint and img_batch.requires_grad:
+            backbone_out = self._forward_image_with_checkpoint(img_batch)
+        else:
+            backbone_out = self.image_encoder(img_batch)
+        
+        # Diagnostic: check backbone output (only if NaN detected)
+        has_nan_output = False
+        for i, feat in enumerate(backbone_out['backbone_fpn']):
+            if not torch.isfinite(feat).all():
+                has_nan_output = True
+                num_nan = (~torch.isfinite(feat)).sum().item()
+                logging.error(f"[forward_image] backbone_fpn[{i}] contains {num_nan}/{feat.numel()} NaN/Inf AFTER backbone!")
+                if torch.isfinite(feat).any():
+                    finite_vals = feat[torch.isfinite(feat)]
+                    logging.error(f"  → Finite values: min={finite_vals.min():.6e}, max={finite_vals.max():.6e}, mean={finite_vals.mean():.6e}")
+        
+        # If output has NaN but input was fine, show input stats for debugging
+        if has_nan_output and not has_nan_input:
+            logging.error(f"[forward_image] Backbone produced NaN from finite input!")
+            logging.error(f"  → Input was: shape={img_batch.shape}, range=[{img_batch.min():.4f}, {img_batch.max():.4f}], mean={img_batch.mean():.4f}")
         if self.use_high_res_features_in_sam:
             # precompute projected level 0 and level 1 features in SAM decoder
             # to avoid running it again on every SAM click
@@ -2145,6 +2486,37 @@ class SAM2Base(torch.nn.Module):
                 backbone_out["backbone_fpn"][1]
             )
         return backbone_out
+
+    def _forward_image_with_checkpoint(self, img_batch: torch.Tensor) -> dict:
+        """Forward image encoder under gradient checkpointing."""
+        def _encode(input_tensor: torch.Tensor):
+            out = self.image_encoder(input_tensor)
+            backbone = tuple(out["backbone_fpn"])
+            pos = tuple(out["vision_pos_enc"])
+            return (out["vision_features"], *backbone, *pos)
+
+        outputs = checkpoint_fn(_encode, img_batch, use_reentrant=False)
+        if not isinstance(outputs, tuple):
+            outputs = (outputs,)
+
+        if len(outputs) < 3 or (len(outputs) - 1) % 2 != 0:
+            raise RuntimeError(
+                f"Unexpected number of tensors from image encoder checkpoint: {len(outputs)}"
+            )
+
+        num_levels = (len(outputs) - 1) // 2
+
+        vision_features = outputs[0]
+        idx = 1
+        backbone_fpn = [outputs[idx + i] for i in range(num_levels)]
+        idx += num_levels
+        vision_pos_enc = [outputs[idx + i] for i in range(num_levels)]
+
+        return {
+            "vision_features": vision_features,
+            "backbone_fpn": backbone_fpn,
+            "vision_pos_enc": vision_pos_enc,
+        }
 
     def _prepare_backbone_features(self, backbone_out):
         """Prepare and flatten visual features."""
