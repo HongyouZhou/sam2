@@ -125,6 +125,3 @@ model:
 
   # AUE (Adversarial Uncertainty Estimation) options (disabled)
   use_aue: false
-
-  # ROI sharing
-  share_roi_views: false

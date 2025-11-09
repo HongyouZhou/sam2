@@ -206,44 +206,47 @@ trainer:
     # Compilation flag
     # compile_image_encoder: False
     
-    freeze_image_encoder: true
+    freeze_image_encoder: false
 
+    # === AUE_GCN_CONFIG_START ===
     # AUE (Adversarial Uncertainty Estimation) with Style-based augmentation
     use_aue: true
-    aue_use_uncertainty: false
+    aue_use_uncertainty: true
     aue_uncertainty_mask_threshold: 0.4
     
     # Style-based AUE parameters
     use_style_aug: true
     style_aug_pgd_steps: 1
     style_aug_pgd_step_size: 0.1
-    style_aug_pgd_epsilon: 2.0  # Local epsilon (reduced from 2.0 to 0.3 for mixed mode)
-    style_aug_use_gt_region_style: true  # Extract style from GT region only (new feature)
+    style_aug_pgd_epsilon: 2.0
+    style_aug_use_gt_region_style: true
     
     # Multi-object style attack control
-    style_aug_use_multi_object: true       # true=attack with all objects in video, false=only current loss object
-    style_aug_enable_background: true      # true=include background as additional object (K+1), false=objects only
+    style_aug_use_multi_object: true
+    style_aug_enable_background: true
     
-    # Global-Local Mixed Style Augmentation (NEW)
-    style_aug_use_global_local_mix: false   # Enable global+local mixed style perturbation
-    style_aug_global_epsilon: 1.5          # Global style perturbation budget
-    style_aug_global_weight: 0.7           # Weight of global drift (0=local only, 1=global only)
+    # Global-Local Mixed Style Augmentation
+    style_aug_use_global_local_mix: false
+    style_aug_global_epsilon: 1.5
+    style_aug_global_weight: 0.7
 
-    # GCN-based multi-object style refinement (NEW)
-    style_aug_use_gcn: true # style_aug_use_global_local_mix=false
-    style_aug_gcn_hidden_dim: 16  # Reduced from 32 to save memory
-    style_aug_gcn_num_layers: 1  # Reduced from 2 to save memory
-    style_aug_gcn_lr_ratio: 0.1
-    style_aug_gcn_edge_threshold: 0.3
+    # GCN-based multi-object style refinement
+    style_aug_use_gcn: true
+    style_aug_gcn_hidden_dim: 64
+    style_aug_gcn_num_layers: 3
+    style_aug_gcn_lr_ratio: 1.0
+    style_aug_gcn_edge_threshold: 0.0
     style_aug_gcn_use_semantic_edges: true
     style_aug_gcn_use_background_edges: true
+    style_aug_gcn_distance_threshold: 1.0
+    style_aug_gcn_use_boundary_distance: true
+    style_aug_gcn_use_visual_features: true  # Enable visual features in GCN for content-aware refinement
+    style_aug_gcn_feature_dim: 256  # Feature dimension (matches backbone_fpn[-1] d_model)
     
     # Patch-based MMD configuration for AUE calibration loss
-    aue_use_patch_mmd: true  # Enable patch-based MMD (better local distribution matching)
-    aue_patch_size: 16       # Patch size for patch-based MMD (16x16 patches)
-
-    # ROI sharing
-    share_roi_views: true
+    aue_use_patch_mmd: true
+    aue_patch_size: 16
+    # === AUE_GCN_CONFIG_END ===
 
     ####### Training specific params #######
     # box/point input and corrections
@@ -385,18 +388,26 @@ trainer:
         # ① 默认组（未被下面命中者）
         - scheduler:
             _target_: fvcore.common.param_scheduler.CosineParamScheduler
-            start_value: 1.0e-5
-            end_value: 5.0e-6
+            start_value: 1.0e-7
+            end_value: 1.0e-8
 
-        # ② BNDL 头：高 LR
+        # ② BNDL head: higher learning rate
         - scheduler:
             _target_: fvcore.common.param_scheduler.CosineParamScheduler
-            start_value: 2.0e-4
-            end_value: 5.0e-5  # 更平缓的衰减，精细调优
+            start_value: 1.0e-4
+            end_value: 3.0e-5
           param_names:
             - 'sam_mask_decoder.pixel_bndl.*'
 
-        # ③ 解码器其他部分：极小 LR（避免破坏 SAM）
+        # ③ GCN: high learning rate for rapid alpha convergence
+        - scheduler:
+            _target_: fvcore.common.param_scheduler.CosineParamScheduler
+            start_value: 1.0e-5
+            end_value: 5.0e-6
+          param_names:
+            - 'style_gcn.*'
+
+        # ④ Other decoder components: very small learning rate
         - scheduler:
             _target_: fvcore.common.param_scheduler.CosineParamScheduler
             start_value: 1.0e-7
@@ -413,7 +424,7 @@ trainer:
             - 'sam_mask_decoder.pred_obj_score_head.*'
 
       weight_decay:
-        # 默认正则化
+        # 默认 weight decay
         - scheduler:
             _target_: fvcore.common.param_scheduler.ConstantParamScheduler
             value: 0.01
@@ -435,25 +446,25 @@ trainer:
         focal_alpha_obj_score: -1.0
       bndl_loss:
         _target_: training.loss_bndl.BNDLLoss
-        kl_weight: 0.005  # 降低KL权重，减少正则化
-      sam_weight: 0.1    # 降低SAM权重，减少对基础分割的影响
-      bndl_weight: 0.5    # 提高BNDL权重，强化BNDL训练
+        kl_weight: 0.005
+      sam_weight: 0.1
+      bndl_weight: 0.5
       aue_loss:
         _target_: training.loss_aue.AUELoss
-      aue_weight: 0.1     # 保持AUE权重
+      aue_weight: 0.1
       weight_schedule:
+        - until_epoch: 1
+          sam_weight: 1.0
+          bndl_weight: 1.0
+          aue_weight: 0.05  # Epoch 0: 极低 AUE
+        - until_epoch: 3
+          sam_weight: 1.0
+          bndl_weight: 1.0
+          aue_weight: 0.10  # Epoch 1-2: 中等 AUE
         - until_epoch: null
           sam_weight: 1.0
-          bndl_weight: 0.5
-          aue_weight: 0.1  # 给AUE一个小的初始权重
-        # - until_epoch: 2
-        #   sam_weight: 1.0
-        #   bndl_weight: 0.3
-        #   aue_weight: 0.05
-        # - until_epoch: null
-        #   sam_weight: 1.0
-        #   bndl_weight: 0.25
-        #   aue_weight: 0.05
+          bndl_weight: 1.0
+          aue_weight: 0.15  # Epoch 3+: 较高 AUE（但仍 < 0.5）
     # val:
     #   _target_: training.loss_combined.CombinedSAMBNDLLoss
     #   sam_loss: ${trainer.loss.all.sam_loss}
@@ -485,14 +496,14 @@ trainer:
     log_visual_frequency: 20
     visualize_bndl: true
     visualize_style_aue: true
-    style_aue_visual_frequency: 100  # 降低到50步一次，更容易看到可视化
+    style_aue_visual_frequency: 100
     uncertainty_metric: ["entropy", "nll"]
     visualize_pavpu_overlay: true
     uncertainty_sample_num: 50
-    # 像素级PAvPU统计配置
-    correlation_foreground_dilation: 4       # 前景区域膨胀半径（像素），0表示不膨胀（仅在use_full_image=false时有效）
-    correlation_per_pixel: true              # 使用像素级统计（vs 图片级）
-    correlation_use_full_image: false         # true=统计全图，false=仅统计前景区域
+    # Pixel-level PAvPU statistics configuration
+    correlation_foreground_dilation: 4
+    correlation_per_pixel: true
+    correlation_use_full_image: false
 
   # initialize from a SAM 2 checkpoint
   checkpoint:
@@ -516,7 +527,9 @@ trainer:
 launcher:
   num_nodes: 1
   gpus_per_node: 8
-  experiment_log_dir: /home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_aue_017_11 # Path to log directory, defaults to ./sam2_logs/${config_name}
+  # NOTE: experiment_log_dir is automatically set by train_and_zs.sh based on BNDL_AUE_VER
+  # To change version, edit BNDL_AUE_VER in scripts/train_and_zs.sh (no need to edit here)
+  experiment_log_dir: /home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_aue_017_13  # Default fallback, will be overridden
 
 # SLURM args if running on a cluster
 submitit:

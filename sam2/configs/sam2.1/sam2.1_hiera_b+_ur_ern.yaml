@@ -127,6 +127,3 @@ model:
 
   # AUE options (关闭，UR-ERN 不依赖 BNDL 采样)
   use_aue: false
-
-  # ROI sharing
-  share_roi_views: true

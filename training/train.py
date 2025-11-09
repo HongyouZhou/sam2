@@ -121,7 +121,11 @@ def add_pythonpath_to_sys_path():
 
 
 def main(args) -> None:
-    cfg = compose(config_name=args.config)
+    # Support Hydra overrides from command line (e.g., launcher.experiment_log_dir=...)
+    overrides = getattr(args, 'hydra_overrides', [])
+    if overrides:
+        print(f"Applying Hydra overrides: {overrides}")
+    cfg = compose(config_name=args.config, overrides=overrides)
     if cfg.launcher.experiment_log_dir is None:
         cfg.launcher.experiment_log_dir = os.path.join(
             os.getcwd(), "sam2_logs", args.config
@@ -264,7 +268,10 @@ if __name__ == "__main__":
         "--num-gpus", type=int, default=None, help="number of GPUS per node"
     )
     parser.add_argument("--num-nodes", type=int, default=None, help="Number of nodes")
-    args = parser.parse_args()
+    # Parse known args to allow Hydra overrides (e.g., launcher.experiment_log_dir=...)
+    args, unknown = parser.parse_known_args()
     args.use_cluster = bool(args.use_cluster) if args.use_cluster is not None else None
+    # Pass unknown args as Hydra overrides
+    args.hydra_overrides = unknown
     register_omegaconf_resolvers()
     main(args)

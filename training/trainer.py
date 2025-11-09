@@ -461,8 +461,6 @@ class Trainer:
         enable_vis = (phase == "train" and self.steps[phase] % style_aue_freq == 0)
         _model._enable_style_visualization = enable_vis
         
-        if enable_vis and self.distributed_rank == 0:
-            logging.info(f"Style AUE visualization enabled at step {self.steps[phase]}")
         
         outputs = model(batch)
         targets = batch.masks
@@ -1191,6 +1189,16 @@ class Trainer:
                     val = value
                 self.logger.log(f"AUE_Losses/{phase}_{key}", val, step)
 
+        # Style GCN statistics (if available)
+        gcn_stats = bndl_outputs.get("gcn_stats") if isinstance(bndl_outputs, dict) else None
+        if gcn_stats:
+            for key, value in gcn_stats.items():
+                try:
+                    scalar = float(value)
+                except (TypeError, ValueError):
+                    continue
+                self.logger.log(f"GCN/{phase}_{key}", scalar, step)
+
     def _log_style_aue_visualization(self, outputs, step):
         """Log Style AUE visualization: original vs adversarial images with style statistics"""
         # Extract visualization data from outputs
@@ -1198,30 +1206,36 @@ class Trainer:
         if vis_data is None:
             return
         
-        # Denormalize images and extract style statistics
-        original_imgs = vis_data["original_images"]  # [N, 3, H, W]
-        adv_imgs = vis_data["adversarial_images"]
+        # Denormalize images
+        original_denorm = self._denormalize_images(vis_data.original_images)
+        adv_denorm = self._denormalize_images(vis_data.adversarial_images)
         
-        from sam2.modeling.style_utils import extract_style_statistics
-        original_styles = extract_style_statistics(original_imgs)  # [N, 6]
-        adv_styles = extract_style_statistics(adv_imgs)
-        
-        original_denorm = self._denormalize_images(original_imgs)
-        adv_denorm = self._denormalize_images(adv_imgs)
+        # Use stored styles if available, otherwise extract from images
+        if vis_data.original_styles is not None and vis_data.adversarial_styles is not None:
+            original_styles = vis_data.original_styles  # [N, K, 6]
+            adv_styles = vis_data.adversarial_styles
+            # For visualization, use global style (average across objects)
+            # Shape: [N, K, 6] -> [N, 6]
+            original_styles_global = original_styles.mean(dim=1)
+            adv_styles_global = adv_styles.mean(dim=1)
+        else:
+            from sam2.modeling.style_utils import extract_style_statistics
+            original_styles_global = extract_style_statistics(vis_data.original_images)
+            adv_styles_global = extract_style_statistics(vis_data.adversarial_images)
         
         # Visualize first sample only (for performance)
         self._visualize_single_sample(
             original_denorm[0],
             adv_denorm[0],
-            original_styles[0],
-            adv_styles[0],
+            original_styles_global[0],
+            adv_styles_global[0],
             vis_data,
             sample_idx=0,
             step=step
         )
         
         # Log style perturbation statistics
-        self._log_style_perturbations(original_styles, adv_styles, step)
+        self._log_style_perturbations(original_styles_global, adv_styles_global, step)
         
         # Log GCN parameters if available
         self._log_gcn_parameters(step)
@@ -1246,8 +1260,14 @@ class Trainer:
                 aue_loss_dict = bndl_outputs["aue_loss_dict"]
                 vis_data = aue_loss_dict.get("style_aue_visualization", None)
                 
-                if vis_data and "original_images" in vis_data and "adversarial_images" in vis_data:
-                    return vis_data
+                # Check if vis_data is AUEVisualizationData or dict
+                if vis_data is not None:
+                    # If it's a dataclass, check if it has data
+                    if hasattr(vis_data, 'original_images'):
+                        return vis_data
+                    # If it's a dict (legacy), check for keys
+                    elif isinstance(vis_data, dict) and "original_images" in vis_data:
+                        return vis_data
         
         return None
     
@@ -1260,12 +1280,14 @@ class Trainer:
     
     def _visualize_single_sample(self, original_img, adv_img, original_style, adv_style, vis_data, sample_idx, step):
         """Visualize a single sample with multi-object support."""
-        # Extract multi-object data from vis_data
-        all_bboxes = vis_data.get("all_bboxes", None)  # [N, K, 4]
-        all_masks = vis_data.get("all_object_masks", None)  # [N, K, H, W]
-        combined_mask = vis_data.get("combined_mask_for_loss", None)  # [N, 1, H, W]
-        area_ratios = vis_data.get("area_ratios", None)  # [N, K]
-        epsilon_weights = vis_data.get("epsilon_weights", None)  # [N, K]
+        # Extract multi-object data from vis_data (support both dataclass and dict)
+        if hasattr(vis_data, 'all_bboxes'):
+            # Dataclass
+            all_bboxes = vis_data.all_bboxes
+            all_masks = vis_data.all_object_masks
+            combined_mask = vis_data.combined_mask_for_loss
+            area_ratios = vis_data.area_ratios
+            epsilon_weights = vis_data.epsilon_weights
         
         # Extract data for this sample
         sample_bboxes = all_bboxes[sample_idx] if all_bboxes is not None else None
@@ -1622,8 +1644,7 @@ class Trainer:
                 return mask_decoder.pixel_bndl
 
             return None
-        except Exception as e:
-            logging.warning(f"Failed to extract pixel_bndl model: {e}")
+        except Exception:
             return None
 
     def _extract_bndl_outputs(self, outputs):
@@ -1815,7 +1836,6 @@ class Trainer:
             else:
                 bndl_outputs["uncertainty_type"] = "sampling"
 
-            # logging.info(f"PAvPU scores calculated: {pavpu_scores}")
 
             # Clear cache after uncertainty calculation to free up memory
             torch.cuda.empty_cache()
@@ -1910,13 +1930,11 @@ class Trainer:
                     "is_box": True,  # 标记这是 box prompt
                 }
 
-                logging.info(f"✓ Extracted bounding box from mask_inputs for visualization")
                 return prompt_info
 
             return None
 
-        except Exception as e:
-            logging.warning(f"Failed to extract mask prompt info: {e}")
+        except Exception:
             return None
 
     def _extract_prompt_info(self, outputs_for_vis, step_index=0):
@@ -1968,8 +1986,7 @@ class Trainer:
 
             return None
 
-        except Exception as e:
-            logging.warning(f"Failed to extract prompt info: {e}")
+        except Exception:
             return None
 
     def _extract_original_image(self, batch, frame_idx=0, batch_idx=0):
@@ -1990,7 +2007,6 @@ class Trainer:
             elif len(img_batch.shape) == 4:  # [B, C, H, W]
                 orig_tensor = img_batch[batch_idx]  # [C, H, W]
             else:
-                logging.warning(f"Unexpected img_batch shape: {img_batch.shape}")
                 return None
 
             # Convert [C, H, W] -> [H, W, C]
@@ -2017,8 +2033,7 @@ class Trainer:
 
             return original_img
 
-        except Exception as e:
-            logging.warning(f"Failed to process original image: {e}")
+        except Exception:
             return None
 
     def _upsample_params_to_image_size(self, lambda_img, k_img, target_shape):
@@ -2092,7 +2107,6 @@ class Trainer:
         save_path = os.path.join(vis_dir, f"epoch_{self.epoch}_iter_{data_iter}_step_{step_index}_unified_{layout_type}.png")
         viz_utils.save_and_close_figure(fig, save_path, dpi=150)
 
-        # logging.info(f"Unified BNDL visualization saved: {save_path}")
 
     def _plot_common_elements_refactored(
         self, axes, original_img, lambda_img, k_img, step_index, bndl_outputs, has_uncertainty=False, batch=None, outputs_for_vis=None, bndl_viz=None, viz_utils=None, prompt_info=None
@@ -2145,7 +2159,6 @@ class Trainer:
 
             # Validate image format
             if adv_images.ndim != 4 or adv_images.shape[1] != 3:
-                logging.warning(f"Unexpected aue_adversarials shape: {adv_images.shape}, expected [K, 3, H, W]")
                 return
 
             K, C, H, W = adv_images.shape
@@ -2197,7 +2210,6 @@ class Trainer:
             save_path1 = os.path.join(vis_dir, f"epoch_{self.epoch}_iter_{data_iter}_aue_images.png")
             plt.savefig(save_path1, dpi=150)
             plt.close(fig1)
-            logging.info(f"AUE adversarial images saved: {save_path1}")
 
             # ==== Visualization 2: Statistics and uncertainty ====
             fig2, axes2 = plt.subplots(2, 3, figsize=(18, 12))
@@ -2282,13 +2294,9 @@ class Trainer:
             save_path2 = os.path.join(vis_dir, f"epoch_{self.epoch}_iter_{data_iter}_aue_stats.png")
             plt.savefig(save_path2, dpi=150)
             plt.close(fig2)
-            logging.info(f"AUE adversarial statistics saved: {save_path2}")
 
-        except Exception as e:
-            logging.warning(f"AUE adversarial visualization failed: {e}")
-            import traceback
-
-            logging.warning(traceback.format_exc())
+        except Exception:
+            pass
 
 
 def print_model_summary(model: torch.nn.Module, log_dir: str = ""):

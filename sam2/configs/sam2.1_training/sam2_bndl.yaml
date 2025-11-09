@@ -205,9 +205,6 @@ trainer:
     # AUE (Adversarial Uncertainty Estimation) options (disabled)
     use_aue: false
 
-    # ROI sharing
-    share_roi_views: true
-
     ####### Training specific params #######
     # box/point input and corrections
     prob_to_use_pt_input_for_train: 0.5

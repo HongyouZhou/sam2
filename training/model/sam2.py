@@ -105,7 +105,7 @@ class SAM2Train(SAM2Base):
     def forward(self, input: BatchedVideoDatapoint):
         if self.training or not self.forward_backbone_per_frame_for_eval:
             # precompute image features on all frames before tracking
-            backbone_out = self.forward_image(input.flat_img_batch)
+            backbone_out = self.forward_image(input.flat_img_batch, use_checkpoint=True)
         else:
             # defer image feature computation on a frame until it's being tracked
             backbone_out = {"backbone_fpn": None, "vision_pos_enc": None}
@@ -125,7 +125,7 @@ class SAM2Train(SAM2Base):
 
         # Compute the image features on those unique image ids
         image = img_batch[unique_img_ids]
-        backbone_out = self.forward_image(image)
+        backbone_out = self.forward_image(image, use_checkpoint=True)
         (
             _,
             vision_feats,
@@ -240,9 +240,10 @@ class SAM2Train(SAM2Base):
         H_mask, W_mask = input.masks.shape[-2:]
         
         # Initialize: [T, B_videos, K, H, W]
+        # Force float32 for AUE masks (input.masks might be bool)
         mask_all_objs_for_aue = torch.zeros(
             num_frames, num_videos, max_num_objects, H_mask, W_mask,
-            dtype=input.masks.dtype, 
+            dtype=torch.float32, 
             device=input.masks.device
         )
         num_objs_per_video_frame = torch.zeros(
@@ -260,29 +261,40 @@ class SAM2Train(SAM2Base):
                 obj_mask = (frame_obj_to_img[:, 1] == video_idx)
                 obj_indices = obj_mask.nonzero(as_tuple=True)[0]
                 K_actual = len(obj_indices)
-                
-                if K_actual > 0:
-                    video_frame_masks = frame_masks[obj_indices]
-                    
-                    if ENABLE_BACKGROUND_MASK:
-                        # Reserve 1 slot for background
-                        K_store = min(K_actual, max_num_objects - 1)
-                        mask_all_objs_for_aue[t, video_idx, :K_store] = video_frame_masks[:K_store]
-                        
-                        # Compute and store background mask at index K_store
-                        union_mask = video_frame_masks[:K_store].sum(dim=0).clamp(0, 1)
-                        background_mask = 1.0 - union_mask
-                        mask_all_objs_for_aue[t, video_idx, K_store] = background_mask
-                        
-                        # Total count = objects + background
-                        num_objs_per_video_frame[t, video_idx] = K_store + 1
+
+                if ENABLE_BACKGROUND_MASK:
+                    # Reserve final slot for background, fill foreground up to max_num_objects - 1
+                    max_fg_slots = max_num_objects - 1
+                    K_store = min(K_actual, max_fg_slots)
+
+                    if K_store > 0:
+                        video_frame_masks = frame_masks[obj_indices[:K_store]]
+                        # Ensure float conversion when assigning bool masks to float tensor
+                        mask_all_objs_for_aue[t, video_idx, :K_store] = video_frame_masks.float()
+                        union_mask = video_frame_masks.float().sum(dim=0).clamp(0, 1)
                     else:
-                        # No background: use all available slots for objects
-                        K_store = min(K_actual, max_num_objects)
-                        mask_all_objs_for_aue[t, video_idx, :K_store] = video_frame_masks[:K_store]
-                        
-                        # Total count = objects only
-                        num_objs_per_video_frame[t, video_idx] = K_store
+                        union_mask = torch.zeros(
+                            H_mask, W_mask, dtype=mask_all_objs_for_aue.dtype, device=mask_all_objs_for_aue.device
+                        )
+
+                    background_mask = (1.0 - union_mask).clamp(0, 1)
+                    background_slot = max_num_objects - 1
+                    mask_all_objs_for_aue[t, video_idx, background_slot] = background_mask
+
+                    # Total count = foreground (possibly zero) + background
+                    num_objs_per_video_frame[t, video_idx] = K_store + 1
+                else:
+                    if K_actual == 0:
+                        continue
+
+                    video_frame_masks = frame_masks[obj_indices]
+                    # No background: use all available slots for objects
+                    K_store = min(K_actual, max_num_objects)
+                    # Ensure float conversion when assigning bool masks to float tensor
+                    mask_all_objs_for_aue[t, video_idx, :K_store] = video_frame_masks[:K_store].float()
+
+                    # Total count = objects only
+                    num_objs_per_video_frame[t, video_idx] = K_store
         
         backbone_out["mask_all_objs_for_aue"] = mask_all_objs_for_aue
         backbone_out["num_objs_per_video_frame"] = num_objs_per_video_frame
@@ -464,7 +476,7 @@ class SAM2Train(SAM2Base):
         # DO NOT initialize pixel_gt_for_aue with gt_masks!
         # gt_masks is reserved for prompt sampling only
         pixel_gt_for_aue = None
-        if USE_MULTI_OBJECT_AUE and hasattr(self, '_current_backbone_out'):
+        if USE_MULTI_OBJECT_AUE and is_init_cond_frame and hasattr(self, '_current_backbone_out'):
             backbone_out = self._current_backbone_out
             if "mask_all_objs_for_aue" in backbone_out:
                 mask_all_objs = backbone_out["mask_all_objs_for_aue"][frame_idx]  # [B_videos, K, H, W]
@@ -485,10 +497,21 @@ class SAM2Train(SAM2Base):
                 for i in range(O_t):
                     video_idx = obj_to_frame[i, 1].item()
                     K_actual = num_objs[video_idx].item()
-                    multi_obj_masks[i, :K_actual] = mask_all_objs[video_idx, :K_actual]
+                    # Copy all non-empty masks from mask_all_objs (includes foreground + background if enabled)
+                    # Background is at slot K-1 (e.g., index 10 when K=11), not necessarily in [:K_actual]
+                    multi_obj_masks[i] = mask_all_objs[video_idx]
                 
                 # Use multi-object masks
                 pixel_gt_for_aue = multi_obj_masks
+                
+                # DEBUG: Log pixel_gt_for_aue details
+                import logging
+                if pixel_gt_for_aue is not None:
+                    per_channel_area = [(pixel_gt_for_aue[:, k] > 0.5).sum().item() for k in range(min(pixel_gt_for_aue.shape[1], 5))]
+                    logging.debug(f"DEBUG track_step: pixel_gt_for_aue.shape={pixel_gt_for_aue.shape}, "
+                                 f"is_init_cond={is_init_cond_frame}, frame_idx={frame_idx}, "
+                                 f"min={pixel_gt_for_aue.min():.3f}, max={pixel_gt_for_aue.max():.3f}, "
+                                 f"per_channel_area[0:5]={per_channel_area}")
         
         current_out, sam_outputs, high_res_features, pix_feat = self._track_step(
             frame_idx,
