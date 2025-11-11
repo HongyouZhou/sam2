@@ -22,13 +22,27 @@ class AdversarialStyleGCN(nn.Module):
     Graph Convolutional Network for refining style perturbations across multiple objects.
 
     Uses a 2-layer GCN with residual connections to coordinate perturbations between
-    spatially or semantically related objects. Optionally accepts visual features
-    to enable content-aware style refinement.
+    spatially or semantically related objects. Visual features are projected to style_dim
+    via MLP and fused with style deltas for content-aware refinement.
 
     Args:
         style_dim: Dimension of style perturbation vector (6 for Gram matrix style)
-        feature_dim: Dimension of visual features (0 = no features, 256 for backbone_fpn[-1])
+        feature_dim: Dimension of visual features (e.g., 256 for backbone_fpn[-1]).
+                     If > 0, creates a feature projection MLP and fuses with styles in GCN
         num_layers: Number of GCN layers (default: 2)
+    
+    Architecture:
+        1. Feature Projection MLP (if feature_dim > 0):
+           feature_dim (256) → feature_dim/2 (128) → style_dim (6)
+           
+        2. Node Feature Fusion:
+           style_deltas [B, K, 6] + projected_features [B, K, 6] → [B, K, 12]
+           
+        3. GCN Layers (operate on fused features):
+           - Intermediate layers: [12] → [12] with ReLU + LayerNorm
+           - Last layer: [12] → [6] (project back to style space)
+           
+        This ensures features and styles have equal weight (both 6-dim) before fusion.
     """
 
     def __init__(self, style_dim: int = 6, feature_dim: int = 0, num_layers: int = 2):
@@ -38,137 +52,121 @@ class AdversarialStyleGCN(nn.Module):
         self.feature_dim = feature_dim
         self.num_layers = num_layers
         
-        # Node dimension: style + optional visual features
-        self.node_dim = style_dim + feature_dim
+        # Node dimension: style + projected features (both style_dim)
+        self.node_dim = style_dim * 2 if feature_dim > 0 else style_dim
+
+        # Feature projection MLP: project high-dim features to style_dim
+        # This balances the contribution of features and styles (both become 6-dim)
+        if feature_dim > 0:
+            self.feature_projection = nn.Sequential(
+                nn.Linear(feature_dim, feature_dim // 2),
+                nn.ReLU(),
+                nn.Linear(feature_dim // 2, style_dim),
+            )
+            # Initialize with small weights for stable projection
+            for m in self.feature_projection.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.normal_(m.weight, mean=0.0, std=0.01)
+                    nn.init.zeros_(m.bias)
+        else:
+            self.feature_projection = None
 
         # Build GCN layers
-        # First num_layers-1 layers maintain node_dim for processing
-        # Last layer projects back to style_dim only
+        # Intermediate layers maintain node_dim, last layer projects to style_dim
         self.layers = nn.ModuleList()
         for i in range(num_layers):
             if i < num_layers - 1:
-                # Intermediate layers: maintain node dimension
+                # Intermediate layers: maintain node_dim
                 layer = nn.Linear(self.node_dim, self.node_dim)
             else:
-                # Last layer: project back to style space
+                # Last layer: project back to style_dim only
                 layer = nn.Linear(self.node_dim, style_dim)
-
+            
             # Initialize all layers with small weights for near-identity behavior
-            # Combined with alpha ≈ 0, this makes the GCN output close to input initially
-            nn.init.normal_(layer.weight, mean=0.0, std=0.01)  # Small random init
+            nn.init.normal_(layer.weight, mean=0.0, std=0.01)
             nn.init.zeros_(layer.bias)
-
+            
             self.layers.append(layer)
 
         # Layer normalization for stability
-        # Use node_dim for intermediate layers, style_dim for last layer
         self.layer_norms = nn.ModuleList()
         for i in range(num_layers):
             if i < num_layers - 1:
                 self.layer_norms.append(nn.LayerNorm(self.node_dim))
             else:
                 self.layer_norms.append(nn.LayerNorm(style_dim))
-
-        # Learnable residual weights (alpha) per layer
-        # Initialize to -2.0 for moderate near-identity mapping at start
-        # sigmoid(-2) ≈ 0.12, so output ≈ 0.12 * GCN(x) + 0.88 * x
-        # This allows GCN to have meaningful impact from the start while
-        # still being conservative enough not to disrupt PGD too much
-        self.alphas = nn.ParameterList([nn.Parameter(torch.tensor([-2.0])) for _ in range(num_layers)])
+        
+        self.dropout = 0.1
 
     def forward(self, style_deltas: torch.Tensor, edge_index: torch.Tensor, edge_weight: torch.Tensor,
                 mask_features: torch.Tensor | None = None) -> torch.Tensor:
-        """
-        Forward pass of GCN with optional visual features.
-
-        Args:
-            style_deltas: Style perturbations [B, num_nodes, style_dim]
-                         where num_nodes = K (foreground only) or K+1 (with background)
-            edge_index: Edge indices [2, E] where E is number of edges
-            edge_weight: Edge weights [E]
-            mask_features: Optional visual features [B, num_nodes, feature_dim]
-                          extracted from image encoder for each mask region
-
-        Returns:
-            Refined style perturbations [B, num_nodes, style_dim]
-        """
+        """Forward pass of GCN for refining style perturbations."""
         B, num_nodes, _ = style_deltas.shape
 
-        # Concatenate visual features if provided
-        if mask_features is not None:
-            assert mask_features.shape[:2] == (B, num_nodes), \
-                f"mask_features shape {mask_features.shape} doesn't match style_deltas batch/nodes ({B}, {num_nodes})"
-            assert mask_features.shape[2] == self.feature_dim, \
-                f"mask_features dim {mask_features.shape[2]} doesn't match feature_dim {self.feature_dim}"
-            node_features = torch.cat([style_deltas, mask_features], dim=-1)  # [B, num_nodes, node_dim]
+        # Fuse visual features with style deltas if provided
+        if mask_features is not None and self.feature_projection is not None:
+            projected_features = self.project_features(mask_features)
+            node_features = torch.cat([style_deltas, projected_features], dim=-1)
         else:
-            node_features = style_deltas  # [B, num_nodes, style_dim]
+            node_features = style_deltas
 
-        # Flatten batch and nodes for processing
-        x = node_features.reshape(B * num_nodes, self.node_dim)  # [B*num_nodes, node_dim]
+        x = node_features.reshape(B * num_nodes, node_features.shape[-1])
 
-        # Apply GCN layers
-        # Intermediate layers maintain node_dim, last layer projects to style_dim
-        for layer_idx, (linear, norm, alpha) in enumerate(zip(self.layers, self.layer_norms, self.alphas)):
-            # x_input = x  # Save input for residual connection
-
-            # Message passing (use actual num_nodes from input shape)
-            x = self._graph_conv(x, edge_index, edge_weight, B, num_nodes)
-
-            # Linear transformation
+        # Apply GCN layers: Transform -> Aggregate -> Activate
+        for layer_idx, (linear, norm) in enumerate(zip(self.layers, self.layer_norms)):
             x = linear(x)
-
-            # ReLU activation (except last layer)
+            x = self._graph_conv(x, edge_index, edge_weight, B, num_nodes)
+            
             if layer_idx < self.num_layers - 1:
-                # Layer normalization
-                x = norm(x) 
+                x = norm(x)
                 x = F.relu(x)
+                x = F.dropout(x, p=self.dropout, training=self.training)
 
-            # # Residual connection with learnable weight (works for all layers now)
-            # alpha_val = torch.sigmoid(alpha)  # Ensure alpha in [0, 1]
-            # x = alpha_val * x + (1 - alpha_val) * x_input  ### TODO: problem unbounded output value
-
-        # Reshape back to [B, num_nodes, style_dim]
-        # Last layer has projected back to style_dim, so output is style perturbations only
         x = x.reshape(B, num_nodes, self.style_dim)
-
         return x
+    
+    def project_features(self, mask_features: torch.Tensor) -> torch.Tensor:
+        """Project high-dim features to style_dim for balanced fusion."""
+        if self.feature_projection is None:
+            raise RuntimeError("Feature projection not available. Set feature_dim > 0.")
+        
+        B, K, C = mask_features.shape
+        features_flat = mask_features.reshape(B * K, C)
+        projected = self.feature_projection(features_flat)
+        projected = projected.reshape(B, K, self.style_dim)
+        return projected
+    
+    def _add_self_loops(
+        self, 
+        edge_index: torch.Tensor, 
+        edge_weight: torch.Tensor, 
+        num_nodes: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Add self-loops to preserve node identity."""
+        device = edge_index.device
+        
+        loop_index = torch.arange(num_nodes, dtype=torch.long, device=device)
+        loop_index = loop_index.unsqueeze(0).repeat(2, 1)
+        loop_weight = torch.ones(num_nodes, dtype=edge_weight.dtype, device=device)
+        
+        edge_index = torch.cat([edge_index, loop_index], dim=1)
+        edge_weight = torch.cat([edge_weight, loop_weight], dim=0)
+        
+        return edge_index, edge_weight
 
-    def _graph_conv(self, x: torch.Tensor, edge_index: torch.Tensor, edge_weight: torch.Tensor, batch_size: int, num_nodes_per_batch: int) -> torch.Tensor:
-        """
-        Perform standard graph convolution operation.
-
-        This method performs a uniform graph convolution on all nodes,
-        without any special handling based on node semantics (foreground/background).
-        The node features should already include all nodes that participate in the graph.
-
-        Args:
-            x: Node features [num_nodes, D] where num_nodes = B * num_nodes_per_batch
-            edge_index: Edge indices [2, E] where E is number of edges
-            edge_weight: Edge weights [E]
-            batch_size: Batch size B
-            num_nodes_per_batch: Number of nodes per batch (K or K+1 depending on config)
-
-        Returns:
-            Aggregated features [num_nodes, D]
-        """
+    def _graph_conv(self, x: torch.Tensor, edge_index: torch.Tensor, edge_weight: torch.Tensor, 
+                    batch_size: int, num_nodes_per_batch: int) -> torch.Tensor:
+        """Graph convolution: aggregate neighbor features with weights."""
         if edge_index.numel() == 0:
-            # No edges, return identity
             return x
 
-        # Extract source and target nodes
         src, tgt = edge_index[0], edge_index[1]
-
-        # Allocate output tensor (use new_zeros for memory efficiency)
         out = x.new_zeros(x.size(0), x.size(1))
-
-        # Gather source features and apply edge weights
-        src_features = x[src]  # [E, D]
-        weighted_features = src_features * edge_weight.unsqueeze(1)  # [E, D]
-
-        # Aggregate messages to target nodes
-        out.index_add_(0, tgt, weighted_features)  # out[tgt] += weighted_features
-
+        
+        src_features = x[src]
+        weighted_features = src_features * edge_weight.unsqueeze(1)
+        out.index_add_(0, tgt, weighted_features)
+        
         return out
 
 
@@ -178,39 +176,20 @@ def compute_boundary_distance(
     grid_y: torch.Tensor,
     grid_x: torch.Tensor,
 ) -> float:
-    """
-    Compute minimum distance between boundaries of two masks.
-
-    Args:
-        mask1: Binary mask [H, W]
-        mask2: Binary mask [H, W]
-        grid_y: Y coordinate grid [1, 1, H, W]
-        grid_x: X coordinate grid [1, 1, H, W]
-
-    Returns:
-        Minimum distance between boundaries (normalized by image diagonal)
-    """
-    # Extract boundary pixels using dilation
-    # boundary = dilated_mask - mask
+    """Compute minimum distance between boundaries of two masks."""
     kernel_size = 3
     padding = kernel_size // 2
 
-    # Dilate masks to find boundaries
-    mask1_expanded = mask1.unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+    mask1_expanded = mask1.unsqueeze(0).unsqueeze(0)
     mask2_expanded = mask2.unsqueeze(0).unsqueeze(0)
 
-    # Use max_pool2d as dilation operation with padding to maintain size
-    # padding=kernel_size//2 ensures output size matches input size
     mask1_dilated = F.max_pool2d(mask1_expanded, kernel_size=kernel_size, stride=1, padding=padding)
     mask2_dilated = F.max_pool2d(mask2_expanded, kernel_size=kernel_size, stride=1, padding=padding)
 
-    # Boundary = dilated - original (both should be [1, 1, H, W] now)
-    boundary1 = (mask1_dilated - mask1_expanded).squeeze() > 0.5  # [H, W] bool
-    boundary2 = (mask2_dilated - mask2_expanded).squeeze() > 0.5  # [H, W] bool
+    boundary1 = (mask1_dilated - mask1_expanded).squeeze() > 0.5
+    boundary2 = (mask2_dilated - mask2_expanded).squeeze() > 0.5
 
-    # If no boundary pixels, fall back to centroid distance
     if not boundary1.any() or not boundary2.any():
-        # Compute centroids as fallback
         area1 = mask1.sum()
         area2 = mask2.sum()
         if area1 <= 0 or area2 <= 0:
@@ -224,21 +203,16 @@ def compute_boundary_distance(
         dist = ((cy1 - cy2) ** 2 + (cx1 - cx2) ** 2) ** 0.5
         return float(dist)
 
-    # Get boundary pixel coordinates
-    boundary1_coords = torch.stack([grid_y[0, 0][boundary1], grid_x[0, 0][boundary1]], dim=1)  # [N1, 2]
-    boundary2_coords = torch.stack([grid_y[0, 0][boundary2], grid_x[0, 0][boundary2]], dim=1)  # [N2, 2]
+    boundary1_coords = torch.stack([grid_y[0, 0][boundary1], grid_x[0, 0][boundary1]], dim=1)
+    boundary2_coords = torch.stack([grid_y[0, 0][boundary2], grid_x[0, 0][boundary2]], dim=1)
 
     if boundary1_coords.shape[0] == 0 or boundary2_coords.shape[0] == 0:
         return float("inf")
 
-    # Compute pairwise distances between boundary pixels
-    # Expand dimensions for broadcasting: [N1, 1, 2] - [1, N2, 2] = [N1, N2, 2]
-    diff = boundary1_coords.unsqueeze(1) - boundary2_coords.unsqueeze(0)  # [N1, N2, 2]
-    distances = (diff**2).sum(dim=2) ** 0.5  # [N1, N2]
-
-    # Return minimum distance
-    min_dist = distances.min().item()
-    return min_dist
+    diff = boundary1_coords.unsqueeze(1) - boundary2_coords.unsqueeze(0)
+    distances = (diff**2).sum(dim=2) ** 0.5
+    
+    return distances.min().item()
 
 
 def build_object_graph(
@@ -249,30 +223,11 @@ def build_object_graph(
     use_semantic: bool = True,
     use_background: bool = False,
     distance_threshold: float | None = None,
-    use_boundary_distance: bool = False,  # Use boundary distance instead of centroid distance
+    use_boundary_distance: bool = False,
+    mask_features: Optional[torch.Tensor] = None,
+    feature_sim_threshold: float = 0.5,
 ) -> Tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
-    """
-    Build object graph from masks for GCN message passing.
-
-    This version respects the real object count per sample (padding slots are ignored),
-    treats the background as the dedicated final slot when `use_background=True`, and
-    optionally connects foreground nodes based on distance (centroid or boundary).
-
-    Args:
-        masks: Binary masks [B, K, H, W] or [B, K, 1, H, W]
-        img_batch: Optional images (unused, reserved for future semantic cues)
-        labels: Optional object labels [B, K] for semantic edges (currently unused)
-        edge_threshold: IoU threshold for spatial edges
-        use_semantic: Whether to add semantic edges between same-label objects
-        use_background: Whether to connect foreground objects with the background node
-        distance_threshold: Distance threshold for geometric adjacency (normalized to [0,1])
-        use_boundary_distance: If True, use boundary distance; if False, use centroid distance
-
-    Returns:
-        edge_index: Edge indices [2, E] in COO format
-        edge_weight: Edge weights [E], normalized by degree
-        stats: Dictionary of summary statistics for logging/debugging
-    """
+    """Build object graph from masks for GCN message passing."""
     if masks.ndim == 5:
         masks = masks.squeeze(2)
 
@@ -313,7 +268,14 @@ def build_object_graph(
         "edges_iou": 0,
         "edges_distance": 0,
         "edges_background": 0,
+        "edges_semantic": 0,
     }
+    
+    # Pre-compute normalized features for semantic similarity if provided
+    normalized_features = None
+    if mask_features is not None:
+        # L2 normalize features for cosine similarity
+        normalized_features = F.normalize(mask_features, p=2, dim=-1)  # [B, K, C]
 
     for b in range(B):
         # Foreground slots: everything before the dedicated background slot (if any)
@@ -482,6 +444,33 @@ def build_object_graph(
                         edge_wgt.extend([weight, weight])
                         stats["edges_distance"] += 2
 
+        # Semantic edges based on visual feature similarity
+        if normalized_features is not None and len(object_indices) > 1:
+            for i_pos, i in enumerate(object_indices):
+                feat_i = normalized_features[b, i]  # [C]
+                node_i = b * nodes_per_batch + i
+                
+                for j in object_indices[i_pos + 1:]:
+                    feat_j = normalized_features[b, j]  # [C]
+                    
+                    # Cosine similarity (dot product of normalized vectors)
+                    similarity = (feat_i * feat_j).sum().item()
+                    
+                    if similarity < feature_sim_threshold:
+                        continue
+                    
+                    # Debug log for first semantic edge found in first batch
+                    if b == 0 and stats["edges_semantic"] == 0:
+                        import logging
+                        logging.debug(f"GCN: First semantic edge found: obj_{i} <-> obj_{j}, similarity={similarity:.3f}, threshold={feature_sim_threshold}")
+                    
+                    # Use similarity as edge weight
+                    node_j = b * nodes_per_batch + j
+                    edge_src.extend([node_i, node_j])
+                    edge_tgt.extend([node_j, node_i])
+                    edge_wgt.extend([similarity, similarity])
+                    stats["edges_semantic"] += 2
+        
         # Optional background edges (foreground ↔ background)
         if background_idx is not None and object_indices:
             node_bg = b * nodes_per_batch + background_idx
@@ -526,6 +515,7 @@ def build_object_graph(
                 "edges_iou": 0.0,
                 "edges_distance": 0.0,
                 "edges_background": 0.0,
+                "edges_semantic": 0.0,
                 "avg_degree": 0.0,
                 "avg_fg_degree": 0.0,
             },
