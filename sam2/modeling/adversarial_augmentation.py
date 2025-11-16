@@ -20,10 +20,14 @@ Key components:
 
 import logging
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+if TYPE_CHECKING:
+    from sam2.modeling.sam2_base import SAM2Base
 
 
 @dataclass
@@ -41,6 +45,8 @@ class AugmentationResult:
         num_backbone_forwards: Number of backbone forward passes required (for monitoring)
         mode: Augmentation mode ("image_level" or "feature_level")
         aug_type: Augmentation type ("style" or "deformation")
+        original_styles: Optional original style statistics (for style augmentation visualization)
+        adversarial_styles: Optional adversarial style statistics (for style augmentation visualization)
     """
     features: torch.Tensor  # [B, C, H, W]
     high_res_features: list[torch.Tensor] | None = None
@@ -48,6 +54,8 @@ class AugmentationResult:
     num_backbone_forwards: int = 0
     mode: str = ""
     aug_type: str = ""
+    original_styles: torch.Tensor | None = None  # For style augmentation visualization
+    adversarial_styles: torch.Tensor | None = None  # For style augmentation visualization
     
     def release_intermediate(self):
         """
@@ -184,7 +192,7 @@ class ImageLevelStyleImpl(nn.Module):
         clean_features: torch.Tensor,
         clean_high_res: list[torch.Tensor] | None,
         pixel_gt: torch.Tensor,
-        model: nn.Module,
+        model: "SAM2Base",
     ) -> AugmentationResult:
         """
         Apply image-level style augmentation.
@@ -212,13 +220,19 @@ class ImageLevelStyleImpl(nn.Module):
         
         # 2. Run PGD to find adversarial styles
         # Note: Pass clean_features for GCN (if enabled)
-        adv_styles = model._pgd_style_attack(
+        # Get pixel_bndl_model from model if available
+        pixel_bndl_model = None
+        if hasattr(model, 'sam_mask_decoder') and hasattr(model.sam_mask_decoder, 'pixel_bndl'):
+            pixel_bndl_model = model.sam_mask_decoder.pixel_bndl
+        
+        adv_styles = model._pgd_find_adversarial_styles(
             img_batch=img_batch,
             pixel_gt=pixel_gt_normalized,
             original_styles=original_styles,
-            pgd_steps=self.pgd_steps,
-            epsilon=self.epsilon,
+            num_steps=self.pgd_steps,
             step_size=self.step_size,
+            epsilon=self.epsilon,
+            pixel_bndl_model=pixel_bndl_model,
             backbone_features=clean_features,  # For GCN
         )
         
@@ -244,6 +258,11 @@ class ImageLevelStyleImpl(nn.Module):
                 backbone_out['backbone_fpn'][1]
             ]
         
+        # Save styles for visualization if enabled
+        enable_vis = getattr(model, '_enable_style_visualization', False)
+        orig_styles_vis = original_styles.detach().cpu() if enable_vis else None
+        adv_styles_vis = adv_styles.detach().cpu() if enable_vis else None
+        
         return AugmentationResult(
             features=styled_features,
             high_res_features=styled_high_res,
@@ -251,6 +270,8 @@ class ImageLevelStyleImpl(nn.Module):
             num_backbone_forwards=1,  # Key cost: 1 extra backbone forward
             mode="image_level",
             aug_type="style",
+            original_styles=orig_styles_vis,
+            adversarial_styles=adv_styles_vis,
         )
 
 

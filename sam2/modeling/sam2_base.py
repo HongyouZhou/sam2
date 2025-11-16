@@ -513,9 +513,23 @@ class SAM2Base(torch.nn.Module):
         original_images_cpu = img_batch[:num_vis_samples].detach().cpu()
         adversarial_images_cpu = adv_images[:num_vis_samples].detach().cpu()
         
-        # Process styles if provided
-        original_styles_cpu = original_styles[:num_vis_samples].detach().cpu() if original_styles is not None else None
-        adv_styles_cpu = adv_styles[:num_vis_samples].detach().cpu() if adv_styles is not None else None
+        # Process styles if provided (handle both GPU and CPU tensors)
+        # Styles are [B, K, 6] where K is number of objects
+        if original_styles is not None:
+            if original_styles.is_cuda:
+                original_styles_cpu = original_styles[:num_vis_samples].detach().cpu()
+            else:
+                original_styles_cpu = original_styles[:num_vis_samples].detach()
+        else:
+            original_styles_cpu = None
+            
+        if adv_styles is not None:
+            if adv_styles.is_cuda:
+                adv_styles_cpu = adv_styles[:num_vis_samples].detach().cpu()
+            else:
+                adv_styles_cpu = adv_styles[:num_vis_samples].detach()
+        else:
+            adv_styles_cpu = None
         
         # Add multi-object visualization data (masks and bboxes)
         if pixel_gt is not None and pixel_gt.ndim == 4:
@@ -734,6 +748,8 @@ class SAM2Base(torch.nn.Module):
  
         # Adversarial augmentation branch (串行: 形变 → 风格)
         calibration_loss_adversarial = torch.tensor(0.0, device=device, dtype=dtype)
+        style_result = None  # Initialize outside try block for visualization
+        vis_data = None  # Initialize outside try block for visualization
         
         if (self.use_deform_aug or self.use_style_aug) and backbone_features is not None:
             # 用于清理的资源列表
@@ -810,19 +826,40 @@ class SAM2Base(torch.nn.Module):
                     # 及时释放
                     del adv_aux_outputs
                 
+                # Extract visualization data BEFORE cleanup (if enabled)
+                # This must be done before finally block releases intermediate_images
+                enable_vis = getattr(self, '_enable_style_visualization', False)
+                if enable_vis and style_result is not None and style_result.intermediate_images is not None:
+                    # Extract visualization data from style augmentation result
+                    styled_images = style_result.intermediate_images  # [B, 3, H, W]
+                    original_styles = style_result.original_styles  # [B, K, 6] or None
+                    adversarial_styles = style_result.adversarial_styles  # [B, K, 6] or None
+                    
+                    # Prepare visualization data (this copies data to CPU, so safe after cleanup)
+                    num_vis_samples = min(4, img_batch.shape[0])
+                    vis_data = self._prepare_aue_visualization_data(
+                        img_batch=img_batch,
+                        adv_images=styled_images,
+                        pixel_gt=pixel_gt,
+                        num_vis_samples=num_vis_samples,
+                        original_styles=original_styles,
+                        adv_styles=adversarial_styles,
+                    )
+                
             finally:
                 # 确保所有结果都被释放（倒序释放）
                 for result in reversed(results_to_cleanup):
                     result.release_intermediate()
         
-        # Initialize loss dictionary for detailed logging
         loss_dict = {}
         
-        # Main losses (只有两个: clean + adversarial)
         loss_dict['calibration_loss_clean'] = calibration_loss_clean
         loss_dict['calibration_loss_adversarial'] = calibration_loss_adversarial
         
-        # Total loss (串行设计)
+        # Save visualization data if available (prepared before cleanup)
+        if vis_data is not None:
+            loss_dict['style_aue_visualization'] = vis_data
+        
         loss = calibration_loss_clean + calibration_loss_adversarial
         loss_dict['total_loss'] = loss
 
@@ -1895,13 +1932,13 @@ class SAM2Base(torch.nn.Module):
             raise RuntimeError("Uncertainty calibration: inputs contain NaN/Inf")
         
         # 3. MMD loss (primary: distribution matching)
-        # KEY CHANGE: No detach() on uncertainty when using analytic mode!
-        # This allows gradients to flow back to BNDL parameters
+        # Uncertainty is detached from BNDL - gradients only flow through error to encoder/decoder
+        # This trains the model to produce robust features, not to modify BNDL uncertainty
         if getattr(self, 'aue_use_patch_mmd', True):
             # Patch-based MMD for better local distribution matching
             mmd_loss = self._compute_patch_based_mmd(
-                uncertainty,  # ✅ No detach! Gradients flow to BNDL (if analytic)
-                error,        # Gradients flow to encoder/decoder
+                uncertainty,  # Detached from BNDL - no gradients to BNDL parameters
+                error,        # Gradients flow to encoder/decoder through pixel_logits
                 patch_size=getattr(self, 'aue_patch_size', 16),
                 kernel='rbf',
                 bandwidth=0.1,
@@ -2533,6 +2570,7 @@ class SAM2Base(torch.nn.Module):
                 
                 # Extract external_pre_out_w (hyper_in) for analytic uncertainty computation
                 external_w_for_aue = bndl_outputs.get('hyper_in', None)
+                assert external_w_for_aue is not None
                 
                 # Unified AUE loss: automatically switches between style-based and feature-based
                 aue_loss, aue_loss_dict = self.compute_aue_loss(

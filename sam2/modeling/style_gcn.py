@@ -164,6 +164,8 @@ class AdversarialStyleGCN(nn.Module):
         out = x.new_zeros(x.size(0), x.size(1))
         
         src_features = x[src]
+        # Ensure edge_weight has the same dtype as x to avoid type mismatch
+        edge_weight = edge_weight.to(dtype=x.dtype)
         weighted_features = src_features * edge_weight.unsqueeze(1)
         out.index_add_(0, tgt, weighted_features)
         

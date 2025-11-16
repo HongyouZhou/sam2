@@ -79,7 +79,7 @@ trainer:
   _target_: training.trainer.Trainer
   mode: train
   max_epochs: ${times:${scratch.num_epochs},${scratch.phases_per_epoch}}
-  actual_max_epochs: 4
+  actual_max_epochs: 6
   accelerator: cuda
   seed_value: 123
   cuda:
@@ -206,7 +206,7 @@ trainer:
     # Compilation flag
     # compile_image_encoder: False
     
-    freeze_image_encoder: false
+    freeze_image_encoder: true
 
     # === AUE_GCN_CONFIG_START ===
     # AUE (Adversarial Uncertainty Estimation) with Style-based augmentation
@@ -416,12 +416,12 @@ trainer:
             - 'sam_mask_decoder.pixel_bndl.*'
 
         # ③ GCN: high learning rate for rapid alpha convergence
-        - scheduler:
-            _target_: fvcore.common.param_scheduler.CosineParamScheduler
-            start_value: 1.0e-5
-            end_value: 5.0e-6
-          param_names:
-            - 'style_gcn.*'
+        # - scheduler:
+        #     _target_: fvcore.common.param_scheduler.CosineParamScheduler
+        #     start_value: 1.0e-5
+        #     end_value: 5.0e-6
+        #   param_names:
+        #     - 'style_gcn.*'
 
         # ④ Other decoder components: very small learning rate
         - scheduler:
@@ -471,16 +471,16 @@ trainer:
       weight_schedule:
         - until_epoch: 1
           sam_weight: 1.0
-          bndl_weight: 1.0
-          aue_weight: 0.05  # Epoch 0: 极低 AUE
+          bndl_weight: 0.5
+          aue_weight: 0.05
         - until_epoch: 3
           sam_weight: 1.0
-          bndl_weight: 1.0
-          aue_weight: 0.10  # Epoch 1-2: 中等 AUE
+          bndl_weight: 0.5
+          aue_weight: 0.20
         - until_epoch: null
           sam_weight: 1.0
-          bndl_weight: 1.0
-          aue_weight: 0.15  # Epoch 3+: 较高 AUE（但仍 < 0.5）
+          bndl_weight: 0.5
+          aue_weight: 0.30
     # val:
     #   _target_: training.loss_combined.CombinedSAMBNDLLoss
     #   sam_loss: ${trainer.loss.all.sam_loss}
@@ -545,7 +545,7 @@ launcher:
   gpus_per_node: 8
   # NOTE: experiment_log_dir is automatically set by train_and_zs.sh based on BNDL_AUE_VER
   # To change version, edit BNDL_AUE_VER in scripts/train_and_zs.sh (no need to edit here)
-  experiment_log_dir: /home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_aue_017_13  # Default fallback, will be overridden
+  experiment_log_dir: /home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_aue_017_19  # Default fallback, will be overridden
 
 # SLURM args if running on a cluster
 submitit:

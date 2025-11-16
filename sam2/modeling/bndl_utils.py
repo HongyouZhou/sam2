@@ -6,7 +6,6 @@ including analytic uncertainty computation from Weibull parameters.
 """
 
 import torch
-import torch.nn.functional as F
 
 
 def pixel_weibull_to_entropy_uncertainty(
@@ -65,28 +64,94 @@ def pixel_weibull_to_entropy_uncertainty(
     
     # Step 1: Forward through BNDL to get Weibull parameters
     # force_sample=False ensures deterministic mode (uses expectation)
-    out, z_out, weibull_lambda, inv_k, pre_out_w, *_ = pixel_bndl_model(
-        pixel_feat, force_sample=False, external_pre_out_w=external_pre_out_w
-    )
+    # Use no_grad to prevent gradients from flowing back to BNDL parameters.
+    # Goal: Use uncertainty as guidance signal to train encoder/decoder,
+    # not to modify BNDL's uncertainty estimation method.
+    # Note: pixel_logits (used for error computation) is computed separately
+    # and retains gradients, allowing mask decoder to be updated.
+    with torch.no_grad():
+        out, z_out, weibull_lambda, inv_k, pre_out_w, *_ = pixel_bndl_model(
+            pixel_feat, force_sample=False, external_pre_out_w=external_pre_out_w
+        )
     K = out.shape[-1]  # number of output classes/masks
+    
+    # Early check: validate BNDL outputs
+    if not torch.isfinite(out).all():
+        raise RuntimeError("BNDL output contains NaN/Inf values")
+    if not torch.isfinite(weibull_lambda).all():
+        raise RuntimeError("BNDL weibull_lambda contains NaN/Inf values")
+    if not torch.isfinite(inv_k).all():
+        raise RuntimeError("BNDL inv_k contains NaN/Inf values")
     
     # Step 2: Compute Weibull statistics (E[Z] and Var[Z])
     eps_kappa = 1e-3
     
-    # Recover kappa from inv_k
+    # Recover kappa from inv_k with improved numerical stability
     # In BNDL: inv_k = 1 / (kappa + eps_kappa)
     # Therefore: kappa ≈ 1 / inv_k - eps_kappa
-    kappa = 1.0 / (inv_k + 1e-8) - eps_kappa
+    # Clamp inv_k to prevent division by extremely small values
+    inv_k_clamped = torch.clamp(inv_k, min=1e-6, max=1.0)
+    kappa = 1.0 / inv_k_clamped - eps_kappa
     kappa = torch.clamp(kappa, min=0.5, max=8.0)  # Enforce KAPPA_MIN/MAX
     
+    # Early check: validate kappa
+    if not torch.isfinite(kappa).all():
+        raise RuntimeError("kappa computation produced NaN/Inf values")
+    
+    # Clamp kappa for lgamma stability (prevent overflow)
+    kappa_safe = torch.clamp(kappa, min=0.5, max=8.0)
+    kappa_reciprocal = 1.0 / (kappa_safe + eps_kappa)
+    kappa_reciprocal_2 = 2.0 / (kappa_safe + eps_kappa)
+    
+    # Clamp reciprocal values to prevent lgamma overflow
+    # lgamma(x) is stable for x < ~170, so we clamp to safe range
+    kappa_reciprocal = torch.clamp(kappa_reciprocal, max=50.0)
+    kappa_reciprocal_2 = torch.clamp(kappa_reciprocal_2, max=50.0)
+    
     # Weibull expectation: E[Z] = λ * Γ(1 + 1/κ)
-    lgamma_1 = torch.lgamma(1.0 + 1.0 / (kappa + eps_kappa))
-    mean_z = weibull_lambda * torch.exp(lgamma_1)  # [B, H, W, C]
+    # (computed but not directly used in variance calculation)
+    lgamma_1_arg = 1.0 + kappa_reciprocal
+    lgamma_1 = torch.lgamma(lgamma_1_arg)
+    
+    # Early check: validate lgamma_1
+    if not torch.isfinite(lgamma_1).all():
+        raise RuntimeError("lgamma(1 + 1/kappa) produced NaN/Inf values")
     
     # Weibull variance: Var[Z] = λ² * [Γ(1 + 2/κ) - Γ²(1 + 1/κ)]
-    lgamma_2 = torch.lgamma(1.0 + 2.0 / (kappa + eps_kappa))
-    var_z = (weibull_lambda ** 2) * (torch.exp(lgamma_2) - torch.exp(2 * lgamma_1))
-    var_z = torch.clamp(var_z, min=0.0)  # Ensure non-negative
+    lgamma_2_arg = 1.0 + kappa_reciprocal_2
+    lgamma_2 = torch.lgamma(lgamma_2_arg)
+    
+    # Early check: validate lgamma_2
+    if not torch.isfinite(lgamma_2).all():
+        raise RuntimeError("lgamma(1 + 2/kappa) produced NaN/Inf values")
+    
+    # Use log-space computation to avoid numerical instability
+    # Var[Z] = λ² * [exp(lgamma_2) - exp(2*lgamma_1)]
+    # Compute in log-space: log(Var[Z]) = 2*log(λ) + log(exp(lgamma_2) - exp(2*lgamma_1))
+    # Use log-sum-exp trick for stability: log(exp(a) - exp(b)) = a + log(1 - exp(b-a)) when a > b
+    lgamma_max = torch.maximum(lgamma_2, 2 * lgamma_1)
+    lgamma_2_shifted = lgamma_2 - lgamma_max
+    lgamma_1_shifted = 2 * lgamma_1 - lgamma_max
+    
+    # Compute log(exp(lgamma_2) - exp(2*lgamma_1)) = lgamma_max + log(exp(shifted_2) - exp(shifted_1))
+    # Clamp the difference to prevent log(0) or log(negative)
+    exp_diff = torch.clamp(
+        torch.exp(lgamma_2_shifted) - torch.exp(lgamma_1_shifted),
+        min=1e-12  # Small positive value to prevent log(0)
+    )
+    log_gamma_diff = lgamma_max + torch.log(exp_diff)
+    
+    # Compute log(var_z) = 2*log(λ) + log_gamma_diff
+    log_lambda = torch.log(torch.clamp(weibull_lambda, min=1e-8))
+    log_var_z = 2 * log_lambda + log_gamma_diff
+    
+    # Convert back and clamp to reasonable range
+    var_z = torch.exp(torch.clamp(log_var_z, max=15.0))  # exp(15) ≈ 3e6, more conservative
+    var_z = torch.clamp(var_z, min=1e-10, max=1e6)  # Final safety clamp
+    
+    # Early check: validate var_z
+    if not torch.isfinite(var_z).all():
+        raise RuntimeError("var_z computation produced NaN/Inf values")
     
     # Step 3: Propagate to logits statistics
     # logits = linear_output(Z) = W @ Z + b
@@ -103,14 +168,36 @@ def pixel_weibull_to_entropy_uncertainty(
         # Fallback: use mean variance across channels
         var_logits = var_z.mean(dim=-1, keepdim=True).expand(B, H, W, K)
     
-    std_logits = torch.sqrt(var_logits + 1e-8)  # [B, H, W, K]
+    # Early check: validate var_logits
+    if not torch.isfinite(var_logits).all():
+        raise RuntimeError("var_logits computation produced NaN/Inf values")
+    
+    # Clamp var_logits to prevent overflow in sqrt and kappa_sigmoid
+    var_logits = torch.clamp(var_logits, min=0.0, max=1e6)
     
     # Step 4: Compute E[sigmoid(logits)] via MacKay approximation
     # For X ~ N(μ, σ²): E[sigmoid(X)] ≈ sigmoid(κ * μ)
     # where κ = 1 / √(1 + π*σ²/8)
     pi = 3.14159265359
-    kappa_sigmoid = 1.0 / torch.sqrt(1.0 + pi * var_logits / 8.0)
-    mean_probs = torch.sigmoid(kappa_sigmoid * mean_logits)  # [B, H, W, K]
+    # Clamp denominator to prevent division issues
+    denominator = 1.0 + pi * var_logits / 8.0
+    denominator = torch.clamp(denominator, min=1e-8)
+    kappa_sigmoid = 1.0 / torch.sqrt(denominator)
+    
+    # Early check: validate kappa_sigmoid
+    if not torch.isfinite(kappa_sigmoid).all():
+        raise RuntimeError("kappa_sigmoid computation produced NaN/Inf values")
+    
+    # Clamp kappa_sigmoid * mean_logits to prevent sigmoid overflow
+    sigmoid_input = kappa_sigmoid * torch.clamp(mean_logits, min=-50.0, max=50.0)
+    mean_probs = torch.sigmoid(sigmoid_input)  # [B, H, W, K]
+    
+    # Early check: validate mean_probs
+    if not torch.isfinite(mean_probs).all():
+        raise RuntimeError("mean_probs computation produced NaN/Inf values")
+    
+    # Clamp mean_probs to valid probability range for numerical stability
+    mean_probs = torch.clamp(mean_probs, min=1e-8, max=1.0 - 1e-8)
     
     # Step 5: Compute Bernoulli entropy H(p) = -p*log(p) - (1-p)*log(1-p)
     # Use torch.special.entr for numerical stability (handles p=0 and p=1 gracefully)
@@ -126,9 +213,12 @@ def pixel_weibull_to_entropy_uncertainty(
             (1.0 - mean_probs) * torch.log(1.0 - mean_probs + eps)
         )
     
-    # Guard against NaN/Inf (should not happen with entr, but defensive)
+    # Final clamp to ensure finite values
+    entropy_per_mask = torch.clamp(entropy_per_mask, min=0.0, max=1.0)
+    
+    # Final check: guard against NaN/Inf
     if not torch.isfinite(entropy_per_mask).all():
-        raise RuntimeError("Analytic uncertainty computation produced NaN/Inf values")
+        raise RuntimeError("Analytic uncertainty computation produced NaN/Inf values in final entropy")
     
     # Return per-channel or aggregated
     if per_channel:

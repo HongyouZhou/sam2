@@ -129,6 +129,7 @@ model:
     
   # Style-based AUE parameters
   use_style_aug: true
+  style_aug_mode: "image_level"  # "image_level" or "feature_level"
   style_aug_pgd_steps: 1
   style_aug_pgd_step_size: 0.1
   style_aug_pgd_epsilon: 2.0
@@ -156,7 +157,22 @@ model:
   style_aug_gcn_use_visual_features: true  # Enable visual features in GCN for content-aware refinement
   style_aug_gcn_feature_dim: 256  # Feature dimension (matches backbone_fpn[-1] d_model)
     
+  # Deformation Augmentation (DG-Font style, feature-level)
+  use_deform_aug: false 
+  deform_aug_epsilon: 0.15  # Deformation strength
+  deform_aug_pgd_steps: 3  # PGD steps for deformation (placeholder, not used yet)
+  deform_aug_use_soft_composite: true  # Use soft compositing for handling overlaps
+  deform_aug_temperature: 1.0  # Temperature for soft compositing softmax
+  deform_aug_use_gcn: false  # GCN coordination for multi-object deformations (not implemented yet)
+  deform_aug_gcn_num_layers: 2  # Number of GCN layers (for future use)
+  deform_aug_num_deform_groups: 4  # Number of deformable convolution groups
+    
   # Patch-based MMD configuration for AUE calibration loss
   aue_use_patch_mmd: true
   aue_patch_size: 16
+    
+  # Analytic uncertainty computation (from Weibull parameters)
+  # true = use analytic uncertainty (with gradients to BNDL, bidirectional optimization)
+  # false = use sampling uncertainty (detached, gradients only to encoder)
+  aue_use_analytic_uncertainty: true
   # === AUE_GCN_CONFIG_END ===

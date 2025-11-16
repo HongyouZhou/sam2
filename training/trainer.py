@@ -727,15 +727,8 @@ class Trainer:
                         self._create_unified_visualization(bndl_outputs, batch, outputs_for_vis, vis_dir, data_iter, step_index, frame_index, layout_type="full")
 
             # Visualize AUE adversarial images periodically during validation
-            if (
-                data_iter % self.logging_conf.log_visual_frequency == 0
-                and self.distributed_rank == 0
-                and hasattr(unwrap_ddp_if_wrapped(self.model), "use_aue")
-                and unwrap_ddp_if_wrapped(self.model).use_aue
-            ):
-                # Visualization disabled for feature-space AUE
-                # self._visualize_aue_adversarials(phase, data_iter)
-                pass
+            # Note: AUE visualization is now handled by _log_style_aue_visualization
+            # which extracts data from model outputs (loss_dict['style_aue_visualization'])
 
             if data_iter % 10 == 0:
                 dist.barrier()
@@ -1110,12 +1103,13 @@ class Trainer:
             pred_logits = bndl_outputs.get("mean_pixel_logits")
 
             # Normalize shapes for evaluator: uncertainty [B,H,W], logits [B,H,W,1]
+            # Match training behavior: use channel average (consistent with loss computation and visualization)
             if isinstance(uncertainty, torch.Tensor) and uncertainty.ndim == 4:
-                # [B,H,W,K] → prefer K=1, else fallback channel 0
+                # [B,H,W,K] → prefer K=1, else use channel average (consistent with training)
                 if uncertainty.shape[-1] == 1:
                     uncertainty = uncertainty.squeeze(-1)
                 else:
-                    uncertainty = uncertainty[..., 0]
+                    uncertainty = uncertainty.mean(dim=-1)  # Cross-channel average, consistent with training
             if isinstance(pred_logits, torch.Tensor):
                 if pred_logits.ndim == 3:
                     pred_logits = pred_logits.unsqueeze(-1)
@@ -1171,13 +1165,9 @@ class Trainer:
         if "aue_loss_dict" in bndl_outputs and bndl_outputs["aue_loss_dict"] is not None:
             aue_loss_dict = bndl_outputs["aue_loss_dict"]
             all_aue_loss_keys = [
-                "ratio_pos",
-                "ratio_adversarial",
-                "range_penalty",
-                "diversity_loss",
                 "total_loss",
                 "calibration_loss_clean",
-                "calibration_loss_adv",
+                "calibration_loss_adversarial",
             ]
             for key in all_aue_loss_keys:
                 if key not in aue_loss_dict:
@@ -1321,12 +1311,19 @@ class Trainer:
             self.logger.log(f"StyleAUE/perturbation_{channel}", style_diff[j].item(), step)
     
     def _log_gcn_parameters(self, step):
-        """Log GCN alpha parameters if GCN is enabled."""
+        """Log GCN layer weight statistics if GCN is enabled."""
         model = self.model.module if hasattr(self.model, 'module') else self.model
         if hasattr(model, 'style_gcn') and model.style_gcn is not None:
-            for layer_idx, alpha in enumerate(model.style_gcn.alphas):
-                alpha_val = torch.sigmoid(alpha).item()
-                self.logger.log(f"GCN/alpha_layer_{layer_idx}", alpha_val, step)
+            gcn = model.style_gcn
+            # Log statistics for each GCN layer
+            for layer_idx, layer in enumerate(gcn.layers):
+                if hasattr(layer, 'weight') and layer.weight is not None:
+                    weight_mean = layer.weight.mean().item()
+                    weight_std = layer.weight.std().item()
+                    weight_norm = layer.weight.norm().item()
+                    self.logger.log(f"GCN/layer_{layer_idx}_weight_mean", weight_mean, step)
+                    self.logger.log(f"GCN/layer_{layer_idx}_weight_std", weight_std, step)
+                    self.logger.log(f"GCN/layer_{layer_idx}_weight_norm", weight_norm, step)
     
     def _log_style_statistics_overlay(self, original_img, adv_img, original_style, adv_style, sample_id, step, 
                                        bbox=None, gt_mask=None, all_bboxes=None, all_masks=None, combined_mask=None,
@@ -1378,13 +1375,17 @@ class Trainer:
             axes[0, 0].set_title(f'Original Image (Sample {sample_id})', fontsize=12, fontweight='bold')
             axes[0, 0].axis('off')
             
-            # Determine which object is used for loss (first non-empty one)
+            # Determine which object is used for loss
+            # In multi-object training, loss typically uses combined_mask (all objects merged)
+            # But we can identify the primary object as the one with largest area or first non-empty
             primary_obj_idx = 0
+            max_area = 0
             for k in range(K):
                 mask_k = all_masks[k].cpu().numpy()
-                if mask_k.sum() > 0:
+                area = mask_k.sum()
+                if area > max_area:
+                    max_area = area
                     primary_obj_idx = k
-                    break
             
             for k in range(K):
                 mask_k = all_masks[k].cpu().numpy()
@@ -2130,174 +2131,6 @@ class Trainer:
                 bndl_viz.plot_multi_uncertainty_visualization(axes[3, :], bndl_outputs, step_index)
             else:
                 bndl_viz.plot_uncertainty_visualization(axes[3, :], bndl_outputs, step_index)
-
-    def _visualize_aue_adversarials(self, phase: str, data_iter: int):
-        """Visualization for AUE adversarial image bank with sample images and statistics.
-
-        Saves plots under log_dir/bndl_visualizations/{phase}/aue_adversarials/:
-        - epoch_{e}_iter_{i}_aue_images.png (actual adversarial sample images)
-        - epoch_{e}_iter_{i}_aue_stats.png (image statistics and uncertainty)
-        """
-        # Locate underlying model (unwrap DDP)
-        model = self.model
-        if isinstance(model, torch.nn.parallel.DistributedDataParallel):
-            model = model.module
-
-        # Build output directory
-        vis_dir = os.path.join(self.logging_conf.log_dir, "bndl_visualizations", phase, "aue_adversarials")
-        makedir(vis_dir)
-
-        try:
-            # Get adversarial image bank (expected shape: [K, 3, H, W])
-            adv_images = getattr(model, "aue_adversarials", None)
-            adv_uncertainty = getattr(model, "aue_adversarial_uncertainty", None)
-            adv_prompts = getattr(model, "adv_prompts", None)  # [K, 4] bounding boxes
-            adv_gt = getattr(model, "adv_gt", None)  # [K, H, W] ground truth masks
-
-            if adv_images is None:
-                return
-
-            # Validate image format
-            if adv_images.ndim != 4 or adv_images.shape[1] != 3:
-                return
-
-            K, C, H, W = adv_images.shape
-            adv_imgs_np = adv_images.detach().cpu().numpy()
-
-            # ==== Visualization 1: Display actual adversarial sample images ====
-            fig1, axes1 = plt.subplots(3, 4, figsize=(16, 12))
-            axes1 = axes1.flatten()
-
-            num_display = min(12, K)
-            for i in range(num_display):
-                # 简单可视化：按初始化保持 [0,1]，否则直接裁剪
-                img = adv_imgs_np[i].transpose(1, 2, 0)
-                img = np.clip(img, 0.0, 1.0)
-
-                axes1[i].imshow(img)
-
-                # Add title with raw statistics (to detect changes even if visually similar)
-                raw_img = adv_imgs_np[i]  # Original [3, H, W] values
-                title = f"Adv #{i}\n"
-                title += f"μ={raw_img.mean():.3f} σ={raw_img.std():.3f}\n"
-                title += f"[{raw_img.min():.2f}, {raw_img.max():.2f}]"
-                if adv_uncertainty is not None and i < len(adv_uncertainty):
-                    unc_val = adv_uncertainty[i].item()
-                    title += f"\nU={unc_val:.3f}"
-
-                axes1[i].set_title(title, fontsize=9)
-
-                # Draw bounding box if available
-                if adv_prompts is not None and i < len(adv_prompts):
-                    x1, y1, x2, y2 = adv_prompts[i].cpu().numpy()
-                    # Convert normalized coords to pixel coords if needed
-                    if x2 <= 1.0:  # Normalized coordinates
-                        x1, x2 = x1 * W, x2 * W
-                        y1, y2 = y1 * H, y2 * H
-                    rect_w, rect_h = x2 - x1, y2 - y1
-                    from matplotlib.patches import Rectangle
-
-                    rect = Rectangle((x1, y1), rect_w, rect_h, linewidth=2, edgecolor="red", facecolor="none")
-                    axes1[i].add_patch(rect)
-
-                axes1[i].axis("off")
-
-            # Hide unused subplots
-            for i in range(num_display, 12):
-                axes1[i].axis("off")
-
-            plt.tight_layout()
-            save_path1 = os.path.join(vis_dir, f"epoch_{self.epoch}_iter_{data_iter}_aue_images.png")
-            plt.savefig(save_path1, dpi=150)
-            plt.close(fig1)
-
-            # ==== Visualization 2: Statistics and uncertainty ====
-            fig2, axes2 = plt.subplots(2, 3, figsize=(18, 12))
-
-            # 2.1: Image pixel intensity distribution
-            pixel_means = adv_imgs_np.reshape(K, -1).mean(axis=1)
-            axes2[0, 0].hist(pixel_means, bins=50, alpha=0.7, color="blue", edgecolor="black")
-            axes2[0, 0].set_title(f"Mean Pixel Intensity (K={K})")
-            axes2[0, 0].set_xlabel("Mean Intensity")
-            axes2[0, 0].set_ylabel("Count")
-            axes2[0, 0].grid(True, alpha=0.3)
-
-            # 2.2: Image pixel standard deviation
-            pixel_stds = adv_imgs_np.reshape(K, -1).std(axis=1)
-            axes2[0, 1].hist(pixel_stds, bins=50, alpha=0.7, color="green", edgecolor="black")
-            axes2[0, 1].set_title(f"Pixel Std Dev (K={K})")
-            axes2[0, 1].set_xlabel("Std Dev")
-            axes2[0, 1].set_ylabel("Count")
-            axes2[0, 1].grid(True, alpha=0.3)
-
-            # 2.3: Per-channel mean across all images
-            channel_means = adv_imgs_np.mean(axis=(0, 2, 3))  # [3]
-            axes2[0, 2].bar(["R", "G", "B"], channel_means, color=["red", "green", "blue"], alpha=0.7)
-            axes2[0, 2].set_title("Mean per Channel")
-            axes2[0, 2].set_ylabel("Mean Intensity")
-            axes2[0, 2].grid(True, alpha=0.3, axis="y")
-
-            # Row 2: Uncertainty statistics (if available)
-            if adv_uncertainty is not None and adv_uncertainty.numel() > 0:
-                uq_np = adv_uncertainty.detach().cpu().numpy()
-
-                # 2.4: Uncertainty distribution
-                axes2[1, 0].hist(uq_np, bins=50, alpha=0.7, color="purple", edgecolor="black")
-                axes2[1, 0].set_title(f"Adversarial Uncertainty Distribution (K={K})")
-                axes2[1, 0].set_xlabel("Uncertainty")
-                axes2[1, 0].set_ylabel("Count")
-                axes2[1, 0].grid(True, alpha=0.3)
-
-                # 2.5: Uncertainty vs pixel intensity
-                axes2[1, 1].scatter(pixel_means, uq_np, alpha=0.5, s=20, c="purple")
-                axes2[1, 1].set_title("Uncertainty vs Mean Pixel Intensity")
-                axes2[1, 1].set_xlabel("Mean Pixel Intensity")
-                axes2[1, 1].set_ylabel("Uncertainty")
-                axes2[1, 1].grid(True, alpha=0.3)
-
-                # 2.6: Top-k uncertain adversarials
-                top_k = min(20, K)
-                top_indices = np.argsort(uq_np)[-top_k:]
-                axes2[1, 2].barh(range(top_k), uq_np[top_indices], alpha=0.7, color="orange")
-                axes2[1, 2].set_title(f"Top-{top_k} Hardest Adversarials")
-                axes2[1, 2].set_xlabel("Uncertainty")
-                axes2[1, 2].set_ylabel("Sample Index (sorted)")
-                axes2[1, 2].grid(True, alpha=0.3)
-            else:
-                # Display ground truth masks with original images if available
-                if adv_gt is not None and adv_gt.numel() > 0:
-                    gt_np = adv_gt.detach().cpu().numpy()
-                    num_gt_display = min(3, len(gt_np))
-                    for i in range(num_gt_display):
-                        # 简单可视化背景图
-                        img = adv_imgs_np[i].transpose(1, 2, 0)
-                        img = np.clip(img, 0.0, 1.0)
-
-                        # Display original image
-                        axes2[1, i].imshow(img)
-
-                        # Overlay mask with transparency
-                        mask = gt_np[i]
-                        # Create colored mask overlay (red for mask regions)
-                        mask_overlay = np.zeros((*mask.shape, 4))
-                        mask_overlay[mask > 0.5] = [1, 0, 0, 0.4]  # Red with 40% opacity
-                        axes2[1, i].imshow(mask_overlay)
-
-                        axes2[1, i].set_title(f"Image + GT Mask #{i}")
-                        axes2[1, i].axis("off")
-                else:
-                    for ax in axes2[1, :]:
-                        ax.text(0.5, 0.5, "Uncertainty not available", ha="center", va="center", transform=ax.transAxes)
-                        ax.axis("off")
-
-            plt.tight_layout()
-            save_path2 = os.path.join(vis_dir, f"epoch_{self.epoch}_iter_{data_iter}_aue_stats.png")
-            plt.savefig(save_path2, dpi=150)
-            plt.close(fig2)
-
-        except Exception:
-            pass
-
 
 def print_model_summary(model: torch.nn.Module, log_dir: str = ""):
     """
