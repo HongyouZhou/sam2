@@ -132,7 +132,7 @@ model:
   style_aug_mode: "image_level"  # "image_level" or "feature_level"
   style_aug_pgd_steps: 1
   style_aug_pgd_step_size: 0.1
-  style_aug_pgd_epsilon: 2.0
+  style_aug_pgd_epsilon: 1.0
   style_aug_use_gt_region_style: true
     
   # Multi-object style attack control
@@ -147,8 +147,7 @@ model:
   # GCN-based multi-object style refinement
   style_aug_use_gcn: true
   style_aug_gcn_hidden_dim: 64
-  style_aug_gcn_num_layers: 3
-  style_aug_gcn_lr_ratio: 1.0
+  style_aug_gcn_num_layers: 2
   style_aug_gcn_edge_threshold: 0.0
   style_aug_gcn_use_semantic_edges: true
   style_aug_gcn_use_background_edges: true
@@ -158,9 +157,9 @@ model:
   style_aug_gcn_feature_dim: 256  # Feature dimension (matches backbone_fpn[-1] d_model)
     
   # Deformation Augmentation (DG-Font style, feature-level)
-  use_deform_aug: false 
-  deform_aug_epsilon: 0.15  # Deformation strength
-  deform_aug_pgd_steps: 3  # PGD steps for deformation (placeholder, not used yet)
+  use_deform_aug: true 
+  deform_aug_epsilon: 5.0  # Deformation strength in pixels (image space, ~3% of 1024px)
+  deform_aug_pgd_steps: 1  # PGD steps for deformation (placeholder, not used yet)
   deform_aug_use_soft_composite: true  # Use soft compositing for handling overlaps
   deform_aug_temperature: 1.0  # Temperature for soft compositing softmax
   deform_aug_use_gcn: false  # GCN coordination for multi-object deformations (not implemented yet)
@@ -169,7 +168,7 @@ model:
     
   # Patch-based MMD configuration for AUE calibration loss
   aue_use_patch_mmd: true
-  aue_patch_size: 16
+  aue_patch_size: 32
     
   # Analytic uncertainty computation (from Weibull parameters)
   # true = use analytic uncertainty (with gradients to BNDL, bidirectional optimization)

@@ -79,7 +79,7 @@ trainer:
   _target_: training.trainer.Trainer
   mode: train
   max_epochs: ${times:${scratch.num_epochs},${scratch.phases_per_epoch}}
-  actual_max_epochs: 6
+  actual_max_epochs: 8
   accelerator: cuda
   seed_value: 123
   cuda:
@@ -219,7 +219,7 @@ trainer:
     style_aug_mode: "image_level"  # "image_level" or "feature_level"
     style_aug_pgd_steps: 1
     style_aug_pgd_step_size: 0.1
-    style_aug_pgd_epsilon: 2.0
+    style_aug_pgd_epsilon: 1.0
     style_aug_use_gt_region_style: true
     
     # Multi-object style attack control
@@ -234,8 +234,7 @@ trainer:
     # GCN-based multi-object style refinement
     style_aug_use_gcn: true
     style_aug_gcn_hidden_dim: 64
-    style_aug_gcn_num_layers: 3
-    style_aug_gcn_lr_ratio: 1.0
+    style_aug_gcn_num_layers: 2
     style_aug_gcn_edge_threshold: 0.0
     style_aug_gcn_use_semantic_edges: true
     style_aug_gcn_use_background_edges: true
@@ -245,9 +244,9 @@ trainer:
     style_aug_gcn_feature_dim: 256  # Feature dimension (matches backbone_fpn[-1] d_model)
     
     # Deformation Augmentation (DG-Font style, feature-level)
-    use_deform_aug: false 
-    deform_aug_epsilon: 0.15  # Deformation strength
-    deform_aug_pgd_steps: 3  # PGD steps for deformation (placeholder, not used yet)
+    use_deform_aug: true 
+    deform_aug_epsilon: 5.0  # Deformation strength in pixels (image space, ~3% of 1024px)
+    deform_aug_pgd_steps: 1  # PGD steps for deformation (placeholder, not used yet)
     deform_aug_use_soft_composite: true  # Use soft compositing for handling overlaps
     deform_aug_temperature: 1.0  # Temperature for soft compositing softmax
     deform_aug_use_gcn: false  # GCN coordination for multi-object deformations (not implemented yet)
@@ -256,7 +255,7 @@ trainer:
     
     # Patch-based MMD configuration for AUE calibration loss
     aue_use_patch_mmd: true
-    aue_patch_size: 16
+    aue_patch_size: 32
     
     # Analytic uncertainty computation (from Weibull parameters)
     # true = use analytic uncertainty (with gradients to BNDL, bidirectional optimization)
@@ -415,15 +414,23 @@ trainer:
           param_names:
             - 'sam_mask_decoder.pixel_bndl.*'
 
-        # ③ GCN: high learning rate for rapid alpha convergence
-        # - scheduler:
-        #     _target_: fvcore.common.param_scheduler.CosineParamScheduler
-        #     start_value: 1.0e-5
-        #     end_value: 5.0e-6
-        #   param_names:
-        #     - 'style_gcn.*'
+        # ③ GCN: moderate learning rate for rapid alpha convergence
+        - scheduler:
+            _target_: fvcore.common.param_scheduler.CosineParamScheduler
+            start_value: 1.0e-5
+            end_value: 5.0e-6
+          param_names:
+            - 'style_gcn.*'
 
-        # ④ Other decoder components: very small learning rate
+        # ④ Deformation augmentation (DG-Font): moderate learning rate for effective training
+        - scheduler:
+            _target_: fvcore.common.param_scheduler.CosineParamScheduler
+            start_value: 1.0e-5
+            end_value: 5.0e-6
+          param_names:
+            - 'deform_augmenter.*'
+
+        # ⑤ Other decoder components: very small learning rate
         - scheduler:
             _target_: fvcore.common.param_scheduler.CosineParamScheduler
             start_value: 1.0e-7
@@ -463,24 +470,29 @@ trainer:
       bndl_loss:
         _target_: training.loss_bndl.BNDLLoss
         kl_weight: 0.005
-      sam_weight: 0.1
-      bndl_weight: 0.5
       aue_loss:
         _target_: training.loss_aue.AUELoss
+      # Initial weights (used as fallback if not specified in weight_schedule below)
+      sam_weight: 1.0
+      bndl_weight: 0.5
       aue_weight: 0.1
       weight_schedule:
         - until_epoch: 1
           sam_weight: 1.0
-          bndl_weight: 0.5
-          aue_weight: 0.05
-        - until_epoch: 3
+          bndl_weight: 0.8
+          aue_weight: 0.02
+        - until_epoch: 2
           sam_weight: 1.0
-          bndl_weight: 0.5
-          aue_weight: 0.20
+          bndl_weight: 0.7
+          aue_weight: 0.08
+        - until_epoch: 4
+          sam_weight: 1.0
+          bndl_weight: 0.6
+          aue_weight: 0.15
         - until_epoch: null
           sam_weight: 1.0
-          bndl_weight: 0.5
-          aue_weight: 0.30
+          bndl_weight: 0.6
+          aue_weight: 0.15
     # val:
     #   _target_: training.loss_combined.CombinedSAMBNDLLoss
     #   sam_loss: ${trainer.loss.all.sam_loss}
@@ -501,6 +513,7 @@ trainer:
     find_unused_parameters: True
 
   logging:
+    # log_level_primary: "DEBUG"
     tensorboard_writer:
       _target_: training.utils.logger.make_tensorboard_logger
       log_dir:  ${launcher.experiment_log_dir}/tensorboard
@@ -511,13 +524,13 @@ trainer:
     log_scalar_frequency: 100
     log_visual_frequency: 20
     visualize_bndl: true
-    visualize_style_aue: true
+    visualize_aue: true
     style_aue_visual_frequency: 100
     uncertainty_metric: ["entropy", "nll"]
     visualize_pavpu_overlay: true
     uncertainty_sample_num: 50
     # Pixel-level PAvPU statistics configuration
-    correlation_foreground_dilation: 4
+    correlation_foreground_dilation: 8
     correlation_per_pixel: true
     correlation_use_full_image: false
 

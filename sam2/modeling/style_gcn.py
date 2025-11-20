@@ -289,29 +289,11 @@ def build_object_graph(
             background_area = torch.tensor(0.0, device=device)
 
         object_indices = [idx for idx in fg_range if mask_areas[b, idx] > 0]
-        background_idx = background_slot if has_background_slot and background_area > 0 else None
+        # Background node always exists if configured (represents global style when no foreground)
+        background_idx = background_slot if has_background_slot else None
         
-        # Debug: log object_indices and background_idx
+        # Skip batch if no nodes at all (neither foreground nor background)
         if not object_indices and background_idx is None:
-            # Log why this batch was skipped (only for first batch to avoid spam)
-            if b == 0:
-                import logging
-
-                total_area = mask_areas[b].sum().item()
-                # Check raw mask values to understand the issue
-                raw_mask_sum = masks[b].sum().item()
-                max_val = masks[b].max().item()
-                min_val = masks[b].min().item()
-                above_threshold = (masks[b] > 0.5).sum().item()
-                # Show per-channel area distribution
-                area_per_channel = [f"{i}:{mask_areas[b, i].item():.0f}" for i in range(min(K, 11))]
-                logging.warning(
-                    f"GCN: Skipping batch {b} - no valid nodes. "
-                    f"has_bg_slot={has_background_slot}, bg_slot={background_slot if has_background_slot else 'N/A'}, "
-                    f"bg_area={background_area.item() if isinstance(background_area, torch.Tensor) else 0:.0f}, "
-                    f"fg_objects=0/{K}, areas=[{', '.join(area_per_channel)}], "
-                    f"raw_sum={raw_mask_sum:.0f}, range=[{min_val:.3f}, {max_val:.3f}]"
-                )
             continue
 
         # Debug log for first batch only
@@ -505,22 +487,14 @@ def build_object_graph(
                 )
             else:
                 logging.debug(f"GCN: Only background nodes ({stats['nodes_background']:.0f}bg), no edges created (expected).")
+        # Return empty edge tensors but preserve the accumulated node stats
+        stats["edges_total"] = 0.0
+        stats["avg_degree"] = 0.0
+        stats["avg_fg_degree"] = 0.0
         return (
             torch.zeros((2, 0), dtype=torch.long, device=device),
             torch.zeros(0, dtype=torch.float32, device=device),
-            {
-                "graphs": 0.0,
-                "nodes_total": 0.0,
-                "nodes_foreground": 0.0,
-                "nodes_background": 0.0,
-                "edges_total": 0.0,
-                "edges_iou": 0.0,
-                "edges_distance": 0.0,
-                "edges_background": 0.0,
-                "edges_semantic": 0.0,
-                "avg_degree": 0.0,
-                "avg_fg_degree": 0.0,
-            },
+            stats,  # Return accumulated stats instead of hardcoded zeros
         )
 
     edge_src_t = torch.tensor(edge_src, dtype=torch.long, device=device)

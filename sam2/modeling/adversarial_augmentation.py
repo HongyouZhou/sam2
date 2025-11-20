@@ -47,6 +47,7 @@ class AugmentationResult:
         aug_type: Augmentation type ("style" or "deformation")
         original_styles: Optional original style statistics (for style augmentation visualization)
         adversarial_styles: Optional adversarial style statistics (for style augmentation visualization)
+        deformation_offsets: Optional deformation offset fields [B, K, 2, H, W] for visualization
     """
     features: torch.Tensor  # [B, C, H, W]
     high_res_features: list[torch.Tensor] | None = None
@@ -56,6 +57,7 @@ class AugmentationResult:
     aug_type: str = ""
     original_styles: torch.Tensor | None = None  # For style augmentation visualization
     adversarial_styles: torch.Tensor | None = None  # For style augmentation visualization
+    deformation_offsets: torch.Tensor | None = None  # [B, K, 2, H, W] For deformation visualization
     
     def release_intermediate(self):
         """
@@ -111,10 +113,12 @@ class AdversarialAugmenter(nn.Module):
                 raise ValueError(f"Unknown mode for style augmentation: {self.mode}")
         
         elif self.aug_type == "deformation":
-            if self.mode == "feature_level":
+            if self.mode == "image_level":
+                return ImageLevelDeformationImpl(**kwargs)
+            elif self.mode == "feature_level":
                 return FeatureLevelDeformationImpl(**kwargs)
             else:
-                raise ValueError(f"Deformation only supports feature_level mode, got: {self.mode}")
+                raise ValueError(f"Unknown mode for deformation: {self.mode}")
         
         else:
             raise ValueError(f"Unknown augmentation type: {self.aug_type}")
@@ -295,6 +299,141 @@ class FeatureLevelStyleImpl(nn.Module):
         raise NotImplementedError()
 
 
+class ImageLevelDeformationImpl(nn.Module):
+    """
+    Image-level deformation augmentation.
+    
+    Applies spatial deformations directly to images using learned offset fields,
+    then forwards warped images through backbone.
+    
+    Key advantages:
+    - Simple GT alignment (use same offset field)
+    - Direct visualization of deformation effect
+    - Consistent with Style AUE (both image-level)
+    
+    Args:
+        epsilon: Deformation strength in pixels (e.g., 30.0)
+        image_channels: Input image channels (default: 3)
+        use_soft_composite: Whether to use soft compositing for overlaps
+        **kwargs: Additional arguments
+    """
+    def __init__(
+        self,
+        epsilon: float = 30.0,
+        image_channels: int = 3,
+        use_soft_composite: bool = True,
+        **kwargs
+    ):
+        super().__init__()
+        self.epsilon = epsilon
+        self.use_soft_composite = use_soft_composite
+        
+        # Offset predictor network (image + mask → offset field)
+        self.offset_net = nn.Sequential(
+            nn.Conv2d(image_channels + 1, 64, kernel_size=7, padding=3, stride=2),  # 1024→512
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 128, kernel_size=5, padding=2, stride=2),  # 512→256
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 2, kernel_size=3, padding=1),  # Output: [B, 2, 256, 256]
+            nn.Tanh(),  # Normalize to [-1, 1]
+        )
+        
+        # Initialize with small weights
+        # Use kaiming for all layers except the last one
+        for i, m in enumerate(self.offset_net):
+            if isinstance(m, nn.Conv2d):
+                if i == len(self.offset_net) - 2:  # Last conv layer (before Tanh)
+                    # Moderate initialization for output layer to enable visible initial deformation
+                    # std=0.1 with epsilon=30 gives ~3 pixel initial offset (0.1 * 30 = 3)
+                    nn.init.normal_(m.weight, mean=0.0, std=0.1)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+                else:
+                    nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+        
+        # Soft compositor
+        if self.use_soft_composite:
+            self.compositor = SoftCompositor(temperature=1.0)
+    
+    def apply(
+        self,
+        img_batch: torch.Tensor,
+        clean_features: torch.Tensor,
+        clean_high_res: list[torch.Tensor] | None,
+        pixel_gt: torch.Tensor,
+        model: nn.Module,
+    ) -> AugmentationResult:
+        """Generate offset fields and return warped images for backbone forward."""
+        B, _, H_img, W_img = img_batch.shape
+        K = pixel_gt.shape[1]
+        
+        # Generate per-object offset fields
+        all_offsets = []
+        for k in range(K):
+            mask_k = pixel_gt[:, k:k+1, :, :].float()  # [B, 1, H, W]
+            
+            # Skip empty masks and background
+            if mask_k.sum() == 0:
+                all_offsets.append(torch.zeros(B, 2, H_img, W_img, device=img_batch.device))
+                continue
+            
+            mask_area = mask_k.sum() / (B * H_img * W_img)
+            if (k == K - 1) and (mask_area > 0.5):
+                all_offsets.append(torch.zeros(B, 2, H_img, W_img, device=img_batch.device))
+                continue
+            
+            # Predict offset (output is 256x256, need to upsample)
+            img_mask_input = torch.cat([img_batch, mask_k], dim=1)  # [B, 4, H, W]
+            offset_raw = self.offset_net(img_mask_input)  # [B, 2, 256, 256]
+            
+            # Debug: check offset magnitudes (first iteration only)
+            if k == 0 and not hasattr(self, '_logged_offset_stats'):
+                offset_mag = torch.sqrt(offset_raw[:, 0]**2 + offset_raw[:, 1]**2)
+                logging.info(f"[DeformAUE Debug] offset_raw stats: "
+                           f"mean={offset_raw.mean():.6f}, std={offset_raw.std():.6f}, "
+                           f"mag_mean={offset_mag.mean():.6f}, mag_max={offset_mag.max():.6f}")
+                self._logged_offset_stats = True
+            
+            # Upsample to image resolution
+            offset_full = F.interpolate(
+                offset_raw, size=(H_img, W_img), mode='bilinear', align_corners=False
+            )  # [B, 2, H, W]
+            
+            # Scale by epsilon and mask
+            offset_scaled = offset_full * self.epsilon * mask_k
+            
+            # Debug: check scaled offset magnitudes
+            if k == 0 and hasattr(self, '_logged_offset_stats') and not hasattr(self, '_logged_scaled_stats'):
+                offset_scaled_mag = torch.sqrt(offset_scaled[:, 0]**2 + offset_scaled[:, 1]**2)
+                masked_region = offset_scaled_mag[mask_k.squeeze(1) > 0.5]
+                if masked_region.numel() > 0:
+                    logging.info(f"[DeformAUE Debug] offset_scaled (in mask) stats: "
+                               f"mean={masked_region.mean():.6f}, std={masked_region.std():.6f}, "
+                               f"max={masked_region.max():.6f}, epsilon={self.epsilon}")
+                self._logged_scaled_stats = True
+            
+            all_offsets.append(offset_scaled)
+        
+        # Stack offsets: [B, K, 2, H, W]
+        stacked_offsets = torch.stack(all_offsets, dim=1)
+        
+        # This will be used by compute_aue_loss to warp images
+        # Return intermediate result without backbone forward
+        return AugmentationResult(
+            features=clean_features,  # Will be replaced after warping
+            high_res_features=clean_high_res,
+            intermediate_images=img_batch,  # Original images
+            num_backbone_forwards=0,  # Will forward after combining with style
+            mode="image_level",
+            aug_type="deformation",
+            deformation_offsets=stacked_offsets,  # [B, K, 2, H, W]
+        )
+
+
 class FeatureLevelDeformationImpl(nn.Module):
     """
     Feature-level deformation augmentation (DG-Font style).
@@ -309,7 +448,7 @@ class FeatureLevelDeformationImpl(nn.Module):
     
     Args:
         feature_dim: Dimension of backbone features (default: 256)
-        epsilon: Deformation strength (not used in PGD yet, placeholder)
+        epsilon: Deformation strength (maximum offset magnitude, used to constrain offsets)
         pgd_steps: Number of PGD steps (not used yet, placeholder)
         use_soft_composite: Whether to use soft compositing for overlaps
         temperature: Temperature for soft compositing softmax
@@ -341,6 +480,7 @@ class FeatureLevelDeformationImpl(nn.Module):
         self.deform_module = DeformableConvModule(
             feature_dim=feature_dim,
             num_deform_groups=num_deform_groups,
+            epsilon=epsilon,  # Pass epsilon for offset constraint
         )
         
         # Soft compositor for handling overlaps
@@ -391,20 +531,44 @@ class FeatureLevelDeformationImpl(nn.Module):
         # Per-object deformation
         deformed_list = []
         mask_list = []
+        all_offsets_list = []  # Store offsets for visualization
         
         for k in range(K):
             mask_k = pixel_gt_resized[:, k:k + 1, :, :]  # [B, 1, H, W]
             
             # Check if mask is non-empty
-            if mask_k.sum() > 0:
-                # Apply deformation to this object
-                deformed_k, offsets_k = self.deform_module(clean_features, mask_k)
-                deformed_list.append(deformed_k)
-                mask_list.append(mask_k)
-            else:
+            if mask_k.sum() == 0:
                 # Empty mask: use clean features
                 deformed_list.append(clean_features)
                 mask_list.append(mask_k)
+                # For empty masks, use zero offsets
+                all_offsets_list.append(torch.zeros_like(
+                    self.deform_module.offset_net(
+                        torch.cat([clean_features, mask_k], dim=1)
+                    )
+                ))
+                continue
+            
+            # Skip background (last object with area > 50% of feature map)
+            mask_area = mask_k.sum() / (B * H_feat * W_feat)
+            is_background = (k == K - 1) and (mask_area > 0.5)
+            if is_background:
+                # Background: use clean features without deformation
+                deformed_list.append(clean_features)
+                mask_list.append(mask_k)
+                # Zero offsets for background
+                all_offsets_list.append(torch.zeros_like(
+                    self.deform_module.offset_net(
+                        torch.cat([clean_features, mask_k], dim=1)
+                    )
+                ))
+                continue
+            
+            # Apply deformation to foreground object
+            deformed_k, offsets_k = self.deform_module(clean_features, mask_k)
+            deformed_list.append(deformed_k)
+            mask_list.append(mask_k)
+            all_offsets_list.append(offsets_k)  # [B, 2*9*groups, H, W]
         
         # Compose deformed features
         if self.use_soft_composite and len(deformed_list) > 0:
@@ -412,6 +576,20 @@ class FeatureLevelDeformationImpl(nn.Module):
         else:
             # Fallback: simple averaging (not recommended)
             final_features = torch.stack(deformed_list, dim=0).mean(dim=0)
+        
+        # Stack offsets for visualization: [B, K, 2*9*groups, H, W]
+        # Extract mean offset per object for visualization (simplified to [B, K, 2, H, W])
+        stacked_offsets = torch.stack(all_offsets_list, dim=1)  # [B, K, 2*9*groups, H, W]
+        
+        # Correct reshape considering interleaved (x,y) format from deform_conv2d
+        # Format: [Δx₀, Δy₀, Δx₁, Δy₁, ..., Δx₈, Δy₈] repeated for each group
+        # Reshape: [B, K, 2*9*groups, H, W] → [B, K, 9*groups, 2, H, W]
+        offsets_reshaped = stacked_offsets.view(
+            B, K, 9 * self.deform_module.num_deform_groups, 2, H_feat, W_feat
+        )
+        
+        # Average over all sampling points: [B, K, 9*groups, 2, H, W] → [B, K, 2, H, W]
+        offsets_mean = offsets_reshaped.mean(dim=2)  # [B, K, 2, H, W]
         
         # TODO: GCN coordination (Phase 5)
         if self.use_gcn and self.deform_gcn is not None:
@@ -425,6 +603,7 @@ class FeatureLevelDeformationImpl(nn.Module):
             num_backbone_forwards=0,  # Key advantage: no extra backbone forward!
             mode="feature_level",
             aug_type="deformation",
+            deformation_offsets=offsets_mean,  # [B, K, 2, H, W] for visualization
         )
 
 
@@ -440,11 +619,13 @@ class DeformableConvModule(nn.Module):
     Args:
         feature_dim: Dimension of input features
         num_deform_groups: Number of groups for deformable convolution
+        epsilon: Maximum offset magnitude (constraint for offsets)
     """
-    def __init__(self, feature_dim: int = 256, num_deform_groups: int = 4):
+    def __init__(self, feature_dim: int = 256, num_deform_groups: int = 4, epsilon: float = 0.15):
         super().__init__()
         self.feature_dim = feature_dim
         self.num_deform_groups = num_deform_groups
+        self.epsilon = epsilon
         
         # Offset predictor network
         # Input: [features + mask] -> Output: offset field [2 * kernel_size^2 * groups]
@@ -456,6 +637,20 @@ class DeformableConvModule(nn.Module):
             nn.ReLU(inplace=True),
             nn.Conv2d(64, 2 * 9 * num_deform_groups, kernel_size=3, padding=1),
         )
+        
+        # Initialize offset_net: use small initialization for last layer to prevent large initial offsets
+        # Initialize first layers with kaiming normal (default)
+        for i in range(len(self.offset_net) - 1):
+            if isinstance(self.offset_net[i], nn.Conv2d):
+                nn.init.kaiming_normal_(
+                    self.offset_net[i].weight, mode='fan_out', nonlinearity='relu'
+                )
+        
+        # Initialize last layer with small random values to have some initial deformation
+        # This ensures non-zero gradients from the start, enabling the network to learn
+        # Scale: 0.01 to ensure initial offsets are small but non-zero
+        nn.init.normal_(self.offset_net[-1].weight, mean=0.0, std=0.005)
+        nn.init.zeros_(self.offset_net[-1].bias)
         
         # Deformable convolution weights
         self.deform_conv_weight = nn.Parameter(
@@ -489,6 +684,11 @@ class DeformableConvModule(nn.Module):
         
         # Predict offsets
         offsets = self.offset_net(feat_with_mask)  # [B, 2*9*groups, H, W]
+        
+        # Constrain offsets using epsilon to prevent excessive deformation
+        # Use tanh to map to [-1, 1] range, then scale by epsilon
+        # This ensures offsets are bounded and training is stable
+        offsets = torch.tanh(offsets) * self.epsilon
         
         # Apply deformable convolution
         from torchvision.ops import deform_conv2d

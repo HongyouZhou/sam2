@@ -35,6 +35,10 @@ class AUEVisualizationData:
     area_ratios: torch.Tensor | None  # [N, K] CPU
     epsilon_weights: torch.Tensor | None  # [N, K] CPU
     combined_mask_for_loss: torch.Tensor | None  # [N, 1, H, W] CPU
+    # Deformation visualization data
+    deform_offsets: torch.Tensor | None  # [N, K, 2, H, W] CPU (deformation offset fields)
+    warped_images: torch.Tensor | None  # [N, 3, H, W] CPU (soft-composited warped images from offsets)
+    # Style visualization data (already included above via original/adversarial images and styles)
 
 
 @dataclass
@@ -164,7 +168,6 @@ class SAM2Base(torch.nn.Module):
         style_aug_use_gcn: bool = False,
         style_aug_gcn_hidden_dim: int = 32,  # Deprecated, kept for backward compatibility
         style_aug_gcn_num_layers: int = 2,
-        style_aug_gcn_lr_ratio: float = 0.1,
         style_aug_gcn_edge_threshold: float = 0.3,
         style_aug_gcn_use_semantic_edges: bool = True,
         style_aug_gcn_use_background_edges: bool = False,
@@ -175,7 +178,7 @@ class SAM2Base(torch.nn.Module):
         style_aug_gcn_feature_sim_threshold: float = 0.5,  # Cosine similarity threshold for semantic edges
         # Deformation Augmentation options (DG-Font style, feature-level)
         use_deform_aug: bool = False,
-        deform_aug_epsilon: float = 0.15,  # Deformation strength
+        deform_aug_epsilon: float = 30.0,  # Deformation strength in pixels (image space)
         deform_aug_pgd_steps: int = 3,  # PGD steps for deformation (placeholder, not used yet)
         deform_aug_use_soft_composite: bool = True,  # Use soft compositing for overlaps
         deform_aug_temperature: float = 1.0,  # Temperature for soft compositing
@@ -309,7 +312,6 @@ class SAM2Base(torch.nn.Module):
         self.style_aug_use_gcn = bool(style_aug_use_gcn)
         self.style_aug_gcn_hidden_dim = int(style_aug_gcn_hidden_dim)  # Deprecated
         self.style_aug_gcn_num_layers = int(style_aug_gcn_num_layers)
-        self.style_aug_gcn_lr_ratio = float(style_aug_gcn_lr_ratio)
         self.style_aug_gcn_edge_threshold = float(style_aug_gcn_edge_threshold)
         self.style_aug_gcn_use_semantic_edges = bool(style_aug_gcn_use_semantic_edges)
         self.style_aug_gcn_use_background_edges = bool(style_aug_gcn_use_background_edges)
@@ -422,26 +424,19 @@ class SAM2Base(torch.nn.Module):
         """
         from sam2.modeling.adversarial_augmentation import AdversarialAugmenter
         
-        # Build deformation augmenter (always feature-level)
+        # Build deformation augmenter (image-level for simplified GT alignment)
         self.deform_augmenter = AdversarialAugmenter(
-            mode="feature_level",
+            mode="image_level",  # Changed from feature_level to image_level
             aug_type="deformation",
-            feature_dim=256,  # Backbone feature dimension
+            image_channels=3,  # RGB image
             epsilon=self.deform_aug_epsilon,
-            pgd_steps=self.deform_aug_pgd_steps,
             use_soft_composite=self.deform_aug_use_soft_composite,
-            temperature=self.deform_aug_temperature,
-            use_gcn=self.deform_aug_use_gcn,
-            gcn_num_layers=self.deform_aug_gcn_num_layers,
-            num_deform_groups=self.deform_aug_num_deform_groups,
         )
         
         logging.info(
-            f"Deformation augmentation components built: "
-            f"epsilon={self.deform_aug_epsilon}, "
-            f"use_soft_composite={self.deform_aug_use_soft_composite}, "
-            f"use_gcn={self.deform_aug_use_gcn}, "
-            f"num_deform_groups={self.deform_aug_num_deform_groups}"
+            f"Deformation augmentation components built (image-level): "
+            f"epsilon={self.deform_aug_epsilon} pixels, "
+            f"use_soft_composite={self.deform_aug_use_soft_composite}"
         )
     
     def _build_aue_components(self) -> None:
@@ -482,6 +477,57 @@ class SAM2Base(torch.nn.Module):
 
     # Image-space constraint methods removed (not needed for feature-space AUE)
 
+    def _apply_offset_to_image(
+        self,
+        image: torch.Tensor,
+        offset_field: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Apply spatial offset field to warp an image using grid_sample.
+        
+        Args:
+            image: [B, 3, H, W] Input image
+            offset_field: [B, 2, H, W] Offset field (Δx, Δy)
+        
+        Returns:
+            warped_image: [B, 3, H, W] Warped image
+        """
+        B, _, H, W = image.shape
+        device = image.device
+        
+        # Create identity grid (standard sampling positions)
+        y_grid, x_grid = torch.meshgrid(
+            torch.arange(H, device=device, dtype=torch.float32),
+            torch.arange(W, device=device, dtype=torch.float32),
+            indexing='ij'
+        )
+        
+        # Add offset (offset order is [Δx, Δy])
+        offset_x = offset_field[:, 0, :, :]  # [B, H, W]
+        offset_y = offset_field[:, 1, :, :]  # [B, H, W]
+        
+        # New sampling positions
+        sampling_x = x_grid.unsqueeze(0) + offset_x  # [B, H, W]
+        sampling_y = y_grid.unsqueeze(0) + offset_y  # [B, H, W]
+        
+        # Normalize to [-1, 1] (required by grid_sample)
+        sampling_x_norm = 2.0 * sampling_x / (W - 1) - 1.0
+        sampling_y_norm = 2.0 * sampling_y / (H - 1) - 1.0
+        
+        # Stack into grid format [B, H, W, 2] (last dimension is x, y)
+        sampling_grid = torch.stack([sampling_x_norm, sampling_y_norm], dim=-1)
+        
+        # Apply warping using grid_sample
+        warped_image = F.grid_sample(
+            image,
+            sampling_grid,
+            mode='bilinear',
+            padding_mode='border',
+            align_corners=True
+        )
+        
+        return warped_image
+    
     def _prepare_aue_visualization_data(
         self,
         img_batch: torch.Tensor,
@@ -490,6 +536,8 @@ class SAM2Base(torch.nn.Module):
         num_vis_samples: int,
         original_styles: torch.Tensor | None = None,
         adv_styles: torch.Tensor | None = None,
+        deform_offsets: torch.Tensor | None = None,
+        warped_images: torch.Tensor | None = None,
     ) -> AUEVisualizationData:
         """
         Prepare visualization data for Style AUE multi-object training.
@@ -583,6 +631,23 @@ class SAM2Base(torch.nn.Module):
             area_ratios = None
             epsilon_weights = None
             combined_mask_for_loss = None
+         
+        if deform_offsets is not None:
+            if deform_offsets.is_cuda:
+                deform_offsets_cpu = deform_offsets[:num_vis_samples].detach().cpu()
+            else:
+                deform_offsets_cpu = deform_offsets[:num_vis_samples].detach()
+        else:
+            deform_offsets_cpu = None
+        
+        # Process warped images if provided
+        if warped_images is not None:
+            if warped_images.is_cuda:
+                warped_images_cpu = warped_images[:num_vis_samples].detach().cpu()
+            else:
+                warped_images_cpu = warped_images[:num_vis_samples].detach()
+        else:
+            warped_images_cpu = None
         
         return AUEVisualizationData(
             original_images=original_images_cpu,
@@ -595,8 +660,21 @@ class SAM2Base(torch.nn.Module):
             area_ratios=area_ratios,
             epsilon_weights=epsilon_weights,
             combined_mask_for_loss=combined_mask_for_loss,
+            deform_offsets=deform_offsets_cpu,
+            warped_images=warped_images_cpu,
         )
 
+    def _cleanup_augmentation_results(self, results_to_cleanup: list) -> None:
+        """
+        Clean up augmentation results to free GPU memory.
+        
+        Args:
+            results_to_cleanup: List of augmentation result objects with release_intermediate() method.
+                               Results are cleaned up in reverse order (LIFO).
+        """
+        for result in reversed(results_to_cleanup):
+            result.release_intermediate()
+    
     def _compute_augmented_calibration_loss(
         self,
         aux_outputs: dict,
@@ -684,6 +762,219 @@ class SAM2Base(torch.nn.Module):
         
         return calibration_loss
     
+    def _apply_adversarial_augmentation_pipeline(
+        self,
+        img_batch: torch.Tensor,
+        pixel_gt: torch.Tensor,
+        backbone_features: torch.Tensor,
+        high_res_features: list[torch.Tensor] | None,
+        uq_sample_num: int,
+        enable_vis: bool,
+        vis_refs: dict,
+    ) -> dict:
+        """
+        Apply adversarial augmentation pipeline: Deform → Style → Forward → Loss.
+        
+        Returns:
+            dict with keys:
+                - calibration_loss_adversarial: torch.Tensor
+                - vis_refs: dict (optional, if visualization is enabled)
+        """
+        current_features = backbone_features
+        current_high_res = high_res_features
+        
+        # Step 1: Generate deformation offsets
+        deform_offsets = None
+        deform_result = None
+        if self.use_deform_aug and hasattr(self, 'deform_augmenter'):
+            deform_result = self.deform_augmenter.apply(
+                img_batch=img_batch,
+                clean_features=current_features,
+                clean_high_res=current_high_res,
+                pixel_gt=pixel_gt,
+                model=self,
+            )
+            deform_offsets = deform_result.deformation_offsets  # [B, K, 2, H, W]
+            
+            if enable_vis:
+                vis_refs['deform_offsets'] = deform_offsets.detach().cpu()
+        
+        # Step 2: Apply deformation to images and GT masks
+        augmented_img, warped_pixel_gt = self._apply_deformation_to_images(
+            img_batch, pixel_gt, deform_offsets, enable_vis, vis_refs
+        )
+        
+        # Update vis_refs with warped GT for correct visualization
+        if enable_vis and deform_offsets is not None:
+            vis_refs['pixel_gt'] = warped_pixel_gt.detach().cpu()
+        
+        # Step 3: Apply style augmentation
+        # Detach augmented_img to cut deform gradient graph for memory efficiency
+        # Deform and Style are trained independently via separate loss signals
+        augmented_img_detached = augmented_img.detach() if augmented_img is not img_batch else augmented_img
+        augmented_img = self._apply_style_augmentation(
+            augmented_img_detached, warped_pixel_gt, current_features, enable_vis, vis_refs
+        )
+        
+        # Step 4: Forward pass with augmented image
+        if augmented_img is not img_batch:
+            backbone_out = self.forward_image(augmented_img, use_checkpoint=True)
+            current_features = backbone_out['backbone_fpn'][-1]
+            if self.use_high_res_features_in_sam:
+                current_high_res = [backbone_out['backbone_fpn'][0], backbone_out['backbone_fpn'][1]]
+            pixel_gt = warped_pixel_gt
+        
+        # Step 5: Compute adversarial loss
+        calibration_loss_adversarial = torch.tensor(0.0, device=img_batch.device, dtype=img_batch.dtype)
+        if current_features is not backbone_features:
+            prev_suppress = getattr(self, "_suppress_nested_aue", False)
+            self._suppress_nested_aue = True
+            try:
+                *_, adv_aux_outputs = self._forward_sam_heads(
+                    backbone_features=current_features,
+                    high_res_features=current_high_res,
+                    pixel_gt_for_aue=None,
+                    multimask_output=False,
+                )
+            finally:
+                self._suppress_nested_aue = prev_suppress
+            
+            pixel_bndl_model = None
+            if hasattr(self, 'sam_mask_decoder') and hasattr(self.sam_mask_decoder, 'pixel_bndl'):
+                pixel_bndl_model = self.sam_mask_decoder.pixel_bndl
+            
+            calibration_loss_adversarial = self._compute_augmented_calibration_loss(
+                aux_outputs=adv_aux_outputs,
+                pixel_gt=pixel_gt,
+                pixel_bndl_model=pixel_bndl_model,
+                uq_sample_num=uq_sample_num,
+            )
+            
+            del adv_aux_outputs
+        
+        # Cleanup deformation result
+        if deform_result is not None:
+            self._cleanup_augmentation_results([deform_result])
+        
+        return {
+            'calibration_loss_adversarial': calibration_loss_adversarial,
+            'vis_refs': vis_refs if enable_vis else {},
+        }
+    
+    def _apply_deformation_to_images(
+        self,
+        img_batch: torch.Tensor,
+        pixel_gt: torch.Tensor,
+        deform_offsets: torch.Tensor | None,
+        enable_vis: bool,
+        vis_refs: dict,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Apply deformation offsets to images and GT masks (vectorized)."""
+        if deform_offsets is None:
+            return img_batch, pixel_gt.clone()
+        
+        B, K, _, H_img, W_img = deform_offsets.shape
+        warped_pixel_gt = pixel_gt.clone()
+        
+        # Identify valid objects (non-empty, non-background)
+        masks_float = pixel_gt.float()
+        mask_areas = masks_float.sum(dim=(2, 3))
+        is_empty = (mask_areas.sum(dim=0) == 0)
+        mask_area_ratio = mask_areas / (H_img * W_img)
+        is_bg_per_sample = (mask_area_ratio > 0.5)
+        is_bg = torch.zeros(K, dtype=torch.bool, device=img_batch.device)
+        is_bg[-1] = is_bg_per_sample[:, -1].all()
+        valid_objects = ~(is_empty | is_bg)
+        valid_indices = torch.where(valid_objects)[0]
+        
+        if len(valid_indices) == 0:
+            return img_batch, warped_pixel_gt
+        
+        # Initialize: start with original image, then selectively replace deformed objects
+        # Only remove objects that will be deformed (keep non-deformed objects in place)
+        valid_masks = masks_float[:, valid_indices, :, :]  # [B, K_valid, H, W]
+        valid_masks_union = valid_masks.sum(dim=1, keepdim=True).clamp(0, 1)  # [B, 1, H, W]
+        
+        # Start with image where valid objects are removed (keep other objects + background)
+        augmented_img = img_batch * (1 - valid_masks_union)
+        
+        # Composite warped objects sequentially (forward order: later objects overwrite earlier ones)
+        # This avoids storing all warped images, reducing memory from O(K) to O(1)
+        for idx_pos, k_idx in enumerate(valid_indices):
+            k_idx_scalar = k_idx.item()
+            offset_k = deform_offsets[:, k_idx_scalar, :, :, :]  # [B, 2, H, W]
+            mask_k = masks_float[:, k_idx_scalar, :, :].unsqueeze(1)  # [B, 1, H, W]
+            
+            # Warp image and mask
+            warped_img_k = self._apply_offset_to_image(img_batch, offset_k)
+            warped_mask_k = self._apply_offset_to_image(mask_k, offset_k)
+            
+            # Update GT
+            warped_pixel_gt[:, k_idx_scalar, :, :] = (warped_mask_k.squeeze(1) > 0.5).float()
+            
+            # Composite: later objects overwrite earlier ones (simple overlay)
+            augmented_img = augmented_img * (1 - warped_mask_k) + warped_img_k * warped_mask_k
+            
+            # Cleanup immediately (no storage needed)
+            del offset_k, mask_k, warped_img_k, warped_mask_k
+        
+        # Save for visualization
+        if enable_vis:
+            vis_refs['warped_images'] = augmented_img.detach().cpu()
+        
+        # Cleanup
+        del valid_masks, valid_masks_union
+        
+        return augmented_img, warped_pixel_gt
+    
+    def _apply_style_augmentation(
+        self,
+        augmented_img: torch.Tensor,
+        warped_pixel_gt: torch.Tensor,
+        current_features: torch.Tensor,
+        enable_vis: bool,
+        vis_refs: dict,
+    ) -> torch.Tensor:
+        """Apply style augmentation to the (potentially deformed) image."""
+        if not (self.use_style_aug and hasattr(self, 'style_augmenter') and augmented_img is not None):
+            return augmented_img
+        
+        pixel_gt_normalized, original_styles = self._prepare_style_adversary_inputs(
+            augmented_img, warped_pixel_gt
+        )
+        
+        pixel_bndl_model = None
+        if hasattr(self, 'sam_mask_decoder') and hasattr(self.sam_mask_decoder, 'pixel_bndl'):
+            pixel_bndl_model = self.sam_mask_decoder.pixel_bndl
+        
+        adversarial_styles = self._pgd_find_adversarial_styles(
+            img_batch=augmented_img,
+            pixel_gt=pixel_gt_normalized,
+            original_styles=original_styles,
+            num_steps=self.style_aug_pgd_steps,
+            step_size=self.style_aug_pgd_step_size,
+            epsilon=self.style_aug_pgd_epsilon,
+            pixel_bndl_model=pixel_bndl_model,
+            backbone_features=current_features,
+        )
+        
+        if self.style_aug_use_gt_region_style:
+            styled_images = self._apply_style_to_images(
+                augmented_img, adversarial_styles, gt_mask=pixel_gt_normalized
+            )
+        else:
+            styled_images = self._apply_style_to_images(
+                augmented_img, adversarial_styles, gt_mask=None
+            )
+        
+        # Save for visualization
+        if enable_vis:
+            vis_refs['styled_images'] = styled_images.detach().cpu()
+            vis_refs['original_styles'] = original_styles.detach().cpu()
+            vis_refs['adversarial_styles'] = adversarial_styles.detach().cpu()
+        
+        return styled_images
+    
     def compute_aue_loss(
         self,
         pixel_feat: torch.Tensor,
@@ -702,6 +993,13 @@ class SAM2Base(torch.nn.Module):
         B, H, W, _ = pixel_feat.shape
         device = pixel_feat.device
         dtype = pixel_feat.dtype
+        
+        # Validate high_res_features when use_high_res_features_in_sam is True
+        if self.use_high_res_features_in_sam and high_res_features is None:
+            raise ValueError(
+                "use_high_res_features_in_sam=True requires high_res_features to be provided, "
+                "but got None. Please ensure high_res_features is passed to compute_aue_loss."
+            )
         
         # Early exit if no GT is available (AUE requires GT for calibration)
         if pixel_gt is None:
@@ -748,117 +1046,71 @@ class SAM2Base(torch.nn.Module):
  
         # Adversarial augmentation branch (串行: 形变 → 风格)
         calibration_loss_adversarial = torch.tensor(0.0, device=device, dtype=dtype)
-        style_result = None  # Initialize outside try block for visualization
+        deform_result = None  # Initialize outside try block for cleanup
         vis_data = None  # Initialize outside try block for visualization
         
         if (self.use_deform_aug or self.use_style_aug) and backbone_features is not None:
-            # 用于清理的资源列表
-            results_to_cleanup = []
+            # ========================================================================
+            # Adversarial Augmentation Pipeline (串行: 形变 → 风格)
+            # ========================================================================
+            vis_refs = {}  # Collect lightweight visualization data (CPU tensors)
+            enable_vis = getattr(self, '_enable_style_visualization', False)
             
-            try:
-                # Step 1: 形变扰动 (如果启用)
-                current_features = backbone_features
-                current_high_res = high_res_features
-                
-                if self.use_deform_aug and hasattr(self, 'deform_augmenter'):
-                    deform_result = self.deform_augmenter.apply(
-                        img_batch=img_batch,
-                        clean_features=current_features,
-                        clean_high_res=current_high_res,
-                        pixel_gt=pixel_gt,
-                        model=self,
-                    )
-                    results_to_cleanup.append(deform_result)
-                    
-                    # 更新当前特征为形变后的特征
-                    current_features = deform_result.features
-                    current_high_res = deform_result.high_res_features
-                    
-                    if self.training and logging.getLogger().isEnabledFor(logging.DEBUG):
-                        logging.debug(
-                            f"[Adversarial Pipeline] Step 1 - Deform: "
-                            f"{deform_result.num_backbone_forwards} backbone forwards"
-                        )
-                
-                # Step 2: 风格扰动 (如果启用) - 作用在形变后的特征上
-                if self.use_style_aug and hasattr(self, 'style_augmenter') and img_batch is not None:
-                    style_result = self.style_augmenter.apply(
-                        img_batch=img_batch,
-                        clean_features=current_features,  # ← 使用形变后的特征！
-                        clean_high_res=current_high_res,
-                        pixel_gt=pixel_gt,
-                        model=self,
-                    )
-                    results_to_cleanup.append(style_result)
-                    
-                    # 更新当前特征为风格扰动后的特征
-                    current_features = style_result.features
-                    current_high_res = style_result.high_res_features
-                    
-                    if self.training and logging.getLogger().isEnabledFor(logging.DEBUG):
-                        logging.debug(
-                            f"[Adversarial Pipeline] Step 2 - Style: "
-                            f"{style_result.num_backbone_forwards} backbone forwards"
-                        )
-                
-                # Step 3: Forward SAM heads with augmented features (串行后的最终特征)
-                if current_features is not backbone_features:  # 确实应用了扰动
-                    prev_suppress = getattr(self, "_suppress_nested_aue", False)
-                    self._suppress_nested_aue = True
-                    try:
-                        *_, adv_aux_outputs = self._forward_sam_heads(
-                            backbone_features=current_features,
-                            high_res_features=current_high_res,
-                            pixel_gt_for_aue=None,
-                            multimask_output=False,
-                        )
-                    finally:
-                        self._suppress_nested_aue = prev_suppress
-                    
-                    # Step 4: Compute adversarial calibration loss
-                    calibration_loss_adversarial = self._compute_augmented_calibration_loss(
-                        aux_outputs=adv_aux_outputs,
-                        pixel_gt=pixel_gt,
-                        pixel_bndl_model=pixel_bndl_model,
-                        uq_sample_num=uq_sample_num,
-                    )
-                    
-                    # 及时释放
-                    del adv_aux_outputs
-                
-                # Extract visualization data BEFORE cleanup (if enabled)
-                # This must be done before finally block releases intermediate_images
-                enable_vis = getattr(self, '_enable_style_visualization', False)
-                if enable_vis and style_result is not None and style_result.intermediate_images is not None:
-                    # Extract visualization data from style augmentation result
-                    styled_images = style_result.intermediate_images  # [B, 3, H, W]
-                    original_styles = style_result.original_styles  # [B, K, 6] or None
-                    adversarial_styles = style_result.adversarial_styles  # [B, K, 6] or None
-                    
-                    # Prepare visualization data (this copies data to CPU, so safe after cleanup)
-                    num_vis_samples = min(4, img_batch.shape[0])
-                    vis_data = self._prepare_aue_visualization_data(
-                        img_batch=img_batch,
-                        adv_images=styled_images,
-                        pixel_gt=pixel_gt,
-                        num_vis_samples=num_vis_samples,
-                        original_styles=original_styles,
-                        adv_styles=adversarial_styles,
-                    )
-                
-            finally:
-                # 确保所有结果都被释放（倒序释放）
-                for result in reversed(results_to_cleanup):
-                    result.release_intermediate()
+            if enable_vis:
+                # Save original image and GT for visualization (move to CPU immediately)
+                vis_refs['img_batch'] = img_batch.detach().cpu()
+                vis_refs['pixel_gt'] = pixel_gt.detach().cpu()
+            
+            # Apply adversarial augmentations and compute loss
+            augmentation_result = self._apply_adversarial_augmentation_pipeline(
+                img_batch=img_batch,
+                pixel_gt=pixel_gt,
+                backbone_features=backbone_features,
+                high_res_features=high_res_features,
+                uq_sample_num=uq_sample_num,
+                enable_vis=enable_vis,
+                vis_refs=vis_refs,
+            )
+            
+            calibration_loss_adversarial = augmentation_result['calibration_loss_adversarial']
+            assert calibration_loss_adversarial is not None
+            if 'vis_refs' in augmentation_result:
+                vis_refs.update(augmentation_result['vis_refs'])
         
+        # ========================================================================
+        # Prepare visualization data (AFTER cleanup, using CPU tensors)
+        # ========================================================================
+        # All visualization data has been moved to CPU during computation,
+        # so this can safely happen after GPU memory cleanup without conflicts.
+        vis_data = None
+        if vis_refs:
+            with torch.no_grad():
+                # Use styled images if available, otherwise use original images
+                adv_images_for_vis = vis_refs.get('styled_images', vis_refs['img_batch'])
+                
+                vis_data = self._prepare_aue_visualization_data(
+                    img_batch=vis_refs['img_batch'],  # Original image (before deformation)
+                    adv_images=adv_images_for_vis,
+                    pixel_gt=vis_refs['pixel_gt'],
+                    num_vis_samples=min(4, vis_refs['img_batch'].shape[0]),
+                    original_styles=vis_refs.get('original_styles'),
+                    adv_styles=vis_refs.get('adversarial_styles'),
+                    deform_offsets=vis_refs.get('deform_offsets'),
+                    warped_images=vis_refs.get('warped_images'),
+                )
+        
+        # ========================================================================
+        # Assemble final loss dictionary
+        # ========================================================================
         loss_dict = {}
         
         loss_dict['calibration_loss_clean'] = calibration_loss_clean
         loss_dict['calibration_loss_adversarial'] = calibration_loss_adversarial
         
-        # Save visualization data if available (prepared before cleanup)
+        # Save visualization data if available (prepared after cleanup)
+        # Note: This contains both style and deformation visualization data
         if vis_data is not None:
-            loss_dict['style_aue_visualization'] = vis_data
+            loss_dict['aue_visualization'] = vis_data
         
         loss = calibration_loss_clean + calibration_loss_adversarial
         loss_dict['total_loss'] = loss
@@ -874,12 +1126,12 @@ class SAM2Base(torch.nn.Module):
         Prepare inputs for style-based adversarial generation.
         
         Args:
-            img_batch: [B, 3, H, W] input images
+            img_batch: [B, 3, H, W] input images (may have gradients from deform AUE)
             pixel_gt: [B, K, H, W] ground truth masks
         
         Returns:
             pixel_gt: [B, K, H, W] normalized GT masks
-            original_styles: [B, K, 6] original style statistics
+            original_styles: [B, K, 6] original style statistics (detached)
         """
         # Ensure 4D: [B, K, H, W]
         if pixel_gt.ndim == 3:
@@ -888,12 +1140,14 @@ class SAM2Base(torch.nn.Module):
         B, K, H, W = pixel_gt.shape
         
         # Extract all objects' styles (vectorized)
+        # CRITICAL: Detach to break gradient flow from deform_augmenter
+        # Style PGD should only optimize style parameters, not deform offsets
         if self.style_aug_use_gt_region_style:
             from sam2.modeling.style_utils import extract_gt_region_style
-            original_styles = extract_gt_region_style(img_batch, pixel_gt)
+            original_styles = extract_gt_region_style(img_batch.detach(), pixel_gt)
         else:
             from sam2.modeling.style_utils import extract_style_statistics
-            global_style = extract_style_statistics(img_batch)
+            global_style = extract_style_statistics(img_batch.detach())
             original_styles = global_style.unsqueeze(1).expand(-1, K, -1)
         
         return pixel_gt, original_styles
@@ -1320,7 +1574,10 @@ class SAM2Base(torch.nn.Module):
             if step > 0:  # Don't clear on first iteration (graph was just built)
                 torch.cuda.empty_cache()
             
-            adv_styles.requires_grad = True
+            # Clone to ensure adv_styles is a leaf variable (needed for requires_grad)
+            # This is necessary because adv_styles may be computed from operations
+            # (e.g., original_styles + refined_delta) that make it a non-leaf tensor
+            adv_styles = adv_styles.clone().requires_grad_(True)
             
             # 1. Apply style and forward through model
             styled_images = self._apply_style_to_images(img_batch, adv_styles, gt_mask=apply_mask)
@@ -2582,6 +2839,7 @@ class SAM2Base(torch.nn.Module):
                     # Style-based AUE parameters (optional, used if use_style_aug=True)
                     img_batch=img_batch_for_style_aue,
                     backbone_features=backbone_features.detach() if backbone_features is not None else None,
+                    high_res_features=high_res_features,  # Pass high_res_features for deform augmentation
                     external_pre_out_w=external_w_for_aue,
                 )
                 bndl_outputs["aue_aux_loss"] = aue_loss

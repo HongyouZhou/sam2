@@ -151,7 +151,7 @@ class LoggingConf:
     log_batch_stats: bool = False
     visualize_bndl: bool = False
     bndl_vis_sample_rate: float = 0.05  # Probability of saving BNDL visualization for each validation batch (0.05 = 5%)
-    visualize_style_aue: bool = False  # Enable Style AUE visualization (original vs adversarial images)
+    visualize_aue: bool = False  # Enable AUE visualization (style and/or deformation: original vs adversarial images)
     style_aue_visual_frequency: int = 100  # Log Style AUE visualization every N steps
     uncertainty_metric: set = field(default_factory=lambda: {"entropy"})  # Options: {"entropy"}, {"nll"}, {"sampling"}, {"entropy", "nll"}, {"entropy", "nll", "sampling"}, etc.
     visualize_pavpu_overlay: bool = True  # Enable PAvPU overlay visualization on original images
@@ -498,10 +498,18 @@ class Trainer:
         # Log Style AUE visualization if available and enabled (only on rank 0)
         if (phase == "train" and 
             self.distributed_rank == 0 and
-            getattr(self.logging_conf, 'visualize_style_aue', False) and
+            getattr(self.logging_conf, 'visualize_aue', False) and
             hasattr(_model, 'use_style_aug') and _model.use_style_aug and
             _model._enable_style_visualization):
             self._log_style_aue_visualization(outputs, self.steps[phase])
+        
+        # Log Deformation AUE visualization if available and enabled (only on rank 0)
+        if (phase == "train" and 
+            self.distributed_rank == 0 and
+            getattr(self.logging_conf, 'visualize_aue', False) and
+            hasattr(_model, 'use_deform_aug') and _model.use_deform_aug and
+            _model._enable_style_visualization):
+            self._log_deform_aue_visualization(outputs, self.steps[phase])
 
         if isinstance(loss, dict):
             step_losses.update({f"Losses/{phase}_{key}_{k}": v for k, v in loss.items()})
@@ -728,7 +736,7 @@ class Trainer:
 
             # Visualize AUE adversarial images periodically during validation
             # Note: AUE visualization is now handled by _log_style_aue_visualization
-            # which extracts data from model outputs (loss_dict['style_aue_visualization'])
+            # which extracts data from model outputs (loss_dict['aue_visualization'])
 
             if data_iter % 10 == 0:
                 dist.barrier()
@@ -1197,7 +1205,10 @@ class Trainer:
             return
         
         # Denormalize images
-        original_denorm = self._denormalize_images(vis_data.original_images)
+        # If warped images are available (from deformation), use them as "before" for StyleAUE
+        # This shows: deformed image -> styled image (the actual StyleAUE input/output)
+        original_images = vis_data.warped_images if (hasattr(vis_data, 'warped_images') and vis_data.warped_images is not None) else vis_data.original_images
+        original_denorm = self._denormalize_images(original_images)
         adv_denorm = self._denormalize_images(vis_data.adversarial_images)
         
         # Use stored styles if available, otherwise extract from images
@@ -1214,7 +1225,7 @@ class Trainer:
             adv_styles_global = extract_style_statistics(vis_data.adversarial_images)
         
         # Visualize first sample only (for performance)
-        self._visualize_single_sample(
+        self._visualize_style_single_sample(
             original_denorm[0],
             adv_denorm[0],
             original_styles_global[0],
@@ -1232,28 +1243,55 @@ class Trainer:
     
     def _extract_vis_data_from_outputs(self, outputs):
         """Extract visualization data from model outputs."""
+        import logging
         outputs_iter = [outputs] if isinstance(outputs, dict) else outputs
+        
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            logging.debug(f"DeformAUE: _extract_vis_data_from_outputs - outputs type={type(outputs)}, is_dict={isinstance(outputs, dict)}")
         
         for outs in outputs_iter:
             if "multistep_aux_outputs" not in outs:
+                if logging.getLogger().isEnabledFor(logging.DEBUG):
+                    logging.debug("DeformAUE: No 'multistep_aux_outputs' in outputs")
                 continue
             
             aux_list = outs["multistep_aux_outputs"]
+            if logging.getLogger().isEnabledFor(logging.DEBUG):
+                logging.debug(f"DeformAUE: Found multistep_aux_outputs with {len(aux_list)} entries")
+            
             for aux in reversed(aux_list):
                 if aux is None or not isinstance(aux, dict):
                     continue
                 
                 bndl_outputs = aux.get("bndl", None)
-                if bndl_outputs is None or "aue_loss_dict" not in bndl_outputs:
+                if bndl_outputs is None:
+                    if logging.getLogger().isEnabledFor(logging.DEBUG):
+                        logging.debug("DeformAUE: No 'bndl' in aux_outputs")
+                    continue
+                
+                if "aue_loss_dict" not in bndl_outputs:
+                    if logging.getLogger().isEnabledFor(logging.DEBUG):
+                        logging.debug(f"DeformAUE: No 'aue_loss_dict' in bndl_outputs, keys={list(bndl_outputs.keys())}")
                     continue
                 
                 aue_loss_dict = bndl_outputs["aue_loss_dict"]
-                vis_data = aue_loss_dict.get("style_aue_visualization", None)
+                vis_data = aue_loss_dict.get("aue_visualization", None)
+                
+                if logging.getLogger().isEnabledFor(logging.DEBUG):
+                    logging.debug(f"DeformAUE: aue_loss_dict keys={list(aue_loss_dict.keys())}, vis_data={'✓' if vis_data is not None else '✗'}")
                 
                 # Check if vis_data is AUEVisualizationData or dict
                 if vis_data is not None:
                     # If it's a dataclass, check if it has data
                     if hasattr(vis_data, 'original_images'):
+                        # Debug: log what data is available
+                        import logging
+                        if logging.getLogger().isEnabledFor(logging.DEBUG):
+                            has_deform_offsets = hasattr(vis_data, 'deform_offsets') and vis_data.deform_offsets is not None
+                            logging.debug(
+                                f"DeformAUE: vis_data found - "
+                                f"deform_offsets={'✓' if has_deform_offsets else '✗'}"
+                            )
                         return vis_data
                     # If it's a dict (legacy), check for keys
                     elif isinstance(vis_data, dict) and "original_images" in vis_data:
@@ -1268,8 +1306,8 @@ class Trainer:
         denorm = images * std + mean
         return torch.clamp(denorm, 0, 1)
     
-    def _visualize_single_sample(self, original_img, adv_img, original_style, adv_style, vis_data, sample_idx, step):
-        """Visualize a single sample with multi-object support."""
+    def _visualize_style_single_sample(self, original_img, adv_img, original_style, adv_style, vis_data, sample_idx, step):
+        """Visualize a single sample for Style AUE with multi-object support."""
         # Extract multi-object data from vis_data (support both dataclass and dict)
         if hasattr(vis_data, 'all_bboxes'):
             # Dataclass
@@ -1309,6 +1347,244 @@ class Trainer:
         channels = ['R_mean', 'G_mean', 'B_mean', 'R_std', 'G_std', 'B_std']
         for j, channel in enumerate(channels):
             self.logger.log(f"StyleAUE/perturbation_{channel}", style_diff[j].item(), step)
+    
+    def _log_deform_aue_visualization(self, outputs, step):
+        """Log Deformation AUE visualization: before/after predictions with offset fields"""
+        import logging
+        
+        # Debug: Check all conditions
+        _model = unwrap_ddp_if_wrapped(self.model)
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
+            logging.debug(
+                f"DeformAUE: Attempting to log at step {step} - "
+                f"visualize_aue={getattr(self.logging_conf, 'visualize_aue', False)}, "
+                f"use_deform_aug={hasattr(_model, 'use_deform_aug') and _model.use_deform_aug}, "
+                f"_enable_style_visualization={getattr(_model, '_enable_style_visualization', False)}, "
+                f"distributed_rank={self.distributed_rank}"
+            )
+        
+        # Extract visualization data from outputs
+        vis_data = self._extract_vis_data_from_outputs(outputs)
+        if vis_data is None:
+            logging.debug("DeformAUE: vis_data is None, skipping visualization")
+            return
+        
+        # Check if deformation data is available (we need offsets for visualization)
+        if vis_data.deform_offsets is None:
+            logging.debug("DeformAUE: deform_offsets not available, skipping visualization")
+            return
+        
+        # Denormalize images
+        original_denorm = self._denormalize_images(vis_data.original_images)
+        
+        # Visualize first sample only (for performance)
+        self._visualize_deform_single_sample(
+            original_denorm[0],
+            vis_data,
+            sample_idx=0,
+            step=step
+        )
+        
+        # Log deformation statistics (offsets are guaranteed to exist at this point)
+        self._log_deform_statistics(vis_data.deform_offsets, step)
+    
+    def _visualize_deform_single_sample(self, original_img, vis_data, sample_idx, step):
+        """Visualize deformation with 2x2 layout (matching StyleAUE format)."""
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as patches
+        import numpy as np
+        
+        # Extract multi-object data from vis_data
+        if hasattr(vis_data, 'all_bboxes'):
+            all_bboxes = vis_data.all_bboxes
+            all_masks = vis_data.all_object_masks
+            area_ratios = vis_data.area_ratios
+            epsilon_weights = vis_data.epsilon_weights
+        else:
+            all_bboxes = None
+            all_masks = None
+            area_ratios = None
+            epsilon_weights = None
+        
+        # Extract data for this sample
+        sample_bboxes = all_bboxes[sample_idx] if all_bboxes is not None else None
+        sample_masks = all_masks[sample_idx] if all_masks is not None else None
+        sample_area_ratios = area_ratios[sample_idx] if area_ratios is not None else None
+        sample_epsilon_weights = epsilon_weights[sample_idx] if epsilon_weights is not None else None
+        
+        # Get deformation data
+        offsets = vis_data.deform_offsets[sample_idx] if vis_data.deform_offsets is not None else None  # [K, 2, H, W]
+        warped_img = vis_data.warped_images[sample_idx] if hasattr(vis_data, 'warped_images') and vis_data.warped_images is not None else None
+        
+        # Get GT masks for overlay
+        gt_masks = sample_masks  # [K, H, W]
+        K = gt_masks.shape[0] if gt_masks is not None else 0
+        
+        # Convert to numpy
+        orig_np = original_img.permute(1, 2, 0).cpu().numpy()
+        orig_np = np.clip(orig_np, 0, 1)
+        H, W = orig_np.shape[0], orig_np.shape[1]
+        
+        # Convert warped image to numpy if available (denormalize first!)
+        if warped_img is not None:
+            # Denormalize warped image (same as original_img)
+            warped_img_denorm = self._denormalize_images(warped_img.unsqueeze(0))[0]  # Add batch dim, then remove
+            warped_np = warped_img_denorm.permute(1, 2, 0).cpu().numpy()
+            warped_np = np.clip(warped_np, 0, 1)
+        else:
+            warped_np = None
+        
+        # Convert GT masks to numpy if available
+        if gt_masks is not None:
+            gt_masks_np = gt_masks.cpu().numpy()  # [K, H, W]
+        else:
+            gt_masks_np = None
+        
+        # Determine primary object (largest area ratio or first non-empty)
+        primary_obj_idx = 0
+        if sample_area_ratios is not None:
+            primary_obj_idx = sample_area_ratios.argmax().item()
+        
+        # Create visualization: 2x2 layout (matching StyleAUE format)
+        fig, axes = plt.subplots(2, 2, figsize=(12, 12))
+        
+        # Row 0, Col 0: Original Image with GT masks and bboxes (Before Deformation)
+        axes[0, 0].imshow(orig_np)
+        axes[0, 0].set_title(f'Before Deformation (Sample {sample_idx})', fontsize=12, fontweight='bold')
+        axes[0, 0].axis('off')
+        
+        # Overlay GT masks and bboxes
+        if gt_masks_np is not None:
+            for k in range(K):
+                mask_k = gt_masks_np[k]
+                if mask_k.sum() == 0:
+                    continue
+                
+                # Check if background (last object slot with large area)
+                is_background = (k == K - 1 and mask_k.sum() > H * W * 0.5)
+                
+                # Draw mask contour
+                from skimage import measure
+                contours = measure.find_contours(mask_k, 0.5)
+                
+                # Determine colors based on object type
+                if is_background:
+                    edge_color = 'lime'
+                    linewidth = 2
+                    linestyle = '--'
+                    label = f'BG'
+                    label_color = 'lime'
+                elif k == primary_obj_idx:
+                    edge_color = 'red'
+                    linewidth = 4
+                    linestyle = '-'
+                    label = f'O{k+1}*'
+                    label_color = 'red'
+                else:
+                    edge_color = 'cyan'
+                    linewidth = 2
+                    linestyle = '-'
+                    label = f'O{k+1}'
+                    label_color = 'cyan'
+                
+                # Draw contours
+                for contour in contours:
+                    axes[0, 0].plot(contour[:, 1], contour[:, 0], color=edge_color, 
+                                    linewidth=linewidth, linestyle=linestyle, alpha=0.8)
+                
+                # Draw bbox
+                if sample_bboxes is not None:
+                    bbox_k = sample_bboxes[k].cpu().numpy()
+                    x1, y1, x2, y2 = bbox_k
+                    if x2 > x1 and y2 > y1:
+                        rect = patches.Rectangle(
+                            (x1, y1), x2 - x1, y2 - y1,
+                            linewidth=linewidth, edgecolor=edge_color,
+                            facecolor='none', linestyle=linestyle, alpha=0.5
+                        )
+                        axes[0, 0].add_patch(rect)
+                        axes[0, 0].text(
+                            x1, y1 - 5, label,
+                            color=label_color, fontsize=9, fontweight='bold',
+                            bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.8)
+                        )
+        
+        # Row 0, Col 1: Statistics (Top Right)
+        axes[0, 1].axis('off')
+        stats_text = f"Deformation Statistics:\n\n"
+        stats_text += f"Objects: {K}\n"
+        if sample_area_ratios is not None:
+            stats_text += f"Primary Object: O{primary_obj_idx+1}\n"
+            stats_text += f"Area Ratios:\n"
+            for k in range(min(K, 5)):  # Show first 5 objects
+                ratio = sample_area_ratios[k].item()
+                stats_text += f"  O{k+1}: {ratio:.3f}\n"
+        if offsets is not None:
+            offsets_np = offsets.cpu().numpy()  # [K, 2, H, W]
+            offset_magnitude = np.sqrt(offsets_np[:, 0]**2 + offsets_np[:, 1]**2)
+            stats_text += f"\nOffset Statistics:\n"
+            stats_text += f"  Max: {offset_magnitude.max():.4f}\n"
+            stats_text += f"  Mean: {offset_magnitude.mean():.4f}\n"
+            stats_text += f"  Std: {offset_magnitude.std():.4f}\n"
+        axes[0, 1].text(0.1, 0.5, stats_text, fontsize=11, verticalalignment='center',
+                       family='monospace',
+                       bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        
+        # Row 1, Col 0: Warped Image (After Deformation)
+        if warped_np is not None:
+            axes[1, 0].imshow(warped_np)
+            axes[1, 0].set_title('After Deformation (Warped)', fontsize=12, fontweight='bold')
+        else:
+            axes[1, 0].imshow(orig_np)
+            axes[1, 0].set_title('After Deformation (Not Available)', fontsize=12, fontweight='bold')
+        axes[1, 0].axis('off')
+        
+        # Row 1, Col 1: Offset Magnitude Overlay
+        if offsets is not None:
+            offsets_np = offsets.cpu().numpy()  # [K, 2, H, W]
+            offset_magnitude = np.sqrt(offsets_np[:, 0]**2 + offsets_np[:, 1]**2)  # [K, H, W]
+            offset_mag_combined = offset_magnitude.sum(axis=0)  # [H, W]
+            
+            axes[1, 1].imshow(orig_np)
+            im = axes[1, 1].imshow(offset_mag_combined, alpha=0.6, cmap='hot')
+            axes[1, 1].set_title('Offset Magnitude (Overlay)', fontsize=12, fontweight='bold')
+            axes[1, 1].axis('off')
+            plt.colorbar(im, ax=axes[1, 1])
+        else:
+            axes[1, 1].axis('off')
+        
+        # Add overall title
+        fig.suptitle(f'Deformation Augmentation ({K} objects)', fontsize=14, fontweight='bold')
+        plt.tight_layout()
+        
+        # Convert figure to image and log to TensorBoard
+        fig.canvas.draw()
+        width, height = fig.canvas.get_width_height()
+        img_array = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+        img_array = img_array.reshape(height, width, 4)[:, :, :3]
+        img_tensor = torch.from_numpy(img_array).permute(2, 0, 1).float() / 255.0
+        
+        # Log to TensorBoard
+        if self.logger.tb_logger and self.logger.tb_logger._writer:
+            self.logger.tb_logger._writer.add_image(
+                f"DeformAUE/sample_{sample_idx}",
+                img_tensor,
+                step
+            )
+        
+        plt.close(fig)
+    
+    def _log_deform_statistics(self, deform_offsets, step):
+        """Log deformation offset statistics."""
+        # deform_offsets: [N, K, 2, H, W]
+        offset_magnitude = torch.sqrt(deform_offsets[:, :, 0]**2 + deform_offsets[:, :, 1]**2)  # [N, K, H, W]
+        max_offset = offset_magnitude.max().item()
+        mean_offset = offset_magnitude.mean().item()
+        std_offset = offset_magnitude.std().item()
+        
+        self.logger.log("DeformAUE/max_offset", max_offset, step)
+        self.logger.log("DeformAUE/mean_offset", mean_offset, step)
+        self.logger.log("DeformAUE/std_offset", std_offset, step)
     
     def _log_gcn_parameters(self, step):
         """Log GCN layer weight statistics if GCN is enabled."""
@@ -1395,45 +1671,53 @@ class Trainer:
                 # Check if this is background mask (last slot in K)
                 is_background = (k == K - 1 and mask_k.sum() > 0)
                 
-                # NO mask overlay - only bboxes
+                # Draw mask contour
+                from skimage import measure
+                contours = measure.find_contours(mask_k, 0.5)
+                
+                # Get epsilon weight if available (simplified label)
+                eps_info = ""
+                if epsilon_weights is not None:
+                    eps_weight = epsilon_weights[k].item()
+                    eps_info = f" ε{eps_weight:.2f}"
+                
+                # Determine colors based on object type
+                if is_background:
+                    # Background: green dashed bbox
+                    edge_color = 'lime'
+                    linewidth = 2
+                    linestyle = '--'
+                    label = f'BG{eps_info}'
+                    label_color = 'lime'
+                elif k == primary_obj_idx:
+                    # Primary object (for loss): RED, thick
+                    edge_color = 'red'
+                    linewidth = 4
+                    linestyle = '-'
+                    label = f'O{k+1}*{eps_info}'
+                    label_color = 'red'
+                else:
+                    # Other objects: cyan, thin
+                    edge_color = 'cyan'
+                    linewidth = 2
+                    linestyle = '-'
+                    label = f'O{k+1}{eps_info}'
+                    label_color = 'cyan'
+                
+                # Draw contours
+                for contour in contours:
+                    axes[0, 0].plot(contour[:, 1], contour[:, 0], color=edge_color, 
+                                    linewidth=linewidth, linestyle=linestyle, alpha=0.8)
                 
                 # Draw bbox
                 if all_bboxes is not None:
                     bbox_k = all_bboxes[k].cpu().numpy()
                     x1, y1, x2, y2 = bbox_k
                     if x2 > x1 and y2 > y1:
-                        # Get epsilon weight if available (simplified label)
-                        eps_info = ""
-                        if epsilon_weights is not None:
-                            eps_weight = epsilon_weights[k].item()
-                            eps_info = f" ε{eps_weight:.2f}"
-                        
-                        if is_background:
-                            # Background: green dashed bbox
-                            edge_color = 'lime'
-                            linewidth = 2
-                            linestyle = '--'
-                            label = f'BG{eps_info}'
-                            label_color = 'lime'
-                        elif k == primary_obj_idx:
-                            # Primary object (for loss): RED, thick
-                            edge_color = 'red'
-                            linewidth = 4
-                            linestyle = '-'
-                            label = f'O{k+1}*{eps_info}'
-                            label_color = 'red'
-                        else:
-                            # Other objects: cyan, thin
-                            edge_color = 'cyan'
-                            linewidth = 2
-                            linestyle = '-'
-                            label = f'O{k+1}{eps_info}'
-                            label_color = 'cyan'
-                        
                         rect = patches.Rectangle(
                             (x1, y1), x2 - x1, y2 - y1,
                             linewidth=linewidth, edgecolor=edge_color, 
-                            facecolor='none', linestyle=linestyle
+                            facecolor='none', linestyle=linestyle, alpha=0.5
                         )
                         axes[0, 0].add_patch(rect)
                         axes[0, 0].text(
@@ -1468,44 +1752,53 @@ class Trainer:
                 # Check if this is background mask (last slot in K)
                 is_background = (k == K - 1 and mask_k.sum() > 0)
                 
-                # NO mask overlay - only bboxes
+                # Draw mask contour
+                from skimage import measure
+                contours = measure.find_contours(mask_k, 0.5)
                 
+                # Get epsilon weight if available (simplified label)
+                eps_info = ""
+                if epsilon_weights is not None:
+                    eps_weight = epsilon_weights[k].item()
+                    eps_info = f" ε{eps_weight:.2f}"
+                
+                # Determine colors based on object type
+                if is_background:
+                    # Background: green dashed bbox
+                    edge_color = 'lime'
+                    linewidth = 2
+                    linestyle = '--'
+                    label = f'BG{eps_info}'
+                    label_color = 'lime'
+                elif k == primary_obj_idx:
+                    # Primary object (for loss): RED, thick
+                    edge_color = 'red'
+                    linewidth = 4
+                    linestyle = '-'
+                    label = f'O{k+1}*{eps_info}'
+                    label_color = 'red'
+                else:
+                    # Other objects: cyan, thin
+                    edge_color = 'cyan'
+                    linewidth = 2
+                    linestyle = '-'
+                    label = f'O{k+1}{eps_info}'
+                    label_color = 'cyan'
+                
+                # Draw contours
+                for contour in contours:
+                    axes[1, 0].plot(contour[:, 1], contour[:, 0], color=edge_color, 
+                                    linewidth=linewidth, linestyle=linestyle, alpha=0.8)
+                
+                # Draw bbox
                 if all_bboxes is not None:
                     bbox_k = all_bboxes[k].cpu().numpy()
                     x1, y1, x2, y2 = bbox_k
                     if x2 > x1 and y2 > y1:
-                        # Get epsilon weight if available (simplified label)
-                        eps_info = ""
-                        if epsilon_weights is not None:
-                            eps_weight = epsilon_weights[k].item()
-                            eps_info = f" ε{eps_weight:.2f}"
-                        
-                        if is_background:
-                            # Background: green dashed bbox
-                            edge_color = 'lime'
-                            linewidth = 2
-                            linestyle = '--'
-                            label = f'BG{eps_info}'
-                            label_color = 'lime'
-                        elif k == primary_obj_idx:
-                            # Primary object (for loss): RED, thick
-                            edge_color = 'red'
-                            linewidth = 4
-                            linestyle = '-'
-                            label = f'O{k+1}*{eps_info}'
-                            label_color = 'red'
-                        else:
-                            # Other objects: cyan, thin
-                            edge_color = 'cyan'
-                            linewidth = 2
-                            linestyle = '-'
-                            label = f'O{k+1}{eps_info}'
-                            label_color = 'cyan'
-                        
                         rect = patches.Rectangle(
                             (x1, y1), x2 - x1, y2 - y1,
                             linewidth=linewidth, edgecolor=edge_color, 
-                            facecolor='none', linestyle=linestyle
+                            facecolor='none', linestyle=linestyle, alpha=0.5
                         )
                         axes[1, 0].add_patch(rect)
                         axes[1, 0].text(
