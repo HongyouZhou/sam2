@@ -159,16 +159,34 @@ model:
   # Deformation Augmentation (DG-Font style, feature-level)
   use_deform_aug: true 
   deform_aug_epsilon: 5.0  # Deformation strength in pixels (image space, ~3% of 1024px)
-  deform_aug_pgd_steps: 1  # PGD steps for deformation (placeholder, not used yet)
+  deform_aug_pgd_steps: 1  # PGD steps for deformation (gradient ascent to maximize calibration loss)
   deform_aug_use_soft_composite: true  # Use soft compositing for handling overlaps
   deform_aug_temperature: 1.0  # Temperature for soft compositing softmax
   deform_aug_use_gcn: false  # GCN coordination for multi-object deformations (not implemented yet)
   deform_aug_gcn_num_layers: 2  # Number of GCN layers (for future use)
   deform_aug_num_deform_groups: 4  # Number of deformable convolution groups
     
-  # Patch-based MMD configuration for AUE calibration loss
-  aue_use_patch_mmd: true
-  aue_patch_size: 32
+  # Distribution matching configuration for AUE calibration loss (nested config)
+  aue_dist_matching_config:
+    method: "mmd"  # Options: "mmd", "cka", "gram"
+    use_patches: true  # Use patch-based (vs global/pixel-level) computation
+    patch_size: 32  # Patch size for patch-based methods
+      
+    # Method-specific parameters (only active when method is selected)
+    mmd:
+      kernel: "rbf"
+      bandwidth: 0.1
+      batch_size: 256
+      n_batches: 10
+      
+    cka:
+      use_linear_kernel: true  # Linear kernel (faster) vs RBF kernel
+      use_minibatch: true  # Mini-batch computation for memory efficiency
+      minibatch_size: 512
+      
+    gram:
+      center: true
+      normalize: true
     
   # Analytic uncertainty computation (from Weibull parameters)
   # true = use analytic uncertainty (with gradients to BNDL, bidirectional optimization)
