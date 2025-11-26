@@ -708,31 +708,39 @@ class Trainer:
                     )
 
             # Randomly visualize BNDL parameters during validation
-            if (
-                self.distributed_rank == 0
-                and self.logging_conf.visualize_bndl
+            # CRITICAL FIX: Run forward pass on ALL ranks to avoid SyncBatchNorm deadlock
+            # Use deterministic sampling based on step count instead of random.random()
+            vis_interval = int(1.0 / max(self.logging_conf.bndl_vis_sample_rate, 0.001))
+            should_visualize = (
+                self.logging_conf.visualize_bndl
                 and getattr(unwrap_ddp_if_wrapped(self.model), "use_bndl_for_pixels", False)
-                and random.random() < self.logging_conf.bndl_vis_sample_rate
-            ):
+                and (data_iter % vis_interval == 0)
+            )
+
+            if should_visualize:
                 # Extract BNDL outputs for visualization
                 _model = unwrap_ddp_if_wrapped(self.model)
                 if hasattr(batch, "img_batch"):
                     # Re-run forward pass to get outputs with BNDL data
+                    # Must run on ALL ranks to keep SyncBatchNorm in sync
                     with torch.no_grad():
                         outputs_for_vis = _model(batch)
-                    bndl_outputs, step_index, frame_index = self._extract_bndl_outputs(outputs_for_vis)
-                    if bndl_outputs is not None:
-                        # Calculate uncertainty for visualization
-                        if frame_index is not None and batch.masks.shape[0] > frame_index:
-                            current_frame_targets = batch.masks[frame_index]
-                        else:
-                            current_frame_targets = batch.masks[0] if batch.masks.shape[0] > 0 else batch.masks
-                        bndl_outputs = self._calculate_uncertainty_for_bndl(bndl_outputs, batch, current_frame_targets)
+                    
+                    # Visualization only on rank 0
+                    if self.distributed_rank == 0:
+                        bndl_outputs, step_index, frame_index = self._extract_bndl_outputs(outputs_for_vis)
+                        if bndl_outputs is not None:
+                            # Calculate uncertainty for visualization
+                            if frame_index is not None and batch.masks.shape[0] > frame_index:
+                                current_frame_targets = batch.masks[frame_index]
+                            else:
+                                current_frame_targets = batch.masks[0] if batch.masks.shape[0] > 0 else batch.masks
+                            bndl_outputs = self._calculate_uncertainty_for_bndl(bndl_outputs, batch, current_frame_targets)
 
-                        vis_dir = os.path.join(self.logging_conf.log_dir, "bndl_visualizations", phase)
-                        makedir(vis_dir)
-                        # Create full visualization with uncertainty and PAvPU overlays
-                        self._create_unified_visualization(bndl_outputs, batch, outputs_for_vis, vis_dir, data_iter, step_index, frame_index, layout_type="full")
+                            vis_dir = os.path.join(self.logging_conf.log_dir, "bndl_visualizations", phase)
+                            makedir(vis_dir)
+                            # Create full visualization with uncertainty and PAvPU overlays
+                            self._create_unified_visualization(bndl_outputs, batch, outputs_for_vis, vis_dir, data_iter, step_index, frame_index, layout_type="full")
 
             # Visualize AUE adversarial images periodically during validation
             # Note: AUE visualization is now handled by _log_style_aue_visualization
@@ -2382,24 +2390,31 @@ class Trainer:
         else:
             rows = 3
 
+        import logging
+        logging.info(f"Creating visualization layout with {rows} rows")
         # 使用重构后的工具创建图表布局
         fig, axes = viz_utils.create_figure_layout(rows, 3, (18, 6 * rows))
 
+        logging.info("Plotting common elements")
         # 绘制通用元素（传递prompt信息）
         self._plot_common_elements_refactored(axes, original_img, lambda_img, k_img, step_index, bndl_outputs, has_uncertainty, batch, outputs_for_vis, bndl_viz, viz_utils, prompt_info)
 
         # 添加PAvPU overlay可视化
         current_row = 4
         if has_pavpu and rows >= 5:
+            logging.info("Plotting PAvPU overlay")
             bndl_viz.plot_pavpu_overlay_visualization(axes[current_row, :], bndl_outputs, original_img, step_index)
             current_row += 1
 
         # 添加U/A比值可视化
         if has_ratio_data and rows >= current_row + 1:
+            logging.info("Plotting U/A ratio visualization")
             bndl_viz.plot_uncertainty_accuracy_ratio_visualization(axes[current_row, :], bndl_outputs, original_img, step_index, ratio_type="U/A")
 
         save_path = os.path.join(vis_dir, f"epoch_{self.epoch}_iter_{data_iter}_step_{step_index}_unified_{layout_type}.png")
+        logging.info(f"Saving visualization to {save_path}")
         viz_utils.save_and_close_figure(fig, save_path, dpi=150)
+        logging.info("Visualization saved successfully")
 
 
     def _plot_common_elements_refactored(

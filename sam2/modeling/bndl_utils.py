@@ -8,6 +8,15 @@ including analytic uncertainty computation from Weibull parameters.
 import torch
 
 
+from dataclasses import dataclass
+
+@dataclass
+class BNDLOutputs:
+    pixel_feat: torch.Tensor
+    pixel_logits: torch.Tensor
+    external_w: torch.Tensor | None
+    pixel_uncertainty: torch.Tensor | None
+
 def pixel_weibull_to_entropy_uncertainty(
     pixel_bndl_model,
     pixel_feat: torch.Tensor,

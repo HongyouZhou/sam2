@@ -60,6 +60,7 @@ class SAM2Train(SAM2Base):
         # of all frames at once. This avoids backbone OOM errors on very long videos in evaluation, but could be slightly slower.
         forward_backbone_per_frame_for_eval=False,
         freeze_image_encoder=False,
+        unfreeze_image_encoder_components=[],
         **kwargs,
     ):
         super().__init__(image_encoder, memory_attention, memory_encoder, **kwargs)
@@ -95,12 +96,89 @@ class SAM2Train(SAM2Base):
         self.rng = np.random.default_rng(seed=42)
 
         if freeze_image_encoder:
+            # 1. Freeze everything by default
             for p in self.image_encoder.parameters():
                 p.requires_grad = False
+            
+            # 2. Unfreeze specific components
+            if "neck" in unfreeze_image_encoder_components:
+                if hasattr(self.image_encoder, "neck"):
+                    for p in self.image_encoder.neck.parameters():
+                        p.requires_grad = True
+                    logging.info("Unfrozen image encoder component: NECK")
+                else:
+                    logging.warning("Requested to unfreeze 'neck' but image_encoder has no 'neck' attribute.")
+
+            if "trunk_last_stage" in unfreeze_image_encoder_components:
+                if hasattr(self.image_encoder, "trunk") and hasattr(self.image_encoder.trunk, "blocks"):
+                    # Hiera structure: blocks are in a ModuleList
+                    # We need to find the blocks belonging to the last stage.
+                    # Hiera stores stage_ends indices.
+                    if hasattr(self.image_encoder.trunk, "stage_ends"):
+                        last_stage_end = self.image_encoder.trunk.stage_ends[-1]
+                        # The stage before the last one ends at stage_ends[-2]
+                        # If there are 4 stages, stage_ends has 4 elements.
+                        # Stage 3 (last) starts after stage_ends[2] + 1
+                        if len(self.image_encoder.trunk.stage_ends) >= 2:
+                            last_stage_start = self.image_encoder.trunk.stage_ends[-2] + 1
+                        else:
+                            last_stage_start = 0 # Fallback if only 1 stage
+                        
+                        # Unfreeze blocks from start to end
+                        for i in range(last_stage_start, last_stage_end + 1):
+                            for p in self.image_encoder.trunk.blocks[i].parameters():
+                                p.requires_grad = True
+                        logging.info(f"Unfrozen image encoder component: TRUNK_LAST_STAGE (blocks {last_stage_start}-{last_stage_end})")
+                    else:
+                         logging.warning("Requested to unfreeze 'trunk_last_stage' but trunk has no 'stage_ends'.")
+                else:
+                    logging.warning("Requested to unfreeze 'trunk_last_stage' but image_encoder structure is unknown.")
+
+            # 3. Set modes
             # Set backbone to eval mode to disable DropPath and other training-only behaviors
             self.image_encoder.eval()
+            
+            # If we unfreeze something, we might want to keep those parts in train mode?
+            # Usually for fine-tuning, we keep BN frozen (eval mode) but allow weights to update.
+            # DropPath should probably be disabled for stability unless we have lots of data.
+            # So keeping eval() mode is generally safer for partial fine-tuning.
+            # However, if the user explicitly wants to train the neck, maybe they want BN updates?
+            # For FPN neck, it usually has LayerNorm or GN, not BN. So eval/train mode matters less for stats,
+            # but matters for Dropout/DropPath.
+            # Let's keep it simple: Force eval() on everything to be safe (consistent with previous logic),
+            # BUT if 'neck' is unfrozen, we might want to allow it to be in train mode if it has dropout?
+            # The previous logic forced everything to eval. Let's stick to that for stability.
+            # Wait, if we use `self.image_encoder.eval()`, it sets everything to eval.
+            # If we want to train neck, we should probably set neck to train()?
+            # Let's check Hiera FPN Neck. It has LayerNorm. No BN.
+            # So eval() vs train() mainly affects Dropout (if any).
+            # Let's stick to the safe bet: Global eval(), but unfreeze weights.
+            
             # Prevent backbone from being set back to train mode by model.train()
-            self.image_encoder.train = lambda mode=True: self.image_encoder
+            # We need to be careful: if we want to train neck, model.train() should ideally set neck to train.
+            # But the monkey patch `self.image_encoder.train = lambda ...` prevents ANY part from going to train.
+            
+            # Revised Logic:
+            # 1. Set global eval()
+            self.image_encoder.eval()
+            
+            # 2. Define custom train function
+            def custom_train(mode=True):
+                # Always keep trunk in eval
+                if hasattr(self.image_encoder, "trunk"):
+                    self.image_encoder.trunk.eval()
+                
+                # If neck is unfrozen, allow it to follow mode
+                if "neck" in unfreeze_image_encoder_components and hasattr(self.image_encoder, "neck"):
+                    self.image_encoder.neck.train(mode)
+                
+                # If last stage is unfrozen, allow it to follow mode?
+                # Hiera blocks have DropPath. Enabling DropPath (train mode) might be good for regularization
+                # but risky for stability. Let's keep trunk fully eval for now to be safe.
+                
+                return self.image_encoder
+
+            self.image_encoder.train = custom_train
 
     def forward(self, input: BatchedVideoDatapoint):
         if self.training or not self.forward_backbone_per_frame_for_eval:
@@ -224,18 +302,20 @@ class SAM2Train(SAM2Base):
         # ============================================================
         # CONTROL: Toggle background mask support (from config)
         # ============================================================
-        # Set style_aug_enable_background = True to include background as 11th object
-        # Set style_aug_enable_background = False for objects-only (K=10)
+        # Set style_aug_enable_background = True to include background as extra object
+        # Set style_aug_enable_background = False for objects-only
         # 
         # When enabled:
-        #   - K = 11 (10 objects + 1 background)
+        #   - K = max_num_objects + 1 (foreground objects + background)
         #   - Background = 1 - union(all objects)
         #   - Background participates in style attack
         #   - Visualization shows green dashed bbox for background
         # ============================================================
         ENABLE_BACKGROUND_MASK = self.style_aug_enable_background
         
-        max_num_objects = 11 if ENABLE_BACKGROUND_MASK else 10
+        # Use max_num_objects from config (matches dataset sampler)
+        # Add 1 slot for background if enabled
+        max_num_objects = (self.max_num_objects + 1) if ENABLE_BACKGROUND_MASK else self.max_num_objects
         num_videos = input.num_videos
         H_mask, W_mask = input.masks.shape[-2:]
         
@@ -676,8 +756,8 @@ class SAM2Train(SAM2Base):
                     mask_inputs=mask_inputs,
                     high_res_features=high_res_features,
                     multimask_output=multimask_output,
-                    pixel_gt_for_aue=pixel_gt_for_aue,
-                    img_batch_for_style_aue=img_batch_for_aue,
+                    pixel_gt_for_aue=None,
+                    img_batch_for_style_aue=None,
                     use_reentrant=False,
                 )
             else:
@@ -687,8 +767,8 @@ class SAM2Train(SAM2Base):
                     mask_inputs=mask_inputs,
                     high_res_features=high_res_features,
                     multimask_output=multimask_output,
-                    pixel_gt_for_aue=pixel_gt_for_aue,
-                    img_batch_for_style_aue=img_batch_for_aue,
+                    pixel_gt_for_aue=None,
+                    img_batch_for_style_aue=None,
                 )
 
             # Unpack sam_outputs: check if aux_outputs is present (8 elements) or not (7 elements)

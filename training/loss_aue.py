@@ -41,9 +41,14 @@ class AUELoss(nn.Module):
             
             for b in reversed(bndl_outputs_list):
                 if b is not None and ("aue_aux_loss" in b):
+                    aue_loss_value = b["aue_aux_loss"]
+                    # Skip zero losses (from frames without pixel_gt)
+                    # We want the first NON-ZERO loss with gradients
+                    if aue_loss_value.item() == 0.0 or not aue_loss_value.requires_grad:
+                        continue  # Keep searching
                     if device is None:
-                        device = b["aue_aux_loss"].device
-                    total = total + b["aue_aux_loss"]  # no weighting here
+                        device = aue_loss_value.device
+                    total = total + aue_loss_value  # no weighting here
                     count += 1
                     break
         if device is None:

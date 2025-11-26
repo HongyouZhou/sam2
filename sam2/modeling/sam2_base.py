@@ -6,6 +6,7 @@
 
 import logging
 from dataclasses import dataclass
+from contextlib import contextmanager
 
 import torch
 import torch.nn.functional as F
@@ -192,8 +193,16 @@ class SAM2Base(torch.nn.Module):
         deform_aug_use_gcn: bool = False,  # GCN coordination for multi-object deformations
         deform_aug_gcn_num_layers: int = 2,  # Number of GCN layers
         deform_aug_num_deform_groups: int = 4,  # Number of deformable convolution groups
+        # Feature-based deformation options
+        deform_aug_init_from_memory_encoder: bool = True,  # Initialize from memory encoder
+        deform_aug_freeze_mask_encoder: bool = False,  # Freeze mask encoder weights
+        # Augmentation pipeline control
+        adversarial_aug_order: list[str] | None = None,  # Order of augmentations, e.g., ["deform", "style"]
+        # Max number of objects (for AUE tensor allocation, matches dataset sampler)
+        max_num_objects: int = 11,  # Default: 10 objects + 1 background
     ):
         super().__init__()
+        self.max_num_objects = max_num_objects
 
         # Part 1: the image backbone
         self.image_encoder = image_encoder
@@ -310,6 +319,12 @@ class SAM2Base(torch.nn.Module):
             
             cfg = self.aue_dist_matching_config
             
+            # Determine max_samples based on active method
+            if cfg['method'] == 'domain_aware_soft_mmd':
+                current_max_samples = cfg.get('domain_aware_soft_mmd', {}).get('max_samples', 4096)
+            else:
+                current_max_samples = cfg.get('mmd_hard_aware', {}).get('max_samples', 4096)
+
             self.distribution_matcher = DistributionMatcher(
                 method=cfg['method'],
                 patch_size=cfg['patch_size'],
@@ -318,6 +333,16 @@ class SAM2Base(torch.nn.Module):
                 cka_use_linear_kernel=cfg.get('cka', {}).get('use_linear_kernel', True),
                 cka_use_minibatch=cfg.get('cka', {}).get('use_minibatch', True),
                 cka_minibatch_size=cfg.get('cka', {}).get('minibatch_size', 512),
+                # Hard-Aware MMD parameters
+                top_k_percent=cfg.get('mmd_hard_aware', {}).get('top_k_percent', 0.25),
+                max_samples=current_max_samples,
+                # Domain-Aware Soft MMD parameters (NEW)
+                diversity_weight=cfg.get('domain_aware_soft_mmd', {}).get('diversity_weight', 0.4),
+                temperature=cfg.get('domain_aware_soft_mmd', {}).get('temperature', 0.1),
+                diversity_method=cfg.get('domain_aware_soft_mmd', {}).get('diversity_method', 'channel_std'),
+                enable_monitoring=cfg.get('domain_aware_soft_mmd', {}).get('enable_monitoring', False),
+                # Checkpointing for memory optimization (enabled by default)
+                use_checkpoint=cfg.get('use_checkpoint', True),
             )
             self._build_aue_components()
 
@@ -364,8 +389,13 @@ class SAM2Base(torch.nn.Module):
         self.deform_aug_use_gcn = bool(deform_aug_use_gcn)
         self.deform_aug_gcn_num_layers = int(deform_aug_gcn_num_layers)
         self.deform_aug_num_deform_groups = int(deform_aug_num_deform_groups)
+        self.deform_aug_init_from_memory_encoder = bool(deform_aug_init_from_memory_encoder)
+        self.deform_aug_freeze_mask_encoder = bool(deform_aug_freeze_mask_encoder)
         if self.use_deform_aug:
             self._build_deform_aug_components()
+        
+        # Augmentation pipeline ordering
+        self.adversarial_aug_order = adversarial_aug_order or ["deform", "style"]
 
         # Model compilation
         if compile_image_encoder:
@@ -433,8 +463,23 @@ class SAM2Base(torch.nn.Module):
         config['gram'].setdefault('center', True)
         config['gram'].setdefault('normalize', True)
         
+        # Set Hard-Aware MMD defaults
+        if 'mmd_hard_aware' not in config:
+            config['mmd_hard_aware'] = {}
+        config['mmd_hard_aware'].setdefault('top_k_percent', 0.25)
+        config['mmd_hard_aware'].setdefault('max_samples', 4096)
+        
+        # Set Domain-Aware Soft MMD defaults (NEW)
+        if 'domain_aware_soft_mmd' not in config:
+            config['domain_aware_soft_mmd'] = {}
+        config['domain_aware_soft_mmd'].setdefault('diversity_weight', 0.4)
+        config['domain_aware_soft_mmd'].setdefault('temperature', 0.1)
+        config['domain_aware_soft_mmd'].setdefault('max_samples', 4096)
+        config['domain_aware_soft_mmd'].setdefault('diversity_method', 'channel_std')
+        config['domain_aware_soft_mmd'].setdefault('enable_monitoring', False)
+        
         # Validate method
-        valid_methods = ['mmd', 'cka', 'gram']
+        valid_methods = ['mmd', 'cka', 'gram', 'mmd_hard_aware', 'domain_aware_soft_mmd']
         if config['method'] not in valid_methods:
             raise ValueError(
                 f"Invalid distribution matching method: {config['method']}. "
@@ -450,6 +495,8 @@ class SAM2Base(torch.nn.Module):
         
         return config
     
+
+
     def _build_style_aug_components(self) -> None:
         """
         Build style augmentation components for adversarial training.
@@ -500,6 +547,7 @@ class SAM2Base(torch.nn.Module):
             use_global_local_mix=self.style_aug_use_global_local_mix,
             global_epsilon=self.style_aug_global_epsilon,
             global_weight=self.style_aug_global_weight,
+            num_objects=self.max_num_objects + (1 if self.style_aug_enable_background else 0),
         )
         
         logging.info(
@@ -507,34 +555,48 @@ class SAM2Base(torch.nn.Module):
             f"pgd_steps={self.style_aug_pgd_steps}, "
             f"epsilon={self.style_aug_pgd_epsilon}"
         )
+        
+
     
     def _build_deform_aug_components(self) -> None:
         """
-        Build deformation augmentation components for adversarial training.
+        Build feature-level deformation augmentation components.
         
-        Deformation-based adversarial training using:
-        - Deformable convolution: Spatial warping in feature space (DG-Font style)
-        - Soft compositing: Handle multi-object overlaps gracefully
-        - Optional GCN: Coordinate deformations across objects
-        
-        Key advantage: No extra backbone forward pass (uses clean features directly).
+        Uses memory encoder components (MaskDownSampler, Fuser) for mask encoding.
+        Produces dual outputs: feature-level deformation + image-level offsets.
+        Optionally initializes weights from pretrained memory encoder.
         """
         from sam2.modeling.adversarial_augmentation import AdversarialAugmenter
         
-        # Build deformation augmenter (image-level for simplified GT alignment)
+        # Build deformation augmenter (feature-level with image offset prediction)
         self.deform_augmenter = AdversarialAugmenter(
-            mode="image_level",  # Changed from feature_level to image_level
+            mode="feature_level",
             aug_type="deformation",
-            image_channels=3,  # RGB image
+            feature_dim=256,
             epsilon=self.deform_aug_epsilon,
             use_soft_composite=self.deform_aug_use_soft_composite,
+            temperature=self.deform_aug_temperature,
+            use_gcn=self.deform_aug_use_gcn,
+            gcn_num_layers=self.deform_aug_gcn_num_layers,
+            num_deform_groups=self.deform_aug_num_deform_groups,
+            init_from_memory_encoder=self.deform_aug_init_from_memory_encoder,
+            freeze_mask_encoder=self.deform_aug_freeze_mask_encoder,
+            image_size=self.image_size,  # Pass image_size for image-level offset prediction
         )
         
+        # Load pretrained weights from memory encoder if enabled
+        if self.deform_aug_init_from_memory_encoder:
+            self.deform_augmenter.impl.load_memory_encoder_weights(self.memory_encoder)
+        
         logging.info(
-            f"Deformation augmentation components built (image-level): "
-            f"epsilon={self.deform_aug_epsilon} pixels, "
-            f"use_soft_composite={self.deform_aug_use_soft_composite}"
+            f"Deformation augmentation built: "
+            f"epsilon={self.deform_aug_epsilon}, "
+            f"image_size={self.image_size}, "
+            f"init_from_memory_encoder={self.deform_aug_init_from_memory_encoder}, "
+            f"freeze_mask_encoder={self.deform_aug_freeze_mask_encoder}"
         )
+        
+
     
     def _build_aue_components(self) -> None:
         """
@@ -871,6 +933,7 @@ class SAM2Base(torch.nn.Module):
         pixel_gt: torch.Tensor,
         pixel_bndl_model,
         uq_sample_num: int,
+        high_res_features: list[torch.Tensor] | None = None, # NEW: Accept high-res features
     ) -> torch.Tensor:
         """
         Compute calibration loss for augmented features (deformation or style).
@@ -882,6 +945,7 @@ class SAM2Base(torch.nn.Module):
             pixel_gt: [B, K, H, W] Ground truth masks
             pixel_bndl_model: BNDL model for uncertainty estimation
             uq_sample_num: Number of samples for uncertainty estimation
+            high_res_features: List of high-res features [stride 4, stride 8]
         
         Returns:
             Calibration loss scalar
@@ -893,7 +957,7 @@ class SAM2Base(torch.nn.Module):
         )
         if bndl_outputs is None:
             logging.warning("No pixel features in augmented outputs, returning zero loss")
-            return torch.tensor(0.0, device=pixel_gt.device, dtype=torch.float32)
+            return torch.tensor(0.0, device=pixel_gt.device, dtype=torch.float32), {}
         
         # 2. Prepare GT
         if bndl_outputs.pixel_logits is not None:
@@ -902,8 +966,22 @@ class SAM2Base(torch.nn.Module):
             H, W = bndl_outputs.pixel_feat.shape[1:3]
         pixel_gt_prepared = self._prepare_gt_for_loss(pixel_gt, target_size=(H, W))
         
+        # Select feature map for domain-aware method
+        feature_map_for_calibration = None
+        if self.aue_dist_matching_config['method'] == 'domain_aware_soft_mmd':
+             # Assume high_res_features is always present as per user config
+             feature_map_for_calibration = high_res_features[0]
+
         # 3. Compute calibration loss
-        return self._compute_uncertainty_calibration_loss(bndl_outputs, pixel_gt_prepared, pixel_bndl_model)
+        # Note: For augmented branch, we pass augmented backbone features
+        # This allows domain_aware_soft_mmd to work if configured
+        return self._compute_uncertainty_calibration_loss(
+            bndl_outputs, 
+            pixel_gt_prepared, 
+            pixel_bndl_model,
+            backbone_features=feature_map_for_calibration,  # Pass selected features
+            tag="augmented", # NEW: Debug tag
+        )
     
     def _apply_adversarial_augmentation_pipeline(
         self,
@@ -916,117 +994,239 @@ class SAM2Base(torch.nn.Module):
         vis_refs: dict,
     ) -> dict:
         """
-        Apply adversarial augmentation pipeline: Deform → Style → Forward → Loss.
+        Apply adversarial augmentation pipeline with configurable ordering.
+        
+        Pipeline supports flexible ordering via self.adversarial_aug_order.
+        Examples:
+            - ["deform", "style"]: Deform first, then style (default)
+            - ["style", "deform"]: Style first, then deform
+            - ["deform"]: Only deformation
+            - ["style"]: Only style
+        
+        Each augmenter can operate in two modes:
+            - Mode 1 (Efficient): Reuse features from previous step
+            - Mode 2 (Flexible): Encode current image on-demand
         
         Returns:
             dict with keys:
                 - calibration_loss_adversarial: torch.Tensor
-                - vis_refs: dict (optional, if visualization is enabled)
+                - vis_refs: dict (if enable_vis=True)
         """
-        current_features = backbone_features
-        current_high_res = high_res_features
+        # === Initialize pipeline state ===
+        state = {
+            'img': img_batch,
+            'features': backbone_features,
+            'high_res': high_res_features,
+            'pixel_gt': pixel_gt,
+        }
         
-        # Step 1: Generate deformation offsets
-        deform_offsets = None
-        deform_result = None
-        if self.use_deform_aug and hasattr(self, 'deform_augmenter'):
-            deform_result = self.deform_augmenter.apply(
-                img_batch=img_batch,
-                clean_features=current_features,
-                clean_high_res=current_high_res,
-                pixel_gt=pixel_gt,
-                model=self,
+        # === Apply augmentations in configured order ===
+        for aug_name in self.adversarial_aug_order:
+            state = self._apply_single_augmentation(
+                aug_name=aug_name,
+                state=state,
+                enable_vis=enable_vis,
+                vis_refs=vis_refs,
             )
-            deform_offsets = deform_result.deformation_offsets  # [B, K, 2, H, W]
-            
-            if enable_vis:
-                vis_refs['deform_offsets'] = deform_offsets.detach().cpu()
         
-        # Step 2: Apply deformation to images and GT masks
-        augmented_img, warped_pixel_gt = self._apply_deformation_to_images(
-            img_batch, pixel_gt, deform_offsets, enable_vis, vis_refs
-        )
+        # === Compute adversarial calibration loss ===
+        final_features = state['features']
+        final_high_res = state['high_res']
+        final_pixel_gt = state['pixel_gt']
         
-        # Update vis_refs with warped GT for correct visualization
-        if enable_vis and deform_offsets is not None:
-            vis_refs['pixel_gt'] = warped_pixel_gt.detach().cpu()
-        
-        # If deformation changed the images, update features to match deformed images
-        if deform_result is not None and augmented_img is not img_batch:
-            # Forward deformed images through backbone to get corresponding features
-            backbone_out = self.forward_image(augmented_img, use_checkpoint=True)
-            current_features = backbone_out['backbone_fpn'][-1]
-            if self.use_high_res_features_in_sam:
-                current_high_res = [
-                    backbone_out['backbone_fpn'][0],
-                    backbone_out['backbone_fpn'][1]
-                ]
-        
-        # Step 3: Apply style augmentation (unified interface - like deform)
-        style_result = None
-        if self.use_style_aug and hasattr(self, 'style_augmenter'):
-            augmented_img_detached = augmented_img.detach() if augmented_img is not img_batch else augmented_img
-            style_result = self.style_augmenter.apply(
-                img_batch=augmented_img_detached,
-                clean_features=current_features,  # Now uses features corresponding to deformed images
-                clean_high_res=current_high_res,
-                pixel_gt=warped_pixel_gt,
-                model=self,
-            )
-            
-            # Update features and images from style result
-            augmented_img = style_result.intermediate_images
-            current_features = style_result.features
-            if style_result.high_res_features is not None:
-                current_high_res = style_result.high_res_features
-            pixel_gt = warped_pixel_gt
-            
-            # Save visualization data
-            if enable_vis:
-                vis_refs['styled_images'] = augmented_img.detach().cpu()
-                if style_result.original_styles is not None:
-                    vis_refs['original_styles'] = style_result.original_styles
-                if style_result.adversarial_styles is not None:
-                    vis_refs['adversarial_styles'] = style_result.adversarial_styles
-        
-        # Step 4: Compute adversarial loss (no forward pass needed - style_result already has features)
+        # Forward through SAM heads
         calibration_loss_adversarial = torch.tensor(0.0, device=img_batch.device, dtype=img_batch.dtype)
-        if current_features is not backbone_features:
+        aug_metrics = {}
+        
+        if final_features is not backbone_features:
             prev_suppress = getattr(self, "_suppress_nested_aue", False)
             self._suppress_nested_aue = True
             try:
-                *_, adv_aux_outputs = self._forward_sam_heads(
-                    backbone_features=current_features,
-                    high_res_features=current_high_res,
+                *_, aux_outputs = self._forward_sam_heads(
+                    backbone_features=final_features,
+                    high_res_features=final_high_res,
                     pixel_gt_for_aue=None,
                     multimask_output=False,
                 )
             finally:
                 self._suppress_nested_aue = prev_suppress
             
+            # Compute calibration loss
             pixel_bndl_model = None
-            if hasattr(self, 'sam_mask_decoder') and hasattr(self.sam_mask_decoder, 'pixel_bndl'):
+            if hasattr(self.sam_mask_decoder, 'pixel_bndl'):
                 pixel_bndl_model = self.sam_mask_decoder.pixel_bndl
             
-            calibration_loss_adversarial = self._compute_augmented_calibration_loss(
-                aux_outputs=adv_aux_outputs,
-                pixel_gt=pixel_gt,
+            calibration_loss_adversarial, aug_metrics = self._compute_augmented_calibration_loss(
+                aux_outputs=aux_outputs,
+                pixel_gt=final_pixel_gt,
                 pixel_bndl_model=pixel_bndl_model,
                 uq_sample_num=uq_sample_num,
+                high_res_features=final_high_res,
             )
             
-            del adv_aux_outputs
-        
-        # Cleanup augmentation results
-        if deform_result is not None:
-            self._cleanup_augmentation_results([deform_result])
-        if style_result is not None:
-            self._cleanup_augmentation_results([style_result])
+            del aux_outputs
         
         return {
             'calibration_loss_adversarial': calibration_loss_adversarial,
-            'vis_refs': vis_refs if enable_vis else {},
+            'aug_metrics': aug_metrics, # Return augmented metrics
+            'vis_refs': vis_refs,
         }
+    
+    def _apply_single_augmentation(
+        self,
+        aug_name: str,
+        state: dict,
+        enable_vis: bool,
+        vis_refs: dict,
+    ) -> dict:
+        """
+        Apply a single augmentation and update pipeline state.
+        
+        This is a clean abstraction that:
+            1. Checks if augmentation is enabled
+            2. Calls the augmenter with current state
+            3. Updates state based on augmentation result
+            4. Handles visualization
+        
+        Args:
+            aug_name: Name of augmentation ("deform" or "style")
+            state: Current pipeline state (img, features, high_res, pixel_gt)
+            enable_vis: Whether to save visualization data
+            vis_refs: Visualization reference dict
+        
+        Returns:
+            Updated state dict
+        """
+        if aug_name == "deform":
+            self._apply_deformation_augmentation(state, enable_vis, vis_refs)
+        elif aug_name == "style":
+            self._apply_style_augmentation(state, enable_vis, vis_refs)
+        
+        # Validate state before returning
+        assert state['features'] is not None, \
+            f"State must have features after {aug_name} augmentation"
+        
+        if self.use_high_res_features_in_sam:
+            assert state['high_res'] is not None, \
+                f"State must have high_res_features after {aug_name} augmentation when use_high_res_features_in_sam=True"
+        
+        return state
+    
+    def _apply_deformation_augmentation(
+        self,
+        state: dict,
+        enable_vis: bool,
+        vis_refs: dict,
+    ) -> None:
+        """Apply deformation augmentation and update state."""
+        if not (self.use_deform_aug and hasattr(self, 'deform_augmenter')):
+            return
+        
+        # Apply deformation
+        deform_result = self.deform_augmenter.apply(
+            img_batch=state['img'],
+            clean_features=state['features'],
+            clean_high_res=state['high_res'],
+            pixel_gt=state['pixel_gt'],
+            model=self,
+        )
+        
+        # Update state with deformation results
+        deform_offsets = deform_result.deformation_offsets  # [B, K, 2, H, W]
+        
+        if deform_offsets is not None:
+            # Warp image and GT using predicted offsets
+            augmented_img, warped_pixel_gt = self._apply_deformation_to_images(
+                state['img'], state['pixel_gt'], deform_offsets, enable_vis, vis_refs
+            )
+            
+            state['img'] = augmented_img
+            state['pixel_gt'] = warped_pixel_gt
+            
+            # CRITICAL: Re-encode warped image to get spatially consistent features
+            # 
+            # Design rationale:
+            # - Deformable conv produces feature-level deformation (for learning guidance)
+            # - But we warped the IMAGE using predicted offsets
+            # - All features (main + high_res) must come from the SAME spatial locations
+            # - Therefore: re-encode the warped image to get consistent feature pyramid
+            #
+            # Alternative design (not chosen):
+            # - Use deformable conv output for main features only
+            # - Problem: Creates spatial inconsistency between main (64×64) and high-res (256×256)
+            #
+            # Memory Optimization & Gradient Flow:
+            # - We MUST allow gradients to flow through the backbone to the image
+            #   so that the deformation network (adversary) can be trained.
+            # - To save memory and prevent backbone updates on this branch, we
+            #   temporarily freeze backbone parameters.
+            logging.debug("Re-encoding warped image (backbone frozen, input grad enabled)")
+            
+            # Memory Optimization:
+            # We use checkpointing to save memory. We do NOT freeze backbone weights here
+            # because dynamic freezing breaks activation checkpointing (metadata mismatch).
+            # Gradients will be computed for backbone weights, which is acceptable.
+            logging.debug("Re-encoding warped image (checkpointing enabled)")
+            backbone_out = self.forward_image(augmented_img, use_checkpoint=True)
+            
+            state['features'] = backbone_out['backbone_fpn'][-1]
+            
+            if self.use_high_res_features_in_sam:
+                state['high_res'] = [
+                    backbone_out['backbone_fpn'][0],  # 256×256
+                    backbone_out['backbone_fpn'][1]   # 128×128
+                ]
+            else:
+                state['high_res'] = None
+            
+            # Explicitly delete backbone_out to free graph references not needed
+            del backbone_out
+        
+        # Visualization
+        if enable_vis and deform_offsets is not None:
+            vis_refs['deform_offsets'] = deform_offsets.detach().cpu()
+        
+        # Cleanup
+        self._cleanup_augmentation_results([deform_result])
+    
+    def _apply_style_augmentation(
+        self,
+        state: dict,
+        enable_vis: bool,
+        vis_refs: dict,
+    ) -> None:
+        """Apply style augmentation and update state."""
+        if not (self.use_style_aug and hasattr(self, 'style_augmenter')):
+            return
+        
+        # Detach image to prevent gradient flow through deformation
+        img_detached = state['img'].detach() if state['img'].requires_grad else state['img']
+        
+        # Apply style
+        style_result = self.style_augmenter.apply(
+            img_batch=img_detached,
+            clean_features=state['features'],
+            clean_high_res=state['high_res'],
+            pixel_gt=state['pixel_gt'],
+            model=self,
+        )
+        
+        # Update state with style results
+        if style_result.intermediate_images is not None:
+            state['img'] = style_result.intermediate_images
+        state['features'] = style_result.features
+        state['high_res'] = style_result.high_res_features
+        
+        # Visualization
+        if enable_vis:
+            vis_refs['styled_images'] = state['img'].detach().cpu()
+            if hasattr(style_result, 'original_styles') and style_result.original_styles is not None:
+                vis_refs['original_styles'] = style_result.original_styles
+            if hasattr(style_result, 'adversarial_styles') and style_result.adversarial_styles is not None:
+                vis_refs['adversarial_styles'] = style_result.adversarial_styles
+        
+        # Cleanup
+        self._cleanup_augmentation_results([style_result])
     
     def _apply_deformation_to_images(
         self,
@@ -1066,7 +1266,8 @@ class SAM2Base(torch.nn.Module):
         augmented_img = img_batch * (1 - valid_masks_union)
         
         # Composite warped objects sequentially (forward order: later objects overwrite earlier ones)
-        # This avoids storing all warped images, reducing memory from O(K) to O(1)
+        warped_imgs_list = []
+        warped_masks_list = []
         for idx_pos, k_idx in enumerate(valid_indices):
             k_idx_scalar = k_idx.item()
             offset_k = deform_offsets[:, k_idx_scalar, :, :, :]  # [B, 2, H, W]
@@ -1076,21 +1277,48 @@ class SAM2Base(torch.nn.Module):
             warped_img_k = self._apply_offset_to_image(img_batch, offset_k)
             warped_mask_k = self._apply_offset_to_image(mask_k, offset_k)
             
-            # Update GT
-            warped_pixel_gt[:, k_idx_scalar, :, :] = (warped_mask_k.squeeze(1) > 0.5).float()
-            
-            # Composite: later objects overwrite earlier ones (simple overlay)
-            augmented_img = augmented_img * (1 - warped_mask_k) + warped_img_k * warped_mask_k
+            warped_imgs_list.append(warped_img_k)
+            warped_masks_list.append((warped_mask_k.squeeze(1) > 0.5).float().unsqueeze(1))
             
             # Cleanup immediately (no storage needed)
             del offset_k, mask_k, warped_img_k, warped_mask_k
         
+        # === Compositing Strategy: Gap Filling ===
+        # 1. Stack all warped images and masks
+        if len(warped_imgs_list) > 0:
+            img_stack = torch.stack(warped_imgs_list, dim=1)  # [B, N_valid, 3, H, W]
+            mask_stack = torch.stack(warped_masks_list, dim=1) # [B, N_valid, 1, H, W]
+            
+            # 2. Compute combined mask of all foreground objects
+            # This represents regions covered by at least one object
+            sum_mask = mask_stack.sum(dim=1).clamp(0, 1) # [B, 1, H, W]
+            
+            # 3. Compute background part (original image where no object is present)
+            # This fills the "holes" left by moving objects with the original background
+            background = img_batch * (1 - sum_mask)
+            
+            # 4. Compute foreground part (warped objects)
+            # For overlapping objects, we can use simple sum (if masks are disjoint enough)
+            # or a more sophisticated blending. Here we use simple sum weighted by masks.
+            foreground = (img_stack * mask_stack).sum(dim=1)
+            
+            # 5. Combine
+            augmented_img = background + foreground
+        else:
+            augmented_img = img_batch.clone()
+            
+        # Update pixel_gt with warped masks
+        # We need to map back the warped masks to their original indices
+        warped_pixel_gt = pixel_gt.clone()
+        for i, k in enumerate(valid_indices):
+            warped_pixel_gt[:, k:k+1, :, :] = warped_masks_list[i]
+            
         # Save for visualization
         if enable_vis:
             vis_refs['warped_images'] = augmented_img.detach().cpu()
         
         # Cleanup
-        del valid_masks, valid_masks_union
+        del masks_float
         
         return augmented_img, warped_pixel_gt
     
@@ -1108,7 +1336,7 @@ class SAM2Base(torch.nn.Module):
         backbone_features: torch.Tensor | None = None,  # [B, C, H, W] detached backbone features for GCN
         high_res_features: list[torch.Tensor] | None = None,  # High-res features for SAM decoder
         external_pre_out_w: torch.Tensor | None = None,  # [B, C', K] for hyper_in (analytic uncertainty)
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, dict]: # Changed return type
         B, H, W, _ = pixel_feat.shape
         device = pixel_feat.device
         dtype = pixel_feat.dtype
@@ -1150,24 +1378,43 @@ class SAM2Base(torch.nn.Module):
             # Resize to feature map resolution
             pixel_gt_resized = F.interpolate(pixel_gt_combined.float(), size=(H_feat, W_feat), mode='nearest').squeeze(1)
 
-        calibration_loss_clean = self._compute_uncertainty_calibration_loss(
-            pixel_logits=pixel_logits,
-            pixel_uncertainty=pixel_uncertainty,
-            pixel_gt=pixel_gt_resized,
-            spatial_hw=(H_feat, W_feat),
-            batch_size=B,
-            device=device,
-            dtype=dtype,
+        # Wrap inputs in BNDLOutputs for compatibility
+        from sam2.modeling.bndl_utils import BNDLOutputs
+        bndl_outputs = BNDLOutputs(
             pixel_feat=pixel_feat,
+            pixel_logits=pixel_logits,
+            external_w=external_pre_out_w,
+            pixel_uncertainty=pixel_uncertainty
+        )
+
+        # Extract feature map for domain-aware method
+        # Priority: High-Res Features (Stride 4, 256x256) > Backbone Features (Stride 16, 64x64)
+        feature_map_for_calibration = None
+        if self.aue_dist_matching_config['method'] == 'domain_aware_soft_mmd':
+            if high_res_features is not None and len(high_res_features) > 0:
+                # Use High-Res Feature (Stride 4) - matches error resolution (256x256)
+                feature_map_for_calibration = high_res_features[0]
+            elif backbone_features is not None:
+                # Fallback to Backbone Feature (Stride 16) - requires interpolation
+                feature_map_for_calibration = backbone_features
+        
+        calibration_loss_clean, clean_metrics = self._compute_uncertainty_calibration_loss(
+            bndl_outputs=bndl_outputs,
+            pixel_gt=pixel_gt_resized,
             pixel_bndl_model=pixel_bndl_model,
-            external_pre_out_w=external_pre_out_w,
+            backbone_features=feature_map_for_calibration,  # NEW: Pass for domain-aware method
+            tag="clean", # NEW: Debug tag
         )
  
         # Adversarial augmentation branch (串行: 形变 → 风格)
         calibration_loss_adversarial = torch.tensor(0.0, device=device, dtype=dtype)
+        aug_metrics = {} # Initialize empty metrics for augmented branch
         vis_data = None  # Initialize outside try block for visualization
         
         if (self.use_deform_aug or self.use_style_aug) and backbone_features is not None:
+            # Clear cache before memory-intensive adversarial branch
+            torch.cuda.empty_cache()
+            
             # ========================================================================
             # Adversarial Augmentation Pipeline (串行: 形变 → 风格)
             # ========================================================================
@@ -1191,7 +1438,9 @@ class SAM2Base(torch.nn.Module):
             )
             
             calibration_loss_adversarial = augmentation_result['calibration_loss_adversarial']
+            aug_metrics = augmentation_result['aug_metrics'] # Get augmented metrics
             assert calibration_loss_adversarial is not None
+            
             if 'vis_refs' in augmentation_result:
                 vis_refs.update(augmentation_result['vis_refs'])
         
@@ -1220,20 +1469,22 @@ class SAM2Base(torch.nn.Module):
         # ========================================================================
         # Assemble final loss dictionary
         # ========================================================================
-        loss_dict = {}
+        # Combine losses
+        total_loss = calibration_loss_clean + calibration_loss_adversarial
         
-        loss_dict['calibration_loss_clean'] = calibration_loss_clean
-        loss_dict['calibration_loss_adversarial'] = calibration_loss_adversarial
-        
+        # Aggregate metrics
+        aue_metrics = {}
+        for k, v in clean_metrics.items():
+            aue_metrics[f'clean/{k}'] = v
+        for k, v in aug_metrics.items():
+            aue_metrics[f'aug/{k}'] = v
+            
         # Save visualization data if available (prepared after cleanup)
         # Note: This contains both style and deformation visualization data
         if vis_data is not None:
-            loss_dict['aue_visualization'] = vis_data
+            aue_metrics['aue_visualization'] = vis_data
         
-        loss = calibration_loss_clean + calibration_loss_adversarial
-        loss_dict['total_loss'] = loss
-
-        return loss, loss_dict
+        return total_loss, aue_metrics
 
     def _generate_bbox_prompts_from_gt(self, gt_masks: torch.Tensor) -> torch.Tensor:
         """
@@ -1283,7 +1534,9 @@ class SAM2Base(torch.nn.Module):
         bndl_outputs: BNDLOutputs,
         pixel_gt: torch.Tensor | None,
         pixel_bndl_model=None,
-    ) -> torch.Tensor:
+        backbone_features: torch.Tensor | None = None,  # NEW: for domain_aware_soft_mmd
+        tag: str = "unknown", # NEW: Debug tag
+    ) -> tuple[torch.Tensor, dict]:
         """Compute uncertainty calibration loss via distribution matching.
         
         Theory: For zero-shot robustness, uncertainty distribution should match
@@ -1306,9 +1559,13 @@ class SAM2Base(torch.nn.Module):
             bndl_outputs: BNDLOutputs containing pixel_feat, pixel_logits, external_w, pixel_uncertainty
             pixel_gt: [B, H, W] ground truth masks (already combined and resized)
             pixel_bndl_model: BNDL model (required for analytic uncertainty)
+            backbone_features: [B, C, H, W] feature map from image encoder's last layer
+                              (required for domain_aware_soft_mmd method)
         
         Returns:
+        Returns:
             calibration_loss: MMD-based distribution matching loss
+            metrics: Dict of metrics for logging (e.g. correlation)
         """
         # Extract fields from bndl_outputs
         pixel_logits = bndl_outputs.pixel_logits
@@ -1321,7 +1578,7 @@ class SAM2Base(torch.nn.Module):
         dtype = pixel_feat.dtype
         
         if pixel_logits is None:
-            return torch.tensor(0.0, device=device, dtype=dtype, requires_grad=True)
+            return torch.tensor(0.0, device=device, dtype=dtype, requires_grad=True), {}
         
         # 1. Compute prediction error [B, H, W] in [0, 1]
         error = self._compute_prediction_error(
@@ -1361,11 +1618,14 @@ class SAM2Base(torch.nn.Module):
         
         # 3. Distribution matching loss (primary: MMD/CKA/Gram)
         # Gradients flow through error to encoder/decoder (and optionally through uncertainty to BNDL)
-        dist_loss = self.distribution_matcher.compute_loss(
+        dist_loss, metrics = self.distribution_matcher.compute_loss(
             uncertainty=uncertainty,
             error=error,
             use_patches=self.aue_use_patches,
+            feature_map=backbone_features,  # NEW: Pass feature map for domain_aware_soft_mmd
+            tag=tag, # Pass tag
         )
+
         
         # 4. MSE loss (regularization: point-wise alignment)
         mse_loss = F.mse_loss(uncertainty, error, reduction='mean')
@@ -1373,7 +1633,10 @@ class SAM2Base(torch.nn.Module):
         # 5. Combine losses
         total_loss = 1.0 * dist_loss + 0.3 * mse_loss
         
-        return total_loss
+        # Add MSE to metrics
+        metrics['mse_loss'] = mse_loss.item()
+        
+        return total_loss, metrics
     
     def _compute_prediction_error(
         self,
@@ -1768,7 +2031,10 @@ class SAM2Base(torch.nn.Module):
                     pixel_bndl_model=self.sam_mask_decoder.pixel_bndl if getattr(self.sam_mask_decoder, "pixel_bndl", None) is not None else None,
                     # Style-based AUE parameters (optional, used if use_style_aug=True)
                     img_batch=img_batch_for_style_aue,
-                    backbone_features=backbone_features.detach() if backbone_features is not None else None,
+                    # CRITICAL: Do NOT detach backbone_features!
+                    # With GRL properly positioned in the adversarial networks,
+                    # gradients will flow: loss -> encoder (reversed by GRL) and loss -> adv_net (normal)
+                    backbone_features=backbone_features,
                     high_res_features=high_res_features,  # Pass high_res_features for deform augmentation
                     external_pre_out_w=external_w_for_aue,
                 )
@@ -2361,3 +2627,22 @@ class SAM2Base(torch.nn.Module):
         # don't overlap (here sigmoid(-10.0)=4.5398e-05)
         pred_masks = torch.where(keep, pred_masks, torch.clamp(pred_masks, max=-10.0))
         return pred_masks
+
+    @contextmanager
+    def _freeze_backbone_weights(self):
+        """
+        Context manager to temporarily freeze backbone weights.
+        Allows gradients to flow THROUGH the backbone (to inputs) but not TO the backbone weights.
+        """
+        # Save original requires_grad states
+        grads = {}
+        for name, param in self.image_encoder.named_parameters():
+            grads[name] = param.requires_grad
+            param.requires_grad = False
+        
+        try:
+            yield
+        finally:
+            # Restore original states
+            for name, param in self.image_encoder.named_parameters():
+                param.requires_grad = grads[name]

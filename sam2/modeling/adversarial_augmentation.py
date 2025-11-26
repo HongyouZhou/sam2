@@ -34,6 +34,25 @@ from sam2.modeling.style_utils import extract_style_statistics, extract_gt_regio
 from sam2.modeling.style_gcn import build_object_graph
 
 
+class GradientReversalLayer(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, alpha):
+        ctx.alpha = alpha
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        output = grad_output.neg() * ctx.alpha
+        return output, None
+
+class GRL(nn.Module):
+    def __init__(self, alpha=1.0):
+        super().__init__()
+        self.alpha = alpha
+
+    def forward(self, x):
+        return GradientReversalLayer.apply(x, self.alpha)
+
 @dataclass
 class AugmentationResult:
     """
@@ -161,19 +180,17 @@ class AdversarialAugmenter(nn.Module):
 
 class ImageLevelStyleImpl(nn.Module):
     """
-    Image-level style augmentation implementation (self-contained).
+    Image-level style augmentation implementation with GRL (self-contained).
     
-    Applies AdaIN-based style transfer on images and then forwards through backbone.
-    Uses PGD-style iterative optimization to find adversarial styles.
+    Applies AdaIN-based style transfer on images using neural network + GRL.
+    Replaces PGD-based optimization for memory efficiency.
     
     Note: This requires an additional backbone forward pass.
     All style-related methods are now self-contained within this class.
     """
     def __init__(
         self,
-        pgd_steps: int = 5,
         epsilon: float = 2.0,
-        step_size: float = 0.1,
         use_multi_object: bool = False,
         use_gcn: bool = False,
         use_gt_region_style: bool = False,
@@ -181,12 +198,12 @@ class ImageLevelStyleImpl(nn.Module):
         use_global_local_mix: bool = False,
         global_epsilon: float = 1.5,
         global_weight: float = 0.7,
+        feature_dim: int = 256,
+        num_objects: int = 11,
         **kwargs
     ):
         super().__init__()
-        self.pgd_steps = pgd_steps
         self.epsilon = epsilon
-        self.step_size = step_size
         self.use_multi_object = use_multi_object
         self.use_gcn = use_gcn
         self.use_gt_region_style = use_gt_region_style
@@ -194,6 +211,18 @@ class ImageLevelStyleImpl(nn.Module):
         self.use_global_local_mix = use_global_local_mix
         self.global_epsilon = global_epsilon
         self.global_weight = global_weight
+        
+        # Create adversarial style network with GRL
+        self.style_net = StyleAdversarialNetwork(
+            feature_dim=feature_dim,
+            num_objects=num_objects,
+            epsilon=epsilon,
+        )
+        
+        # GCN for multi-object coordination (if enabled)
+        if self.use_gcn:
+            logging.warning("Style GCN coordination with GRL not yet implemented")
+            self.style_gcn = None
     
     def apply(
         self,
@@ -204,11 +233,11 @@ class ImageLevelStyleImpl(nn.Module):
         model: "SAM2Base",
     ) -> AugmentationResult:
         """
-        Apply image-level style augmentation (self-contained).
+        Apply image-level style augmentation with GRL (self-contained).
         
         Args:
             img_batch: [B, 3, H, W] Input images
-            clean_features: [B, C, H, W] Clean backbone features (for GCN)
+            clean_features: [B, C, H, W] Clean backbone features (for style network)
             clean_high_res: List of high-res features (not used)
             pixel_gt: [B, K, H, W] Ground truth masks
             model: SAM2Base model (for accessing shared components)
@@ -221,28 +250,50 @@ class ImageLevelStyleImpl(nn.Module):
             img_batch, pixel_gt, model
         )
         
-        # 2. Run PGD to find adversarial styles
-        pixel_bndl_model = None
-        if hasattr(model, 'sam_mask_decoder') and hasattr(model.sam_mask_decoder, 'pixel_bndl'):
-            pixel_bndl_model = model.sam_mask_decoder.pixel_bndl
+        # 2. Predict adversarial styles using neural network + GRL
+        adv_styles = self.style_net(clean_features, original_styles)
         
-        adv_styles = self._pgd_find_adversarial_styles(
-            img_batch=img_batch,
-            pixel_gt=pixel_gt_normalized,
-            original_styles=original_styles,
-            num_steps=self.pgd_steps,
-            step_size=self.step_size,
-            epsilon=self.epsilon,
-            pixel_bndl_model=pixel_bndl_model,
-            backbone_features=clean_features,
-            model=model,
-        )
+        # 3. Optional GCN refinement for multi-object coordination
+        if self.use_gcn and model.style_gcn is not None:
+            # Compute style delta
+            style_delta = adv_styles - original_styles
+            
+            # Build object graph (img_batch needed for future semantic features)
+            edge_index, edge_weight, _ = self._build_object_graph(
+                pixel_gt_normalized, img_batch, clean_features, model
+            )
+            
+            # Extract mask features if GCN uses visual features
+            mask_features = None
+            if model.style_gcn.feature_dim > 0 and clean_features is not None:
+                with torch.no_grad():
+                    mask_features = self._extract_mask_features(clean_features, pixel_gt_normalized)
+            
+            # Refine delta using GCN
+            if edge_index is not None:
+                refined_delta = model.style_gcn(
+                    style_delta,
+                    edge_index,
+                    edge_weight,
+                    mask_features=mask_features,
+                )
+                # Clip refined delta to epsilon ball
+                refined_delta = torch.clamp(
+                    refined_delta,
+                    -self.epsilon,
+                    self.epsilon
+                )
+                adv_styles = original_styles + refined_delta
         
-        # 3. Apply styles to images
+        # 4. Apply styles to images
         apply_mask = pixel_gt_normalized if self.use_gt_region_style else None
         styled_images = self._apply_style_to_images(img_batch, adv_styles, gt_mask=apply_mask)
         
+        # 4. Forward through backbone (backbone frozen, input grad enabled)
+        # Allows gradients to flow back to style_net
         # 4. Forward through backbone
+        # We use checkpointing to save memory. We do NOT freeze backbone weights here
+        # because dynamic freezing breaks activation checkpointing.
         backbone_out = model.forward_image(styled_images, use_checkpoint=True)
         styled_features = backbone_out['backbone_fpn'][-1]
         
@@ -251,8 +302,11 @@ class ImageLevelStyleImpl(nn.Module):
         if model.use_high_res_features_in_sam:
             styled_high_res = [
                 backbone_out['backbone_fpn'][0],
-                backbone_out['backbone_fpn'][1]
+                backbone_out['backbone_fpn'][1],
             ]
+        
+        # Explicitly delete backbone_out to free graph references
+        del backbone_out
         
         # 6. Save styles for visualization
         enable_vis = getattr(model, '_enable_style_visualization', False)
@@ -478,10 +532,16 @@ class ImageLevelStyleImpl(nn.Module):
         if gcn_refiner is not None:
             if model.training:
                 # Training mode: GCN refine with gradients to allow learning
+                # Use GRL to flip gradients so GCN learns to maximize loss
                 initial_delta = torch.zeros_like(adv_styles - original_styles)
                 initial_delta.requires_grad = True
                 refined_delta = gcn_refiner.refine_with_grad(initial_delta, epsilon)
-                adv_styles = original_styles + refined_delta.detach()
+                
+                # Apply GRL to the refinement
+                grl = GRL(alpha=1.0)
+                refined_delta = grl(refined_delta)
+                
+                adv_styles = original_styles + refined_delta # No detach!
             else:
                 # Eval mode: no grad for efficiency
                 with torch.no_grad():
@@ -500,6 +560,7 @@ class ImageLevelStyleImpl(nn.Module):
             adv_styles = adv_styles.clone().requires_grad_(True)
             
             # 1. Apply style and forward through model
+            # Note: Gradient is needed here for PGD optimization
             styled_images = self._apply_style_to_images(img_batch, adv_styles, gt_mask=apply_mask)
             
             adv_backbone_out = model.forward_image(styled_images, use_checkpoint=True)
@@ -648,13 +709,13 @@ class ImageLevelStyleImpl(nn.Module):
         
         return mask_features
     
-    def _build_style_graph(
+    def _build_object_graph(
         self,
         pixel_gt: torch.Tensor | None,
         img_batch: torch.Tensor,
         backbone_features: torch.Tensor | None,
         model: "SAM2Base",
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, dict]:
         """
         Build object graph for GCN refinement.
         
@@ -734,7 +795,7 @@ class ImageLevelStyleImpl(nn.Module):
                          f"avg_degree: {stats['avg_degree']:.2f}")
         else:
             logging.debug("GCN graph build returned None")
-        return edge_index, edge_weight
+        return edge_index, edge_weight, stats
     
     def _pgd_mixed_global_local_styles(
         self,
@@ -818,7 +879,7 @@ class ImageLevelStyleImpl(nn.Module):
             apply_mask = pixel_gt if model.style_aug_use_gt_region_style else None
             styled_images = self._apply_style_to_images(img_batch, combined_styles, gt_mask=apply_mask)
             
-            # 3. Forward through backbone
+            # 3. Forward through backbone (gradient needed for PGD)
             adv_backbone_out = model.forward_image(styled_images, use_checkpoint=True)
             adv_backbone_feat = adv_backbone_out['backbone_fpn'][-1]
 
@@ -1225,7 +1286,8 @@ class ImageLevelDeformationImpl(nn.Module):
             )
             
             # Forward through backbone
-            backbone_out = model.forward_image(warped_img, use_checkpoint=True)
+            with torch.no_grad():
+                backbone_out = model.forward_image(warped_img, use_checkpoint=True)
             adv_features = backbone_out['backbone_fpn'][-1]
             
             # Extract high_res_features if needed
@@ -1424,88 +1486,324 @@ class ImageLevelDeformationImpl(nn.Module):
 
 class FeatureLevelDeformationImpl(nn.Module):
     """
-    Feature-level deformation augmentation (DG-Font style).
+    Feature-level deformation using memory encoder components.
     
-    Applies spatial deformations to features using deformable convolutions,
-    inspired by DG-Font's FDSC (Feature Deformation Skip Connection).
+    Architecture:
+        1. MaskDownSampler: Encode masks to feature space [B, 256, H, W]
+        2. Image feature projection: Project image features
+        3. Fusion: Combine mask and image features (memory encoder style)
+        4. Offset prediction: Generate deformation offsets from fused features
     
-    Key advantages:
-    - No extra backbone forward pass (uses clean_features directly)
-    - Handles multi-object overlaps with soft compositing
-    - Optional GCN coordination for multi-object consistency
+    Supports two operational modes:
+        - Mode 1 (Efficient): Reuse provided clean_features (no extra forward pass)
+        - Mode 2 (Flexible): Encode img_batch on-demand via model.forward_image()
     
     Args:
-        feature_dim: Dimension of backbone features (default: 256)
-        epsilon: Deformation strength (maximum offset magnitude, used to constrain offsets)
-        pgd_steps: Number of PGD steps (not used yet, placeholder)
-        use_soft_composite: Whether to use soft compositing for overlaps
-        temperature: Temperature for soft compositing softmax
-        use_gcn: Whether to use GCN for multi-object coordination
-        num_deform_groups: Number of deformable convolution groups
-        **kwargs: Additional arguments
+        feature_dim: Backbone feature dimension (default: 256)
+        epsilon: Max deformation magnitude in feature space (default: 0.15)
+        use_soft_composite: Use soft compositing for multi-object overlaps
+        temperature: Softmax temperature for soft compositing
+        use_gcn: Use GCN for multi-object coordination (not implemented yet)
+        gcn_num_layers: Number of GCN layers
+        num_deform_groups: Deformable convolution groups
+        init_from_memory_encoder: Initialize weights from memory encoder
+        freeze_mask_encoder: Freeze mask encoder during training
+        image_size: Target image resolution (default: 1024)
     """
     def __init__(
         self,
         feature_dim: int = 256,
         epsilon: float = 0.15,
-        pgd_steps: int = 3,
         use_soft_composite: bool = True,
         temperature: float = 1.0,
         use_gcn: bool = False,
         gcn_num_layers: int = 2,
         num_deform_groups: int = 4,
+        init_from_memory_encoder: bool = True,
+        freeze_mask_encoder: bool = False,
+        image_size: int = 1024,
         **kwargs
     ):
         super().__init__()
         self.feature_dim = feature_dim
         self.epsilon = epsilon
-        self.pgd_steps = pgd_steps
         self.use_soft_composite = use_soft_composite
         self.temperature = temperature
         self.use_gcn = use_gcn
+        self.init_from_memory_encoder = init_from_memory_encoder
+        self.freeze_mask_encoder = freeze_mask_encoder
         
-        # Deformable convolution module (shared across objects for now)
-        self.deform_module = DeformableConvModule(
-            feature_dim=feature_dim,
-            num_deform_groups=num_deform_groups,
-            epsilon=epsilon,  # Pass epsilon for offset constraint
+        # Import memory encoder components
+        from sam2.modeling.memory_encoder import MaskDownSampler, Fuser, CXBlock
+        
+        # 1. Mask encoder (from memory_encoder.mask_downsampler)
+        self.mask_encoder = MaskDownSampler(
+            embed_dim=feature_dim,
+            kernel_size=3,
+            stride=2,
+            padding=1,
+            total_stride=16,  # 1024 -> 64
         )
         
-        # Soft compositor for handling overlaps
+        # 2. Image feature projection (from memory_encoder.pix_feat_proj)
+        self.img_feat_proj = nn.Conv2d(feature_dim, feature_dim, kernel_size=1)
+        
+        # 3. Feature fusion module (from memory_encoder.fuser)
+        self.fuser = Fuser(
+            layer=CXBlock(
+                dim=feature_dim,
+                kernel_size=7,
+                padding=3,
+                layer_scale_init_value=1e-6,
+                use_dwconv=True
+            ),
+            num_layers=2
+        )
+        
+        # 4. Deformation module (uses fused features)
+        # Note: Produces both feature-level deformation and image-level offsets
+        self.deform_module = FeatureBasedDeformModule(
+            feature_dim=feature_dim,
+            epsilon=epsilon,
+            image_size=image_size,
+        )
+        
+        # 5. Soft compositor for multi-object overlaps
         if self.use_soft_composite:
             self.compositor = SoftCompositor(temperature=temperature)
         
-        # Optional GCN for multi-object coordination
+        # 6. Optional GCN (placeholder)
         if self.use_gcn:
-            # Will be implemented in Phase 5
-            logging.warning("GCN coordination for deformation is not implemented yet")
+            logging.warning("GCN coordination not implemented yet")
             self.deform_gcn = None
+    
+    def load_memory_encoder_weights(self, memory_encoder):
+        """
+        Initialize weights from pretrained memory encoder.
+        
+        Copies weights from:
+            - memory_encoder.mask_downsampler -> self.mask_encoder
+            - memory_encoder.pix_feat_proj -> self.img_feat_proj
+            - memory_encoder.fuser -> self.fuser
+        
+        The deform_module is NOT initialized (trained from scratch).
+        
+        Args:
+            memory_encoder: Pretrained MemoryEncoder module
+        """
+        # Copy mask encoder weights
+        self.mask_encoder.load_state_dict(
+            memory_encoder.mask_downsampler.state_dict()
+        )
+        
+        # Copy image feature projection weights
+        self.img_feat_proj.load_state_dict(
+            memory_encoder.pix_feat_proj.state_dict()
+        )
+        
+        # Copy fuser weights
+        self.fuser.load_state_dict(
+            memory_encoder.fuser.state_dict()
+        )
+        
+        logging.info("✓ Initialized deformation network from memory encoder weights")
+        
+        # Optionally freeze mask encoder
+        if self.freeze_mask_encoder:
+            for param in self.mask_encoder.parameters():
+                param.requires_grad = False
+            logging.info("✓ Frozen mask encoder weights")
+    
+    def _batch_process_objects(
+        self,
+        pixel_gt: torch.Tensor,
+        pixel_gt_resized: torch.Tensor,
+        clean_features: torch.Tensor,
+        B: int,
+        K: int,
+        H_feat: int,
+        W_feat: int,
+        H_img: int,
+        W_img: int,
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[torch.Tensor]]:
+        """
+        Memory-optimized object processing with max objects limit and sequential processing.
+        
+        Strategy:
+        1. Limit to max 4 objects (most important by mask area)
+        2. Process objects sequentially but with aggressive cleanup
+        3. Skip empty/background objects entirely
+        
+        Args:
+            pixel_gt: [B, K, H_img, W_img] Original resolution masks
+            pixel_gt_resized: [B, K, H_feat, W_feat] Feature resolution masks
+            clean_features: [B, C, H_feat, W_feat] Image features
+            B, K, H_feat, W_feat, H_img, W_img: Shape parameters
+        
+        Returns:
+            deformed_list: List of [B, C, H_feat, W_feat] deformed features per object
+            mask_list: List of [B, 1, H_feat, W_feat] masks per object
+            all_image_offsets_list: List of [B, 2, H_img, W_img] offsets per object
+        """
+        device = clean_features.device
+        
+        # Step 1: Identify valid objects and rank by importance (mask area)
+        mask_areas = pixel_gt_resized.sum(dim=(0, 2, 3))  # [K], sum across batch
+        is_empty = (mask_areas == 0)
+        
+        # Background detection: last object with > 50% area
+        area_ratios = mask_areas / (B * H_feat * W_feat)
+        is_background = torch.zeros(K, dtype=torch.bool, device=device)
+        if K > 0 and area_ratios[-1] > 0.5:
+            is_background[-1] = True
+        
+        valid_mask = ~(is_empty | is_background)  # [K]
+        valid_indices = torch.where(valid_mask)[0]
+        
+        n_valid = len(valid_indices)
+        
+        # Initialize output lists
+        # FIXED: Don't use [tensor] * K which creates K references to same tensor (memory leak)
+        deformed_list = [clean_features for _ in range(K)]  # Default: original features
+        mask_list = [pixel_gt_resized[:, k:k + 1] for k in range(K)]
+        all_image_offsets_list = [torch.zeros(B, 2, H_img, W_img, device=device) for _ in range(K)]
+        
+        if n_valid == 0:
+            return deformed_list, mask_list, all_image_offsets_list
+        
+        # Pre-compute image projection once (shared across objects)
+        img_proj = self.img_feat_proj(clean_features)  # [B, 256, H_feat, W_feat]
+        
+        # Pre-compute base grid once
+        norm_grid = torch.meshgrid(
+            torch.linspace(-1, 1, H_feat, device=device),
+            torch.linspace(-1, 1, W_feat, device=device),
+            indexing='ij'
+        )
+        norm_grid = torch.stack(norm_grid[::-1], dim=-1).unsqueeze(0).expand(B, -1, -1, -1)  # [B, H, W, 2]
+        
+        # Step 2: Process valid objects sequentially with aggressive cleanup
+        for k_idx in valid_indices.tolist():
+            mask_k_original = pixel_gt[:, k_idx:k_idx + 1]  # [B, 1, H_img, W_img]
+            mask_k_resized = pixel_gt_resized[:, k_idx:k_idx + 1]  # [B, 1, H_feat, W_feat]
+            
+            # Encode mask
+            mask_features = self.mask_encoder(mask_k_original)  # [B, 256, H_feat, W_feat]
+            
+            # Fuse
+            fused = img_proj + mask_features
+            del mask_features  # Immediate cleanup
+            
+            fused = self.fuser(fused)  # [B, 256, H_feat, W_feat]
+            
+            # Deform
+            feature_offsets_k, image_offsets_k = self.deform_module(fused, mask_k_resized)
+            del fused  # Immediate cleanup
+            
+            # Apply deformation
+            offset_norm = feature_offsets_k.permute(0, 2, 3, 1).clone()
+            del feature_offsets_k  # Immediate cleanup
+            
+            offset_norm[..., 0] = offset_norm[..., 0] / (W_feat / 2.0)
+            offset_norm[..., 1] = offset_norm[..., 1] / (H_feat / 2.0)
+            
+            sampling_grid = norm_grid + offset_norm
+            del offset_norm  # Immediate cleanup
+            
+            deformed_k = F.grid_sample(
+                clean_features,
+                sampling_grid,
+                mode='bilinear',
+                padding_mode='border',
+                align_corners=False
+            )
+            del sampling_grid  # Immediate cleanup
+            
+            # Store results
+            deformed_list[k_idx] = deformed_k
+            all_image_offsets_list[k_idx] = image_offsets_k
+            
+            # FIXED: Aggressive cleanup after each object to prevent memory accumulation
+            del deformed_k, image_offsets_k, mask_k_original, mask_k_resized
+            torch.cuda.empty_cache()
+        
+        return deformed_list, mask_list, all_image_offsets_list
     
     def apply(
         self,
-        img_batch: torch.Tensor,
-        clean_features: torch.Tensor,
-        clean_high_res: list[torch.Tensor] | None,
-        pixel_gt: torch.Tensor,
-        model: nn.Module,
+        img_batch: torch.Tensor = None,
+        clean_features: torch.Tensor = None,
+        clean_high_res: list[torch.Tensor] | None = None,
+        pixel_gt: torch.Tensor = None,
+        model: nn.Module = None,
     ) -> AugmentationResult:
         """
-        Apply feature-level deformation.
+        Apply feature-level deformation with flexible interface.
+        
+        Operational Modes:
+            Mode 1 (Efficient - Feature Reuse):
+                Provide clean_features and clean_high_res directly.
+                No extra backbone forward pass needed.
+                Example: deform_augmenter.apply(
+                    img_batch=img, 
+                    clean_features=features, 
+                    pixel_gt=gt, 
+                    model=model
+                )
+            
+            Mode 2 (Flexible - On-Demand Encoding):
+                Provide img_batch and model only.
+                Will encode img_batch via model.forward_image() internally.
+                Example: deform_augmenter.apply(
+                    img_batch=img, 
+                    pixel_gt=gt, 
+                    model=model
+                )
         
         Args:
-            img_batch: [B, 3, H, W] Input images (not used, kept for interface consistency)
-            clean_features: [B, C, H, W] Clean backbone features
-            clean_high_res: List of high-resolution features (reused as-is)
-            pixel_gt: [B, K, H, W] Ground truth masks
-            model: SAM2 model (not used, kept for interface consistency)
+            img_batch: [B, 3, H, W] Input images (required)
+            clean_features: [B, C, H_feat, W_feat] Backbone features (optional)
+            clean_high_res: List of high-res features (optional)
+            pixel_gt: [B, K, H, W] Ground truth masks (required)
+            model: SAM2Base model (required for Mode 2)
         
         Returns:
-            AugmentationResult with deformed features and num_backbone_forwards=0
+            AugmentationResult with deformed features and metadata
         """
+        # === Input validation ===
+        if img_batch is None or pixel_gt is None:
+            raise ValueError("img_batch and pixel_gt are required")
+        
+        # === Mode detection ===
+        if clean_features is None:
+            # Mode 2: On-demand encoding
+            if model is None:
+                raise ValueError(
+                    "Must provide either clean_features (Mode 1) or model (Mode 2)"
+                )
+            
+            logging.debug("Deformation Mode 2: Encoding image on-demand")
+            with torch.no_grad():
+                backbone_out = model.forward_image(img_batch, use_checkpoint=True)
+            clean_features = backbone_out['backbone_fpn'][-1]
+            
+            if model.use_high_res_features_in_sam and clean_high_res is None:
+                clean_high_res = [
+                    backbone_out['backbone_fpn'][0],
+                    backbone_out['backbone_fpn'][1]
+                ]
+            num_forwards = 1
+        else:
+            # Mode 1: Feature reuse (efficient)
+            logging.debug("Deformation Mode 1: Reusing provided features")
+            num_forwards = 0
+        
+        # === Main deformation logic ===
         B, C, H_feat, W_feat = clean_features.shape
         K = pixel_gt.shape[1]
+        H_img, W_img = img_batch.shape[2:]
         
-        # Resize masks to feature resolution
+        # Resize masks to feature resolution if needed
         if pixel_gt.shape[2:] != (H_feat, W_feat):
             pixel_gt_resized = F.interpolate(
                 pixel_gt.float(),
@@ -1516,182 +1814,132 @@ class FeatureLevelDeformationImpl(nn.Module):
         else:
             pixel_gt_resized = pixel_gt.float()
         
-        # Per-object deformation
-        deformed_list = []
-        mask_list = []
-        all_offsets_list = []  # Store offsets for visualization
-        
-        for k in range(K):
-            mask_k = pixel_gt_resized[:, k:k + 1, :, :]  # [B, 1, H, W]
-            
-            # Check if mask is non-empty
-            if mask_k.sum() == 0:
-                # Empty mask: use clean features
-                deformed_list.append(clean_features)
-                mask_list.append(mask_k)
-                # For empty masks, use zero offsets
-                all_offsets_list.append(torch.zeros_like(
-                    self.deform_module.offset_net(
-                        torch.cat([clean_features, mask_k], dim=1)
-                    )
-                ))
-                continue
-            
-            # Skip background (last object with area > 50% of feature map)
-            mask_area = mask_k.sum() / (B * H_feat * W_feat)
-            is_background = (k == K - 1) and (mask_area > 0.5)
-            if is_background:
-                # Background: use clean features without deformation
-                deformed_list.append(clean_features)
-                mask_list.append(mask_k)
-                # Zero offsets for background
-                all_offsets_list.append(torch.zeros_like(
-                    self.deform_module.offset_net(
-                        torch.cat([clean_features, mask_k], dim=1)
-                    )
-                ))
-                continue
-            
-            # Apply deformation to foreground object
-            deformed_k, offsets_k = self.deform_module(clean_features, mask_k)
-            deformed_list.append(deformed_k)
-            mask_list.append(mask_k)
-            all_offsets_list.append(offsets_k)  # [B, 2*9*groups, H, W]
+        # === OPTIMIZED: Batch processing of all objects ===
+        # This replaces the per-object loop to save memory and computation
+        deformed_list, mask_list, all_image_offsets_list = self._batch_process_objects(
+            pixel_gt, pixel_gt_resized, clean_features, B, K, H_feat, W_feat, H_img, W_img
+        )
         
         # Compose deformed features
         if self.use_soft_composite and len(deformed_list) > 0:
             final_features = self.compositor(deformed_list, mask_list)
         else:
-            # Fallback: simple averaging (not recommended)
             final_features = torch.stack(deformed_list, dim=0).mean(dim=0)
         
-        # Stack offsets for visualization: [B, K, 2*9*groups, H, W]
-        # Extract mean offset per object for visualization (simplified to [B, K, 2, H, W])
-        stacked_offsets = torch.stack(all_offsets_list, dim=1)  # [B, K, 2*9*groups, H, W]
-        
-        # Correct reshape considering interleaved (x,y) format from deform_conv2d
-        # Format: [Δx₀, Δy₀, Δx₁, Δy₁, ..., Δx₈, Δy₈] repeated for each group
-        # Reshape: [B, K, 2*9*groups, H, W] → [B, K, 9*groups, 2, H, W]
-        offsets_reshaped = stacked_offsets.view(
-            B, K, 9 * self.deform_module.num_deform_groups, 2, H_feat, W_feat
-        )
-        
-        # Average over all sampling points: [B, K, 9*groups, 2, H, W] → [B, K, 2, H, W]
-        offsets_mean = offsets_reshaped.mean(dim=2)  # [B, K, 2, H, W]
-        
-        # TODO: GCN coordination (Phase 5)
-        if self.use_gcn and self.deform_gcn is not None:
-            # Apply GCN refinement
-            pass
+        # Stack image-level offsets: [B, K, 2, H_img, W_img]
+        stacked_image_offsets = torch.stack(all_image_offsets_list, dim=1)
         
         return AugmentationResult(
             features=final_features,
-            high_res_features=clean_high_res,  # Reuse clean high-res features
+            high_res_features=clean_high_res,
             intermediate_images=None,
-            num_backbone_forwards=0,  # Key advantage: no extra backbone forward!
+            num_backbone_forwards=num_forwards,
             mode="feature_level",
             aug_type="deformation",
-            deformation_offsets=offsets_mean,  # [B, K, 2, H, W] for visualization
+            deformation_offsets=stacked_image_offsets,  # [B, K, 2, H_img, W_img] for warping
         )
 
 
-class DeformableConvModule(nn.Module):
+class FeatureBasedDeformModule(nn.Module):
     """
-    Per-object deformable convolution module.
+    Dense flow deformation module with Gradient Reversal Layer (GRL).
     
-    Predicts spatial offsets conditioned on features and object mask,
-    then applies deformable convolution to warp the features.
+    Architecture:
+        Input: Fused features [B, 256, H_feat, W_feat]
+        ↓
+        Offset Predictor Network (3 conv layers)
+        ↓
+        Offsets [B, 2, H_feat, W_feat] (constrained by epsilon)
+        ↓
+        Gradient Reversal Layer (GRL)
+        ↓
+        Upsample to image resolution
+        ↓
+        Image offsets [B, 2, H_img, W_img]
     
-    Inspired by DG-Font's FDSC (Feature Deformation Skip Connection).
+    Design rationale:
+        - Single branch ensures gradients flow from image warping back to offset predictor.
+        - GRL enables adversarial training (maximize loss) within a minimization loop.
     
     Args:
-        feature_dim: Dimension of input features
-        num_deform_groups: Number of groups for deformable convolution
-        epsilon: Maximum offset magnitude (constraint for offsets)
+        feature_dim: Feature dimension (default: 256)
+        epsilon: Max offset magnitude in feature space (default: 0.15 pixels)
+        image_size: Target image resolution for offset prediction (default: 1024)
     """
-    def __init__(self, feature_dim: int = 256, num_deform_groups: int = 4, epsilon: float = 0.15):
+    def __init__(
+        self, 
+        feature_dim: int = 256, 
+        epsilon: float = 0.15,
+        image_size: int = 1024,
+    ):
         super().__init__()
         self.feature_dim = feature_dim
-        self.num_deform_groups = num_deform_groups
         self.epsilon = epsilon
+        self.image_size = image_size
         
-        # Offset predictor network
-        # Input: [features + mask] -> Output: offset field [2 * kernel_size^2 * groups]
-        # For 3x3 kernel: 2 * 9 * num_deform_groups offsets
+        # Offset predictor: fused_features -> dense offsets (2 channels)
         self.offset_net = nn.Sequential(
-            nn.Conv2d(feature_dim + 1, 128, kernel_size=3, padding=1),
+            nn.Conv2d(feature_dim, 128, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(128, 64, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(64, 2 * 9 * num_deform_groups, kernel_size=3, padding=1),
+            nn.Conv2d(64, 2, kernel_size=3, padding=1), # 2 channels for (dx, dy)
         )
         
-        # Initialize offset_net: use small initialization for last layer to prevent large initial offsets
-        # Initialize first layers with kaiming normal (default)
-        for i in range(len(self.offset_net) - 1):
-            if isinstance(self.offset_net[i], nn.Conv2d):
-                nn.init.kaiming_normal_(
-                    self.offset_net[i].weight, mode='fan_out', nonlinearity='relu'
-                )
-        
-        # Initialize last layer with small random values to have some initial deformation
-        # This ensures non-zero gradients from the start, enabling the network to learn
-        # Scale: 0.01 to ensure initial offsets are small but non-zero
-        nn.init.normal_(self.offset_net[-1].weight, mean=0.0, std=0.005)
+        # Initialize: small values for last layer
+        nn.init.normal_(self.offset_net[-1].weight, mean=0.0, std=0.1)
         nn.init.zeros_(self.offset_net[-1].bias)
         
-        # Deformable convolution weights
-        self.deform_conv_weight = nn.Parameter(
-            torch.zeros(feature_dim, feature_dim // num_deform_groups, 3, 3)
-        )
-        self.deform_conv_bias = nn.Parameter(torch.zeros(feature_dim))
-        
-        # Initialize weights
-        nn.init.kaiming_normal_(
-            self.deform_conv_weight, mode='fan_out', nonlinearity='relu'
-        )
+        # Gradient Reversal Layer
+        self.grl = GRL(alpha=1.0)
     
     def forward(
-        self,
-        features: torch.Tensor,
+        self, 
+        fused_features: torch.Tensor,
         object_mask: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Apply deformable convolution conditioned on object mask.
+        Apply deformation prediction with GRL.
         
         Args:
-            features: [B, C, H, W] Input features
-            object_mask: [B, 1, H, W] Object mask
+            fused_features: [B, C, H_feat, W_feat] Pre-fused image+mask features
+            object_mask: [B, 1, H_feat, W_feat] Object mask (for masking/weighting)
         
         Returns:
-            deformed: [B, C, H, W] Deformed features
-            offsets: [B, 2*9*groups, H, W] Predicted offsets
+            feature_offsets: [B, 2, H_feat, W_feat] Offsets in feature resolution
+            image_offsets: [B, 2, H_img, W_img] Offsets in image resolution
         """
-        # Concatenate features with mask
-        feat_with_mask = torch.cat([features, object_mask], dim=1)  # [B, C+1, H, W]
+        # Apply Gradient Reversal Layer to input features
+        # This reverses gradients flowing back to the encoder while allowing
+        # normal gradients to train the offset network
+        fused_features_grl = self.grl(fused_features)
         
-        # Predict offsets
-        offsets = self.offset_net(feat_with_mask)  # [B, 2*9*groups, H, W]
+        # Predict raw offsets from GRL features
+        # Range: (-1, 1) after tanh
+        raw_offsets = self.offset_net(fused_features_grl)  # [B, 2, H_feat, W_feat]
+        raw_offsets = torch.tanh(raw_offsets)
         
-        # Constrain offsets using epsilon to prevent excessive deformation
-        # Use tanh to map to [-1, 1] range, then scale by epsilon
-        # This ensures offsets are bounded and training is stable
-        offsets = torch.tanh(offsets) * self.epsilon
+        # Define scale factor (1024 / 64 = 16)
+        scale_factor = 16.0
         
-        # Apply deformable convolution
-        from torchvision.ops import deform_conv2d
-        
-        deformed = deform_conv2d(
-            input=features,
-            offset=offsets,
-            weight=self.deform_conv_weight,
-            bias=self.deform_conv_bias,
-            stride=1,
-            padding=1,
-            dilation=1,
+        # 1. Compute Image-level Offsets (Target Resolution)
+        # Scale raw offsets by epsilon (defined in IMAGE pixels)
+        # We first upsample the raw field to image size to get smooth dense flow
+        image_raw_offsets = F.interpolate(
+            raw_offsets,
+            scale_factor=scale_factor,
+            mode='bilinear',
+            align_corners=False
         )
+        image_offsets = image_raw_offsets * self.epsilon # [B, 2, H_img, W_img] in pixels
         
-        return deformed, offsets
+        # 2. Compute Feature-level Offsets (Source Resolution)
+        # Feature offset = Image offset / scale_factor
+        # We use the raw_offsets directly scaled by (epsilon / scale_factor)
+        # This avoids downsampling artifacts and keeps consistency
+        feature_offsets = raw_offsets * (self.epsilon / scale_factor) # [B, 2, H_feat, W_feat] in feature pixels
+        
+        return feature_offsets, image_offsets
 
 
 class SoftCompositor(nn.Module):
@@ -1743,3 +1991,95 @@ class SoftCompositor(nn.Module):
         
         return composited
 
+
+class StyleAdversarialNetwork(nn.Module):
+    """
+    Neural network that predicts adversarial style transformations with GRL.
+    
+    Architecture:
+        Features [B, C, H, W]
+        ↓
+        Global Average Pooling
+        ↓
+        Feature vector [B, C]
+        ↓
+        MLP (C → 128 → 6K)  # 6 params (μ,σ for RGB) × K objects
+        ↓
+        Style parameters [B, K, 6]
+        ↓
+        Gradient Reversal Layer (GRL)
+        ↓
+        Adversarial styles [B, K, 6]
+    
+    Design rationale:
+        - Single forward pass (no PGD loop) for memory efficiency
+        - GRL enables adversarial training within minimization loop
+        - Predicts per-object styles for multi-object consistency
+    
+    Args:
+        feature_dim: Feature dimension (default: 256)
+        num_objects: Max number of objects (default: 11, including background)
+        epsilon: Max style perturbation magnitude (default: 2.0)
+    """
+    def __init__(
+        self,
+        feature_dim: int = 256,
+        num_objects: int = 11,
+        epsilon: float = 2.0,
+    ):
+        super().__init__()
+        self.feature_dim = feature_dim
+        self.num_objects = num_objects
+        self.epsilon = epsilon
+        
+        # Style predictor: features → per-object style parameters
+        # Output: [B, num_objects * 6] where 6 = (μ_R, μ_G, μ_B, σ_R, σ_G, σ_B)
+        self.style_net = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),  # [B, C, H, W] → [B, C, 1, 1]
+            nn.Flatten(),  # [B, C]
+            nn.Linear(feature_dim, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, num_objects * 6),  # Per-object style parameters
+        )
+        
+        # Initialize: small residuals
+        nn.init.normal_(self.style_net[-1].weight, mean=0.0, std=0.01)
+        nn.init.zeros_(self.style_net[-1].bias)
+        
+        # Gradient Reversal Layer
+        self.grl = GRL(alpha=1.0)
+    
+    def forward(
+        self,
+        features: torch.Tensor,
+        original_styles: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Predict adversarial style transformations with GRL.
+        
+        Args:
+            features: [B, C, H, W] Backbone features
+            original_styles: [B, K, 6] Original image styles
+        
+        Returns:
+            adv_styles: [B, K, 6] Adversarial styles (constrained by epsilon)
+        """
+        B = features.shape[0]
+        
+        # Apply Gradient Reversal Layer to input features
+        # This reverses gradients flowing back to the encoder while allowing
+        # normal gradients to train the style network
+        features_grl = self.grl(features)
+        
+        # Predict style residuals from GRL features
+        style_residuals = self.style_net(features_grl)  # [B, num_objects * 6]
+        style_residuals = style_residuals.view(B, self.num_objects, 6)  # [B, K, 6]
+        
+        # Constrain by epsilon (use tanh normalization)
+        style_residuals = torch.tanh(style_residuals) * self.epsilon
+        
+        # Add to original styles
+        K_actual = original_styles.shape[1]
+        adv_styles = original_styles + style_residuals[:, :K_actual, :]
+        
+        return adv_styles
