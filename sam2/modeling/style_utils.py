@@ -10,7 +10,6 @@ Style augmentation utilities for domain generalization.
 Implements:
 - Style extraction from images (mean + std per channel)
 - AdaIN (Adaptive Instance Normalization) for style transfer
-- PGD attack in style space
 """
 
 import logging
@@ -182,93 +181,5 @@ class AdaIN(nn.Module):
         return styled
 
 
-def pgd_style_attack(
-    model,
-    img_batch: torch.Tensor,
-    initial_styles: torch.Tensor,
-    gt: torch.Tensor,
-    num_steps: int = 5,
-    step_size: float = 0.1,
-    epsilon: float = 2.0,
-    style_mean: torch.Tensor = None,
-    style_std: torch.Tensor = None,
-) -> torch.Tensor:
-    """
-    PGD attack in style space to find adversarial styles.
-    
-    Performs projected gradient descent to maximize the segmentation loss
-    by perturbing style statistics within a constrained range.
-    
-    Args:
-        model: SAM2 model with forward_image_with_style method
-        img_batch: [B, 3, H, W] input images
-        initial_styles: [B, 6] starting styles (from cache or extracted)
-        gt: [B, H, W] ground truth masks
-        num_steps: number of PGD iterations
-        step_size: gradient ascent step size
-        epsilon: L∞ constraint radius (max perturbation per dimension)
-        style_mean: [6] dataset mean for range projection (optional)
-        style_std: [6] dataset std for range projection (optional)
-    
-    Returns:
-        adversarial_styles: [B, 6] optimized adversarial styles
-    """
-    adv_styles = initial_styles.clone().detach()
-    
-    # Compute valid style range if statistics provided
-    if style_mean is not None and style_std is not None:
-        valid_min = style_mean - 3 * style_std
-        valid_max = style_mean + 3 * style_std
-    else:
-        valid_min = valid_max = None
-    
-    for step in range(num_steps):
-        adv_styles.requires_grad = True
-        
-        # Forward with current adversarial styles
-        # This will apply AdaIN with adv_styles
-        backbone_out = model.forward_image_with_style(img_batch, adv_styles)
-        
-        # Continue through the full model to get predictions
-        # We need to compute a loss that we want to maximize
-        # For now, use a simplified approach: extract features and compute uncertainty
-        # The actual implementation will depend on the model's forward signature
-        
-        # Simplified loss computation (placeholder)
-        # In practice, this should compute the full segmentation loss
-        try:
-            # Try to get some output to compute gradient
-            # This is a simplified version - actual implementation needs full forward
-            features = backbone_out['vision_features']
-            
-            # Simple proxy loss: maximize feature magnitude (encourages large changes)
-            # Real implementation should compute actual segmentation loss
-            loss = features.abs().mean()
-            
-        except Exception as e:
-            logging.warning(f"PGD forward failed at step {step}: {e}")
-            # If forward fails, return initial styles
-            return initial_styles
-        
-        # Compute gradient w.r.t. adversarial styles
-        try:
-            grad = torch.autograd.grad(loss, adv_styles, create_graph=False)[0]
-        except Exception as e:
-            logging.warning(f"PGD gradient computation failed at step {step}: {e}")
-            return initial_styles
-        
-        # Gradient ascent (maximize loss)
-        with torch.no_grad():
-            adv_styles = adv_styles.detach() + step_size * grad.sign()
-            
-            # Project to epsilon ball around initial styles (L∞ constraint)
-            delta = adv_styles - initial_styles
-            delta = torch.clamp(delta, -epsilon, epsilon)
-            adv_styles = initial_styles + delta
-            
-            # Project to valid range (based on dataset statistics)
-            if valid_min is not None and valid_max is not None:
-                adv_styles = torch.clamp(adv_styles, valid_min, valid_max)
-    
-    return adv_styles.detach()
+
 

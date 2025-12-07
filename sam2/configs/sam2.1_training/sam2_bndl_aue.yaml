@@ -9,7 +9,7 @@ scratch:
   base_lr: 5.0e-6
   vision_lr: 3.0e-06
   phases_per_epoch: 1
-  num_epochs: 50
+  num_epochs: 100
 
 dataset:
   # PATHS to Dataset
@@ -79,7 +79,8 @@ trainer:
   _target_: training.trainer.Trainer
   mode: train
   max_epochs: ${times:${scratch.num_epochs},${scratch.phases_per_epoch}}
-  actual_max_epochs: 10
+  actual_max_epochs: 100
+  val_epoch_freq: 2
   accelerator: cuda
   seed_value: 123
   cuda:
@@ -172,14 +173,14 @@ trainer:
     # apply scaled sigmoid on mask logits for memory encoder, and directly feed input mask as output mask
     sigmoid_scale_for_mem_enc: 20.0
     sigmoid_bias_for_mem_enc: -10.0
-    use_mask_input_as_output_without_sam: true
+    use_mask_input_as_output_without_sam: false  # Must be false when use_bndl_for_pixels=True (incompatible)
     # Memory
     directly_add_no_mem_embed: true
     no_obj_embed_spatial: true
     # use high-resolution feature map in the SAM mask decoder
     use_high_res_features_in_sam: true
     # output 3 masks on the first click on initial conditioning frames
-    multimask_output_in_sam: false
+    multimask_output_in_sam: true
     # SAM heads
     iou_prediction_use_sigmoid: True
     # cross-attend to object pointers from other frames (based on SAM output tokens) in the encoder
@@ -198,106 +199,126 @@ trainer:
     multimask_min_pt_num: 0
     multimask_max_pt_num: 1
     use_mlp_for_obj_ptr_proj: true
+    # === BNDL_CONFIG_START ===
     # BNDL
     use_bndl_for_pixels: true
     bndl_fuse_type: none
     bndl_replace_global_with_hyper: true
     bndl_hyper_in_sparse: true
+    # === BNDL_CONFIG_END ===
     # Compilation flag
     # Freeze image encoder to save memory
-    freeze_image_encoder: false
+    # === IMPORTANT: Conv-LoRA Configuration ===
+    freeze_image_encoder: false  # true = PEFT (only train LoRA, ~2-3% params), false = joint fine-tuning (train all, ~33% params)
     # Unfreeze specific components for adaptation (e.g. "neck", "trunk_last_stage")
-    unfreeze_image_encoder_components: ["neck"]
+    unfreeze_image_encoder_components: []
+
+    # === CONV_LORA_CONFIG_START ===
+    # Conv-LoRA: Parameter-efficient fine-tuning with MoE
+    use_conv_lora: true
+    conv_lora_rank: 8
+    conv_lora_alpha: 16.0
+    conv_lora_dropout: 0.1
+    conv_lora_expert_scales: [1.0, 0.5, 2.0]  # Multi-scale experts for MoE
+    conv_lora_target_modules:  # Layers to inject Conv-LoRA
+      - "mlp.layers.0"
+      - "mlp.layers.1"
+    # === CONV_LORA_CONFIG_END ===
     
+    # === MAX_OBJECTS_CONFIG_START ===
     # Max number of objects (matches dataset sampler for memory efficiency)
     max_num_objects: ${scratch.max_num_objects}
+    # === MAX_OBJECTS_CONFIG_END ===
 
     # === AUE_GCN_CONFIG_START ===
     # AUE (Adversarial Uncertainty Estimation) with Style-based augmentation
-    use_aue: true
+    use_aue: false
     aue_use_uncertainty: true
     aue_uncertainty_mask_threshold: 0.4
+    # Constraint weight for adversarial samples (L1 distance to initial)
+    aue_constraint_loss_weight: 0.0  # Weight for constraint regularization (0 = disabled)
+    # Attack mode: "cooperative" (parallel prediction, joint application) or "sequential" (iterative)
+    aue_attack_mode: "cooperative"
+    # Style Adversarial options (alternative to AUE, for domain generalization)
+    use_style_adv: false
+    style_adv_mode: "image_level"  # "image_level" or "feature_level"
+    style_adv_use_gt_region_style: false
     
-    # Style-based AUE parameters
-    use_style_aug: true
-    style_aug_mode: "image_level"  # "image_level" or "feature_level"
-    style_aug_pgd_steps: 1
-    style_aug_pgd_step_size: 0.1
-    style_aug_pgd_epsilon: 0.3
-    style_aug_use_gt_region_style: true
+    # Consistency Regularization: MMD(U_clean, U_adv)
+    aue_consistency_weight: 0.5  # Weight for consistency loss (0.3-0.7 recommended)
     
     # Multi-object style attack control
-    style_aug_use_multi_object: true
-    style_aug_enable_background: true
+    style_adv_use_multi_object: false  # Only global style (no multi-object)
+    style_adv_enable_background: false  # Only global style (no background)
     
-    # Global-Local Mixed Style Augmentation
-    style_aug_use_global_local_mix: false
-    style_aug_global_epsilon: 1.5
-    style_aug_global_weight: 0.3
+    # Global-Local Mixed Style Adversarial
+    style_adv_use_global_local_mix: false
+    style_adv_global_epsilon: 1.5
+    style_adv_global_weight: 0.3
 
     # GCN-based multi-object style refinement
-    style_aug_use_gcn: true
-    style_aug_gcn_hidden_dim: 64
-    style_aug_gcn_num_layers: 2
-    style_aug_gcn_edge_threshold: 0.0
-    style_aug_gcn_use_semantic_edges: true
-    style_aug_gcn_use_background_edges: true
-    style_aug_gcn_distance_threshold: 1.0
-    style_aug_gcn_use_boundary_distance: true
-    style_aug_gcn_use_visual_features: true  # Enable visual features in GCN for content-aware refinement
-    style_aug_gcn_feature_dim: 256  # Feature dimension (matches backbone_fpn[-1] d_model)
+    style_adv_use_gcn: false  # Not needed for global-only style
+    style_adv_gcn_hidden_dim: 64
+    style_adv_gcn_num_layers: 2
+    style_adv_gcn_edge_threshold: 0.0
+    style_adv_gcn_use_semantic_edges: true
+    style_adv_gcn_use_background_edges: true
+    style_adv_gcn_distance_threshold: 1.0
+    style_adv_gcn_use_boundary_distance: true
+    style_adv_gcn_use_visual_features: true  # Enable visual features in GCN for content-aware refinement
+    style_adv_gcn_feature_dim: 256  # Feature dimension (matches backbone_fpn[-1] d_model)
     
-    # Deformation Augmentation (feature-level, memory encoder based)
-    use_deform_aug: true  # Set to true to enable
-    deform_aug_epsilon: 16.0  # Max offset magnitude in IMAGE pixels
-    deform_aug_use_soft_composite: true
-    deform_aug_temperature: 1.0
-    deform_aug_use_gcn: false
-    deform_aug_gcn_num_layers: 2
-    deform_aug_num_deform_groups: 4
-    deform_aug_init_from_memory_encoder: true  # Initialize from pretrained memory encoder
-    deform_aug_freeze_mask_encoder: false  # Allow fine-tuning
+    # Deformation Adversarial (feature-level, memory encoder based)
+    use_deform_adv: false  # Disabled for style-only ablation
+    deform_adv_epsilon: 5.0  # Reduced from 10.0 to 5.0 for mild spatial perturbation
+    deform_adv_use_soft_composite: true
+    deform_adv_temperature: 1.0
+    deform_adv_use_gcn: false
+    deform_adv_gcn_num_layers: 2
+    deform_adv_num_deform_groups: 4
+    deform_adv_init_from_memory_encoder: true  # Initialize from pretrained memory encoder
+    deform_adv_freeze_mask_encoder: false  # Allow fine-tuning
     
-    # Augmentation Pipeline Ordering
-    adversarial_aug_order: ["deform", "style"]  # Options: ["deform", "style"], ["style", "deform"], ["deform"], ["style"]
+    # Adversarial Pipeline Ordering
+    adversarial_attack_order: ["style"]  # Only style attack for this ablation
     
     # Distribution matching configuration for AUE calibration loss (nested config)
     aue_dist_matching_config:
       # Current method: Baseline Hard-Aware MMD (error-based Top-K mining)
-      method: "domain_aware_soft_mmd"  # Options: "mmd", "cka", "gram", "mmd_hard_aware", "domain_aware_soft_mmd"
-      
+      method: "mmd"  # Options: "mmd", "cka", "gram", "mmd_hard_aware", "domain_aware_soft_mmd"
+        
       # To use NEW theory-driven method, change to:
       # method: "domain_aware_soft_mmd"
-      
+        
       use_patches: true  # Ignored for hard-aware methods (inherently patch-based)
-      patch_size: 16  # Patch size for patch-based methods
-      
+      patch_size: 32  # Patch size for patch-based methods
+        
       # Method-specific parameters (only active when method is selected)
       mmd:
         kernel: "rbf"
         bandwidth: 0.1
         batch_size: 256
         n_batches: 10
-      
+        
       # Baseline: Hard-Aware MMD (error-based Top-K mining)
       mmd_hard_aware:
         top_k_percent: 0.25     # Top 25% hardest patches (by error)
         max_samples: 4096        # Memory optimization
-      
+        
       # NEW: Domain-Aware Soft MMD (theory-driven: OOD detection + MaxEnt)
       # Combines error (aleatoric) + feature diversity (epistemic) with soft weighting
       domain_aware_soft_mmd:
-        diversity_weight: 0.4        # 40% epistemic, 60% aleatoric (recommended: 0.3-0.5)
-        temperature: 0.1             # Softmax temperature (lower = more focused, recommended: 0.05-0.2)
+        diversity_weight: 0.25       # Reduced from 0.4 to 0.25 (less emphasis on epistemic diversity)
+        temperature: 0.2             # Increased from 0.1 to 0.2 (smoother sample selection, less aggressive)
         max_samples: 8192
         diversity_method: "channel_std"  # "channel_std" (faster) | "spatial_var"
         enable_monitoring: false     # Disable monitoring to save memory and ignore low correlation for now
-      
+        
       cka:
         use_linear_kernel: true  # Linear kernel (faster) vs RBF kernel
         use_minibatch: true  # Mini-batch computation for memory efficiency
         minibatch_size: 512
-      
+        
       gram:
         center: true
         normalize: true
@@ -445,51 +466,79 @@ trainer:
 
     options:
       lr:
-        # ① 默认组（未被下面命中者）
+        # 默认组（未被下面命中者）
         - scheduler:
             _target_: fvcore.common.param_scheduler.CosineParamScheduler
-            start_value: 1.0e-7
-            end_value: 1.0e-8
+            start_value: 1.0e-6
+            end_value: 1.0e-7
 
-        # ② BNDL head: higher learning rate
         - scheduler:
             _target_: fvcore.common.param_scheduler.CosineParamScheduler
-            start_value: 1.0e-4
-            end_value: 3.0e-5
+            start_value: 1.0e-07
+            end_value: 1.0e-07
           param_names:
-            - 'sam_mask_decoder.pixel_bndl.*'
+            - 'image_encoder.*'
+          exclude_param_names:
+            - '*conv_lora.*'
 
-        # ③ GCN: moderate learning rate for rapid alpha convergence
+        # # Conv-LoRA learning rate (MoE-based)
         - scheduler:
             _target_: fvcore.common.param_scheduler.CosineParamScheduler
-            start_value: 1.0e-5
-            end_value: 5.0e-6
-          param_names:
-            - 'style_gcn.*'
-
-        # ④ Deformation augmentation (DG-Font): moderate learning rate for effective training
-        - scheduler:
-            _target_: fvcore.common.param_scheduler.CosineParamScheduler
-            start_value: 1.0e-4
+            start_value: 5.0e-5
             end_value: 1.0e-5
           param_names:
-            - 'deform_augmenter.*'
+            - '*conv_lora.lora_A.*'
+            - '*conv_lora.lora_B.*'
+            - '*conv_lora.gating_fc.*'
+            - '*conv_lora.experts.*'
 
-        # ⑤ Other decoder components: very small learning rate
-        - scheduler:
-            _target_: fvcore.common.param_scheduler.CosineParamScheduler
-            start_value: 1.0e-7
-            end_value: 1.0e-8
-          param_names:
-            - 'sam_mask_decoder.mask_tokens.*'
-            - 'sam_mask_decoder.iou_token.*'
-            - 'sam_mask_decoder.obj_score_token.*'
-            - 'sam_mask_decoder.output_upscaling.*'
-            - 'sam_mask_decoder.conv_s0.*'
-            - 'sam_mask_decoder.conv_s1.*'
-            - 'sam_mask_decoder.output_hypernetworks_mlps.*'
-            - 'sam_mask_decoder.iou_prediction_head.*'
-            - 'sam_mask_decoder.pred_obj_score_head.*'
+        # BNDL head: higher learning rate
+        # - scheduler:
+        #     _target_: fvcore.common.param_scheduler.CosineParamScheduler
+        #     start_value: 1.0e-4
+        #     end_value: 5.0e-5
+        #   param_names:
+        #     - 'sam_mask_decoder.pixel_bndl.*'
+
+        # Style Adversarial Network: moderate learning rate for effective adversarial training
+        # - scheduler:
+        #     _target_: fvcore.common.param_scheduler.CosineParamScheduler
+        #     start_value: 1.0e-4
+        #     end_value: 1.0e-5
+        #   param_names:
+        #     - 'style_attacker.impl.style_net.*'
+
+        # GCN: moderate learning rate for rapid alpha convergence
+        # - scheduler:
+        #     _target_: fvcore.common.param_scheduler.CosineParamScheduler
+        #     start_value: 1.0e-5
+        #     end_value: 5.0e-6
+        #   param_names:
+        #     - 'style_gcn.*'
+
+        # Deformation augmentation (DG-Font): moderate learning rate for effective training
+        # - scheduler:
+        #     _target_: fvcore.common.param_scheduler.CosineParamScheduler
+        #     start_value: 1.0e-4
+        #     end_value: 1.0e-5
+        #   param_names:
+        #     - 'deform_attacker.*'
+
+        # Other decoder components: very small learning rate
+        # - scheduler:
+        #     _target_: fvcore.common.param_scheduler.CosineParamScheduler
+        #     start_value: 1.0e-7
+        #     end_value: 1.0e-8
+        #   param_names:
+        #     - 'sam_mask_decoder.mask_tokens.*'
+        #     - 'sam_mask_decoder.iou_token.*'
+        #     - 'sam_mask_decoder.obj_score_token.*'
+        #     - 'sam_mask_decoder.output_upscaling.*'
+        #     - 'sam_mask_decoder.conv_s0.*'
+        #     - 'sam_mask_decoder.conv_s1.*'
+        #     - 'sam_mask_decoder.output_hypernetworks_mlps.*'
+        #     - 'sam_mask_decoder.iou_prediction_head.*'
+        #     - 'sam_mask_decoder.pred_obj_score_head.*'
 
       weight_decay:
         # 默认 weight decay
@@ -520,24 +569,24 @@ trainer:
       # Initial weights (used as fallback if not specified in weight_schedule below)
       sam_weight: 1.0
       bndl_weight: 0.5
-      aue_weight: 0.1
+      aue_weight: 0.05
       weight_schedule:
-        - until_epoch: 1
+        - until_epoch: 5
           sam_weight: 1.0
           bndl_weight: 0.5
-          aue_weight: 0.02
-        - until_epoch: 2
+          aue_weight: 0.01
+        - until_epoch: 10
           sam_weight: 1.0
-          bndl_weight: 0.7
+          bndl_weight: 0.5
+          aue_weight: 0.05
+        - until_epoch: 20
+          sam_weight: 1.0
+          bndl_weight: 0.5
           aue_weight: 0.08
-        - until_epoch: 4
-          sam_weight: 1.0
-          bndl_weight: 0.6
-          aue_weight: 0.15
         - until_epoch: null
           sam_weight: 1.0
-          bndl_weight: 0.6
-          aue_weight: 0.15
+          bndl_weight: 0.5
+          aue_weight: 0.08
     # val:
     #   _target_: training.loss_combined.CombinedSAMBNDLLoss
     #   sam_loss: ${trainer.loss.all.sam_loss}
@@ -569,7 +618,7 @@ trainer:
     log_scalar_frequency: 10
     log_visual_frequency: 100
     visualize_bndl: true
-    visualize_aue: true
+    visualize_aue: false
     style_aue_visual_frequency: 100
     uncertainty_metric: ["entropy", "nll"]
     visualize_pavpu_overlay: true
@@ -588,7 +637,7 @@ trainer:
       _target_: training.utils.checkpoint_utils.load_state_dict_into_model
       strict: False
       ignore_missing_keys: [
-          "sam_mask_decoder.pixel_bndl.*",
+          # "sam_mask_decoder.pixel_bndl.*",
       ]
       ignore_unexpected_keys: [
           # "sam_mask_decoder.pixel_bndl.*",
@@ -603,7 +652,7 @@ launcher:
   gpus_per_node: 8
   # NOTE: experiment_log_dir is automatically set by train_and_zs.sh based on BNDL_AUE_VER
   # To change version, edit BNDL_AUE_VER in scripts/train_and_zs.sh (no need to edit here)
-  experiment_log_dir: /home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_aue_017_19  # Default fallback, will be overridden
+  experiment_log_dir: /home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_aue_017_bndl  # Default fallback, will be overridden
 
 # SLURM args if running on a cluster
 submitit:

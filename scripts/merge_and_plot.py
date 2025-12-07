@@ -211,6 +211,7 @@ def main():
                 output_path=args.output_path,
                 uctta_results=uctta_results,
                 uctta_statistics=uctta_statistics,
+                bndl_baseline_results=bndl_results if bndl_results else None,
             )
             print("✓ 综合对比图已生成")
         except Exception as e:

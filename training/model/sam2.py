@@ -100,6 +100,20 @@ class SAM2Train(SAM2Base):
             for p in self.image_encoder.parameters():
                 p.requires_grad = False
             
+            # 1.5. Auto-unfreeze Conv-LoRA parameters if use_conv_lora=True (PEFT)
+            if hasattr(self, 'use_conv_lora') and self.use_conv_lora:
+                # Conv-LoRA parameters are those in LinearWithConvLoRA.conv_lora submodules
+                conv_lora_params_unfrozen = 0
+                for name, module in self.image_encoder.named_modules():
+                    # Check if this is a LinearWithConvLoRA wrapper
+                    if module.__class__.__name__ == 'LinearWithConvLoRA':
+                        # Unfreeze only the conv_lora submodule, keep .linear frozen
+                        if hasattr(module, 'conv_lora'):
+                            for p in module.conv_lora.parameters():
+                                p.requires_grad = True
+                                conv_lora_params_unfrozen += 1
+                logging.info(f"Frozen image encoder, but unfrozen {conv_lora_params_unfrozen} Conv-LoRA parameters for PEFT")
+            
             # 2. Unfreeze specific components
             if "neck" in unfreeze_image_encoder_components:
                 if hasattr(self.image_encoder, "neck"):
@@ -311,7 +325,7 @@ class SAM2Train(SAM2Base):
         #   - Background participates in style attack
         #   - Visualization shows green dashed bbox for background
         # ============================================================
-        ENABLE_BACKGROUND_MASK = self.style_aug_enable_background
+        ENABLE_BACKGROUND_MASK = self.style_adv_enable_background
         
         # Use max_num_objects from config (matches dataset sampler)
         # Add 1 slot for background if enabled
@@ -551,48 +565,44 @@ class SAM2Train(SAM2Base):
         # Set style_aug_use_multi_object = True to attack with all objects in the video
         # Set style_aug_use_multi_object = False to disable AUE (no pixel_gt_for_aue)
         # ============================================================
-        USE_MULTI_OBJECT_AUE = self.style_aug_use_multi_object
+        USE_MULTI_OBJECT_AUE = self.style_adv_use_multi_object
         
         # DO NOT initialize pixel_gt_for_aue with gt_masks!
         # gt_masks is reserved for prompt sampling only
         pixel_gt_for_aue = None
-        if USE_MULTI_OBJECT_AUE and is_init_cond_frame and hasattr(self, '_current_backbone_out'):
-            backbone_out = self._current_backbone_out
-            if "mask_all_objs_for_aue" in backbone_out:
-                mask_all_objs = backbone_out["mask_all_objs_for_aue"][frame_idx]  # [B_videos, K, H, W]
-                num_objs = backbone_out["num_objs_per_video_frame"][frame_idx]    # [B_videos]
-                obj_to_frame = self._current_obj_to_frame_idx  # [O_t, 2]
-                
-                # For each object, construct all object masks from its video
-                O_t = len(obj_to_frame)
-                K = mask_all_objs.shape[1]
-                H, W = mask_all_objs.shape[2:]
-                
-                multi_obj_masks = torch.zeros(
-                    O_t, K, H, W,
-                    dtype=mask_all_objs.dtype,
-                    device=mask_all_objs.device
-                )
-                
-                for i in range(O_t):
-                    video_idx = obj_to_frame[i, 1].item()
-                    K_actual = num_objs[video_idx].item()
-                    # Copy all non-empty masks from mask_all_objs (includes foreground + background if enabled)
-                    # Background is at slot K-1 (e.g., index 10 when K=11), not necessarily in [:K_actual]
-                    multi_obj_masks[i] = mask_all_objs[video_idx]
-                
-                # Use multi-object masks
-                pixel_gt_for_aue = multi_obj_masks
-                
-                # DEBUG: Log pixel_gt_for_aue details
-                import logging
-                if pixel_gt_for_aue is not None:
-                    per_channel_area = [(pixel_gt_for_aue[:, k] > 0.5).sum().item() for k in range(min(pixel_gt_for_aue.shape[1], 5))]
-                    logging.debug(f"DEBUG track_step: pixel_gt_for_aue.shape={pixel_gt_for_aue.shape}, "
-                                 f"is_init_cond={is_init_cond_frame}, frame_idx={frame_idx}, "
-                                 f"min={pixel_gt_for_aue.min():.3f}, max={pixel_gt_for_aue.max():.3f}, "
-                                 f"per_channel_area[0:5]={per_channel_area}")
-        
+        if self.use_aue and is_init_cond_frame:
+            if USE_MULTI_OBJECT_AUE and hasattr(self, '_current_backbone_out'):
+                backbone_out = self._current_backbone_out
+                if "mask_all_objs_for_aue" in backbone_out:
+                    mask_all_objs = backbone_out["mask_all_objs_for_aue"][frame_idx]  # [B_videos, K, H, W]
+                    num_objs = backbone_out["num_objs_per_video_frame"][frame_idx]    # [B_videos]
+                    obj_to_frame = self._current_obj_to_frame_idx  # [O_t, 2]
+                    
+                    # For each object, construct all object masks from its video
+                    O_t = len(obj_to_frame)
+                    K = mask_all_objs.shape[1]
+                    H, W = mask_all_objs.shape[2:]
+                    
+                    multi_obj_masks = torch.zeros(
+                        O_t, K, H, W,
+                        dtype=mask_all_objs.dtype,
+                        device=mask_all_objs.device
+                    )
+                    
+                    for i in range(O_t):
+                        video_idx = obj_to_frame[i, 1].item()
+                        K_actual = num_objs[video_idx].item()
+                        # Copy all non-empty masks from mask_all_objs (includes foreground + background if enabled)
+                        # Background is at slot K-1 (e.g., index 10 when K=11), not necessarily in [:K_actual]
+                        multi_obj_masks[i] = mask_all_objs[video_idx]
+                    
+                    # Use multi-object masks
+                    pixel_gt_for_aue = multi_obj_masks
+            elif not USE_MULTI_OBJECT_AUE and gt_masks is not None:
+                # Single-object mode: use the current object's GT mask
+                # gt_masks is [B, 1, H, W], which matches [B, K=1, H, W]
+                pixel_gt_for_aue = gt_masks
+                 
         current_out, sam_outputs, high_res_features, pix_feat = self._track_step(
             frame_idx,
             is_init_cond_frame,
@@ -609,30 +619,40 @@ class SAM2Train(SAM2Base):
             current_img_batch=current_img_batch,
         )
 
-        if len(sam_outputs) == 8:  # 包含辅助输出（BNDL/UR-ERN等）
-            (
-                low_res_multimasks,
-                high_res_multimasks,
-                ious,
-                low_res_masks,
-                high_res_masks,
-                obj_ptr,
-                object_score_logits,
-                aux_outputs,
-            ) = sam_outputs
-        else:
-            (
-                low_res_multimasks,
-                high_res_multimasks,
-                ious,
-                low_res_masks,
-                high_res_masks,
-                obj_ptr,
-                object_score_logits,
-            ) = sam_outputs
-            aux_outputs = None
+        (
+            low_res_multimasks,
+            high_res_multimasks,
+            ious,
+            low_res_masks,
+            high_res_masks,
+            obj_ptr,
+            object_score_logits,
+            aux_outputs,
+        ) = sam_outputs
 
         # 初始化多步辅助输出列表（统一为 aux_outputs）
+        # Check: if use_bndl_for_pixels=True, aux_outputs must contain valid BNDL data
+        if self.use_bndl_for_pixels:
+            if aux_outputs is None:
+                raise RuntimeError(
+                    f"SAM2Train.track_step (frame_idx={frame_idx}): use_bndl_for_pixels=True but aux_outputs is None!"
+                )
+            if not isinstance(aux_outputs, dict):
+                raise RuntimeError(
+                    f"SAM2Train.track_step (frame_idx={frame_idx}): use_bndl_for_pixels=True but aux_outputs is not a dict! "
+                    f"type: {type(aux_outputs)}"
+                )
+            if "bndl" not in aux_outputs:
+                raise RuntimeError(
+                    f"SAM2Train.track_step (frame_idx={frame_idx}): use_bndl_for_pixels=True but aux_outputs does not contain 'bndl'! "
+                    f"aux_outputs keys: {list(aux_outputs.keys())}"
+                )
+            bndl_data = aux_outputs["bndl"]
+            if not isinstance(bndl_data, dict):
+                raise RuntimeError(
+                    f"SAM2Train.track_step (frame_idx={frame_idx}): aux_outputs['bndl'] is not a dict! type: {type(bndl_data)}"
+                )
+        
         if aux_outputs is not None:
             # 将 GT 添加到 BNDL 命名空间（如果存在）
             bndl_ns = aux_outputs.get("bndl", None)
@@ -771,30 +791,44 @@ class SAM2Train(SAM2Base):
                     img_batch_for_style_aue=None,
                 )
 
-            # Unpack sam_outputs: check if aux_outputs is present (8 elements) or not (7 elements)
-            if isinstance(sam_outputs, tuple) and len(sam_outputs) == 8:
-                (
-                    low_res_multimasks,
-                    high_res_multimasks,
-                    ious,
-                    low_res_masks,
-                    high_res_masks,
-                    _,
-                    object_score_logits,
-                    aux_outputs,
-                ) = sam_outputs
-                all_aux_outputs.append(aux_outputs)
-            else:
-                (
-                    low_res_multimasks,
-                    high_res_multimasks,
-                    ious,
-                    low_res_masks,
-                    high_res_masks,
-                    _,
-                    object_score_logits,
-                ) = sam_outputs
-                all_aux_outputs.append(None)
+            # Unpack sam_outputs (always 8 elements now)
+            (
+                low_res_multimasks,
+                high_res_multimasks,
+                ious,
+                low_res_masks,
+                high_res_masks,
+                _,
+                object_score_logits,
+                aux_outputs,
+            ) = sam_outputs
+            
+            # Check: if use_bndl_for_pixels=True, aux_outputs must contain valid BNDL data
+            if self.use_bndl_for_pixels:
+                if aux_outputs is None:
+                    raise RuntimeError(
+                        f"SAM2Train._iter_correct_pt_sampling (step {_}, frame_idx={current_out.get('frame_idx', 'unknown')}): "
+                        f"use_bndl_for_pixels=True but aux_outputs is None!"
+                    )
+                if not isinstance(aux_outputs, dict):
+                    raise RuntimeError(
+                        f"SAM2Train._iter_correct_pt_sampling (step {_}, frame_idx={current_out.get('frame_idx', 'unknown')}): "
+                        f"use_bndl_for_pixels=True but aux_outputs is not a dict! type: {type(aux_outputs)}"
+                    )
+                if "bndl" not in aux_outputs:
+                    raise RuntimeError(
+                        f"SAM2Train._iter_correct_pt_sampling (step {_}, frame_idx={current_out.get('frame_idx', 'unknown')}): "
+                        f"use_bndl_for_pixels=True but aux_outputs does not contain 'bndl'! "
+                        f"aux_outputs keys: {list(aux_outputs.keys())}"
+                    )
+                bndl_data = aux_outputs["bndl"]
+                if not isinstance(bndl_data, dict):
+                    raise RuntimeError(
+                        f"SAM2Train._iter_correct_pt_sampling (step {_}, frame_idx={current_out.get('frame_idx', 'unknown')}): "
+                        f"aux_outputs['bndl'] is not a dict! type: {type(bndl_data)}"
+                    )
+            
+            all_aux_outputs.append(aux_outputs)
             all_pred_masks.append(low_res_masks)
             all_pred_high_res_masks.append(high_res_masks)
             all_pred_multimasks.append(low_res_multimasks)

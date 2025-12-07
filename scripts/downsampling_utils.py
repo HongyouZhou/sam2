@@ -121,7 +121,7 @@ def downsample_statistics_pavpu(statistics_dict, max_samples=10000):
         降采样后的statistics_dict（就地修改）
     """
     if not statistics_dict:
-        return statistics_dict
+        return statistics_dict, 0, 0
     
     # 收集所有PAvPU样本
     all_uncertainty = []

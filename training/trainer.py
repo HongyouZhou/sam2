@@ -494,12 +494,30 @@ class Trainer:
 
                 # Log BNDL statistics for both train and val
                 self._log_bndl_statistics(bndl_outputs, self.steps[phase], phase)
+
+                # Capture AUE/BNDL loss terms for epoch aggregation
+                if isinstance(bndl_outputs, dict):
+                    aue_metrics = bndl_outputs.get("aue_metrics", {})
+                    for metric in (
+                        "total_loss",
+                        "calibration_loss_clean",
+                        "calibration_loss_adversarial",
+                    ):
+                        val = aue_metrics.get(metric)
+                        if isinstance(val, torch.Tensor):
+                            step_losses[
+                                f"Losses/{phase}_{key}_aue_{metric}"
+                            ] = val
+
+                    pixel_nll = bndl_outputs.get("pixel_nll")
+                    if isinstance(pixel_nll, torch.Tensor):
+                        step_losses[f"Losses/{phase}_{key}_bndl_nll"] = pixel_nll
         
         # Log Style AUE visualization if available and enabled (only on rank 0)
         if (phase == "train" and 
             self.distributed_rank == 0 and
             getattr(self.logging_conf, 'visualize_aue', False) and
-            hasattr(_model, 'use_style_aug') and _model.use_style_aug and
+            hasattr(_model, 'use_style_adv') and _model.use_style_adv and
             _model._enable_style_visualization):
             self._log_style_aue_visualization(outputs, self.steps[phase])
         
@@ -507,12 +525,17 @@ class Trainer:
         if (phase == "train" and 
             self.distributed_rank == 0 and
             getattr(self.logging_conf, 'visualize_aue', False) and
-            hasattr(_model, 'use_deform_aug') and _model.use_deform_aug and
+            hasattr(_model, 'use_deform_adv') and _model.use_deform_adv and
             _model._enable_style_visualization):
             self._log_deform_aue_visualization(outputs, self.steps[phase])
 
         if isinstance(loss, dict):
-            step_losses.update({f"Losses/{phase}_{key}_{k}": v for k, v in loss.items()})
+            if CORE_LOSS_KEY not in loss:
+                raise KeyError(f"Missing {CORE_LOSS_KEY} in loss dict for phase={phase}, key={key}")
+
+            step_losses.update(
+                {f"Losses/{phase}_{key}_{k}": v for k, v in loss.items() if k != CORE_LOSS_KEY}
+            )
             loss = self._log_loss_detailed_and_return_core_loss(loss, loss_log_str, self.steps[phase])
 
         if self.steps[phase] % self.logging_conf.log_scalar_frequency == 0:
@@ -1154,8 +1177,15 @@ class Trainer:
         return core_loss
 
     def _log_bndl_statistics(self, bndl_outputs, step, phase):
-        """Log BNDL statistics including pixel-level uncertainty"""
+        """Log BNDL statistics including pixel-level uncertainty.
+
+        Uses the global scalar logging frequency to avoid spamming tensorboard when
+        running long validation epochs.
+        """
         if bndl_outputs is None:
+            return
+
+        if step % self.logging_conf.log_scalar_frequency != 0:
             return
 
         # Pixel-level parameters (lambda and k)
@@ -1177,23 +1207,27 @@ class Trainer:
             self.logger.log(f"Stats/{phase}_lambda_w", lambda_w_mean, step)
             self.logger.log(f"Stats/{phase}_k_w", k_w_mean, step)
 
-        # AUE loss components
-        if "aue_loss_dict" in bndl_outputs and bndl_outputs["aue_loss_dict"] is not None:
-            aue_loss_dict = bndl_outputs["aue_loss_dict"]
-            all_aue_loss_keys = [
-                "total_loss",
-                "calibration_loss_clean",
-                "calibration_loss_adversarial",
-            ]
-            for key in all_aue_loss_keys:
-                if key not in aue_loss_dict:
-                    continue  # Skip if key doesn't exist
-                value = aue_loss_dict[key]
-                if isinstance(value, torch.Tensor):
-                    val = value.item()
-                else:
-                    val = value
-                self.logger.log(f"AUE_Losses/{phase}_{key}", val, step)
+        # AUE metrics (use aue_metrics directly)
+        if "aue_metrics" in bndl_outputs and bndl_outputs["aue_metrics"] is not None:
+            aue_metrics = bndl_outputs["aue_metrics"]
+            # Log loss values
+            loss_keys = ["total_loss", "calibration_loss_clean", "calibration_loss_adversarial"]
+            for key in loss_keys:
+                if key in aue_metrics:
+                    value = aue_metrics[key]
+                    val = value.item() if isinstance(value, torch.Tensor) else value
+                    self.logger.log(f"AUE_Losses/{phase}_{key}", val, step)
+            
+            # Log clean/ and aug/ prefixed metrics
+            for key, value in aue_metrics.items():
+                if key == "aue_visualization" or key in loss_keys:
+                    continue
+                if key.startswith("clean/") or key.startswith("aug/"):
+                    try:
+                        scalar = value.item() if isinstance(value, torch.Tensor) and value.numel() == 1 else (value.mean().item() if isinstance(value, torch.Tensor) else float(value))
+                        self.logger.log(f"AUE_Metrics/{phase}_{key}", scalar, step)
+                    except (TypeError, ValueError):
+                        continue
 
         # Style GCN statistics (if available)
         gcn_stats = bndl_outputs.get("gcn_stats") if isinstance(bndl_outputs, dict) else None
@@ -1277,16 +1311,17 @@ class Trainer:
                         logging.debug("DeformAUE: No 'bndl' in aux_outputs")
                     continue
                 
-                if "aue_loss_dict" not in bndl_outputs:
+                # Use aue_metrics directly
+                aue_metrics = bndl_outputs.get("aue_metrics")
+                if aue_metrics is None:
                     if logging.getLogger().isEnabledFor(logging.DEBUG):
-                        logging.debug(f"DeformAUE: No 'aue_loss_dict' in bndl_outputs, keys={list(bndl_outputs.keys())}")
+                        logging.debug(f"DeformAUE: No 'aue_metrics' in bndl_outputs, keys={list(bndl_outputs.keys())}")
                     continue
                 
-                aue_loss_dict = bndl_outputs["aue_loss_dict"]
-                vis_data = aue_loss_dict.get("aue_visualization", None)
+                vis_data = aue_metrics.get("aue_visualization", None)
                 
                 if logging.getLogger().isEnabledFor(logging.DEBUG):
-                    logging.debug(f"DeformAUE: aue_loss_dict keys={list(aue_loss_dict.keys())}, vis_data={'✓' if vis_data is not None else '✗'}")
+                    logging.debug(f"DeformAUE: aue_metrics keys={list(aue_metrics.keys())}, vis_data={'✓' if vis_data is not None else '✗'}")
                 
                 # Check if vis_data is AUEVisualizationData or dict
                 if vis_data is not None:

@@ -154,58 +154,91 @@ class SAM2Base(torch.nn.Module):
         aue_diversity_loss_weight: float = 0.0,  # Weight for diversity regularization (0 = disabled)
         # Constraint weight for adversarial samples (L1 distance to initial)
         aue_constraint_loss_weight: float = 0.0,  # Weight for constraint regularization (0 = disabled)
-        # Style Augmentation options (alternative to AUE, for domain generalization)
-        use_style_aug: bool = False,
-        style_aug_mode: str = "image_level",  # "image_level" or "feature_level"
-        style_aug_pgd_steps: int = 5,
-        style_aug_pgd_step_size: float = 0.1,
-        style_aug_pgd_epsilon: float = 2.0,
-        style_aug_use_gt_region_style: bool = False,  # Extract style only from GT region
+        # Attack mode: "cooperative" (parallel prediction, joint application) or "sequential" (iterative)
+        aue_attack_mode: str = "cooperative",
+        # Style Adversarial options (alternative to AUE, for domain generalization)
+        use_style_adv: bool = False,
+        style_adv_mode: str = "image_level",  # "image_level" or "feature_level"
+        style_adv_use_gt_region_style: bool = False,  # Extract style only from GT region
         # Multi-object style attack control
-        style_aug_use_multi_object: bool = False,  # true=attack with all objects, false=only current loss object
-        style_aug_enable_background: bool = False,  # true=include background as K+1, false=objects only
-        # Global-Local Mixed Style Augmentation
-        style_aug_use_global_local_mix: bool = False,  # Enable global+local mixed style perturbation
-        style_aug_global_epsilon: float = 1.5,  # Perturbation budget for global style
-        style_aug_global_weight: float = 0.7,  # Weight of global style shift (0=local only, 1=global only)
+        style_adv_use_multi_object: bool = False,  # true=attack with all objects, false=only current loss object
+        style_adv_enable_background: bool = False,  # true=include background as K+1, false=objects only
+        # Global-Local Mixed Style Adversarial
+        style_adv_use_global_local_mix: bool = False,  # Enable global+local mixed style perturbation
+        style_adv_global_epsilon: float = 1.5,  # Perturbation budget for global style
+        style_adv_global_weight: float = 0.7,  # Weight of global style shift (0=local only, 1=global only)
         # Distribution matching configuration for AUE calibration loss
         aue_dist_matching_config: dict | None = None,  # Nested config dict
         # Analytic uncertainty computation (from Weibull parameters, with gradients)
         aue_use_analytic_uncertainty: bool = True,  # Use analytic uncertainty (enables bidirectional optimization)
+        # Consistency weight for adversarial uncertainty regularization
+        aue_consistency_weight: float = 0.5,  # Weight for MMD(U_clean, U_adv) consistency loss
         # GCN-based multi-object style refinement
-        style_aug_use_gcn: bool = False,
-        style_aug_gcn_hidden_dim: int = 32,  # Deprecated, kept for backward compatibility
-        style_aug_gcn_num_layers: int = 2,
-        style_aug_gcn_edge_threshold: float = 0.3,
-        style_aug_gcn_use_semantic_edges: bool = True,
-        style_aug_gcn_use_background_edges: bool = False,
-        style_aug_gcn_distance_threshold: float | None = 0.35,
-        style_aug_gcn_use_boundary_distance: bool = False,  # Use boundary distance instead of centroid distance
-        style_aug_gcn_use_visual_features: bool = False,  # Enable visual features in GCN for semantic edges
-        style_aug_gcn_feature_dim: int = 256,  # Feature dimension (matches backbone_fpn[-1])
-        style_aug_gcn_feature_sim_threshold: float = 0.5,  # Cosine similarity threshold for semantic edges
-        # Deformation Augmentation options (DG-Font style, feature-level)
-        use_deform_aug: bool = False,
-        deform_aug_epsilon: float = 30.0,  # Deformation strength in pixels (image space)
-        deform_aug_pgd_steps: int = 3,  # PGD steps for deformation (placeholder, not used yet)
-        deform_aug_use_soft_composite: bool = True,  # Use soft compositing for overlaps
-        deform_aug_temperature: float = 1.0,  # Temperature for soft compositing
-        deform_aug_use_gcn: bool = False,  # GCN coordination for multi-object deformations
-        deform_aug_gcn_num_layers: int = 2,  # Number of GCN layers
-        deform_aug_num_deform_groups: int = 4,  # Number of deformable convolution groups
+        style_adv_use_gcn: bool = False,
+        style_adv_gcn_hidden_dim: int = 32,  # Deprecated, kept for backward compatibility
+        style_adv_gcn_num_layers: int = 2,
+        style_adv_gcn_edge_threshold: float = 0.3,
+        style_adv_gcn_use_semantic_edges: bool = True,
+        style_adv_gcn_use_background_edges: bool = False,
+        style_adv_gcn_distance_threshold: float | None = 0.35,
+        style_adv_gcn_use_boundary_distance: bool = False,  # Use boundary distance instead of centroid distance
+        style_adv_gcn_use_visual_features: bool = False,  # Enable visual features in GCN for semantic edges
+        style_adv_gcn_feature_dim: int = 256,  # Feature dimension (matches backbone_fpn[-1])
+        style_adv_gcn_feature_sim_threshold: float = 0.5,  # Cosine similarity threshold for semantic edges
+        # Deformation Adversarial options (DG-Font style, feature-level)
+        use_deform_adv: bool = False,
+        deform_adv_epsilon: float = 30.0,  # Deformation strength in pixels (image space)
+        deform_adv_use_soft_composite: bool = True,  # Use soft compositing for overlaps
+        deform_adv_temperature: float = 1.0,  # Temperature for soft compositing
+        deform_adv_use_gcn: bool = False,  # GCN coordination for multi-object deformations
+        deform_adv_gcn_num_layers: int = 2,  # Number of GCN layers
+        deform_adv_num_deform_groups: int = 4,  # Number of deformable convolution groups
         # Feature-based deformation options
-        deform_aug_init_from_memory_encoder: bool = True,  # Initialize from memory encoder
-        deform_aug_freeze_mask_encoder: bool = False,  # Freeze mask encoder weights
-        # Augmentation pipeline control
-        adversarial_aug_order: list[str] | None = None,  # Order of augmentations, e.g., ["deform", "style"]
+        deform_adv_init_from_memory_encoder: bool = True,  # Initialize from memory encoder
+        deform_adv_freeze_mask_encoder: bool = False,  # Freeze mask encoder weights
+        # Adversarial pipeline control
+        adversarial_attack_order: list[str] | None = None,  # Order of attacks, e.g., ["deform", "style"]
         # Max number of objects (for AUE tensor allocation, matches dataset sampler)
         max_num_objects: int = 11,  # Default: 10 objects + 1 background
+        # Conv-LoRA options (parameter-efficient fine-tuning)
+        use_conv_lora: bool = False,
+        conv_lora_rank: int = 8,
+        conv_lora_alpha: float = 16.0,
+        conv_lora_dropout: float = 0.0,
+        conv_lora_expert_scales: list[float] | None = None,  # e.g., [1.0, 0.5, 2.0]
+        conv_lora_target_modules: list[str] | None = None,  # e.g., ["attn.qkv", "attn.proj", "mlp"]
     ):
         super().__init__()
         self.max_num_objects = max_num_objects
+        self.aue_attack_mode = aue_attack_mode
 
         # Part 1: the image backbone
         self.image_encoder = image_encoder
+        
+        # Apply Conv-LoRA if enabled (parameter-efficient fine-tuning)
+        self.use_conv_lora = use_conv_lora
+        if use_conv_lora:
+            from sam2.modeling.conv_lora import inject_conv_lora
+            expert_scales = conv_lora_expert_scales or [1.0, 0.5, 2.0]
+            conv_lora_config = {
+                'rank': conv_lora_rank,
+                'alpha': conv_lora_alpha,
+                'dropout': conv_lora_dropout,
+                'expert_scales': expert_scales,
+                'target_modules': conv_lora_target_modules or [
+                    "attn.qkv", "attn.proj", "mlp.layers.0", "mlp.layers.1"
+                ],
+            }
+            # Apply to trunk (Hiera backbone) only
+            self.image_encoder.trunk = inject_conv_lora(
+                self.image_encoder.trunk,
+                conv_lora_config,
+                verbose=True
+            )
+            logging.info(
+                f"Conv-LoRA enabled: rank={conv_lora_rank}, alpha={conv_lora_alpha}, "
+                f"expert_scales={expert_scales}, targets={conv_lora_config['target_modules']}"
+            )
         # Use level 0, 1, 2 for high-res setting, or just level 2 for the default setting
         self.use_high_res_features_in_sam = use_high_res_features_in_sam
         self.num_feature_levels = 3 if use_high_res_features_in_sam else 1
@@ -346,56 +379,52 @@ class SAM2Base(torch.nn.Module):
             )
             self._build_aue_components()
 
-        # Style Augmentation components (alternative to AUE)
-        self.use_style_aug = bool(use_style_aug)
-        self.style_aug_mode = str(style_aug_mode)
-        self.style_aug_pgd_steps = int(style_aug_pgd_steps)
-        self.style_aug_pgd_step_size = float(style_aug_pgd_step_size)
-        self.style_aug_pgd_epsilon = float(style_aug_pgd_epsilon)
-        self.style_aug_use_gt_region_style = bool(style_aug_use_gt_region_style)
+        # Style Adversarial components (alternative to AUE)
+        self.use_style_adv = bool(use_style_adv)
+        self.style_adv_mode = str(style_adv_mode)
+        self.style_adv_use_gt_region_style = bool(style_adv_use_gt_region_style)
         # Multi-object style attack control
-        self.style_aug_use_multi_object = bool(style_aug_use_multi_object)
-        self.style_aug_enable_background = bool(style_aug_enable_background)
+        self.style_adv_use_multi_object = bool(style_adv_use_multi_object)
+        self.style_adv_enable_background = bool(style_adv_enable_background)
         # Global-Local Mixed Style parameters
-        self.style_aug_use_global_local_mix = bool(style_aug_use_global_local_mix)
-        self.style_aug_global_epsilon = float(style_aug_global_epsilon)
-        self.style_aug_global_weight = float(style_aug_global_weight)
+        self.style_adv_use_global_local_mix = bool(style_adv_use_global_local_mix)
+        self.style_adv_global_epsilon = float(style_adv_global_epsilon)
+        self.style_adv_global_weight = float(style_adv_global_weight)
         # GCN parameters
-        self.style_aug_use_gcn = bool(style_aug_use_gcn)
-        self.style_aug_gcn_hidden_dim = int(style_aug_gcn_hidden_dim)  # Deprecated
-        self.style_aug_gcn_num_layers = int(style_aug_gcn_num_layers)
-        self.style_aug_gcn_edge_threshold = float(style_aug_gcn_edge_threshold)
-        self.style_aug_gcn_use_semantic_edges = bool(style_aug_gcn_use_semantic_edges)
-        self.style_aug_gcn_use_background_edges = bool(style_aug_gcn_use_background_edges)
-        self.style_aug_gcn_distance_threshold = (
-            float(style_aug_gcn_distance_threshold)
-            if style_aug_gcn_distance_threshold is not None
+        self.style_adv_use_gcn = bool(style_adv_use_gcn)
+        self.style_adv_gcn_hidden_dim = int(style_adv_gcn_hidden_dim)  # Deprecated
+        self.style_adv_gcn_num_layers = int(style_adv_gcn_num_layers)
+        self.style_adv_gcn_edge_threshold = float(style_adv_gcn_edge_threshold)
+        self.style_adv_gcn_use_semantic_edges = bool(style_adv_gcn_use_semantic_edges)
+        self.style_adv_gcn_use_background_edges = bool(style_adv_gcn_use_background_edges)
+        self.style_adv_gcn_distance_threshold = (
+            float(style_adv_gcn_distance_threshold)
+            if style_adv_gcn_distance_threshold is not None
             else None
         )
-        self.style_aug_gcn_use_boundary_distance = bool(style_aug_gcn_use_boundary_distance)
-        self.style_aug_gcn_use_visual_features = bool(style_aug_gcn_use_visual_features)
-        self.style_aug_gcn_feature_dim = int(style_aug_gcn_feature_dim)
-        self.style_aug_gcn_feature_sim_threshold = float(style_aug_gcn_feature_sim_threshold)
+        self.style_adv_gcn_use_boundary_distance = bool(style_adv_gcn_use_boundary_distance)
+        self.style_adv_gcn_use_visual_features = bool(style_adv_gcn_use_visual_features)
+        self.style_adv_gcn_feature_dim = int(style_adv_gcn_feature_dim)
+        self.style_adv_gcn_feature_sim_threshold = float(style_adv_gcn_feature_sim_threshold)
         self._latest_gcn_stats: dict[str, float] | None = None
-        if self.use_style_aug:
-            self._build_style_aug_components()
+        if self.use_style_adv:
+            self._build_style_adv_components()
         
-        # Deformation Augmentation components (DG-Font style)
-        self.use_deform_aug = bool(use_deform_aug)
-        self.deform_aug_epsilon = float(deform_aug_epsilon)
-        self.deform_aug_pgd_steps = int(deform_aug_pgd_steps)
-        self.deform_aug_use_soft_composite = bool(deform_aug_use_soft_composite)
-        self.deform_aug_temperature = float(deform_aug_temperature)
-        self.deform_aug_use_gcn = bool(deform_aug_use_gcn)
-        self.deform_aug_gcn_num_layers = int(deform_aug_gcn_num_layers)
-        self.deform_aug_num_deform_groups = int(deform_aug_num_deform_groups)
-        self.deform_aug_init_from_memory_encoder = bool(deform_aug_init_from_memory_encoder)
-        self.deform_aug_freeze_mask_encoder = bool(deform_aug_freeze_mask_encoder)
-        if self.use_deform_aug:
-            self._build_deform_aug_components()
+        # Deformation Adversarial components (DG-Font style)
+        self.use_deform_adv = bool(use_deform_adv)
+        self.deform_adv_epsilon = float(deform_adv_epsilon)
+        self.deform_adv_use_soft_composite = bool(deform_adv_use_soft_composite)
+        self.deform_adv_temperature = float(deform_adv_temperature)
+        self.deform_adv_use_gcn = bool(deform_adv_use_gcn)
+        self.deform_adv_gcn_num_layers = int(deform_adv_gcn_num_layers)
+        self.deform_adv_num_deform_groups = int(deform_adv_num_deform_groups)
+        self.deform_adv_init_from_memory_encoder = bool(deform_adv_init_from_memory_encoder)
+        self.deform_adv_freeze_mask_encoder = bool(deform_adv_freeze_mask_encoder)
+        if self.use_deform_adv:
+            self._build_deform_adv_components()
         
-        # Augmentation pipeline ordering
-        self.adversarial_aug_order = adversarial_aug_order or ["deform", "style"]
+        # Adversarial pipeline ordering
+        self.adversarial_attack_order = adversarial_attack_order or ["deform", "style"]
 
         # Model compilation
         if compile_image_encoder:
@@ -497,13 +526,14 @@ class SAM2Base(torch.nn.Module):
     
 
 
-    def _build_style_aug_components(self) -> None:
+    def _build_style_adv_components(self) -> None:
         """
         Build style augmentation components for adversarial training.
         
         Style-based adversarial training using:
         - AdaIN: Style transfer for domain augmentation
-        - PGD: Iterative adversarial optimization in style space
+        Style-based adversarial training using:
+        - AdaIN: Style transfer for domain augmentation
         
         No pre-computed style bank needed - styles are extracted on-the-fly.
         """
@@ -512,53 +542,49 @@ class SAM2Base(torch.nn.Module):
         self.adain = AdaIN()
         
         # GCN module for multi-object style refinement
-        if self.style_aug_use_gcn:
-            if not self.style_aug_use_multi_object:
-                raise ValueError("GCN requires style_aug_use_multi_object=True")
-            if self.style_aug_use_global_local_mix:
-                raise ValueError("GCN is incompatible with style_aug_use_global_local_mix")
+        if self.style_adv_use_gcn:
+            if not self.style_adv_use_multi_object:
+                raise ValueError("GCN requires style_adv_use_multi_object=True")
+            if self.style_adv_use_global_local_mix:
+                raise ValueError("GCN is incompatible with style_adv_use_global_local_mix")
             
             from sam2.modeling.style_gcn import AdversarialStyleGCN
             self.style_gcn = AdversarialStyleGCN(
                 style_dim=6,
-                feature_dim=self.style_aug_gcn_feature_dim if self.style_aug_gcn_use_visual_features else 0,
-                num_layers=self.style_aug_gcn_num_layers,
+                feature_dim=self.style_adv_gcn_feature_dim if self.style_adv_gcn_use_visual_features else 0,
+                num_layers=self.style_adv_gcn_num_layers,
             )
             logging.info(
-                f"GCN module built: num_layers={self.style_aug_gcn_num_layers}, "
-                f"use_visual_features={self.style_aug_gcn_use_visual_features}, "
-                f"feature_dim={self.style_aug_gcn_feature_dim if self.style_aug_gcn_use_visual_features else 0}"
+                f"GCN module built: num_layers={self.style_adv_gcn_num_layers}, "
+                f"use_visual_features={self.style_adv_gcn_use_visual_features}, "
+                f"feature_dim={self.style_adv_gcn_feature_dim if self.style_adv_gcn_use_visual_features else 0}"
             )
         else:
             self.style_gcn = None
         
         # Build style augmenter (unified interface)
-        from sam2.modeling.adversarial_augmentation import AdversarialAugmenter
-        self.style_augmenter = AdversarialAugmenter(
-            mode=self.style_aug_mode,
+        from sam2.modeling.adversarial_augmentation import AdversarialAttacker
+        self.style_attacker = AdversarialAttacker(
+            mode=self.style_adv_mode,
             aug_type="style",
-            pgd_steps=self.style_aug_pgd_steps,
-            epsilon=self.style_aug_pgd_epsilon,
-            step_size=self.style_aug_pgd_step_size,
-            use_multi_object=self.style_aug_use_multi_object,
-            use_gcn=self.style_aug_use_gcn,
-            use_gt_region_style=self.style_aug_use_gt_region_style,
-            enable_background=self.style_aug_enable_background,
-            use_global_local_mix=self.style_aug_use_global_local_mix,
-            global_epsilon=self.style_aug_global_epsilon,
-            global_weight=self.style_aug_global_weight,
-            num_objects=self.max_num_objects + (1 if self.style_aug_enable_background else 0),
+            use_multi_object=self.style_adv_use_multi_object,
+            use_gcn=self.style_adv_use_gcn,
+            use_gt_region_style=self.style_adv_use_gt_region_style,
+            enable_background=self.style_adv_enable_background,
+            use_global_local_mix=self.style_adv_use_global_local_mix,
+            global_epsilon=self.style_adv_global_epsilon,
+            global_weight=self.style_adv_global_weight,
+            num_objects=self.max_num_objects + (1 if self.style_adv_enable_background else 0),
         )
         
         logging.info(
             f"Style augmentation components built: "
-            f"pgd_steps={self.style_aug_pgd_steps}, "
-            f"epsilon={self.style_aug_pgd_epsilon}"
+            f"mode={self.style_adv_mode}"
         )
         
 
     
-    def _build_deform_aug_components(self) -> None:
+    def _build_deform_adv_components(self) -> None:
         """
         Build feature-level deformation augmentation components.
         
@@ -566,34 +592,34 @@ class SAM2Base(torch.nn.Module):
         Produces dual outputs: feature-level deformation + image-level offsets.
         Optionally initializes weights from pretrained memory encoder.
         """
-        from sam2.modeling.adversarial_augmentation import AdversarialAugmenter
+        from sam2.modeling.adversarial_augmentation import AdversarialAttacker
         
         # Build deformation augmenter (feature-level with image offset prediction)
-        self.deform_augmenter = AdversarialAugmenter(
+        self.deform_attacker = AdversarialAttacker(
             mode="feature_level",
             aug_type="deformation",
             feature_dim=256,
-            epsilon=self.deform_aug_epsilon,
-            use_soft_composite=self.deform_aug_use_soft_composite,
-            temperature=self.deform_aug_temperature,
-            use_gcn=self.deform_aug_use_gcn,
-            gcn_num_layers=self.deform_aug_gcn_num_layers,
-            num_deform_groups=self.deform_aug_num_deform_groups,
-            init_from_memory_encoder=self.deform_aug_init_from_memory_encoder,
-            freeze_mask_encoder=self.deform_aug_freeze_mask_encoder,
+            epsilon=self.deform_adv_epsilon,
+            use_soft_composite=self.deform_adv_use_soft_composite,
+            temperature=self.deform_adv_temperature,
+            use_gcn=self.deform_adv_use_gcn,
+            gcn_num_layers=self.deform_adv_gcn_num_layers,
+            num_deform_groups=self.deform_adv_num_deform_groups,
+            init_from_memory_encoder=self.deform_adv_init_from_memory_encoder,
+            freeze_mask_encoder=self.deform_adv_freeze_mask_encoder,
             image_size=self.image_size,  # Pass image_size for image-level offset prediction
         )
         
         # Load pretrained weights from memory encoder if enabled
-        if self.deform_aug_init_from_memory_encoder:
+        if self.deform_adv_init_from_memory_encoder:
             self.deform_augmenter.impl.load_memory_encoder_weights(self.memory_encoder)
         
         logging.info(
             f"Deformation augmentation built: "
-            f"epsilon={self.deform_aug_epsilon}, "
+            f"epsilon={self.deform_adv_epsilon}, "
             f"image_size={self.image_size}, "
-            f"init_from_memory_encoder={self.deform_aug_init_from_memory_encoder}, "
-            f"freeze_mask_encoder={self.deform_aug_freeze_mask_encoder}"
+            f"init_from_memory_encoder={self.deform_adv_init_from_memory_encoder}, "
+            f"freeze_mask_encoder={self.deform_adv_freeze_mask_encoder}"
         )
         
 
@@ -840,6 +866,7 @@ class SAM2Base(torch.nn.Module):
         pixel_bndl_model,
         compute_logits: bool = True,
         compute_uncertainty: bool = False,
+        compute_analytic_uncertainty: bool = False,
         uq_sample_num: int = 20,
     ) -> BNDLOutputs | None:
         """
@@ -851,8 +878,9 @@ class SAM2Base(torch.nn.Module):
             aux_outputs: Auxiliary outputs containing BNDL dict
             pixel_bndl_model: BNDL model for computing logits/uncertainty
             compute_logits: Whether to compute logits if not present
-            compute_uncertainty: Whether to compute sampling-based uncertainty
-            uq_sample_num: Number of samples for uncertainty estimation
+            compute_uncertainty: Whether to compute sampling-based uncertainty (no grad)
+            compute_analytic_uncertainty: Whether to compute analytic uncertainty (with grad)
+            uq_sample_num: Number of samples for uncertainty estimation (only for sampling)
         
         Returns:
             BNDLOutputs containing pixel_feat, external_w, pixel_logits, pixel_uncertainty
@@ -885,7 +913,26 @@ class SAM2Base(torch.nn.Module):
         
         # Compute uncertainty if requested
         pixel_uncertainty = None
-        if compute_uncertainty:
+        if compute_analytic_uncertainty:
+            # Analytic uncertainty from Weibull parameters (with gradients)
+            use_analytic = getattr(self, 'aue_use_analytic_uncertainty', True)
+            if use_analytic and pixel_bndl_model is not None:
+                from sam2.modeling.bndl_utils import pixel_weibull_to_entropy_uncertainty
+                pixel_uncertainty = pixel_weibull_to_entropy_uncertainty(
+                    pixel_bndl_model=pixel_bndl_model,
+                    pixel_feat=pixel_feat,
+                    external_pre_out_w=external_w,
+                    per_channel=False,
+                ).clamp(0.0, 1.0)
+            elif pixel_logits is not None:
+                # Fallback: 1 - confidence
+                if pixel_logits.ndim == 4:  # [B, H, W, K]
+                    confidence = torch.sigmoid(pixel_logits).max(dim=-1)[0]
+                else:  # [B, H, W]
+                    confidence = torch.sigmoid(pixel_logits)
+                pixel_uncertainty = (1.0 - confidence).clamp(0.0, 1.0)
+        elif compute_uncertainty:
+            # Sampling-based uncertainty (no gradients)
             with torch.no_grad():
                 from BNDL.BNDL_upload.ViT_Sparse.utils.bndl import pixel_entropy_uncertainty
                 pixel_uncertainty = pixel_entropy_uncertainty(
@@ -934,7 +981,7 @@ class SAM2Base(torch.nn.Module):
         pixel_bndl_model,
         uq_sample_num: int,
         high_res_features: list[torch.Tensor] | None = None, # NEW: Accept high-res features
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, dict, torch.Tensor]:
         """
         Compute calibration loss for augmented features (deformation or style).
         
@@ -948,18 +995,30 @@ class SAM2Base(torch.nn.Module):
             high_res_features: List of high-res features [stride 4, stride 8]
         
         Returns:
-            Calibration loss scalar
+            calibration_loss: Scalar loss
+            metrics: Dict of metrics
+            adv_uncertainty: [B, H, W] uncertainty map
         """
-        # 1. Extract BNDL outputs
+        # 1. Extract BNDL outputs with analytic uncertainty
         bndl_outputs = self._extract_bndl_outputs(
             aux_outputs, pixel_bndl_model,
-            compute_logits=True, compute_uncertainty=True, uq_sample_num=uq_sample_num
+            compute_logits=True,
+            compute_analytic_uncertainty=True,  # Use analytic for consistency loss
+            uq_sample_num=uq_sample_num
         )
         if bndl_outputs is None:
             logging.warning("No pixel features in augmented outputs, returning zero loss")
-            return torch.tensor(0.0, device=pixel_gt.device, dtype=torch.float32), {}
+            device = pixel_gt.device
+            return (
+                torch.tensor(0.0, device=device, dtype=torch.float32),
+                {},
+                torch.zeros(pixel_gt.shape[0], 1, 1, device=device, dtype=torch.float32)
+            )
         
-        # 2. Prepare GT
+        # 2. Extract adversarial uncertainty (already computed in _extract_bndl_outputs)
+        adv_uncertainty = bndl_outputs.pixel_uncertainty  # [B, H, W]
+        
+        # 3. Prepare GT
         if bndl_outputs.pixel_logits is not None:
             H, W = bndl_outputs.pixel_logits.shape[1:3]
         else:
@@ -969,43 +1028,46 @@ class SAM2Base(torch.nn.Module):
         # Select feature map for domain-aware method
         feature_map_for_calibration = None
         if self.aue_dist_matching_config['method'] == 'domain_aware_soft_mmd':
-             # Assume high_res_features is always present as per user config
-             feature_map_for_calibration = high_res_features[0]
+            if high_res_features is not None and len(high_res_features) > 0:
+                feature_map_for_calibration = high_res_features[0]
+            else:
+                feature_map_for_calibration = None
 
-        # 3. Compute calibration loss
+        # 4. Compute calibration loss
         # Note: For augmented branch, we pass augmented backbone features
         # This allows domain_aware_soft_mmd to work if configured
-        return self._compute_uncertainty_calibration_loss(
+        calibration_loss, metrics = self._compute_uncertainty_calibration_loss(
             bndl_outputs, 
             pixel_gt_prepared, 
             pixel_bndl_model,
             backbone_features=feature_map_for_calibration,  # Pass selected features
             tag="augmented", # NEW: Debug tag
         )
+        
+        return calibration_loss, metrics, adv_uncertainty
     
-    def _apply_adversarial_augmentation_pipeline(
+    def _apply_adversarial_attack_pipeline(
         self,
         img_batch: torch.Tensor,
-        pixel_gt: torch.Tensor,
         backbone_features: torch.Tensor,
-        high_res_features: list[torch.Tensor] | None,
-        uq_sample_num: int,
-        enable_vis: bool,
-        vis_refs: dict,
+        high_res_features: list[torch.Tensor],
+        pixel_gt: torch.Tensor,
+        enable_vis: bool = False,
+        uq_sample_num: int = 8,
     ) -> dict:
         """
-        Apply adversarial augmentation pipeline with configurable ordering.
+        Apply adversarial attack pipeline (cooperative or sequential).
         
-        Pipeline supports flexible ordering via self.adversarial_aug_order.
-        Examples:
-            - ["deform", "style"]: Deform first, then style (default)
-            - ["style", "deform"]: Style first, then deform
-            - ["deform"]: Only deformation
-            - ["style"]: Only style
+        Modes:
+        - Cooperative: Predict all params first (parallel), then apply (jointly).
+        - Sequential: Predict and apply iteratively (legacy).
         
-        Each augmenter can operate in two modes:
-            - Mode 1 (Efficient): Reuse features from previous step
-            - Mode 2 (Flexible): Encode current image on-demand
+        Args:
+            img_batch: [B, 3, H, W]
+            backbone_features: [B, C, H/4, W/4]
+            high_res_features: List of high-res features
+            pixel_gt: [B, H, W]
+            enable_vis: Whether to return visualization data
         
         Returns:
             dict with keys:
@@ -1020,14 +1082,20 @@ class SAM2Base(torch.nn.Module):
             'pixel_gt': pixel_gt,
         }
         
-        # === Apply augmentations in configured order ===
-        for aug_name in self.adversarial_aug_order:
-            state = self._apply_single_augmentation(
-                aug_name=aug_name,
-                state=state,
-                enable_vis=enable_vis,
-                vis_refs=vis_refs,
-            )
+        vis_refs = {} # Initialize vis_refs here
+        
+        if self.aue_attack_mode == "cooperative":
+            state = self._apply_cooperative_attack(state, enable_vis, vis_refs)
+        else:
+            # === Sequential Strategy: Predict and Apply one by one ===
+            # Existing logic (legacy behavior)
+            for aug_name in self.adversarial_attack_order:
+                state = self._apply_single_attack(
+                    aug_name=aug_name,
+                    state=state,
+                    enable_vis=enable_vis,
+                    vis_refs=vis_refs,
+                )
         
         # === Compute adversarial calibration loss ===
         final_features = state['features']
@@ -1037,6 +1105,7 @@ class SAM2Base(torch.nn.Module):
         # Forward through SAM heads
         calibration_loss_adversarial = torch.tensor(0.0, device=img_batch.device, dtype=img_batch.dtype)
         aug_metrics = {}
+        adv_uncertainty = None
         
         if final_features is not backbone_features:
             prev_suppress = getattr(self, "_suppress_nested_aue", False)
@@ -1051,12 +1120,12 @@ class SAM2Base(torch.nn.Module):
             finally:
                 self._suppress_nested_aue = prev_suppress
             
-            # Compute calibration loss
+            # Compute calibration loss and extract uncertainty
             pixel_bndl_model = None
             if hasattr(self.sam_mask_decoder, 'pixel_bndl'):
                 pixel_bndl_model = self.sam_mask_decoder.pixel_bndl
             
-            calibration_loss_adversarial, aug_metrics = self._compute_augmented_calibration_loss(
+            calibration_loss_adversarial, aug_metrics, adv_uncertainty = self._compute_augmented_calibration_loss(
                 aux_outputs=aux_outputs,
                 pixel_gt=final_pixel_gt,
                 pixel_bndl_model=pixel_bndl_model,
@@ -1069,10 +1138,101 @@ class SAM2Base(torch.nn.Module):
         return {
             'calibration_loss_adversarial': calibration_loss_adversarial,
             'aug_metrics': aug_metrics, # Return augmented metrics
+            'adv_uncertainty': adv_uncertainty,  # Return adversarial uncertainty
             'vis_refs': vis_refs,
         }
     
-    def _apply_single_augmentation(
+    def _apply_cooperative_attack(
+        self,
+        state: dict,
+        enable_vis: bool,
+        vis_refs: dict,
+    ) -> dict:
+        """
+        Apply cooperative adversarial attack.
+        
+        Strategy:
+        1. Predict parameters for all active attackers using CLEAN features.
+           This allows joint optimization as gradients flow back to all parameter networks
+           from the final loss, without interference from intermediate steps.
+        2. Apply transformations sequentially using the predicted parameters.
+        """
+        aug_params = {}
+        clean_features = state['features']
+        pixel_gt = state['pixel_gt']
+        img_batch = state['img']
+        
+        # === Phase 1: Predict (Parallel) ===
+        for aug_name in self.adversarial_attack_order:
+            attacker = getattr(self, f"{aug_name}_attacker", None)
+            if attacker is not None:
+                # Predict params using clean features
+                # Note: predict_params implementations handle detaching input features
+                # to prevent backbone updates from the prediction path.
+                params = attacker.predict_params(
+                    clean_features=clean_features,
+                    pixel_gt=pixel_gt,
+                    model=self,
+                    img_batch=img_batch # Needed for style
+                )
+                aug_params[aug_name] = params
+        
+        # === Phase 2: Apply (Sequential) ===
+        for aug_name in self.adversarial_attack_order:
+            if aug_name not in aug_params:
+                continue
+                
+            attacker = getattr(self, f"{aug_name}_attacker")
+            params = aug_params[aug_name]
+            
+            # Apply transform
+            # Note: We pass the CURRENT state features/images, which might have been
+            # modified by previous augmentations in the loop.
+            
+            if attacker.mode == "image_level":
+                # Image level attack (e.g. Style)
+                styled_images = attacker.apply_transform(
+                    img_batch=state['img'],
+                    params=params,
+                    pixel_gt=state['pixel_gt'],
+                    model=self
+                )
+                state['img'] = styled_images
+                
+                # Re-encode (checkpointed)
+                backbone_out = self.forward_image(styled_images, use_checkpoint=True)
+                state['features'] = backbone_out['backbone_fpn'][-1]
+                if self.use_high_res_features_in_sam:
+                    state['high_res'] = [
+                        backbone_out['backbone_fpn'][0],
+                        backbone_out['backbone_fpn'][1]
+                    ]
+                    
+                # Visualization data
+                if enable_vis:
+                    vis_refs['adversarial_images'] = styled_images.detach().cpu()
+                    if attacker.aug_type == "style":
+                        vis_refs['adversarial_styles'] = params.detach().cpu()
+                        
+            elif attacker.mode == "feature_level":
+                # Feature level attack (e.g. Deform)
+                deformed_features = attacker.apply_transform(
+                    img_batch=state['img'],
+                    clean_features=state['features'], # Use current features
+                    params=params,
+                    pixel_gt=state['pixel_gt'],
+                    model=self
+                )
+                state['features'] = deformed_features
+                
+                # Visualization data
+                if enable_vis:
+                    if attacker.aug_type == "deformation":
+                        vis_refs['deform_offsets'] = params["image_offsets"].detach().cpu()
+                        
+        return state
+
+    def _apply_single_attack(
         self,
         aug_name: str,
         state: dict,
@@ -1080,16 +1240,16 @@ class SAM2Base(torch.nn.Module):
         vis_refs: dict,
     ) -> dict:
         """
-        Apply a single augmentation and update pipeline state.
+        Apply a single attack and update pipeline state.
         
         This is a clean abstraction that:
-            1. Checks if augmentation is enabled
-            2. Calls the augmenter with current state
-            3. Updates state based on augmentation result
+            1. Checks if attack is enabled
+            2. Calls the attacker with current state
+            3. Updates state based on attack result
             4. Handles visualization
         
         Args:
-            aug_name: Name of augmentation ("deform" or "style")
+            aug_name: Name of attack ("deform" or "style")
             state: Current pipeline state (img, features, high_res, pixel_gt)
             enable_vis: Whether to save visualization data
             vis_refs: Visualization reference dict
@@ -1098,32 +1258,32 @@ class SAM2Base(torch.nn.Module):
             Updated state dict
         """
         if aug_name == "deform":
-            self._apply_deformation_augmentation(state, enable_vis, vis_refs)
+            self._apply_deformation_attack(state, enable_vis, vis_refs)
         elif aug_name == "style":
-            self._apply_style_augmentation(state, enable_vis, vis_refs)
+            self._apply_style_attack(state, enable_vis, vis_refs)
         
         # Validate state before returning
         assert state['features'] is not None, \
-            f"State must have features after {aug_name} augmentation"
+            f"State must have features after {aug_name} attack"
         
         if self.use_high_res_features_in_sam:
             assert state['high_res'] is not None, \
-                f"State must have high_res_features after {aug_name} augmentation when use_high_res_features_in_sam=True"
+                f"State must have high_res_features after {aug_name} attack when use_high_res_features_in_sam=True"
         
         return state
     
-    def _apply_deformation_augmentation(
+    def _apply_deformation_attack(
         self,
         state: dict,
         enable_vis: bool,
         vis_refs: dict,
     ) -> None:
-        """Apply deformation augmentation and update state."""
-        if not (self.use_deform_aug and hasattr(self, 'deform_augmenter')):
+        """Apply deformation attack and update state."""
+        if not (self.use_deform_adv and hasattr(self, 'deform_attacker')):
             return
         
         # Apply deformation
-        deform_result = self.deform_augmenter.apply(
+        deform_result = self.deform_attacker.apply(
             img_batch=state['img'],
             clean_features=state['features'],
             clean_high_res=state['high_res'],
@@ -1160,17 +1320,11 @@ class SAM2Base(torch.nn.Module):
             #   so that the deformation network (adversary) can be trained.
             # - To save memory and prevent backbone updates on this branch, we
             #   temporarily freeze backbone parameters.
-            logging.debug("Re-encoding warped image (backbone frozen, input grad enabled)")
             
-            # Memory Optimization:
-            # We use checkpointing to save memory. We do NOT freeze backbone weights here
-            # because dynamic freezing breaks activation checkpointing (metadata mismatch).
-            # Gradients will be computed for backbone weights, which is acceptable.
-            logging.debug("Re-encoding warped image (checkpointing enabled)")
-            backbone_out = self.forward_image(augmented_img, use_checkpoint=True)
-            
+            # Re-encode (checkpointed) without updating backbone grads on adv branch
+            with torch.no_grad():
+                backbone_out = self.forward_image(augmented_img, use_checkpoint=True)
             state['features'] = backbone_out['backbone_fpn'][-1]
-            
             if self.use_high_res_features_in_sam:
                 state['high_res'] = [
                     backbone_out['backbone_fpn'][0],  # 256×256
@@ -1189,21 +1343,21 @@ class SAM2Base(torch.nn.Module):
         # Cleanup
         self._cleanup_augmentation_results([deform_result])
     
-    def _apply_style_augmentation(
+    def _apply_style_attack(
         self,
         state: dict,
         enable_vis: bool,
         vis_refs: dict,
     ) -> None:
-        """Apply style augmentation and update state."""
-        if not (self.use_style_aug and hasattr(self, 'style_augmenter')):
+        """Apply style attack and update state."""
+        if not (self.use_style_adv and hasattr(self, 'style_attacker')):
             return
         
         # Detach image to prevent gradient flow through deformation
         img_detached = state['img'].detach() if state['img'].requires_grad else state['img']
         
         # Apply style
-        style_result = self.style_augmenter.apply(
+        style_result = self.style_attacker.apply(
             img_batch=img_detached,
             clean_features=state['features'],
             clean_high_res=state['high_res'],
@@ -1411,7 +1565,7 @@ class SAM2Base(torch.nn.Module):
         aug_metrics = {} # Initialize empty metrics for augmented branch
         vis_data = None  # Initialize outside try block for visualization
         
-        if (self.use_deform_aug or self.use_style_aug) and backbone_features is not None:
+        if (self.use_deform_adv or self.use_style_adv) and backbone_features is not None:
             # Clear cache before memory-intensive adversarial branch
             torch.cuda.empty_cache()
             
@@ -1426,20 +1580,19 @@ class SAM2Base(torch.nn.Module):
                 vis_refs['img_batch'] = img_batch.detach().cpu()
                 vis_refs['pixel_gt'] = pixel_gt.detach().cpu()
             
-            # Apply adversarial augmentations and compute loss
-            augmentation_result = self._apply_adversarial_augmentation_pipeline(
+            # Apply adversarial augmentations and get adversarial calibration loss
+            augmentation_result = self._apply_adversarial_attack_pipeline(
                 img_batch=img_batch,
                 pixel_gt=pixel_gt,
                 backbone_features=backbone_features,
                 high_res_features=high_res_features,
-                uq_sample_num=uq_sample_num,
                 enable_vis=enable_vis,
-                vis_refs=vis_refs,
+                uq_sample_num=uq_sample_num,
             )
             
-            calibration_loss_adversarial = augmentation_result['calibration_loss_adversarial']
+            # Extract adversarial calibration loss: MMD(UQ_adv, Err_adv)
+            calibration_loss_adversarial = augmentation_result.get('calibration_loss_adversarial', torch.tensor(0.0, device=device, dtype=dtype))
             aug_metrics = augmentation_result['aug_metrics'] # Get augmented metrics
-            assert calibration_loss_adversarial is not None
             
             if 'vis_refs' in augmentation_result:
                 vis_refs.update(augmentation_result['vis_refs'])
@@ -1469,11 +1622,17 @@ class SAM2Base(torch.nn.Module):
         # ========================================================================
         # Assemble final loss dictionary
         # ========================================================================
-        # Combine losses
+        # Combine losses: Calibration on clean + Calibration on adversarial
+        # Loss = MMD(UQ_main, Err_main) + MMD(UQ_adv, Err_adv)
         total_loss = calibration_loss_clean + calibration_loss_adversarial
         
         # Aggregate metrics
         aue_metrics = {}
+        # Add loss values to metrics for logging (detached for logging, original used for backward pass)
+        aue_metrics['calibration_loss_clean'] = calibration_loss_clean.detach() if isinstance(calibration_loss_clean, torch.Tensor) else calibration_loss_clean
+        aue_metrics['calibration_loss_adversarial'] = calibration_loss_adversarial.detach() if isinstance(calibration_loss_adversarial, torch.Tensor) else calibration_loss_adversarial
+        aue_metrics['total_loss'] = total_loss.detach() if isinstance(total_loss, torch.Tensor) else total_loss
+        
         for k, v in clean_metrics.items():
             aue_metrics[f'clean/{k}'] = v
         for k, v in aug_metrics.items():
@@ -1928,22 +2087,32 @@ class SAM2Base(torch.nn.Module):
             high_res_features=high_res_features,
         )
         
-        if len(mask_decoder_outputs) == 5:  # 包含辅助输出（BNDL/UR-ERN 等）
-            (
-                low_res_multimasks,
-                ious,
-                sam_output_tokens,
-                object_score_logits,
-                aux_outputs,
-            ) = mask_decoder_outputs
-        else:  # 标准输出
-            (
-                low_res_multimasks,
-                ious,
-                sam_output_tokens,
-                object_score_logits,
-            ) = mask_decoder_outputs
-            aux_outputs = {}  # 标准 SAM2 模式：空的辅助输出
+        # mask_decoder always returns 5 elements (masks, iou_pred, sam_tokens_out, object_score_logits, aux_outputs)
+        (
+            low_res_multimasks,
+            ious,
+            sam_output_tokens,
+            object_score_logits,
+            aux_outputs,
+        ) = mask_decoder_outputs
+
+        # Check: if use_bndl_for_pixels=True, aux_outputs must contain valid BNDL data
+        if self.use_bndl_for_pixels:
+            if not isinstance(aux_outputs, dict):
+                raise RuntimeError(
+                    f"SAM2Base._forward_sam_heads: use_bndl_for_pixels=True but aux_outputs is not a dict! "
+                    f"type: {type(aux_outputs)}"
+                )
+            if "bndl" not in aux_outputs:
+                raise RuntimeError(
+                    f"SAM2Base._forward_sam_heads: use_bndl_for_pixels=True but aux_outputs does not contain 'bndl'! "
+                    f"aux_outputs keys: {list(aux_outputs.keys())}"
+                )
+            bndl_data = aux_outputs["bndl"]
+            if not isinstance(bndl_data, dict):
+                raise RuntimeError(
+                    f"SAM2Base._forward_sam_heads: aux_outputs['bndl'] is not a dict! type: {type(bndl_data)}"
+                )
 
         if self.pred_obj_scores:
             is_obj_appearing = object_score_logits > 0
@@ -2020,10 +2189,15 @@ class SAM2Base(torch.nn.Module):
                 
                 # Extract external_pre_out_w (hyper_in) for analytic uncertainty computation
                 external_w_for_aue = bndl_outputs.get('hyper_in', None)
-                assert external_w_for_aue is not None
+                if external_w_for_aue is None:
+                    raise RuntimeError(
+                        f"SAM2Base._forward_sam_heads: use_bndl_for_pixels=True and use_aue=True, "
+                        f"but bndl_outputs['hyper_in'] is None! "
+                        f"bndl_outputs keys: {list(bndl_outputs.keys())}"
+                    )
                 
                 # Unified AUE loss: automatically switches between style-based and feature-based
-                aue_loss, aue_loss_dict = self.compute_aue_loss(
+                aue_loss, aue_metrics = self.compute_aue_loss(
                     pixel_feat=pixel_feat,
                     pixel_uncertainty=pixel_uncertainty,
                     pixel_gt=pixel_gt_for_aue,
@@ -2039,7 +2213,7 @@ class SAM2Base(torch.nn.Module):
                     external_pre_out_w=external_w_for_aue,
                 )
                 bndl_outputs["aue_aux_loss"] = aue_loss
-                bndl_outputs["aue_loss_dict"] = aue_loss_dict
+                bndl_outputs["aue_metrics"] = aue_metrics
                 
                 # After AUE computation, check if GCN stats were generated and add them
                 gcn_stats = getattr(self, "_latest_gcn_stats", None)
@@ -2119,6 +2293,7 @@ class SAM2Base(torch.nn.Module):
                 obj_ptr = lambda_is_obj_appearing * obj_ptr
             obj_ptr = obj_ptr + (1 - lambda_is_obj_appearing) * self.no_obj_ptr
 
+        aux_outputs = {}
         return (
             low_res_masks,
             high_res_masks,
@@ -2127,6 +2302,7 @@ class SAM2Base(torch.nn.Module):
             high_res_masks,
             obj_ptr,
             object_score_logits,
+            aux_outputs,
         )
 
     def forward_image(self, img_batch: torch.Tensor, use_checkpoint: bool = False):
@@ -2452,6 +2628,12 @@ class SAM2Base(torch.nn.Module):
         if mask_inputs is not None and self.use_mask_input_as_output_without_sam:
             # When use_mask_input_as_output_without_sam=True, we directly output the mask input
             # (see it as a GT mask) without using a SAM prompt encoder + mask decoder.
+            if self.use_bndl_for_pixels:
+                raise RuntimeError(
+                    f"SAM2Base._track_step (frame_idx={frame_idx}): "
+                    f"use_bndl_for_pixels=True but use_mask_input_as_output_without_sam=True! "
+                    f"This is incompatible - _use_mask_as_output does not compute BNDL outputs."
+                )
             pix_feat = current_vision_feats[-1].permute(1, 2, 0)
             pix_feat = pix_feat.view(-1, self.hidden_dim, *feat_sizes[-1])
             sam_outputs = self._use_mask_as_output(

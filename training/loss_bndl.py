@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn as nn
 
 from training.trainer import CORE_LOSS_KEY
 
@@ -18,18 +19,21 @@ class BNDLLoss(nn.Module):
             outs_batch: sam ouputs
             targets_batch: targets, not used here
         """
-        total_loss = 0.0
+        # Get device and initialize all accumulators as tensors to preserve gradients
+        device = targets_batch.device if targets_batch is not None else torch.device("cpu")
+        
+        total_loss = torch.tensor(0.0, device=device, requires_grad=True)
         valid_samples = 0
         
-        # Initialize accumulators for individual part losses
-        total_part1_x = 0.0
-        total_part2_x = 0.0
-        total_part3_x = 0.0
-        total_part1_w = 0.0
-        total_part2_w = 0.0
-        total_part3_w = 0.0
+        # Initialize accumulators for individual part losses (as tensors)
+        total_part1_x = torch.tensor(0.0, device=device, requires_grad=True)
+        total_part2_x = torch.tensor(0.0, device=device, requires_grad=True)
+        total_part3_x = torch.tensor(0.0, device=device, requires_grad=True)
+        total_part1_w = torch.tensor(0.0, device=device, requires_grad=True)
+        total_part2_w = torch.tensor(0.0, device=device, requires_grad=True)
+        total_part3_w = torch.tensor(0.0, device=device, requires_grad=True)
 
-        for outs in outs_batch:
+        for batch_idx, outs in enumerate(outs_batch):
             # 从统一的 aux_outputs 中提取 BNDL 命名空间
             if "multistep_aux_outputs" in outs:
                 aux_list = outs["multistep_aux_outputs"]
@@ -39,44 +43,53 @@ class BNDLLoss(nn.Module):
                 bndl_outputs_list = outs["multistep_bndl_outputs"]
             else:
                 continue
-                step_loss = 0.0
-                valid_steps = 0
+            
+            # Initialize step accumulators as tensors
+            step_loss = torch.tensor(0.0, device=device, requires_grad=True)
+            valid_steps = 0
                 
-                # Initialize step accumulators for individual part losses
-                step_part1_x = 0.0
-                step_part2_x = 0.0
-                step_part3_x = 0.0
-                step_part1_w = 0.0
-                step_part2_w = 0.0
-                step_part3_w = 0.0
-                
-                for bndl_outputs in bndl_outputs_list:
-                    if bndl_outputs is not None:
-                        loss, part_losses = self._compute_kl_loss(bndl_outputs)
-                        step_loss += loss
-                        
-                        # Accumulate individual part losses
-                        step_part1_x += part_losses['part1_x']
-                        step_part2_x += part_losses['part2_x']
-                        step_part3_x += part_losses['part3_x']
-                        step_part1_w += part_losses['part1_w']
-                        step_part2_w += part_losses['part2_w']
-                        step_part3_w += part_losses['part3_w']
-                        
-                        valid_steps += 1
-                
-                if valid_steps > 0:
-                    total_loss += step_loss / valid_steps
+            # Initialize step accumulators for individual part losses (as tensors)
+            step_part1_x = torch.tensor(0.0, device=device, requires_grad=True)
+            step_part2_x = torch.tensor(0.0, device=device, requires_grad=True)
+            step_part3_x = torch.tensor(0.0, device=device, requires_grad=True)
+            step_part1_w = torch.tensor(0.0, device=device, requires_grad=True)
+            step_part2_w = torch.tensor(0.0, device=device, requires_grad=True)
+            step_part3_w = torch.tensor(0.0, device=device, requires_grad=True)
+            
+            for step_idx, bndl_outputs in enumerate(bndl_outputs_list):
+                if bndl_outputs is not None:
+                    kl_loss, part_losses = self._compute_kl_loss(bndl_outputs)
                     
-                    # Accumulate averaged step part losses
-                    total_part1_x += step_part1_x / valid_steps
-                    total_part2_x += step_part2_x / valid_steps
-                    total_part3_x += step_part3_x / valid_steps
-                    total_part1_w += step_part1_w / valid_steps
-                    total_part2_w += step_part2_w / valid_steps
-                    total_part3_w += step_part3_w / valid_steps
+                    loss = kl_loss
                     
-                    valid_samples += 1
+                    # Use tensor addition to preserve gradients
+                    step_loss = step_loss + loss
+                    
+                    # Accumulate individual part losses
+                    step_part1_x = step_part1_x + part_losses['part1_x']
+                    step_part2_x = step_part2_x + part_losses['part2_x']
+                    step_part3_x = step_part3_x + part_losses['part3_x']
+                    step_part1_w = step_part1_w + part_losses['part1_w']
+                    step_part2_w = step_part2_w + part_losses['part2_w']
+                    step_part3_w = step_part3_w + part_losses['part3_w']
+                    
+                    valid_steps += 1
+            
+            if valid_steps > 0:
+                avg_step_loss = step_loss / valid_steps
+                
+                # Use tensor addition to preserve gradients
+                total_loss = total_loss + avg_step_loss
+                
+                # Accumulate averaged step part losses
+                total_part1_x = total_part1_x + (step_part1_x / valid_steps)
+                total_part2_x = total_part2_x + (step_part2_x / valid_steps)
+                total_part3_x = total_part3_x + (step_part3_x / valid_steps)
+                total_part1_w = total_part1_w + (step_part1_w / valid_steps)
+                total_part2_w = total_part2_w + (step_part2_w / valid_steps)
+                total_part3_w = total_part3_w + (step_part3_w / valid_steps)
+                
+                valid_samples += 1
 
         if valid_samples > 0:
             core_loss = total_loss / valid_samples
@@ -89,7 +102,6 @@ class BNDLLoss(nn.Module):
             avg_part2_w = total_part2_w / valid_samples
             avg_part3_w = total_part3_w / valid_samples
         else:
-            device = targets_batch.device if targets_batch is not None else torch.device("cpu")
             core_loss = torch.tensor(0.0, device=device, requires_grad=True)
             avg_part1_x = torch.tensor(0.0, device=device, requires_grad=True)
             avg_part2_x = torch.tensor(0.0, device=device, requires_grad=True)

@@ -263,13 +263,25 @@ def _unix_pattern_to_parameter_names(
     """
     if "param_names" not in scheduler_cfg and "module_cls_names" not in scheduler_cfg:
         return None
-    return unix_param_pattern_to_parameter_names(
+    
+    included_params = unix_param_pattern_to_parameter_names(
         scheduler_cfg.get("param_names"), parameter_names
     ).union(
         unix_module_cls_pattern_to_parameter_names(
             scheduler_cfg.get("module_cls_names"), module_cls_to_param_names
         )
     )
+
+    if "exclude_param_names" in scheduler_cfg:
+        exclude_patterns = scheduler_cfg.get("exclude_param_names")
+        if exclude_patterns:
+            excluded_params = set()
+            for pattern in exclude_patterns:
+                matches = fnmatch.filter(parameter_names, pattern)
+                excluded_params.update(matches)
+            included_params = included_params - excluded_params
+
+    return included_params
 
 
 def get_module_cls_to_param_names(

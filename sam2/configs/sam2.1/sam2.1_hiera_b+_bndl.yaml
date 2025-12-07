@@ -86,7 +86,7 @@ model:
   # apply scaled sigmoid on mask logits for memory encoder, and directly feed input mask as output mask
   sigmoid_scale_for_mem_enc: 20.0
   sigmoid_bias_for_mem_enc: -10.0
-  use_mask_input_as_output_without_sam: true
+  use_mask_input_as_output_without_sam: false
   # Memory
   directly_add_no_mem_embed: true
   no_obj_embed_spatial: true
@@ -122,6 +122,25 @@ model:
   bndl_hyper_in_sparse: true
   # Compilation flag
   # compile_image_encoder: False
+  
+  # === MAX_OBJECTS_CONFIG_START ===
+  # Max number of objects (matches dataset sampler for memory efficiency)
+  max_num_objects: 3
+  # === MAX_OBJECTS_CONFIG_END ===
+  
+  # === CONV_LORA_CONFIG_START ===
+  # Conv-LoRA: Parameter-efficient fine-tuning with MoE
+  use_conv_lora: false
+  # conv_lora_rank: 8
+  # conv_lora_alpha: 16.0
+  # conv_lora_dropout: 0.1
+  # conv_lora_expert_scales: [1.0, 0.5, 2.0]  # Multi-scale experts for MoE
+  # conv_lora_target_modules:
+  #   - "attn.qkv"
+  #   - "attn.proj"
+  #   - "mlp.layers.0"
+  #   - "mlp.layers.1"
+  # === CONV_LORA_CONFIG_END ===
 
   # AUE (Adversarial Uncertainty Estimation) options (disabled)
   use_aue: false

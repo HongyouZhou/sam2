@@ -89,6 +89,11 @@ METHOD_CONFIGS = {
         "color": "\033[94m",  # Blue
         "output_suffix": "sam",
     },
+    "SAM_FT": {
+        "flags": ["--run_sam"],  # Reuse SAM's testing logic
+        "color": "\033[34m",  # Dark Blue
+        "output_suffix": "sam_ft",
+    },
     "UCTTA": {
         "flags": ["--run_uctta"],
         "color": "\033[92m",  # Green
@@ -111,12 +116,13 @@ METHOD_CONFIGS = {
     },
 }
 
-ALL_METHODS = ["SAM", "UCTTA", "BNDL_AUE", "BNDL", "UR-ERN"]
+ALL_METHODS = ["SAM", "SAM_FT", "UCTTA", "BNDL_AUE", "BNDL", "UR-ERN"]
 RESET_COLOR = "\033[0m"
 
 # 方法名到JSON键的映射（避免重复定义）
 METHOD_RESULT_KEYS = {
     "SAM": "sam2_results",
+    "SAM_FT": "sam2_results",  # SAM_FT uses same result key as SAM
     "UCTTA": "uctta_results",
     "BNDL_AUE": "bndl_aue_results",
     "BNDL": "bndl_results",
@@ -125,6 +131,7 @@ METHOD_RESULT_KEYS = {
 
 METHOD_STATS_KEYS = {
     "SAM": "sam2_statistics",
+    "SAM_FT": "sam2_statistics",  # SAM_FT uses same stats key as SAM
     "UCTTA": "uctta_statistics",
     "BNDL_AUE": "bndl_aue_statistics",
     "BNDL": "bndl_statistics",
@@ -303,8 +310,13 @@ def build_task_command(
     cmd.extend(METHOD_CONFIGS[method]["flags"])
     
     # SAM-2配置 (所有方法都需要)
-    cmd.extend(["--sam2_cfg", args.sam2_cfg])
-    cmd.extend(["--sam2_checkpoint", args.sam2_checkpoint])
+    # SAM_FT uses its own checkpoint, otherwise use standard SAM checkpoint
+    if method == "SAM_FT":
+        cmd.extend(["--sam2_cfg", args.sam_ft_cfg if hasattr(args, 'sam_ft_cfg') and args.sam_ft_cfg else args.sam2_cfg])
+        cmd.extend(["--sam2_checkpoint", args.sam_ft_checkpoint])
+    else:
+        cmd.extend(["--sam2_cfg", args.sam2_cfg])
+        cmd.extend(["--sam2_checkpoint", args.sam2_checkpoint])
     
     # BNDL+AUE配置
     if method == "BNDL_AUE":
@@ -405,6 +417,37 @@ def run_task(
     color = METHOD_CONFIGS[method]["color"]
     task_id = f"{method}@{dataset_name}"
     
+    # 从 checkpoint 路径推断实验配置目录（如果还没有设置）
+    if "EXPERIMENT_CONFIG_DIR" not in env:
+        # 根据方法类型选择对应的 checkpoint 路径
+        checkpoint_path = None
+        if method == "SAM_FT" and hasattr(args, 'sam_ft_checkpoint') and args.sam_ft_checkpoint:
+            checkpoint_path = args.sam_ft_checkpoint
+        elif method == "BNDL_AUE" and hasattr(args, 'bndl_aue_checkpoint') and args.bndl_aue_checkpoint:
+            checkpoint_path = args.bndl_aue_checkpoint
+        elif method == "BNDL" and hasattr(args, 'bndl_checkpoint') and args.bndl_checkpoint:
+            checkpoint_path = args.bndl_checkpoint
+        elif method == "UR-ERN" and hasattr(args, 'ur_ern_checkpoint') and args.ur_ern_checkpoint:
+            checkpoint_path = args.ur_ern_checkpoint
+        
+        # 尝试推断实验配置目录
+        # checkpoint 路径格式: .../sam2_bndl_aue_XXX/log/checkpoints/checkpoint.pt
+        # 实验配置目录: .../sam2_bndl_aue_XXX/sam2/sam2/ (NOT .../configs, because Hydra will append configs/...)
+        if checkpoint_path:
+            checkpoint_path_obj = Path(checkpoint_path)
+            # 检查是否是实验目录结构
+            if checkpoint_path_obj.parent.name == "checkpoints" and checkpoint_path_obj.parent.parent.name == "log":
+                experiment_root = checkpoint_path_obj.parent.parent.parent
+                # Point to sam2/sam2/ directory, NOT sam2/sam2/configs/
+                # Hydra will search for "configs/sam2.1/..." relative to this directory
+                experiment_config_dir = experiment_root / "sam2" / "sam2"
+                if experiment_config_dir.exists():
+                    env["EXPERIMENT_CONFIG_DIR"] = str(experiment_config_dir.resolve())
+                    if progress_monitor and RICH_AVAILABLE:
+                        progress_monitor.console.log(f"[{task_id}] Inferred EXPERIMENT_CONFIG_DIR: {experiment_config_dir}")
+                    else:
+                        print(f"[{task_id}] Inferred EXPERIMENT_CONFIG_DIR: {experiment_config_dir}")
+    
     # 日志文件
     log_file = output_dir / f"{dataset_name.lower()}_{method.lower()}_run.log"
     
@@ -426,6 +469,10 @@ def run_task(
     start_time = time.time()
     total_videos = 0
     task_started = False
+    process = None
+    
+    # 获取项目根目录（确保工作目录正确，这样 Hydra 才能正确解析相对路径）
+    project_root = Path(__file__).parent.parent.parent
     
     try:
         # 使用Popen实时捕获输出，同时写入日志文件
@@ -437,54 +484,79 @@ def run_task(
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,  # Line buffered
+                errors="replace",  # 防止编码错误导致崩溃
+                cwd=str(project_root),  # 设置工作目录为项目根目录，确保 Hydra 能正确解析配置路径
             )
             
             # 实时读取并显示输出
-            for line in process.stdout:
-                # 写入日志文件
-                f.write(line)
+            try:
+                for line in process.stdout:
+                    # 写入日志文件
+                    f.write(line)
+                    f.flush()
+                    
+                    line_stripped = line.strip()
+                    
+                    # 尝试提取总视频数（用于初始化进度条）
+                    if not task_started and progress_monitor:
+                        total_match = total_videos_pattern.search(line_stripped)
+                        if total_match:
+                            total_videos = int(total_match.group(1))
+                            progress_monitor.start_task(gpu_id, dataset_name, method, total_videos)
+                            task_started = True
+                        else:
+                            # 兼容：如果没有打印 "inference on X videos"，
+                            # 则从第一条 Progress: a/b 中提取总数并初始化
+                            progress_match_early = progress_pattern.search(line_stripped)
+                            if progress_match_early:
+                                current_early = int(progress_match_early.group(1))
+                                total_videos = int(progress_match_early.group(2))
+                                if total_videos > 0:
+                                    progress_monitor.start_task(gpu_id, dataset_name, method, total_videos)
+                                    task_started = True
+                                    # 立即更新一次当前进度
+                                    progress_monitor.update_task_progress(dataset_name, method, current_early, total_videos)
+                    
+                    # 尝试解析进度更新
+                    if progress_monitor and task_started:
+                        progress_match = progress_pattern.search(line_stripped)
+                        if progress_match:
+                            current = int(progress_match.group(1))
+                            total = int(progress_match.group(2))
+                            progress_monitor.update_task_progress(dataset_name, method, current, total)
+                    
+                    # 实时显示关键进度（只在无progress_monitor时，否则进度条已显示）
+                    if not progress_monitor and line_stripped and any(keyword in line_stripped for keyword in [
+                        'Processing', 'Evaluating', 'video', 'Progress', 
+                        'Completed', 'Dataset', 'Inference', '✓', '✗', '⚠️'
+                    ]):
+                        print(f"{color}[{task_id}] {line_stripped}{RESET_COLOR}")
+            except (BrokenPipeError, OSError):
+                # stdout被关闭（进程可能被kill），但继续等待进程退出
+                f.write("\n⚠️  Warning: stdout was closed unexpectedly (process may have been killed)\n")
                 f.flush()
-                
-                line_stripped = line.strip()
-                
-                # 尝试提取总视频数（用于初始化进度条）
-                if not task_started and progress_monitor:
-                    total_match = total_videos_pattern.search(line_stripped)
-                    if total_match:
-                        total_videos = int(total_match.group(1))
-                        progress_monitor.start_task(gpu_id, dataset_name, method, total_videos)
-                        task_started = True
-                    else:
-                        # 兼容：如果没有打印 "inference on X videos"，
-                        # 则从第一条 Progress: a/b 中提取总数并初始化
-                        progress_match_early = progress_pattern.search(line_stripped)
-                        if progress_match_early:
-                            current_early = int(progress_match_early.group(1))
-                            total_videos = int(progress_match_early.group(2))
-                            if total_videos > 0:
-                                progress_monitor.start_task(gpu_id, dataset_name, method, total_videos)
-                                task_started = True
-                                # 立即更新一次当前进度
-                                progress_monitor.update_task_progress(dataset_name, method, current_early, total_videos)
-                
-                # 尝试解析进度更新
-                if progress_monitor and task_started:
-                    progress_match = progress_pattern.search(line_stripped)
-                    if progress_match:
-                        current = int(progress_match.group(1))
-                        total = int(progress_match.group(2))
-                        progress_monitor.update_task_progress(dataset_name, method, current, total)
-                
-                # 实时显示关键进度（只在无progress_monitor时，否则进度条已显示）
-                if not progress_monitor and line_stripped and any(keyword in line_stripped for keyword in [
-                    'Processing', 'Evaluating', 'video', 'Progress', 
-                    'Completed', 'Dataset', 'Inference', '✓', '✗', '⚠️'
-                ]):
-                    print(f"{color}[{task_id}] {line_stripped}{RESET_COLOR}")
             
-            # 等待进程完成
-            process.wait()
-            returncode = process.returncode
+            # 确保所有输出都已读取完毕，并等待进程完全退出
+            # 注意：for line in process.stdout 循环结束时，stdout 已关闭，
+            # 但进程可能还在运行（特别是如果它还在写 stderr 或其他操作）
+            # 必须调用 wait() 确保进程完全退出后才能获取正确的返回码
+            returncode = process.wait()
+            
+            # 记录退出代码和可能的信号信息
+            f.write(f"\nProcess finished with return code {returncode}\n")
+            if returncode < 0:
+                import signal
+                sig = -returncode
+                try:
+                    sig_name = signal.Signals(sig).name
+                    f.write(f"Process was killed by signal: {sig_name} ({sig})\n")
+                    if sig == signal.SIGKILL:
+                        f.write("⚠️  Process was killed by SIGKILL (likely OOM killer or manual kill)\n")
+                    elif sig == signal.SIGTERM:
+                        f.write("⚠️  Process was terminated by SIGTERM\n")
+                except (ValueError, AttributeError):
+                    f.write(f"Process was killed by unknown signal: {sig}\n")
+            f.flush()
         
         elapsed = time.time() - start_time
         
@@ -517,6 +589,14 @@ def run_task(
         return dataset_name, method, returncode, elapsed, output_dir
         
     except Exception as e:
+        # 确保进程被终止
+        if process and process.poll() is None:
+            try:
+                process.terminate()
+                process.wait(timeout=5)
+            except:
+                process.kill()
+                
         elapsed = time.time() - start_time
         if progress_monitor and task_started:
             progress_monitor.complete_task(gpu_id, dataset_name, method, False)
@@ -1164,6 +1244,7 @@ def merge_detailed_results(
                 uctta_results=uctta_results or None,
                 uctta_statistics=uctta_statistics or None,
                 aue_version=aue_version_suffix,
+                bndl_baseline_results=bndl_results if bndl_results else None,
             )
             print("    ✓ 综合对比图已生成")
         except Exception as e:
@@ -1272,8 +1353,14 @@ def main():
     )
     
     # SAM-2配置
+    # 注意：Hydra 的搜索路径是 pkg://sam2，指向 sam2/sam2/ 目录
+    # 所以配置路径应该是相对于 sam2/sam2/ 的，即 configs/sam2.1/...
     parser.add_argument("--sam2_cfg", default="configs/sam2.1/sam2.1_hiera_b+.yaml")
     parser.add_argument("--sam2_checkpoint", default="/home/hongyou/dev/ada_samp/sam2/checkpoints/sam2.1_hiera_base_plus.pt")
+    
+    # SAM_FT配置 (fine-tuned SAM)
+    parser.add_argument("--sam_ft_cfg", default=None, help="SAM FT config (defaults to sam2_cfg if not specified)")
+    parser.add_argument("--sam_ft_checkpoint", default=None, help="SAM FT checkpoint path")
     
     # BNDL+AUE配置
     parser.add_argument("--bndl_aue_cfg", default="configs/sam2.1/sam2.1_hiera_b+_bndl_aue.yaml")
@@ -1318,8 +1405,9 @@ def main():
     
     # 版本号配置
     parser.add_argument("--sam_version", type=str, default="001_01")
+    parser.add_argument("--sam_ft_version", type=str, default="017_sam_ft", help="SAM FT version string")
     parser.add_argument("--uctta_version", type=str, default="001_01")
-    parser.add_argument("--bndl_aue_version", type=str, default="017_12")
+    parser.add_argument("--bndl_aue_version", type=str, default="017_bndl_lora")
     parser.add_argument("--bndl_version", type=str, default="013_01")
     parser.add_argument("--ur_ern_version", type=str, default="001_01")
     
@@ -1354,6 +1442,7 @@ def main():
     # 方法版本映射
     method_versions = {
         "SAM": args.sam_version,
+        "SAM_FT": args.sam_ft_version,
         "UCTTA": args.uctta_version,
         "BNDL_AUE": args.bndl_aue_version,
         "BNDL": args.bndl_version,

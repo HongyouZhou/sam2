@@ -93,14 +93,12 @@ def pixel_weibull_to_entropy_uncertainty(
         raise RuntimeError("BNDL inv_k contains NaN/Inf values")
     
     # Step 2: Compute Weibull statistics (E[Z] and Var[Z])
-    eps_kappa = 1e-3
-    
-    # Recover kappa from inv_k with improved numerical stability
-    # In BNDL: inv_k = 1 / (kappa + eps_kappa)
-    # Therefore: kappa ≈ 1 / inv_k - eps_kappa
+    # Revert to 013 version: no eps_kappa correction
+    # In BNDL: inv_k = 1 / kappa (direct, no epsilon)
+    # Therefore: kappa = 1 / inv_k
     # Clamp inv_k to prevent division by extremely small values
     inv_k_clamped = torch.clamp(inv_k, min=1e-6, max=1.0)
-    kappa = 1.0 / inv_k_clamped - eps_kappa
+    kappa = 1.0 / inv_k_clamped
     kappa = torch.clamp(kappa, min=0.5, max=8.0)  # Enforce KAPPA_MIN/MAX
     
     # Early check: validate kappa
@@ -109,8 +107,8 @@ def pixel_weibull_to_entropy_uncertainty(
     
     # Clamp kappa for lgamma stability (prevent overflow)
     kappa_safe = torch.clamp(kappa, min=0.5, max=8.0)
-    kappa_reciprocal = 1.0 / (kappa_safe + eps_kappa)
-    kappa_reciprocal_2 = 2.0 / (kappa_safe + eps_kappa)
+    kappa_reciprocal = 1.0 / kappa_safe
+    kappa_reciprocal_2 = 2.0 / kappa_safe
     
     # Clamp reciprocal values to prevent lgamma overflow
     # lgamma(x) is stable for x < ~170, so we clamp to safe range

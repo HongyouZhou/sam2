@@ -186,31 +186,6 @@ class MaskDecoder(nn.Module):
             # are always the single mask token (and we'll let it be the object-memory token).
             sam_tokens_out = mask_tokens_out[:, 0:1]  # [b, 1, c] shape
 
-        # Apply the same multimask selection logic to BNDL mask-related outputs
-        if bndl_outputs is not None and "bndl" in bndl_outputs:
-            bndl_data = bndl_outputs["bndl"]
-            
-            # Only process mask-related outputs that have channel dimension
-            mask_related_keys = ["pixel_logits", "masks_bndl_raw", "masks_bndl", "wei_lambda_w", "inv_k_w"]
-            
-            for key in mask_related_keys:
-                if key in bndl_data and bndl_data[key] is not None:
-                    if key == "masks_bndl":  # [B, K, H, W] format
-                        if multimask_output:
-                            bndl_data[key] = bndl_data[key][:, 1:, :, :]  # [B, K-1, H, W]
-                        else:
-                            bndl_data[key] = bndl_data[key][:, 0:1, :, :]  # [B, 1, H, W]
-                    elif key in ["wei_lambda_w", "inv_k_w"]:  # [C', K] format
-                        if multimask_output:
-                            bndl_data[key] = bndl_data[key][:, 1:]  # [C', K-1]
-                        else:
-                            bndl_data[key] = bndl_data[key][:, 0:1]  # [C', 1]
-                    else:  # [B, H, W, K] format for pixel_logits and masks_bndl_raw
-                        if multimask_output:
-                            bndl_data[key] = bndl_data[key][:, :, :, 1:]  # [B, H, W, K-1]
-                        else:
-                            bndl_data[key] = bndl_data[key][:, :, :, 0:1]  # [B, H, W, 1]
-
         # Prepare output
         return masks, iou_pred, sam_tokens_out, object_score_logits, bndl_outputs
 
@@ -224,25 +199,6 @@ class MaskDecoder(nn.Module):
         high_res_features: Optional[List[torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Predicts masks. See 'forward' for more details."""
-        # Diagnostic: check all inputs at entry
-        import logging
-        if not torch.isfinite(image_embeddings).all():
-            num_nan = (~torch.isfinite(image_embeddings)).sum().item()
-            logging.error(f"[MaskDecoder] INPUT image_embeddings contains {num_nan}/{image_embeddings.numel()} NaN/Inf!")
-        if not torch.isfinite(image_pe).all():
-            num_nan = (~torch.isfinite(image_pe)).sum().item()
-            logging.error(f"[MaskDecoder] INPUT image_pe contains {num_nan}/{image_pe.numel()} NaN/Inf!")
-        if not torch.isfinite(sparse_prompt_embeddings).all():
-            num_nan = (~torch.isfinite(sparse_prompt_embeddings)).sum().item()
-            logging.error(f"[MaskDecoder] INPUT sparse_prompt_embeddings contains {num_nan}/{sparse_prompt_embeddings.numel()} NaN/Inf!")
-        if not torch.isfinite(dense_prompt_embeddings).all():
-            num_nan = (~torch.isfinite(dense_prompt_embeddings)).sum().item()
-            logging.error(f"[MaskDecoder] INPUT dense_prompt_embeddings contains {num_nan}/{dense_prompt_embeddings.numel()} NaN/Inf!")
-        if high_res_features is not None:
-            for i, feat in enumerate(high_res_features):
-                if not torch.isfinite(feat).all():
-                    num_nan = (~torch.isfinite(feat)).sum().item()
-                    logging.error(f"[MaskDecoder] INPUT high_res_features[{i}] contains {num_nan}/{feat.numel()} NaN/Inf!")
         
         # Concatenate output tokens
         s = 0
@@ -271,22 +227,7 @@ class MaskDecoder(nn.Module):
         assert image_pe.size(0) == 1, "image_pe should have size 1 in batch dim (from `get_dense_pe()`)"
         pos_src = torch.repeat_interleave(image_pe, tokens.shape[0], dim=0)
         b, c, h, w = src.shape
-
-        # Diagnostic: check inputs before transformer
-        if not torch.isfinite(src).all():
-            import logging
-            num_nan = (~torch.isfinite(src)).sum().item()
-            logging.error(f"[MaskDecoder] src (BEFORE transformer) contains {num_nan}/{src.numel()} NaN/Inf!")
-        if not torch.isfinite(pos_src).all():
-            import logging
-            num_nan = (~torch.isfinite(pos_src)).sum().item()
-            logging.error(f"[MaskDecoder] pos_src (BEFORE transformer) contains {num_nan}/{pos_src.numel()} NaN/Inf!")
-        if not torch.isfinite(tokens).all():
-            import logging
-            num_nan = (~torch.isfinite(tokens)).sum().item()
-            logging.error(f"[MaskDecoder] tokens (BEFORE transformer) contains {num_nan}/{tokens.numel()} NaN/Inf!")
-        
-        # Run the transformer
+ 
         hs, src = self.transformer(src, pos_src, tokens)
         iou_token_out = hs[:, s, :]
         mask_tokens_out = hs[:, s + 1 : (s + 1 + self.num_mask_tokens), :]
@@ -305,17 +246,7 @@ class MaskDecoder(nn.Module):
         else:
             dc1, ln1, act1, dc2, act2 = self.output_upscaling
             feat_s0, feat_s1 = high_res_features
-            
-            # Diagnostic: check high_res_features
-            if not torch.isfinite(feat_s0).all():
-                import logging
-                num_nan = (~torch.isfinite(feat_s0)).sum().item()
-                logging.error(f"[MaskDecoder] feat_s0 (high_res) contains {num_nan}/{feat_s0.numel()} NaN/Inf!")
-            if not torch.isfinite(feat_s1).all():
-                import logging
-                num_nan = (~torch.isfinite(feat_s1)).sum().item()
-                logging.error(f"[MaskDecoder] feat_s1 (high_res) contains {num_nan}/{feat_s1.numel()} NaN/Inf!")
-            
+             
             upscaled_embedding = act1(ln1(dc1(src) + feat_s1))
             upscaled_embedding = act2(dc2(upscaled_embedding) + feat_s0)
 
@@ -331,15 +262,6 @@ class MaskDecoder(nn.Module):
         masks = masks_sam
 
         if self.use_bndl_for_pixels:
-            # Diagnostic: check upscaled_embedding before passing to BNDL
-            if not torch.isfinite(upscaled_embedding).all():
-                import logging
-                num_nan = (~torch.isfinite(upscaled_embedding)).sum().item()
-                logging.error(f"[MaskDecoder] upscaled_embedding contains {num_nan}/{upscaled_embedding.numel()} NaN/Inf before BNDL!")
-                if torch.isfinite(upscaled_embedding).any():
-                    finite_vals = upscaled_embedding[torch.isfinite(upscaled_embedding)]
-                    logging.error(f"[MaskDecoder] Finite upscaled_embedding stats: min={finite_vals.min():.6e}, max={finite_vals.max():.6e}")
-            
             pixel_feat = upscaled_embedding.permute(0, 2, 3, 1)  # [B, C, H, W] -> [B, H, W, C]
 
             masks_bndl_raw, z_out, wei_lambda, inv_k, out_w, wei_lambda_w, inv_k_w = self.pixel_bndl(
@@ -415,6 +337,29 @@ class MaskDecoder(nn.Module):
         else:
             # Obj scores logits - default to 10.0, i.e. assuming the object is present, sigmoid(10)=1
             object_score_logits = 10.0 * iou_pred.new_ones(iou_pred.shape[0], 1)
+
+        if aux_outputs is None:
+            aux_outputs = {}
+
+        # Check: if use_bndl_for_pixels=True, aux_outputs must contain valid BNDL data
+        if self.use_bndl_for_pixels:
+            if "bndl" not in aux_outputs:
+                raise RuntimeError(
+                    "MaskDecoder.predict_masks: use_bndl_for_pixels=True but aux_outputs does not contain 'bndl'! "
+                    f"aux_outputs keys: {list(aux_outputs.keys())}"
+                )
+            bndl_data = aux_outputs["bndl"]
+            if not isinstance(bndl_data, dict):
+                raise RuntimeError(
+                    f"MaskDecoder.predict_masks: aux_outputs['bndl'] is not a dict! type: {type(bndl_data)}"
+                )
+            required_keys = ["wei_lambda", "inv_k", "masks_bndl_raw"]
+            missing_keys = [k for k in required_keys if k not in bndl_data]
+            if missing_keys:
+                raise RuntimeError(
+                    f"MaskDecoder.predict_masks: aux_outputs['bndl'] missing required keys: {missing_keys}. "
+                    f"Available keys: {list(bndl_data.keys())}"
+                )
 
         return masks, iou_pred, mask_tokens_out, object_score_logits, aux_outputs
 

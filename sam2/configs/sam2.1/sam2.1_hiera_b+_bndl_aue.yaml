@@ -84,7 +84,7 @@ model:
   # apply scaled sigmoid on mask logits for memory encoder, and directly feed input mask as output mask
   sigmoid_scale_for_mem_enc: 20.0
   sigmoid_bias_for_mem_enc: -10.0
-  use_mask_input_as_output_without_sam: true
+  use_mask_input_as_output_without_sam: false
   # Memory
   directly_add_no_mem_embed: true
   no_obj_embed_spatial: true
@@ -113,100 +113,123 @@ model:
   # Compilation flag
   compile_image_encoder: False
 
+  # === BNDL_CONFIG_START ===
   # BNDL
   use_bndl_for_pixels: true
   bndl_fuse_type: none
   bndl_replace_global_with_hyper: true
   bndl_hyper_in_sparse: true
+  # === BNDL_CONFIG_END ===
   # Compilation flag
   # compile_image_encoder: False
   
+  # === MAX_OBJECTS_CONFIG_START ===
+  # Max number of objects (matches dataset sampler for memory efficiency)
+  max_num_objects: 3
+  # === MAX_OBJECTS_CONFIG_END ===
+  
+  # === CONV_LORA_CONFIG_START ===
+  # Conv-LoRA: Parameter-efficient fine-tuning with MoE
+  use_conv_lora: true
+  conv_lora_rank: 8
+  conv_lora_alpha: 16.0
+  conv_lora_dropout: 0.1
+  conv_lora_expert_scales: [1.0, 0.5, 2.0]  # Multi-scale experts for MoE
+  conv_lora_target_modules:  # Layers to inject Conv-LoRA
+    - "mlp.layers.0"
+    - "mlp.layers.1"
+  # === CONV_LORA_CONFIG_END ===
+  
+
   # === AUE_GCN_CONFIG_START ===
   # AUE (Adversarial Uncertainty Estimation) with Style-based augmentation
-  use_aue: true
+  use_aue: false
   aue_use_uncertainty: true
   aue_uncertainty_mask_threshold: 0.4
+  # Constraint weight for adversarial samples (L1 distance to initial)
+  aue_constraint_loss_weight: 0.0  # Weight for constraint regularization (0 = disabled)
+  # Attack mode: "cooperative" (parallel prediction, joint application) or "sequential" (iterative)
+  aue_attack_mode: "cooperative"
+  # Style Adversarial options (alternative to AUE, for domain generalization)
+  use_style_adv: false
+  style_adv_mode: "image_level"  # "image_level" or "feature_level"
+  style_adv_use_gt_region_style: false
     
-  # Style-based AUE parameters
-  use_style_aug: true
-  style_aug_mode: "image_level"  # "image_level" or "feature_level"
-  style_aug_pgd_steps: 1
-  style_aug_pgd_step_size: 0.1
-  style_aug_pgd_epsilon: 0.3
-  style_aug_use_gt_region_style: true
+  # Consistency Regularization: MMD(U_clean, U_adv)
+  aue_consistency_weight: 0.5  # Weight for consistency loss (0.3-0.7 recommended)
     
   # Multi-object style attack control
-  style_aug_use_multi_object: true
-  style_aug_enable_background: true
+  style_adv_use_multi_object: false  # Only global style (no multi-object)
+  style_adv_enable_background: false  # Only global style (no background)
     
-  # Global-Local Mixed Style Augmentation
-  style_aug_use_global_local_mix: false
-  style_aug_global_epsilon: 1.5
-  style_aug_global_weight: 0.3
+  # Global-Local Mixed Style Adversarial
+  style_adv_use_global_local_mix: false
+  style_adv_global_epsilon: 1.5
+  style_adv_global_weight: 0.3
 
   # GCN-based multi-object style refinement
-  style_aug_use_gcn: true
-  style_aug_gcn_hidden_dim: 64
-  style_aug_gcn_num_layers: 2
-  style_aug_gcn_edge_threshold: 0.0
-  style_aug_gcn_use_semantic_edges: true
-  style_aug_gcn_use_background_edges: true
-  style_aug_gcn_distance_threshold: 1.0
-  style_aug_gcn_use_boundary_distance: true
-  style_aug_gcn_use_visual_features: true  # Enable visual features in GCN for content-aware refinement
-  style_aug_gcn_feature_dim: 256  # Feature dimension (matches backbone_fpn[-1] d_model)
+  style_adv_use_gcn: false  # Not needed for global-only style
+  style_adv_gcn_hidden_dim: 64
+  style_adv_gcn_num_layers: 2
+  style_adv_gcn_edge_threshold: 0.0
+  style_adv_gcn_use_semantic_edges: true
+  style_adv_gcn_use_background_edges: true
+  style_adv_gcn_distance_threshold: 1.0
+  style_adv_gcn_use_boundary_distance: true
+  style_adv_gcn_use_visual_features: true  # Enable visual features in GCN for content-aware refinement
+  style_adv_gcn_feature_dim: 256  # Feature dimension (matches backbone_fpn[-1] d_model)
     
-  # Deformation Augmentation (feature-level, memory encoder based)
-  use_deform_aug: true  # Set to true to enable
-  deform_aug_epsilon: 16.0  # Max offset magnitude in IMAGE pixels
-  deform_aug_use_soft_composite: true
-  deform_aug_temperature: 1.0
-  deform_aug_use_gcn: false
-  deform_aug_gcn_num_layers: 2
-  deform_aug_num_deform_groups: 4
-  deform_aug_init_from_memory_encoder: true  # Initialize from pretrained memory encoder
-  deform_aug_freeze_mask_encoder: false  # Allow fine-tuning
+  # Deformation Adversarial (feature-level, memory encoder based)
+  use_deform_adv: false  # Disabled for style-only ablation
+  deform_adv_epsilon: 5.0  # Reduced from 10.0 to 5.0 for mild spatial perturbation
+  deform_adv_use_soft_composite: true
+  deform_adv_temperature: 1.0
+  deform_adv_use_gcn: false
+  deform_adv_gcn_num_layers: 2
+  deform_adv_num_deform_groups: 4
+  deform_adv_init_from_memory_encoder: true  # Initialize from pretrained memory encoder
+  deform_adv_freeze_mask_encoder: false  # Allow fine-tuning
     
-  # Augmentation Pipeline Ordering
-  adversarial_aug_order: ["deform", "style"]  # Options: ["deform", "style"], ["style", "deform"], ["deform"], ["style"]
+  # Adversarial Pipeline Ordering
+  adversarial_attack_order: ["style"]  # Only style attack for this ablation
     
   # Distribution matching configuration for AUE calibration loss (nested config)
   aue_dist_matching_config:
     # Current method: Baseline Hard-Aware MMD (error-based Top-K mining)
-    method: "domain_aware_soft_mmd"  # Options: "mmd", "cka", "gram", "mmd_hard_aware", "domain_aware_soft_mmd"
-      
+    method: "mmd"  # Options: "mmd", "cka", "gram", "mmd_hard_aware", "domain_aware_soft_mmd"
+        
     # To use NEW theory-driven method, change to:
     # method: "domain_aware_soft_mmd"
-      
+        
     use_patches: true  # Ignored for hard-aware methods (inherently patch-based)
-    patch_size: 16  # Patch size for patch-based methods
-      
+    patch_size: 32  # Patch size for patch-based methods
+        
     # Method-specific parameters (only active when method is selected)
     mmd:
       kernel: "rbf"
       bandwidth: 0.1
       batch_size: 256
       n_batches: 10
-      
+        
     # Baseline: Hard-Aware MMD (error-based Top-K mining)
     mmd_hard_aware:
       top_k_percent: 0.25     # Top 25% hardest patches (by error)
       max_samples: 4096        # Memory optimization
-      
+        
     # NEW: Domain-Aware Soft MMD (theory-driven: OOD detection + MaxEnt)
     # Combines error (aleatoric) + feature diversity (epistemic) with soft weighting
     domain_aware_soft_mmd:
-      diversity_weight: 0.4        # 40% epistemic, 60% aleatoric (recommended: 0.3-0.5)
-      temperature: 0.1             # Softmax temperature (lower = more focused, recommended: 0.05-0.2)
+      diversity_weight: 0.25       # Reduced from 0.4 to 0.25 (less emphasis on epistemic diversity)
+      temperature: 0.2             # Increased from 0.1 to 0.2 (smoother sample selection, less aggressive)
       max_samples: 8192
       diversity_method: "channel_std"  # "channel_std" (faster) | "spatial_var"
       enable_monitoring: false     # Disable monitoring to save memory and ignore low correlation for now
-      
+        
     cka:
       use_linear_kernel: true  # Linear kernel (faster) vs RBF kernel
       use_minibatch: true  # Mini-batch computation for memory efficiency
       minibatch_size: 512
-      
+        
     gram:
       center: true
       normalize: true

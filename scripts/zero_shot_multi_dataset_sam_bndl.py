@@ -946,6 +946,16 @@ def inference_with_bndl(
                 # Limit to 3 objects per frame for stats collection (memory already managed by checkpoints)
                 max_obj_stats = 3
                 logger.info(f"Processing {len(out_obj_ids[:max_obj_stats])} objects for stats collection")
+                
+                # Pre-load GT mask once per frame to avoid redundant I/O
+                gt_mask_full = None
+                current_mask_path = ann_dir / vid / f"{frame_names[f_idx]}.png"
+                if current_mask_path.exists():
+                    try:
+                        gt_mask_full = np.array(Image.open(current_mask_path))
+                    except Exception as e:
+                        logger.warning(f"Failed to load GT mask for frame {f_idx}: {e}")
+
                 for obj_id in out_obj_ids[:max_obj_stats]:
                     # Convert obj_id to internal obj_idx using predictor's mapping
                     obj_idx = predictor._obj_id_to_idx(state, obj_id)
@@ -955,9 +965,9 @@ def inference_with_bndl(
                     
                     if bndl_outputs is not None:
                         # Calculate PAvPU if we have ground truth
-                        first_mask_path = ann_dir / vid / f"{frame_names[f_idx]}.png"
-                        if first_mask_path.exists():
-                            gt_mask = np.array(Image.open(first_mask_path))
+                        if gt_mask_full is not None:
+                            # Extract binary mask for current object
+                            gt_mask = (gt_mask_full == obj_id).astype(np.float32)
                             # Convert to tensor format for PAvPU calculation
                             gt_tensor = torch.from_numpy(gt_mask).float().unsqueeze(0)  # [1, H, W]
                             # Move to the same device as BNDL outputs
@@ -977,12 +987,10 @@ def inference_with_bndl(
                             _idx = id_to_idx.get(obj_id)
                             if _idx is not None and _idx < len(out_logits):
                                 pred_logits = out_logits[_idx]
-                                current_mask_path = ann_dir / vid / f"{frame_names[f_idx]}.png"
                                 
-                                if current_mask_path.exists() and "pixel_uncertainty" in bndl_outputs:
+                                if gt_mask_full is not None and "pixel_uncertainty" in bndl_outputs:
                                     # Extract binary mask for current object only
-                                    current_gt_mask_full = np.array(Image.open(current_mask_path))
-                                    current_gt_mask = (current_gt_mask_full == obj_id).astype(np.float32)
+                                    current_gt_mask = (gt_mask_full == obj_id).astype(np.float32)
                                     current_gt_tensor = torch.from_numpy(current_gt_mask).unsqueeze(0)
                                     
                                     # Move to same device

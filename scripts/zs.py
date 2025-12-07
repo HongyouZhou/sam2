@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -131,12 +133,57 @@ def run_comparison_evaluation(
     sam2_predictor = None
     if run_sam or run_uctta:  # UCTTA needs SAM-2 predictor
         print("\nLoading SAM-2 checkpoint...")
-        sam2_predictor = build_predictor_with_overrides(
-            cfg_file=sam2_cfg,
-            ckpt=sam2_checkpoint,
-            device=device,
-        )
-        print("SAM-2 loaded successfully!")
+        try:
+            # 检查文件是否存在
+            # 配置文件路径可能是相对于 Hydra 搜索路径的（如 configs/sam2.1/...）
+            # Hydra 的搜索路径是 pkg://sam2，指向 sam2/sam2/ 目录
+            # 需要尝试多个可能的路径
+            import sam2
+            sam2_package_root = Path(sam2.__path__[0])  # /path/to/sam2
+            sam2_package_dir = sam2_package_root / "sam2"  # /path/to/sam2/sam2
+            config_paths_to_try = [
+                Path(sam2_cfg),  # 相对路径（相对于当前工作目录）
+                sam2_package_dir / sam2_cfg,  # 相对于 sam2/sam2/ 目录（Hydra 搜索路径）
+                sam2_package_root / sam2_cfg,  # 相对于 sam2/ 目录
+            ]
+            
+            # Add experiment config directory if set
+            experiment_config_dir = os.environ.get("EXPERIMENT_CONFIG_DIR")
+            if experiment_config_dir:
+                config_paths_to_try.insert(0, Path(experiment_config_dir) / sam2_cfg)
+
+            config_found = False
+            for cfg_path in config_paths_to_try:
+                if cfg_path.exists():
+                    config_found = True
+                    break
+            if not config_found:
+                raise FileNotFoundError(f"SAM-2 config file not found: {sam2_cfg} (tried: {[str(p) for p in config_paths_to_try]})")
+            
+            if not Path(sam2_checkpoint).exists():
+                raise FileNotFoundError(f"SAM-2 checkpoint file not found: {sam2_checkpoint}")
+            
+            sam2_predictor = build_predictor_with_overrides(
+                cfg_file=sam2_cfg,
+                ckpt=sam2_checkpoint,
+                device=device,
+            )
+            print("SAM-2 loaded successfully!")
+        except FileNotFoundError as e:
+            print(f"❌ File not found error when loading SAM-2: {e}")
+            raise
+        except RuntimeError as e:
+            print(f"❌ Runtime error when loading SAM-2 checkpoint: {e}")
+            print(f"   Config: {sam2_cfg}")
+            print(f"   Checkpoint: {sam2_checkpoint}")
+            raise
+        except Exception as e:
+            print(f"❌ Unexpected error when loading SAM-2: {type(e).__name__}: {e}")
+            print(f"   Config: {sam2_cfg}")
+            print(f"   Checkpoint: {sam2_checkpoint}")
+            import traceback
+            traceback.print_exc()
+            raise
 
     # Load BNDL predictor with the same overrides (optional)
     bndl_predictor = None
@@ -144,23 +191,93 @@ def run_comparison_evaluation(
         if bndl_cfg is None or bndl_checkpoint is None:
             raise ValueError("BNDL requires both bndl_cfg and bndl_checkpoint to be specified")
         print("\nLoading BNDL checkpoint...")
-        bndl_predictor = build_predictor_with_overrides(
-            cfg_file=bndl_cfg,
-            ckpt=bndl_checkpoint,
-            device=device,
-        )
-        print("BNDL loaded successfully!")
+        try:
+            # 检查文件是否存在（使用与 SAM-2 相同的路径解析逻辑）
+            import sam2
+            sam2_package_root = Path(sam2.__path__[0])
+            sam2_package_dir = sam2_package_root / "sam2"
+            bndl_config_paths_to_try = [
+                Path(bndl_cfg),
+                sam2_package_dir / bndl_cfg,
+                sam2_package_root / bndl_cfg,
+            ]
+            bndl_config_found = False
+            for cfg_path in bndl_config_paths_to_try:
+                if cfg_path.exists():
+                    bndl_config_found = True
+                    break
+            if not bndl_config_found:
+                raise FileNotFoundError(f"BNDL config file not found: {bndl_cfg} (tried: {[str(p) for p in bndl_config_paths_to_try]})")
+            if not Path(bndl_checkpoint).exists():
+                raise FileNotFoundError(f"BNDL checkpoint file not found: {bndl_checkpoint}")
+            
+            bndl_predictor = build_predictor_with_overrides(
+                cfg_file=bndl_cfg,
+                ckpt=bndl_checkpoint,
+                device=device,
+            )
+            print("BNDL loaded successfully!")
+        except FileNotFoundError as e:
+            print(f"❌ File not found error when loading BNDL: {e}")
+            raise
+        except RuntimeError as e:
+            print(f"❌ Runtime error when loading BNDL checkpoint: {e}")
+            print(f"   Config: {bndl_cfg}")
+            print(f"   Checkpoint: {bndl_checkpoint}")
+            raise
+        except Exception as e:
+            print(f"❌ Unexpected error when loading BNDL: {type(e).__name__}: {e}")
+            print(f"   Config: {bndl_cfg}")
+            print(f"   Checkpoint: {bndl_checkpoint}")
+            import traceback
+            traceback.print_exc()
+            raise
 
     # Load BNDL_AUE predictor with the same overrides (optional)
     bndl_aue_predictor = None
     if run_bndl_aue:
         print("\nLoading BNDL_AUE checkpoint...")
-        bndl_aue_predictor = build_predictor_with_overrides(
-            cfg_file=bndl_aue_cfg,
-            ckpt=bndl_aue_checkpoint,
-            device=device,
-        )
-        print("BNDL_AUE loaded successfully!")
+        try:
+            # 检查文件是否存在（使用与 SAM-2 相同的路径解析逻辑）
+            import sam2
+            sam2_package_root = Path(sam2.__path__[0])
+            sam2_package_dir = sam2_package_root / "sam2"
+            bndl_aue_config_paths_to_try = [
+                Path(bndl_aue_cfg),
+                sam2_package_dir / bndl_aue_cfg,
+                sam2_package_root / bndl_aue_cfg,
+            ]
+            bndl_aue_config_found = False
+            for cfg_path in bndl_aue_config_paths_to_try:
+                if cfg_path.exists():
+                    bndl_aue_config_found = True
+                    break
+            if not bndl_aue_config_found:
+                raise FileNotFoundError(f"BNDL_AUE config file not found: {bndl_aue_cfg} (tried: {[str(p) for p in bndl_aue_config_paths_to_try]})")
+            if not Path(bndl_aue_checkpoint).exists():
+                raise FileNotFoundError(f"BNDL_AUE checkpoint file not found: {bndl_aue_checkpoint}")
+            
+            bndl_aue_predictor = build_predictor_with_overrides(
+                cfg_file=bndl_aue_cfg,
+                ckpt=bndl_aue_checkpoint,
+                device=device,
+            )
+            print("BNDL_AUE loaded successfully!")
+        except FileNotFoundError as e:
+            print(f"❌ File not found error when loading BNDL_AUE: {e}")
+            raise
+        except RuntimeError as e:
+            print(f"❌ Runtime error when loading BNDL_AUE checkpoint: {e}")
+            print(f"   Config: {bndl_aue_cfg}")
+            print(f"   Checkpoint: {bndl_aue_checkpoint}")
+            raise
+        except Exception as e:
+            print(f"❌ Unexpected error when loading BNDL_AUE: {type(e).__name__}: {e}")
+            print(f"   Config: {bndl_aue_cfg}")
+            print(f"   Checkpoint: {bndl_aue_checkpoint}")
+            import traceback
+            traceback.print_exc()
+            raise
 
     # Load SAM-2+UR-ERN predictor with the same overrides (if needed)
     ur_ern_predictor = None
@@ -168,12 +285,47 @@ def run_comparison_evaluation(
         if ur_ern_cfg is None or ur_ern_checkpoint is None:
             raise ValueError("UR-ERN requires both ur_ern_cfg and ur_ern_checkpoint to be specified")
         print("\nLoading SAM-2+UR-ERN checkpoint...")
-        ur_ern_predictor = build_predictor_with_overrides(
-            cfg_file=ur_ern_cfg,
-            ckpt=ur_ern_checkpoint,
-            device=device,
-        )
-        print("SAM-2+UR-ERN loaded successfully!")
+        try:
+            # 检查文件是否存在（使用与 SAM-2 相同的路径解析逻辑）
+            import sam2
+            sam2_package_root = Path(sam2.__path__[0])
+            sam2_package_dir = sam2_package_root / "sam2"
+            ur_ern_config_paths_to_try = [
+                Path(ur_ern_cfg),
+                sam2_package_dir / ur_ern_cfg,
+                sam2_package_root / ur_ern_cfg,
+            ]
+            ur_ern_config_found = False
+            for cfg_path in ur_ern_config_paths_to_try:
+                if cfg_path.exists():
+                    ur_ern_config_found = True
+                    break
+            if not ur_ern_config_found:
+                raise FileNotFoundError(f"UR-ERN config file not found: {ur_ern_cfg} (tried: {[str(p) for p in ur_ern_config_paths_to_try]})")
+            if not Path(ur_ern_checkpoint).exists():
+                raise FileNotFoundError(f"UR-ERN checkpoint file not found: {ur_ern_checkpoint}")
+            
+            ur_ern_predictor = build_predictor_with_overrides(
+                cfg_file=ur_ern_cfg,
+                ckpt=ur_ern_checkpoint,
+                device=device,
+            )
+            print("SAM-2+UR-ERN loaded successfully!")
+        except FileNotFoundError as e:
+            print(f"❌ File not found error when loading UR-ERN: {e}")
+            raise
+        except RuntimeError as e:
+            print(f"❌ Runtime error when loading UR-ERN checkpoint: {e}")
+            print(f"   Config: {ur_ern_cfg}")
+            print(f"   Checkpoint: {ur_ern_checkpoint}")
+            raise
+        except Exception as e:
+            print(f"❌ Unexpected error when loading UR-ERN: {type(e).__name__}: {e}")
+            print(f"   Config: {ur_ern_cfg}")
+            print(f"   Checkpoint: {ur_ern_checkpoint}")
+            import traceback
+            traceback.print_exc()
+            raise
 
     # Run evaluations
     sam2_results = {}
@@ -549,70 +701,69 @@ def create_comprehensive_comparison_plots(
     uctta_results: dict[str, tuple[float, float, float]] | None = None,
     uctta_statistics: dict[str, Any] | None = None,
     aue_version: str | None = None,
+    bndl_baseline_results: dict[str, tuple[float, float, float]] | None = None,
 ) -> None:
-    """Create comprehensive comparison plots between SAM-2 and BNDL
+    """Create comprehensive comparison plots between SAM-2, BNDL baseline, and BNDL_AUE
     
     Args:
         aue_version: AUE版本标识，用于生成带版本后缀的文件夹名
+        bndl_baseline_results: Optional BNDL baseline results for comparison
     """
 
     print("\nGenerating comprehensive comparison plots...")
 
-    # Prepare data - only use datasets that exist in BOTH results
+    # Prepare data - use datasets that exist in SAM-2 and BNDL_AUE results
     datasets = [d for d in sam2_results if d in bndl_results]
     if not datasets:
         print("No common results to plot!")
         return
 
-    # Extract metrics
+    # Extract metrics (only J&F needed)
     sam2_jf = [sam2_results[d][0] for d in datasets]
-    sam2_j = [sam2_results[d][1] for d in datasets]
-    sam2_f = [sam2_results[d][2] for d in datasets]
+    bndl_aue_jf = [bndl_results[d][0] for d in datasets]
 
-    bndl_jf = [bndl_results[d][0] for d in datasets]
-    bndl_j = [bndl_results[d][1] for d in datasets]
-    bndl_f = [bndl_results[d][2] for d in datasets]
+    # Extract BNDL baseline metrics if available (only J&F needed)
+    bndl_baseline_jf = None
+    if bndl_baseline_results:
+        # Only use datasets that exist in BNDL baseline
+        baseline_datasets = [d for d in datasets if d in bndl_baseline_results]
+        if baseline_datasets:
+            # Align with main datasets list
+            bndl_baseline_jf = [bndl_baseline_results.get(d, (0, 0, 0))[0] for d in datasets]
 
-    # Calculate improvements
-    jf_improvements = [bndl_jf[i] - sam2_jf[i] for i in range(len(datasets))]
-    j_improvements = [bndl_j[i] - sam2_j[i] for i in range(len(datasets))]
-    f_improvements = [bndl_f[i] - sam2_f[i] for i in range(len(datasets))]
-
-    # Create DataFrame for easier plotting
-    df_data = []
-    for i, dataset in enumerate(datasets):
-        df_data.extend([
-            {"Dataset": dataset, "Method": "SAM-2", "Metric": "J&F", "Score": sam2_jf[i]},
-            {"Dataset": dataset, "Method": "BNDL_AUE", "Metric": "J&F", "Score": bndl_jf[i]},
-            {"Dataset": dataset, "Method": "SAM-2", "Metric": "J (IoU)", "Score": sam2_j[i]},
-            {"Dataset": dataset, "Method": "BNDL_AUE", "Metric": "J (IoU)", "Score": bndl_j[i]},
-            {"Dataset": dataset, "Method": "SAM-2", "Metric": "F (Boundary)", "Score": sam2_f[i]},
-            {"Dataset": dataset, "Method": "BNDL_AUE", "Metric": "F (Boundary)", "Score": bndl_f[i]},
-        ])
-
-    df = pd.DataFrame(df_data)
+    # Calculate improvements (only J&F)
+    jf_improvements = [bndl_aue_jf[i] - sam2_jf[i] for i in range(len(datasets))]
+    
+    # Calculate improvements (BNDL baseline vs SAM-2) if baseline available
+    jf_improvements_baseline_vs_sam = None
+    if bndl_baseline_jf:
+        jf_improvements_baseline_vs_sam = [bndl_baseline_jf[i] - sam2_jf[i] for i in range(len(datasets))]
 
     # 计算去除 MOSE 的宏平均 (排除 MOSE_train 和 MOSE_val)
     averages_excl_mose = None
     non_mose_idx = [i for i, d in enumerate(datasets) if not d.startswith("MOSE")]
     if non_mose_idx:
         avg_sam2_jf = float(np.mean([sam2_jf[i] for i in non_mose_idx]))
-        avg_bndl_jf = float(np.mean([bndl_jf[i] for i in non_mose_idx]))
-        avg_sam2_j = float(np.mean([sam2_j[i] for i in non_mose_idx]))
-        avg_bndl_j = float(np.mean([bndl_j[i] for i in non_mose_idx]))
-        avg_sam2_f = float(np.mean([sam2_f[i] for i in non_mose_idx]))
-        avg_bndl_f = float(np.mean([bndl_f[i] for i in non_mose_idx]))
+        avg_bndl_aue_jf = float(np.mean([bndl_aue_jf[i] for i in non_mose_idx]))
 
         averages_excl_mose = {
-            "sam2": {"jf": avg_sam2_jf, "j": avg_sam2_j, "f": avg_sam2_f},
-            "bndl": {"jf": avg_bndl_jf, "j": avg_bndl_j, "f": avg_bndl_f},
+            "sam2": {"jf": avg_sam2_jf},
+            "bndl_aue": {"jf": avg_bndl_aue_jf},
             "improvements": {
-                "jf": avg_bndl_jf - avg_sam2_jf,
-                "j": avg_bndl_j - avg_sam2_j,
-                "f": avg_bndl_f - avg_sam2_f,
+                "jf": avg_bndl_aue_jf - avg_sam2_jf,
             },
             "datasets_count": len(non_mose_idx),
         }
+        
+        # Add BNDL baseline averages if available
+        if bndl_baseline_jf:
+            avg_bndl_baseline_jf = float(np.mean([bndl_baseline_jf[i] for i in non_mose_idx]))
+            averages_excl_mose["bndl_baseline"] = {
+                "jf": avg_bndl_baseline_jf,
+            }
+            averages_excl_mose["improvements_baseline_vs_sam"] = {
+                "jf": avg_bndl_baseline_jf - avg_sam2_jf,
+            }
 
     # Set up plotting style
     plt.style.use("default")
@@ -623,23 +774,22 @@ def create_comprehensive_comparison_plots(
     gs = fig.add_gridspec(2, 1, hspace=0.5, wspace=0.4)
 
     # Main title
-    fig.suptitle("SAM-2 vs BNDL_AUE Zero-shot Evaluation (Compact)", fontsize=18, fontweight="bold", y=0.95)
+    title = "SAM-2 vs BNDL vs BNDL_AUE Zero-shot Evaluation (Compact)"
+    if not bndl_baseline_jf:
+        title = "SAM-2 vs BNDL_AUE Zero-shot Evaluation (Compact)"
+    fig.suptitle(title, fontsize=18, fontweight="bold", y=0.95)
 
     # Improvement Summary (top) - 横坐标为improvement，纵坐标为数据集
     ax4 = fig.add_subplot(gs[0, 0])
-    improvement_data = [jf_improvements, j_improvements, f_improvements]
-    improvement_labels = ["J&F", "J (IoU)", "F (Boundary)"]
     y_imp = np.arange(len(datasets))
-    height_imp = 0.25
     
-    # 使用水平条形图（barh）
-    for i, (data, label) in enumerate(zip(improvement_data, improvement_labels, strict=True)):
-        ax4.barh(y_imp + i * height_imp, data, height_imp, label=label, alpha=0.85)
+    # 使用水平条形图（barh），只显示 J&F
+    ax4.barh(y_imp, jf_improvements, alpha=0.85, color="steelblue", label="J&F")
     
-    ax4.set_title("Improvement Summary", fontweight="bold", fontsize=14)
+    ax4.set_title("Improvement Summary (BNDL_AUE vs SAM-2)", fontweight="bold", fontsize=14)
     ax4.set_xlabel("Improvement (BNDL_AUE - SAM-2)", fontsize=11)
     ax4.set_ylabel("Dataset", fontsize=11)
-    ax4.set_yticks(y_imp + height_imp)
+    ax4.set_yticks(y_imp)
     ax4.set_yticklabels(datasets, fontsize=10)
     ax4.legend(fontsize=10)
     ax4.axvline(x=0, color="black", linestyle="-", alpha=0.3)
@@ -659,7 +809,7 @@ def create_comprehensive_comparison_plots(
     if averages_excl_mose:
         col_labels.append("AVG (excl MOSE)")
     
-    # 表数据：三行（SAM-2, BNDL_AUE, Improvement）
+    # 表数据：根据是否有BNDL baseline决定行数
     summary_data = []
     
     # 第一行：SAM-2 J&F
@@ -670,16 +820,34 @@ def create_comprehensive_comparison_plots(
         row_sam2.append(f"{averages_excl_mose['sam2']['jf']:.2f}")
     summary_data.append(row_sam2)
     
-    # 第二行：BNDL_AUE J&F
-    row_bndl = ["BNDL_AUE J&F"]
-    for i in range(len(datasets)):
-        row_bndl.append(f"{bndl_jf[i]:.2f}")
-    if averages_excl_mose:
-        row_bndl.append(f"{averages_excl_mose['bndl']['jf']:.2f}")
-    summary_data.append(row_bndl)
+    # 第二行：BNDL baseline J&F (if available)
+    if bndl_baseline_jf:
+        row_bndl_baseline = ["BNDL J&F"]
+        for i in range(len(datasets)):
+            row_bndl_baseline.append(f"{bndl_baseline_jf[i]:.2f}")
+        if averages_excl_mose and "bndl_baseline" in averages_excl_mose:
+            row_bndl_baseline.append(f"{averages_excl_mose['bndl_baseline']['jf']:.2f}")
+        summary_data.append(row_bndl_baseline)
     
-    # 第三行：ΔJ&F (Improvement)
-    row_delta = ["ΔJ&F"]
+    # BNDL_AUE J&F
+    row_bndl_aue = ["BNDL_AUE J&F"]
+    for i in range(len(datasets)):
+        row_bndl_aue.append(f"{bndl_aue_jf[i]:.2f}")
+    if averages_excl_mose:
+        row_bndl_aue.append(f"{averages_excl_mose['bndl_aue']['jf']:.2f}")
+    summary_data.append(row_bndl_aue)
+    
+    # ΔJ&F (BNDL baseline vs SAM-2) if available
+    if bndl_baseline_jf and jf_improvements_baseline_vs_sam:
+        row_delta_baseline_sam = ["ΔJ&F (BNDL-SAM)"]
+        for i in range(len(datasets)):
+            row_delta_baseline_sam.append(f"{jf_improvements_baseline_vs_sam[i]:+.2f}")
+        if averages_excl_mose and "improvements_baseline_vs_sam" in averages_excl_mose:
+            row_delta_baseline_sam.append(f"{averages_excl_mose['improvements_baseline_vs_sam']['jf']:+.2f}")
+        summary_data.append(row_delta_baseline_sam)
+    
+    # ΔJ&F (BNDL_AUE vs SAM-2)
+    row_delta = ["ΔJ&F (AUE-SAM)"]
     for i in range(len(datasets)):
         row_delta.append(f"{jf_improvements[i]:+.2f}")
     if averages_excl_mose:
@@ -697,18 +865,48 @@ def create_comprehensive_comparison_plots(
     table.set_fontsize(9)
     table.scale(1, 2.0)
 
-    # Color code improvements in the ΔJ&F row
+    # Color code improvements in the ΔJ&F rows
+    # Find the row indices for improvement rows
+    # Order: SAM-2, BNDL (if exists), BNDL_AUE, ΔJ&F (BNDL-SAM) (if exists), ΔJ&F (AUE-SAM)
+    if bndl_baseline_jf:
+        # Find indices: BNDL-SAM, AUE-SAM
+        delta_baseline_sam_idx = None
+        delta_aue_sam_idx = None
+        for idx, row in enumerate(summary_data):
+            if row[0] == "ΔJ&F (BNDL-SAM)":
+                delta_baseline_sam_idx = idx
+            elif row[0] == "ΔJ&F (AUE-SAM)":
+                delta_aue_sam_idx = idx
+    else:
+        # Only AUE-SAM
+        delta_aue_sam_idx = len(summary_data) - 1
+    
     for j in range(1, len(col_labels)):  # Skip first column (Method label)
         try:
-            val = float(summary_data[2][j])  # Row 2 is ΔJ&F
-            if val > 0:
-                table[(3, j)].set_facecolor("#90EE90")  # Light green (row 3 because header is row 0)
-            elif val < 0:
-                table[(3, j)].set_facecolor("#FFB6C1")  # Light red
+            # Color code BNDL baseline vs SAM-2 improvement if available
+            if bndl_baseline_jf and delta_baseline_sam_idx is not None:
+                val_baseline_sam = float(summary_data[delta_baseline_sam_idx][j])
+                row_num_baseline_sam = delta_baseline_sam_idx + 1  # +1 because header is row 0
+                if val_baseline_sam > 0:
+                    table[(row_num_baseline_sam, j)].set_facecolor("#ADD8E6")  # Light blue
+                elif val_baseline_sam < 0:
+                    table[(row_num_baseline_sam, j)].set_facecolor("#FFB6C1")  # Light red
+            
+            # Color code BNDL_AUE vs SAM-2 improvement
+            if delta_aue_sam_idx is not None:
+                val_aue_sam = float(summary_data[delta_aue_sam_idx][j])
+                row_num_aue_sam = delta_aue_sam_idx + 1
+                if val_aue_sam > 0:
+                    table[(row_num_aue_sam, j)].set_facecolor("#90EE90")  # Light green
+                elif val_aue_sam < 0:
+                    table[(row_num_aue_sam, j)].set_facecolor("#FFB6C1")  # Light red
         except (ValueError, IndexError):
             pass
 
-    ax9.set_title("Summary Statistics (ΔJ&F Focus)", fontweight="bold", fontsize=12, pad=20)
+    title = "Summary Statistics (ΔJ&F Focus)"
+    if bndl_baseline_jf:
+        title = "Summary Statistics: SAM-2 vs BNDL vs BNDL_AUE"
+    ax9.set_title(title, fontweight="bold", fontsize=12, pad=20)
 
     # Save plots with AUE version suffix if provided
     if aue_version:
@@ -723,37 +921,37 @@ def create_comprehensive_comparison_plots(
 
     print(f"Comprehensive comparison plots saved to: {plot_path}")
 
-    # Save CSV summary
+    # Save CSV summary (only J&F)
     csv_file = plots_dir / "comparison_summary.csv"
     csv_data = []
     for i, dataset in enumerate(datasets):
-        csv_data.append({
+        row = {
             "Dataset": dataset,
             "SAM2_JF": sam2_jf[i],
-            "BNDL_JF": bndl_jf[i],
-            "JF_Improvement": jf_improvements[i],
-            "SAM2_J": sam2_j[i],
-            "BNDL_J": bndl_j[i],
-            "J_Improvement": j_improvements[i],
-            "SAM2_F": sam2_f[i],
-            "BNDL_F": bndl_f[i],
-            "F_Improvement": f_improvements[i],
-        })
+            "BNDL_AUE_JF": bndl_aue_jf[i],
+            "JF_Improvement_AUE_SAM": jf_improvements[i],
+        }
+        if bndl_baseline_jf:
+            row.update({
+                "BNDL_JF": bndl_baseline_jf[i],
+                "JF_Improvement_BNDL_SAM": jf_improvements_baseline_vs_sam[i],
+            })
+        csv_data.append(row)
 
     # CSV 中追加平均行（不含 MOSE_train/val）
     if averages_excl_mose:
-        csv_data.append({
+        avg_row = {
             "Dataset": "AVG(excl MOSE)",
             "SAM2_JF": averages_excl_mose["sam2"]["jf"],
-            "BNDL_JF": averages_excl_mose["bndl"]["jf"],
-            "JF_Improvement": averages_excl_mose["improvements"]["jf"],
-            "SAM2_J": averages_excl_mose["sam2"]["j"],
-            "BNDL_J": averages_excl_mose["bndl"]["j"],
-            "J_Improvement": averages_excl_mose["improvements"]["j"],
-            "SAM2_F": averages_excl_mose["sam2"]["f"],
-            "BNDL_F": averages_excl_mose["bndl"]["f"],
-            "F_Improvement": averages_excl_mose["improvements"]["f"],
-        })
+            "BNDL_AUE_JF": averages_excl_mose["bndl_aue"]["jf"],
+            "JF_Improvement_AUE_SAM": averages_excl_mose["improvements"]["jf"],
+        }
+        if "bndl_baseline" in averages_excl_mose:
+            avg_row.update({
+                "BNDL_JF": averages_excl_mose["bndl_baseline"]["jf"],
+                "JF_Improvement_BNDL_SAM": averages_excl_mose["improvements_baseline_vs_sam"]["jf"],
+            })
+        csv_data.append(avg_row)
 
     df_summary = pd.DataFrame(csv_data)
     df_summary.to_csv(csv_file, index=False)
@@ -1860,6 +2058,40 @@ def load_results_from_detailed_json(
 
 
 def parse_args():
+    # Initialize Hydra config module if not already initialized
+    from hydra import initialize_config_module
+    from hydra.core.global_hydra import GlobalHydra
+    import os
+    
+    # Check if experiment config directory is specified via environment variable
+    experiment_config_dir = os.environ.get("EXPERIMENT_CONFIG_DIR")
+    
+    if not GlobalHydra.instance().is_initialized():
+        initialize_config_module("sam2", version_base="1.2")
+    
+    # If experiment config directory is set, prepend it to search path (highest priority)
+    if experiment_config_dir and os.path.exists(experiment_config_dir):
+        gh = GlobalHydra.instance()
+        if gh.is_initialized():
+            config_loader = gh.config_loader()
+            search_path = config_loader.get_search_path()
+            
+            # Prepend experiment directory to search path (highest priority)
+            # Hydra will search this directory first before default paths
+            search_path.prepend("file", experiment_config_dir)
+            print(f"[zs.py] Prepended experiment config directory to search path (highest priority): {experiment_config_dir}")
+    else:
+        # If no experiment config directory, use default behavior
+        gh = GlobalHydra.instance()
+        if gh.is_initialized():
+            config_loader = gh.config_loader()
+            search_path = config_loader.get_search_path()
+            # Optionally, you can still prepend experiment directory if it exists but wasn't set
+            # This maintains backward compatibility
+            if experiment_config_dir and os.path.exists(experiment_config_dir):
+                search_path.prepend("file", experiment_config_dir)
+                print(f"[zs.py] Added experiment config directory to search path: {experiment_config_dir}")
+    
     p = argparse.ArgumentParser(description="Compare SAM-2 vs BNDL vs BNDL_AUE zero-shot evaluation")
 
     # Dataset selection
@@ -1992,113 +2224,114 @@ def main():
     output_path = Path(args.output_path)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    print("Starting comparison evaluation...")
-    print(f"Output directory: {output_path}")
-    
-    # If plot_only mode, try to load existing results
-    if args.plot_only:
-        print("\n🎨 Plot-only mode enabled - will only generate visualizations from existing results")
+    try:
+        print("Starting comparison evaluation...")
+        print(f"Output directory: {output_path}")
         
-        # Try to find detailed_results.json
-        if args.load_detailed_json is not None:
+        # If plot_only mode, try to load existing results
+        if args.plot_only:
+            print("\n🎨 Plot-only mode enabled - will only generate visualizations from existing results")
+            
+            # Try to find detailed_results.json
+            if args.load_detailed_json is not None:
+                detailed_path = Path(args.load_detailed_json)
+            else:
+                # Auto-detect from output_path
+                detailed_path = output_path / "comparison_plots" / "detailed_results.json"
+                if not detailed_path.exists():
+                    print(f"❌ Error: No detailed_results.json found at {detailed_path}")
+                    print("   Please specify --load_detailed_json or run evaluation first without --plot_only")
+                    return
+            
+            print(f"📂 Loading results from: {detailed_path}")
+            (sam2_results, bndl_aue_results, bndl_aue_statistics, bndl_results, bndl_statistics,
+             uctta_results, ur_ern_results, ua_data, uctta_statistics, ur_ern_statistics) = (
+                load_results_from_detailed_json(detailed_path)
+            )
+            print("✓ Results loaded successfully")
+            
+        # Optionally load previous results to avoid re-running
+        elif args.load_detailed_json is not None:
             detailed_path = Path(args.load_detailed_json)
+            print(f"Loading cached results from: {detailed_path}")
+            (sam2_results, bndl_aue_results, bndl_aue_statistics, bndl_results, bndl_statistics,
+             uctta_results, ur_ern_results, ua_data, uctta_statistics, ur_ern_statistics) = (
+                load_results_from_detailed_json(detailed_path)
+            )
         else:
-            # Auto-detect from output_path
-            detailed_path = output_path / "comparison_plots" / "detailed_results.json"
-            if not detailed_path.exists():
-                print(f"❌ Error: No detailed_results.json found at {detailed_path}")
-                print("   Please specify --load_detailed_json or run evaluation first without --plot_only")
-                return
-        
-        print(f"📂 Loading results from: {detailed_path}")
-        (sam2_results, bndl_aue_results, bndl_aue_statistics, bndl_results, bndl_statistics,
-         uctta_results, ur_ern_results, ua_data, uctta_statistics, ur_ern_statistics) = (
-            load_results_from_detailed_json(detailed_path)
-        )
-        print("✓ Results loaded successfully")
-        
-    # Optionally load previous results to avoid re-running
-    elif args.load_detailed_json is not None:
-        detailed_path = Path(args.load_detailed_json)
-        print(f"Loading cached results from: {detailed_path}")
-        (sam2_results, bndl_aue_results, bndl_aue_statistics, bndl_results, bndl_statistics,
-         uctta_results, ur_ern_results, ua_data, uctta_statistics, ur_ern_statistics) = (
-            load_results_from_detailed_json(detailed_path)
-        )
-    else:
-        # Run comparison evaluation
-        print(f"Datasets: {args.datasets}")
-        print(f"SAM-2 config: {args.sam2_cfg}")
-        print(f"SAM-2 checkpoint: {args.sam2_checkpoint}")
-        print(f"BNDL config: {args.bndl_cfg}")
-        print(f"BNDL checkpoint: {args.bndl_checkpoint}")
-        print(f"BNDL_AUE config: {args.bndl_aue_cfg}")
-        print(f"BNDL_AUE checkpoint: {args.bndl_aue_checkpoint}")
-        sam2_results, bndl_aue_results, bndl_aue_statistics, bndl_results, bndl_statistics, uctta_results, ur_ern_results, ua_data, uctta_statistics, ur_ern_statistics = run_comparison_evaluation(
-            datasets=args.datasets,
-            sam2_cfg=args.sam2_cfg,
-            sam2_checkpoint=args.sam2_checkpoint,
-            bndl_aue_cfg=args.bndl_aue_cfg,
-            bndl_aue_checkpoint=args.bndl_aue_checkpoint,
-            bndl_cfg=args.bndl_cfg,
-            bndl_checkpoint=args.bndl_checkpoint,
-            output_path=output_path,
-            ur_ern_cfg=args.ur_ern_cfg,
-            ur_ern_checkpoint=args.ur_ern_checkpoint,
-            device=args.device,
-            score_thresh=args.score_thresh,
-            thresh_grid=args.thresh_grid,
-            prompt_method=args.prompt_method,
-            first_frame_only=args.first_frame_only,
-            max_objects=args.max_objects,
-            video_limit=args.video_limit,
-            num_workers=args.num_workers,
-            save_vis=args.save_vis,
-            collect_bndl_stats=args.collect_bndl_stats,
-            uctta_steps=args.uctta_steps,
-            uctta_lr=args.uctta_lr,
-            run_sam=args.run_sam,
-            run_uctta=args.run_uctta,
-            run_bndl_aue=args.run_bndl_aue,
-            run_bndl=args.run_bndl,
-            run_ur_ern=args.run_ur_ern,
-            click_protocol=args.click_protocol,
-            min_click_dist=args.min_click_dist,
-            seed=args.seed,
-            # Full UCTTA parameters
-            uctta_enable_bn=args.uctta_enable_bn,
-            uctta_fisher_reg=args.uctta_fisher_reg,
-            uctta_fisher_alpha=args.uctta_fisher_alpha,
-            uctta_entropy_th=args.uctta_entropy_th,
-            uctta_selection_p=args.uctta_selection_p,
-            downsample_max_samples=args.downsample_max_samples,
-        )
+            # Run comparison evaluation
+            print(f"Datasets: {args.datasets}")
+            print(f"SAM-2 config: {args.sam2_cfg}")
+            print(f"SAM-2 checkpoint: {args.sam2_checkpoint}")
+            print(f"BNDL config: {args.bndl_cfg}")
+            print(f"BNDL checkpoint: {args.bndl_checkpoint}")
+            print(f"BNDL_AUE config: {args.bndl_aue_cfg}")
+            print(f"BNDL_AUE checkpoint: {args.bndl_aue_checkpoint}")
+            sam2_results, bndl_aue_results, bndl_aue_statistics, bndl_results, bndl_statistics, uctta_results, ur_ern_results, ua_data, uctta_statistics, ur_ern_statistics = run_comparison_evaluation(
+                datasets=args.datasets,
+                sam2_cfg=args.sam2_cfg,
+                sam2_checkpoint=args.sam2_checkpoint,
+                bndl_aue_cfg=args.bndl_aue_cfg,
+                bndl_aue_checkpoint=args.bndl_aue_checkpoint,
+                bndl_cfg=args.bndl_cfg,
+                bndl_checkpoint=args.bndl_checkpoint,
+                output_path=output_path,
+                ur_ern_cfg=args.ur_ern_cfg,
+                ur_ern_checkpoint=args.ur_ern_checkpoint,
+                device=args.device,
+                score_thresh=args.score_thresh,
+                thresh_grid=args.thresh_grid,
+                prompt_method=args.prompt_method,
+                first_frame_only=args.first_frame_only,
+                max_objects=args.max_objects,
+                video_limit=args.video_limit,
+                num_workers=args.num_workers,
+                save_vis=args.save_vis,
+                collect_bndl_stats=args.collect_bndl_stats,
+                uctta_steps=args.uctta_steps,
+                uctta_lr=args.uctta_lr,
+                run_sam=args.run_sam,
+                run_uctta=args.run_uctta,
+                run_bndl_aue=args.run_bndl_aue,
+                run_bndl=args.run_bndl,
+                run_ur_ern=args.run_ur_ern,
+                click_protocol=args.click_protocol,
+                min_click_dist=args.min_click_dist,
+                seed=args.seed,
+                # Full UCTTA parameters
+                uctta_enable_bn=args.uctta_enable_bn,
+                uctta_fisher_reg=args.uctta_fisher_reg,
+                uctta_fisher_alpha=args.uctta_fisher_alpha,
+                uctta_entropy_th=args.uctta_entropy_th,
+                uctta_selection_p=args.uctta_selection_p,
+                downsample_max_samples=args.downsample_max_samples,
+            )
 
-    # Save detailed results JSON (needed for parallel_compare.py) - skip if plot_only mode
-    if not args.plot_only:
-        save_detailed_results(
-            output_path=output_path,
-            sam2_results=sam2_results,
-            bndl_aue_results=bndl_aue_results,
-            bndl_aue_statistics=bndl_aue_statistics,
-            bndl_results=bndl_results,
-            bndl_statistics=bndl_statistics,
-            uctta_results=uctta_results,
-            ur_ern_results=ur_ern_results,
-            uctta_statistics=uctta_statistics,
-            ur_ern_statistics=ur_ern_statistics,
-            ua_data=ua_data,
-        )
-    
-    # Generate plots if requested or if plot_only mode
-    if args.plot_only or (not args.load_detailed_json and any([args.run_sam, args.run_bndl, args.run_bndl_aue])):
-        print("\n" + "=" * 80)
-        print("📊 Generating visualization plots...")
-        print("=" * 80)
+        # Save detailed results JSON (needed for parallel_compare.py) - skip if plot_only mode
+        if not args.plot_only:
+            save_detailed_results(
+                output_path=output_path,
+                sam2_results=sam2_results,
+                bndl_aue_results=bndl_aue_results,
+                bndl_aue_statistics=bndl_aue_statistics,
+                bndl_results=bndl_results,
+                bndl_statistics=bndl_statistics,
+                uctta_results=uctta_results,
+                ur_ern_results=ur_ern_results,
+                uctta_statistics=uctta_statistics,
+                ur_ern_statistics=ur_ern_statistics,
+                ua_data=ua_data,
+            )
         
-        # Create comparison plots
-        if sam2_results and bndl_aue_results:
-            print("\n🎨 Creating comprehensive comparison plots...")
+        # Generate plots if requested or if plot_only mode
+        if args.plot_only or (not args.load_detailed_json and any([args.run_sam, args.run_bndl, args.run_bndl_aue])):
+            print("\n" + "=" * 80)
+            print("📊 Generating visualization plots...")
+            print("=" * 80)
+            
+            # Create comparison plots
+            if sam2_results and bndl_aue_results:
+                print("\n🎨 Creating comprehensive comparison plots...")
             try:
                 # 从命令行参数获取AUE版本（parallel_compare.py会传递）
                 aue_version = getattr(args, 'aue_version', None)
@@ -2113,6 +2346,7 @@ def main():
                     uctta_results=uctta_results,
                     uctta_statistics=uctta_statistics,
                     aue_version=aue_version,
+                    bndl_baseline_results=bndl_results if bndl_results else None,
                 )
                 print("✓ Comprehensive comparison plots generated")
             except Exception as e:
@@ -2152,10 +2386,37 @@ def main():
                 print(f"⚠️  Warning: Failed to generate UA shift plots: {e}")
                 import traceback
                 traceback.print_exc()
-        
-        print("\n" + "=" * 80)
-        print("✓ All visualization plots generated successfully!")
-        print("=" * 80)
+            
+            print("\n" + "=" * 80)
+            print("✓ All visualization plots generated successfully!")
+            print("=" * 80)
+    
+    except KeyboardInterrupt:
+        print("\n⚠️  Interrupted by user", file=sys.stderr)
+        sys.exit(130)
+    except SystemExit:
+        # 重新抛出SystemExit，保持退出码
+        raise
+    except FileNotFoundError as e:
+        print(f"\n❌ File not found: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(1)
+    except RuntimeError as e:
+        print(f"\n❌ Runtime error: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(1)
+    except ValueError as e:
+        print(f"\n❌ Configuration error: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n❌ Unexpected error: {type(e).__name__}: {e}", file=sys.stderr)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
