@@ -173,7 +173,7 @@ DATASET_CONFIGS = {
     # MOSE split for domain shift analysis
     # Both use MOSE official train set (val set has no GT), split via different file lists
     "MOSE_train": {
-        "root": "/ssdArray/hongyou/dev/data/MOSE_release/",
+        "root": "/ssdArray/hongyou/dev/data/sam2_data/MOSE_release/",
         "splits": ["train"],
         "default_split": ["train"],
         "has_split_subdir": True,
@@ -182,7 +182,7 @@ DATASET_CONFIGS = {
         "note": "Source domain for BNDL/UR-ERN fine-tuning",
     },
     "MOSE_val": {
-        "root": "/ssdArray/hongyou/dev/data/MOSE_release/",
+        "root": "/ssdArray/hongyou/dev/data/sam2_data/MOSE_release/",
         "splits": ["train"],  # Note: still uses 'train' directory (official val has no GT)
         "default_split": ["train"],
         "has_split_subdir": True,

@@ -128,14 +128,13 @@ model:
   max_num_objects: 3
   # === MAX_OBJECTS_CONFIG_END ===
   
-  # === CONV_LORA_CONFIG_START ===
-  # Conv-LoRA: Parameter-efficient fine-tuning with MoE
-  use_conv_lora: false
-  # conv_lora_rank: 8
-  # conv_lora_alpha: 16.0
-  # conv_lora_dropout: 0.1
-  # conv_lora_expert_scales: [1.0, 0.5, 2.0]  # Multi-scale experts for MoE
-  # conv_lora_target_modules:
+  # === LORA_CONFIG_START ===
+  # LoRA: Parameter-efficient fine-tuning
+  use_lora: false
+  # lora_rank: 8
+  # lora_alpha: 16.0
+  # lora_dropout: 0.1
+  # lora_target_modules:
   #   - "attn.qkv"
   #   - "attn.proj"
   #   - "mlp.layers.0"

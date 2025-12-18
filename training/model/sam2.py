@@ -100,19 +100,28 @@ class SAM2Train(SAM2Base):
             for p in self.image_encoder.parameters():
                 p.requires_grad = False
             
-            # 1.5. Auto-unfreeze Conv-LoRA parameters if use_conv_lora=True (PEFT)
-            if hasattr(self, 'use_conv_lora') and self.use_conv_lora:
-                # Conv-LoRA parameters are those in LinearWithConvLoRA.conv_lora submodules
-                conv_lora_params_unfrozen = 0
+            # 1.5. Auto-unfreeze LoRA parameters if use_lora=True (PEFT)
+            if hasattr(self, 'use_lora') and self.use_lora:
+                # LoRA parameters are those in LinearWithLoRA.lora or Conv2dWithLoRA.lora submodules
+                lora_params_unfrozen = 0
                 for name, module in self.image_encoder.named_modules():
-                    # Check if this is a LinearWithConvLoRA wrapper
-                    if module.__class__.__name__ == 'LinearWithConvLoRA':
-                        # Unfreeze only the conv_lora submodule, keep .linear frozen
+                    # Check if this is a LoRA wrapper
+                    if module.__class__.__name__ in ['LinearWithLoRA', 'Conv2dWithLoRA', 'LinearWithDoRA', 'Conv2dWithDoRA', 'LinearWithConvLoRA']:
+                        # Unfreeze only the lora submodule, keep .linear/.conv frozen
+                        if hasattr(module, 'lora'):
+                            for p in module.lora.parameters():
+                                p.requires_grad = True
+                                lora_params_unfrozen += 1
+                        # Unfreeze conv_lora submodule (for MoE Conv-LoRA)
                         if hasattr(module, 'conv_lora'):
                             for p in module.conv_lora.parameters():
                                 p.requires_grad = True
-                                conv_lora_params_unfrozen += 1
-                logging.info(f"Frozen image encoder, but unfrozen {conv_lora_params_unfrozen} Conv-LoRA parameters for PEFT")
+                                lora_params_unfrozen += 1
+                        # Unfreeze magnitude parameter for DoRA
+                        if hasattr(module, 'm'):
+                            module.m.requires_grad = True
+                            lora_params_unfrozen += 1
+                logging.info(f"Frozen image encoder, but unfrozen {lora_params_unfrozen} LoRA parameters for PEFT")
             
             # 2. Unfreeze specific components
             if "neck" in unfreeze_image_encoder_components:
@@ -193,6 +202,27 @@ class SAM2Train(SAM2Base):
                 return self.image_encoder
 
             self.image_encoder.train = custom_train
+
+        # If we are NOT freezing the encoder (joint training), we must ensure that
+        # the base weights of LoRA layers (which are frozen by default upon injection)
+        # are explicitly unfrozen.
+        if not freeze_image_encoder and hasattr(self, 'use_lora') and self.use_lora:
+            unfrozen_count = 0
+            for name, module in self.image_encoder.named_modules():
+                if module.__class__.__name__ in ['LinearWithLoRA', 'LinearWithDoRA', 'LinearWithConvLoRA']:
+                     # Unfreeze the original linear layer
+                     if hasattr(module, 'linear'):
+                         for p in module.linear.parameters():
+                             p.requires_grad = True
+                             unfrozen_count += 1
+                elif module.__class__.__name__ in ['Conv2dWithLoRA', 'Conv2dWithDoRA']:
+                     # Unfreeze the original conv layer
+                     if hasattr(module, 'conv'):
+                         for p in module.conv.parameters():
+                             p.requires_grad = True
+                             unfrozen_count += 1
+            if unfrozen_count > 0:
+                logging.info(f"Joint Training: Unfrozen {unfrozen_count} base layers within LoRA modules.")
 
     def forward(self, input: BatchedVideoDatapoint):
         if self.training or not self.forward_backbone_per_frame_for_eval:

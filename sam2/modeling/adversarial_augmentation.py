@@ -20,7 +20,7 @@ Key components:
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch.nn as nn
@@ -172,9 +172,9 @@ class AdversarialAttacker(nn.Module):
     
     def apply_transform(
         self,
-        img_batch: torch.Tensor | None,
-        clean_features: torch.Tensor | None,
-        params: torch.Tensor,
+        params: torch.Tensor | dict,
+        img_batch: torch.Tensor | None = None,
+        clean_features: torch.Tensor | None = None,
         pixel_gt: torch.Tensor | None = None,
         model: nn.Module | None = None,
         **kwargs
@@ -183,9 +183,9 @@ class AdversarialAttacker(nn.Module):
         Apply the transformation using predicted parameters.
         
         Args:
+            params: Adversarial parameters predicted by predict_params
             img_batch: [B, 3, H, W] Input images (for image-level aug)
             clean_features: [B, C, H, W] Clean features (for feature-level aug)
-            params: Adversarial parameters predicted by predict_params
             pixel_gt: [B, K, H, W] Ground truth masks
             model: SAM2 model
             **kwargs: Additional arguments
@@ -307,7 +307,11 @@ class ImageLevelStyleImpl(nn.Module):
         )
         
         # 2. Predict adversarial styles using neural network + GRL
-        adv_styles = self.style_net(clean_features, original_styles)
+        adv_styles = self.style_net(
+            clean_features, 
+            original_styles, 
+            pixel_gt=pixel_gt_normalized
+        )
         
         # 3. Optional GCN refinement for multi-object coordination
         if self.use_gcn and model.style_gcn is not None:
@@ -347,8 +351,8 @@ class ImageLevelStyleImpl(nn.Module):
         self,
         img_batch: torch.Tensor,
         params: torch.Tensor,
+        model: "SAM2Base",
         pixel_gt: torch.Tensor | None = None,
-        model: "SAM2Base" | None = None,
         **kwargs
     ) -> torch.Tensor:
         """
@@ -357,8 +361,8 @@ class ImageLevelStyleImpl(nn.Module):
         Args:
             img_batch: [B, 3, H, W] Input images
             params: [B, K, 6] Adversarial style parameters
+            model: SAM2Base model (required for accessing config)
             pixel_gt: [B, K, H, W] Ground truth masks (optional, for region-based style)
-            model: SAM2Base model (optional, for accessing config)
             
         Returns:
             styled_images: [B, 3, H, W] Styled images
@@ -541,7 +545,7 @@ class ImageLevelStyleImpl(nn.Module):
         base_stds = img_batch.std(dim=[2, 3], keepdim=True)    # [B, 3, 1, 1]
         
         # Pre-compute normalized images once to avoid repeated work inside the loop
-        normalized = (img_batch - base_means) / (base_stds + 1e-8)
+        normalized = (img_batch - base_means) / (base_stds + 1e-6)
 
         # Accumulate style applications (start from original)
         styled_images = img_batch.clone()
@@ -1036,9 +1040,9 @@ class FeatureLevelDeformationImpl(nn.Module):
             
             sampling_grid = norm_grid + offset_norm
             
-            # Warp (detach backbone features to keep grads off encoder)
+            # Warp (DO NOT detach backbone features if we want to train the backbone!)
             deformed_k = F.grid_sample(
-                clean_features.detach(),
+                clean_features,
                 sampling_grid,
                 mode='bilinear',
                 padding_mode='border',
@@ -1083,8 +1087,8 @@ class FeatureLevelDeformationImpl(nn.Module):
                 )
             
             logging.debug("Deformation Mode 2: Encoding image on-demand")
-            with torch.no_grad():
-                backbone_out = model.forward_image(img_batch, use_checkpoint=True)
+            # Remove no_grad to allow backbone updates during adversarial training
+            backbone_out = model.forward_image(img_batch, use_checkpoint=True)
             clean_features = backbone_out['backbone_fpn'][-1]
             
             if model.use_high_res_features_in_sam and clean_high_res is None:
@@ -1279,95 +1283,79 @@ class StyleAdversarialNetwork(nn.Module):
     Neural network that predicts adversarial style transformations with GRL.
     
     Architecture:
-        Features [B, C, H, W]
-        ↓
-        Global Average Pooling
-        ↓
-        Feature vector [B, C]
-        ↓
-        MLP (C → 128 → 6K)  # 6 params (μ,σ for RGB) × K objects
-        ↓
-        Style parameters [B, K, 6]
-        ↓
-        Gradient Reversal Layer (GRL)
-        ↓
-        Adversarial styles [B, K, 6]
-    
-    Design rationale:
-        - Single forward pass (no PGD loop) for memory efficiency
-        - GRL enables adversarial training within minimization loop
-        - Predicts per-object styles for multi-object consistency
+        Features + Masks -> Mask-Aware Pooling -> Object Features -> Shared MLP -> Style Params -> GRL
     
     Args:
         feature_dim: Feature dimension (default: 256)
-        num_objects: Max number of objects (default: 11, including background)
         epsilon: Max style perturbation magnitude (default: 2.0)
     """
     def __init__(
         self,
         feature_dim: int = 256,
-        num_objects: int = 11,
         epsilon: float = 2.0,
+        **kwargs
     ):
         super().__init__()
         self.feature_dim = feature_dim
-        self.num_objects = num_objects
         self.epsilon = epsilon
         
-        # Style predictor: features → per-object style parameters
-        # Output: [B, num_objects * 6] where 6 = (μ_R, μ_G, μ_B, σ_R, σ_G, σ_B)
-        self.style_net = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),  # [B, C, H, W] → [B, C, 1, 1]
-            nn.Flatten(),  # [B, C]
+        # Shared MLP: [B, K, C] -> [B, K, 6]
+        self.object_mlp = nn.Sequential(
             nn.Linear(feature_dim, 128),
             nn.ReLU(inplace=True),
-            nn.Linear(128, num_objects * 6),  # Per-object style parameters
+            nn.Linear(128, 6),
         )
         
-        # Initialize: small residuals
-        nn.init.normal_(self.style_net[-1].weight, mean=0.0, std=0.1)
-        nn.init.zeros_(self.style_net[-1].bias)
+        # Initialize small residuals
+        nn.init.normal_(self.object_mlp[-1].weight, mean=0.0, std=0.1)
+        nn.init.zeros_(self.object_mlp[-1].bias)
         
-        # Gradient Reversal Layer
-        # Placed at OUTPUT to invert gradients for the style network parameters
         self.grl = GRL(alpha=1.0)
     
     def forward(
         self,
         features: torch.Tensor,
         original_styles: torch.Tensor,
+        pixel_gt: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """
-        Predict adversarial style transformations with GRL.
+        B, C, H, W = features.shape
+        K_actual = original_styles.shape[1]
         
-        Args:
-            features: [B, C, H, W] Backbone features
-            original_styles: [B, K, 6] Original image styles
-        
-        Returns:
-            adv_styles: [B, K, 6] Adversarial styles (constrained by epsilon)
-        """
-        B = features.shape[0]
-        
-        # 1. Detach input features
-        # Best Practice: Backbone should not update to "fool" the style predictor.
-        # The style predictor should attack based on current backbone state.
+        # Detach input features to prevent backbone updates from style loss
         features_detached = features.detach()
         
-        # 2. Predict style residuals
-        style_residuals = self.style_net(features_detached)  # [B, num_objects * 6]
-        style_residuals = style_residuals.view(B, self.num_objects, 6)  # [B, K, 6]
+        if pixel_gt is not None:
+            if pixel_gt.shape[-2:] != (H, W):
+                masks = F.interpolate(pixel_gt.float(), size=(H, W), mode='nearest')
+            else:
+                masks = pixel_gt.float()
+            
+            # Efficient Masked Pooling
+            flat_features = features_detached.flatten(2).transpose(1, 2) # [B, N, C]
+            flat_masks = masks.flatten(2) # [B, K, N]
+            
+            mask_sums = flat_masks.sum(dim=2, keepdim=True).clamp(min=1e-6)
+            flat_masks_norm = flat_masks / mask_sums
+            
+            object_features = torch.bmm(flat_masks_norm, flat_features) # [B, K, C]
+            
+        else:
+            # Fallback: Global pooling
+            global_feat = features_detached.mean(dim=[2, 3]) # [B, C]
+            object_features = global_feat.unsqueeze(1).expand(-1, K_actual, -1)
+            
+        style_residuals = self.object_mlp(object_features)
         
-        # 3. Apply GRL to the residuals (OUTPUT side)
-        # This ensures StyleNet receives inverted gradients (Maximize Loss)
-        # while Backbone receives normal gradients (Minimize Loss) via the augmented image path.
+        # Apply GRL and constrain
         style_residuals_adv = self.grl(style_residuals)
-        
-        # Constrain by epsilon (use tanh normalization)
         style_residuals_adv = torch.tanh(style_residuals_adv) * self.epsilon
         
-        # Add to original styles
-        K_actual = original_styles.shape[1]
-        adv_styles = original_styles + style_residuals_adv[:, :K_actual, :]
-        
-        return adv_styles
+        # Handle shape mismatch if pixel_gt K != original_styles K
+        if style_residuals_adv.shape[1] != K_actual:
+             if style_residuals_adv.shape[1] > K_actual:
+                 style_residuals_adv = style_residuals_adv[:, :K_actual, :]
+             else:
+                 pad_k = K_actual - style_residuals_adv.shape[1]
+                 style_residuals_adv = F.pad(style_residuals_adv, (0, 0, 0, pad_k))
+
+        return original_styles + style_residuals_adv

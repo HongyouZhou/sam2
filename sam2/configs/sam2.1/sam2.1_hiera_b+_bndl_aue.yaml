@@ -128,14 +128,13 @@ model:
   max_num_objects: 3
   # === MAX_OBJECTS_CONFIG_END ===
   
-  # === CONV_LORA_CONFIG_START ===
-  # Conv-LoRA: Parameter-efficient fine-tuning with MoE
-  use_conv_lora: true
-  conv_lora_rank: 8
-  conv_lora_alpha: 16.0
-  conv_lora_dropout: 0.1
-  conv_lora_expert_scales: [1.0, 0.5, 2.0]  # Multi-scale experts for MoE
-  conv_lora_target_modules:  # Layers to inject Conv-LoRA
+  # === LORA_CONFIG_START ===
+  # LoRA: Parameter-efficient fine-tuning
+  use_lora: false
+  lora_rank: 8
+  lora_alpha: 16.0
+  lora_dropout: 0.1
+  lora_target_modules:  # Layers to inject LoRA
     - "mlp.layers.0"
     - "mlp.layers.1"
   # === CONV_LORA_CONFIG_END ===
@@ -143,29 +142,27 @@ model:
 
   # === AUE_GCN_CONFIG_START ===
   # AUE (Adversarial Uncertainty Estimation) with Style-based augmentation
-  use_aue: false
-  aue_use_uncertainty: true
-  aue_uncertainty_mask_threshold: 0.4
+  use_aue: true
   # Constraint weight for adversarial samples (L1 distance to initial)
   aue_constraint_loss_weight: 0.0  # Weight for constraint regularization (0 = disabled)
   # Attack mode: "cooperative" (parallel prediction, joint application) or "sequential" (iterative)
   aue_attack_mode: "cooperative"
   # Style Adversarial options (alternative to AUE, for domain generalization)
-  use_style_adv: false
+  use_style_adv: true
   style_adv_mode: "image_level"  # "image_level" or "feature_level"
-  style_adv_use_gt_region_style: false
+  style_adv_use_gt_region_style: true
     
   # Consistency Regularization: MMD(U_clean, U_adv)
   aue_consistency_weight: 0.5  # Weight for consistency loss (0.3-0.7 recommended)
     
   # Multi-object style attack control
-  style_adv_use_multi_object: false  # Only global style (no multi-object)
-  style_adv_enable_background: false  # Only global style (no background)
+  style_adv_use_multi_object: true
+  style_adv_enable_background: false
     
   # Global-Local Mixed Style Adversarial
-  style_adv_use_global_local_mix: false
-  style_adv_global_epsilon: 1.5
-  style_adv_global_weight: 0.3
+  style_adv_use_global_local_mix: true
+  style_adv_global_epsilon: 0.5
+  style_adv_global_weight: 0.5
 
   # GCN-based multi-object style refinement
   style_adv_use_gcn: false  # Not needed for global-only style

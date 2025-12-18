@@ -4,6 +4,7 @@ BNDL可视化器模块
 """
 
 import logging
+import os
 from typing import Any
 
 import cv2
@@ -768,3 +769,175 @@ class BNDLVisualizer:
                 axes[i].text(0.5, 0.5, "Correlation\nAnalysis\nFailed", ha="center", va="center", transform=axes[i].transAxes)
                 axes[i].set_title("Error")
                 axes[i].axis("off")
+
+    def create_unified_visualization(
+        self,
+        vis_dir: str,
+        data_iter: int,
+        step_index: int,
+        original_img: np.ndarray,
+        lambda_img: np.ndarray,
+        k_img: np.ndarray,
+        bndl_outputs: dict,
+        prompt_info: dict = None,
+        layout_type: str = "basic",
+        save_individual: bool = True,
+        save_unified: bool = True,
+        visualize_pavpu_overlay: bool = False,
+        uncertainty_metric: list = None,
+        epoch: int = None
+    ):
+        """
+        创建统一的可视化，支持保存单独的图和组合图
+        """
+        if uncertainty_metric is None:
+            uncertainty_metric = ["entropy"]
+
+        has_uncertainty = "pixel_uncertainty" in bndl_outputs and bndl_outputs["pixel_uncertainty"] is not None
+        has_pavpu = visualize_pavpu_overlay and "pixel_pavpu" in bndl_outputs and bndl_outputs["pixel_pavpu"] is not None
+        
+        # 检查是否有数据支持比值可视化
+        has_ratio_data = (
+            "pixel_uncertainty" in bndl_outputs and 
+            "mean_pixel_logits" in bndl_outputs and 
+            bndl_outputs["pixel_uncertainty"] is not None and 
+            bndl_outputs["mean_pixel_logits"] is not None
+        )
+
+        # 1. 保存单独的图
+        if save_individual:
+            self._save_individual_plots(
+                vis_dir, data_iter, step_index, original_img, lambda_img, k_img, 
+                bndl_outputs, prompt_info, has_uncertainty, has_pavpu, has_ratio_data, uncertainty_metric, epoch
+            )
+
+        # 2. 保存组合图
+        if save_unified:
+            self._save_unified_plot(
+                vis_dir, data_iter, step_index, original_img, lambda_img, k_img, 
+                bndl_outputs, prompt_info, layout_type, has_uncertainty, has_pavpu, has_ratio_data, uncertainty_metric, epoch
+            )
+
+    def _save_individual_plots(
+        self, vis_dir, data_iter, step_index, original_img, lambda_img, k_img, 
+        bndl_outputs, prompt_info, has_uncertainty, has_pavpu, has_ratio_data, uncertainty_metric, epoch=None
+    ):
+        if epoch is not None:
+            base_filename = f"epoch_{epoch}_iter_{data_iter}_step_{step_index}"
+        else:
+            base_filename = f"iter_{data_iter}_step_{step_index}"
+        
+        # 1. Original Image
+        fig, ax = plt.subplots(figsize=(6, 6))
+        self.viz_utils.plot_original_image(ax, original_img, prompt_info=prompt_info)
+        self.viz_utils.save_and_close_figure(fig, os.path.join(vis_dir, f"{base_filename}_original.png"))
+
+        # 2. Lambda Heatmap
+        fig, ax = plt.subplots(figsize=(6, 6))
+        self.viz_utils.plot_parameter_heatmap(ax, lambda_img, f"Lambda (λ) Step {step_index}", "viridis")
+        self.viz_utils.save_and_close_figure(fig, os.path.join(vis_dir, f"{base_filename}_lambda.png"))
+
+        # 3. K Heatmap
+        fig, ax = plt.subplots(figsize=(6, 6))
+        self.viz_utils.plot_parameter_heatmap(ax, k_img, f"Shape (k) Step {step_index}", "plasma")
+        self.viz_utils.save_and_close_figure(fig, os.path.join(vis_dir, f"{base_filename}_k.png"))
+
+        # 4. Parameter Overlays
+        if original_img is not None and original_img.shape[:2] == lambda_img.shape:
+            # 这里 plot_parameter_and_uncertainty_overlays 需要3个axes，所以我们需要创建一个包含3个子图的figure
+            fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+            if has_uncertainty:
+                self.plot_parameter_and_uncertainty_overlays(axes, original_img, lambda_img, k_img, bndl_outputs, step_index)
+            else:
+                self.viz_utils.plot_parameter_overlays(axes, original_img, lambda_img, k_img, step_index)
+            self.viz_utils.save_and_close_figure(fig, os.path.join(vis_dir, f"{base_filename}_overlays.png"))
+        else:
+            fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+            self.viz_utils.plot_parameter_distributions(axes, lambda_img, k_img, step_index)
+            self.viz_utils.save_and_close_figure(fig, os.path.join(vis_dir, f"{base_filename}_distributions.png"))
+
+        # 5. Global Parameters
+        fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+        self.plot_global_parameters_in_layout(axes, bndl_outputs, step_index)
+        self.viz_utils.save_and_close_figure(fig, os.path.join(vis_dir, f"{base_filename}_global_params.png"))
+
+        # 6. Uncertainty Visualization
+        if has_uncertainty:
+            fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+            if len(uncertainty_metric) > 1:
+                self.plot_multi_uncertainty_visualization(axes, bndl_outputs, step_index)
+            else:
+                self.plot_uncertainty_visualization(axes, bndl_outputs, step_index)
+            self.viz_utils.save_and_close_figure(fig, os.path.join(vis_dir, f"{base_filename}_uncertainty.png"))
+
+        # 7. PAvPU Overlay
+        if has_pavpu:
+            fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+            self.plot_pavpu_overlay_visualization(axes, bndl_outputs, original_img, step_index)
+            self.viz_utils.save_and_close_figure(fig, os.path.join(vis_dir, f"{base_filename}_pavpu.png"))
+
+        # 8. U/A Ratio
+        if has_ratio_data:
+            fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+            self.plot_uncertainty_accuracy_ratio_visualization(axes, bndl_outputs, original_img, step_index, ratio_type="U/A")
+            self.viz_utils.save_and_close_figure(fig, os.path.join(vis_dir, f"{base_filename}_ua_ratio.png"))
+
+    def _save_unified_plot(
+        self, vis_dir, data_iter, step_index, original_img, lambda_img, k_img, 
+        bndl_outputs, prompt_info, layout_type, has_uncertainty, has_pavpu, has_ratio_data, uncertainty_metric, epoch=None
+    ):
+        # 根据布局类型决定行数
+        if layout_type == "full" and has_uncertainty:
+            if has_pavpu and has_ratio_data:
+                rows = 6
+            elif has_pavpu or has_ratio_data:
+                rows = 5
+            else:
+                rows = 4
+        else:
+            rows = 3
+
+        logging.info(f"Creating visualization layout with {rows} rows")
+        fig, axes = self.viz_utils.create_figure_layout(rows, 3, (18, 6 * rows))
+
+        # Row 0: Common elements
+        self.viz_utils.plot_original_image(axes[0, 0], original_img, prompt_info=prompt_info)
+        self.viz_utils.plot_parameter_heatmap(axes[0, 1], lambda_img, f"Lambda (λ) Step {step_index}", "viridis")
+        self.viz_utils.plot_parameter_heatmap(axes[0, 2], k_img, f"Shape (k) Step {step_index}", "plasma")
+
+        # Row 1: Overlays or Distributions
+        if original_img is not None and original_img.shape[:2] == lambda_img.shape:
+            if has_uncertainty:
+                self.plot_parameter_and_uncertainty_overlays(axes[1, :], original_img, lambda_img, k_img, bndl_outputs, step_index)
+            else:
+                self.viz_utils.plot_parameter_overlays(axes[1, :], original_img, lambda_img, k_img, step_index)
+        else:
+            self.viz_utils.plot_parameter_distributions(axes[1, :], lambda_img, k_img, step_index)
+
+        # Row 2: Global Parameters
+        self.plot_global_parameters_in_layout(axes[2, :], bndl_outputs, step_index)
+
+        # Row 3: Uncertainty
+        if has_uncertainty and rows >= 4:
+            if len(uncertainty_metric) > 1:
+                self.plot_multi_uncertainty_visualization(axes[3, :], bndl_outputs, step_index)
+            else:
+                self.plot_uncertainty_visualization(axes[3, :], bndl_outputs, step_index)
+
+        current_row = 4
+        # Row 4/5: PAvPU
+        if has_pavpu and rows >= 5:
+            self.plot_pavpu_overlay_visualization(axes[current_row, :], bndl_outputs, original_img, step_index)
+            current_row += 1
+
+        # Row 5/6: U/A Ratio
+        if has_ratio_data and rows >= current_row + 1:
+            self.plot_uncertainty_accuracy_ratio_visualization(axes[current_row, :], bndl_outputs, original_img, step_index, ratio_type="U/A")
+
+        if epoch is not None:
+            filename = f"epoch_{epoch}_iter_{data_iter}_step_{step_index}_unified_{layout_type}.png"
+        else:
+            filename = f"iter_{data_iter}_step_{step_index}_unified_{layout_type}.png"
+            
+        save_path = os.path.join(vis_dir, filename)
+        self.viz_utils.save_and_close_figure(fig, save_path, dpi=150)

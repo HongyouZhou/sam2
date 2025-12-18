@@ -2385,11 +2385,9 @@ class Trainer:
 
     def _create_unified_visualization(self, bndl_outputs, batch, outputs_for_vis, vis_dir, data_iter, step_index, frame_index, layout_type="basic"):
         """统一的BNDL可视化方法，使用重构后的模块"""
-        from .utils.visualization_utils import VisualizationUtils
         from .utils.bndl_visualizer import BNDLVisualizer
 
         # 初始化可视化器
-        viz_utils = VisualizationUtils()
         bndl_viz = BNDLVisualizer()
 
         # 提取参数和图像
@@ -2406,74 +2404,23 @@ class Trainer:
         if original_img is not None:
             lambda_img, k_img = self._upsample_params_to_image_size(lambda_img, k_img, original_img.shape)
 
-        has_uncertainty = "pixel_uncertainty" in bndl_outputs and bndl_outputs["pixel_uncertainty"] is not None
-        has_pavpu = self.logging_conf.visualize_pavpu_overlay and "pixel_pavpu" in bndl_outputs and bndl_outputs["pixel_pavpu"] is not None
-
-        # 检查是否有数据支持比值可视化
-        has_ratio_data = (
-            "pixel_uncertainty" in bndl_outputs and "mean_pixel_logits" in bndl_outputs and bndl_outputs["pixel_uncertainty"] is not None and bndl_outputs["mean_pixel_logits"] is not None
+        # 调用BNDLVisualizer的统一可视化方法
+        bndl_viz.create_unified_visualization(
+            vis_dir=vis_dir,
+            data_iter=data_iter,
+            step_index=step_index,
+            original_img=original_img,
+            lambda_img=lambda_img,
+            k_img=k_img,
+            bndl_outputs=bndl_outputs,
+            prompt_info=prompt_info,
+            layout_type=layout_type,
+            save_individual=True,
+            save_unified=True,
+            visualize_pavpu_overlay=self.logging_conf.visualize_pavpu_overlay,
+            uncertainty_metric=self.logging_conf.uncertainty_metric,
+            epoch=self.epoch
         )
-
-        # 根据布局类型决定行数
-        if layout_type == "full" and has_uncertainty:
-            if has_pavpu and has_ratio_data:
-                rows = 6  # 添加PAvPU overlay行和比值可视化行
-            elif has_pavpu or has_ratio_data:
-                rows = 5  # 添加其中一种可视化
-            else:
-                rows = 4
-        else:
-            rows = 3
-
-        import logging
-        logging.info(f"Creating visualization layout with {rows} rows")
-        # 使用重构后的工具创建图表布局
-        fig, axes = viz_utils.create_figure_layout(rows, 3, (18, 6 * rows))
-
-        logging.info("Plotting common elements")
-        # 绘制通用元素（传递prompt信息）
-        self._plot_common_elements_refactored(axes, original_img, lambda_img, k_img, step_index, bndl_outputs, has_uncertainty, batch, outputs_for_vis, bndl_viz, viz_utils, prompt_info)
-
-        # 添加PAvPU overlay可视化
-        current_row = 4
-        if has_pavpu and rows >= 5:
-            logging.info("Plotting PAvPU overlay")
-            bndl_viz.plot_pavpu_overlay_visualization(axes[current_row, :], bndl_outputs, original_img, step_index)
-            current_row += 1
-
-        # 添加U/A比值可视化
-        if has_ratio_data and rows >= current_row + 1:
-            logging.info("Plotting U/A ratio visualization")
-            bndl_viz.plot_uncertainty_accuracy_ratio_visualization(axes[current_row, :], bndl_outputs, original_img, step_index, ratio_type="U/A")
-
-        save_path = os.path.join(vis_dir, f"epoch_{self.epoch}_iter_{data_iter}_step_{step_index}_unified_{layout_type}.png")
-        logging.info(f"Saving visualization to {save_path}")
-        viz_utils.save_and_close_figure(fig, save_path, dpi=150)
-        logging.info("Visualization saved successfully")
-
-
-    def _plot_common_elements_refactored(
-        self, axes, original_img, lambda_img, k_img, step_index, bndl_outputs, has_uncertainty=False, batch=None, outputs_for_vis=None, bndl_viz=None, viz_utils=None, prompt_info=None
-    ):
-        viz_utils.plot_original_image(axes[0, 0], original_img, prompt_info=prompt_info)
-        viz_utils.plot_parameter_heatmap(axes[0, 1], lambda_img, f"Lambda (λ) Step {step_index}", "viridis")
-        viz_utils.plot_parameter_heatmap(axes[0, 2], k_img, f"Shape (k) Step {step_index}", "plasma")
-
-        if original_img is not None and original_img.shape[:2] == lambda_img.shape:
-            if has_uncertainty:
-                bndl_viz.plot_parameter_and_uncertainty_overlays(axes[1, :], original_img, lambda_img, k_img, bndl_outputs, step_index)
-            else:
-                viz_utils.plot_parameter_overlays(axes[1, :], original_img, lambda_img, k_img, step_index)
-        else:
-            viz_utils.plot_parameter_distributions(axes[1, :], lambda_img, k_img, step_index)
-
-        bndl_viz.plot_global_parameters_in_layout(axes[2, :], bndl_outputs, step_index)
-        if has_uncertainty:
-            # Use multi-uncertainty visualization if multiple metrics are requested
-            if len(self.logging_conf.uncertainty_metric) > 1:
-                bndl_viz.plot_multi_uncertainty_visualization(axes[3, :], bndl_outputs, step_index)
-            else:
-                bndl_viz.plot_uncertainty_visualization(axes[3, :], bndl_outputs, step_index)
 
 def print_model_summary(model: torch.nn.Module, log_dir: str = ""):
     """

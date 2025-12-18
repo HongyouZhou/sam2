@@ -96,6 +96,7 @@ class ConvLoRALayer(nn.Module):
         alpha: float = 16.0,
         dropout: float = 0.0,
         expert_scales: List[float] = [1.0, 0.5, 2.0],
+        top_k: int = 1,
     ):
         super().__init__()
         self.in_features = in_features
@@ -105,6 +106,7 @@ class ConvLoRALayer(nn.Module):
         self.scaling = alpha / rank
         self.expert_scales = expert_scales
         self.num_experts = len(expert_scales)
+        self.top_k = max(1, min(top_k, self.num_experts))
         
         # 1. Down-projection (Linear A)
         self.lora_A = nn.Linear(in_features, rank, bias=False)
@@ -167,7 +169,14 @@ class ConvLoRALayer(nn.Module):
         # Global Average Pooling for context
         x_gap = x_map.mean(dim=(2, 3)) # [B, rank]
         gating_logits = self.gating_fc(x_gap) # [B, num_experts]
-        gating_weights = F.softmax(gating_logits, dim=1) # [B, num_experts]
+        # Top-k sparse gating (paper: top-k=1 by default)
+        if self.top_k >= self.num_experts:
+            gating_weights = F.softmax(gating_logits, dim=1)
+        else:
+            topk_vals, topk_idx = torch.topk(gating_logits, k=self.top_k, dim=1)
+            masked_logits = torch.full_like(gating_logits, float('-inf'))
+            masked_logits.scatter_(1, topk_idx, topk_vals)
+            gating_weights = F.softmax(masked_logits, dim=1)
         
         # Apply experts
         expert_outputs = []
@@ -210,6 +219,7 @@ class LinearWithConvLoRA(nn.Module):
         alpha: float = 16.0,
         dropout: float = 0.0,
         expert_scales: List[float] = [1.0, 0.5, 2.0],
+        top_k: int = 1,
     ):
         super().__init__()
         
@@ -226,6 +236,7 @@ class LinearWithConvLoRA(nn.Module):
             alpha=alpha,
             dropout=dropout,
             expert_scales=expert_scales,
+            top_k=top_k,
         )
         
         # Store spatial dimensions (will be set during forward)
@@ -242,20 +253,30 @@ class LinearWithConvLoRA(nn.Module):
         # Determine spatial shape
         if self._spatial_shape is not None:
             H, W = self._spatial_shape
-        elif x.ndim == 3:
-            # Infer square shape from sequence length
-            B, N, C = x.shape
-            H = W = int(math.sqrt(N))
-            if H * W != N:
-                # Fallback for non-square or padded inputs if strictly required,
-                # but for now we follow the plan to fail or approximate.
-                # Given user confirmation of square inputs, we stick to this.
-                raise ValueError(f"Input sequence length {N} is not a perfect square. "
-                                 f"Cannot infer spatial dimensions (H, W). "
-                                 f"Please call set_spatial_shape() or ensure square input.")
         elif x.ndim == 4:
             # Assume (B, H, W, C) for Linear input
             H, W = x.shape[1], x.shape[2]
+            self._spatial_shape = (H, W)
+        elif x.ndim == 3:
+            B, N, C = x.shape
+            root = int(math.isqrt(N))
+            if root * root == N:
+                H = W = root
+            else:
+                # Find a factor pair (H, W) close to square to avoid hard failure on non-square inputs
+                best_pair = None
+                best_gap = None
+                for h in range(1, root + 1):
+                    if N % h == 0:
+                        w = N // h
+                        gap = abs(h - w)
+                        if best_gap is None or gap < best_gap:
+                            best_gap = gap
+                            best_pair = (h, w)
+                if best_pair is None:
+                    raise ValueError(f"Cannot infer spatial dimensions from sequence length {N}.")
+                H, W = best_pair
+            self._spatial_shape = (H, W)
         else:
             raise ValueError(f"Unsupported input shape: {x.shape}")
         
@@ -270,7 +291,8 @@ class LinearWithConvLoRA(nn.Module):
             f"out_features={self.linear.out_features}, "
             f"rank={self.conv_lora.rank}, "
             f"alpha={self.conv_lora.alpha}, "
-            f"experts={self.conv_lora.num_experts})"
+            f"experts={self.conv_lora.num_experts}, "
+            f"top_k={self.conv_lora.top_k})"
         )
 
     def _load_from_state_dict(

@@ -236,8 +236,8 @@ class MMDComputer:
         # Clamp before sqrt
         mmd_squared_avg = torch.clamp(mmd_squared_avg, min=0.0, max=10.0)
         
-        # Take square root
-        mmd = torch.sqrt(mmd_squared_avg)
+        # Take square root with epsilon for gradient stability at 0
+        mmd = torch.sqrt(mmd_squared_avg + 1e-8)
         
         return mmd
     
@@ -426,7 +426,13 @@ class HardAwareMMD:
         
         # Optimization 1: Use torch.cdist for efficient L2 distance computation
         # This has better memory layout and is optimized in PyTorch
-        L2_distance = torch.cdist(total, total, p=2).pow(2)  # [2N, 2N]
+        # L2_distance = torch.cdist(total, total, p=2).pow(2)  # [2N, 2N]
+        
+        # REPLACEMENT for stability: Manual squared distance to avoid sqrt(0) gradient issues in cdist
+        # ||x - y||^2 = ||x||^2 + ||y||^2 - 2<x, y>
+        # But (x-y)^2 is safer for precision if x,y are large.
+        # Since total is [2N, 1], we can use broadcasting.
+        L2_distance = (total.unsqueeze(1) - total.unsqueeze(0)).pow(2).sum(dim=-1)
         
         # Heuristic bandwidth (median or mean distance)
         if fix_sigma:
@@ -434,6 +440,9 @@ class HardAwareMMD:
         else:
             # Use mean distance as base bandwidth for stability
             bandwidth = torch.sum(L2_distance.detach()) / (n_samples**2 - n_samples + 1e-8)
+        
+        # Clamp bandwidth to avoid division by zero or extremely small values
+        bandwidth = torch.clamp(bandwidth, min=1e-6)
         
         # Multi-scale kernels (多尺度核，覆盖不同的分布宽度)
         bandwidth /= kernel_mul ** (kernel_num // 2)

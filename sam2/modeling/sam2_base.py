@@ -146,10 +146,6 @@ class SAM2Base(torch.nn.Module):
         aue_num_adversarial_samples: int = 32,
         # Whether to initialize adversarial samples from dataset
         aue_init_from_dataset: bool = False,
-        # Whether AUE uses uncertainty for ROI weighting (can be disabled)
-        aue_use_uncertainty: bool = True,
-        # Uncertainty-aware controls
-        aue_uncertainty_mask_threshold: float | None = None,
         # Diversity regularization for adversarial samples
         aue_diversity_loss_weight: float = 0.0,  # Weight for diversity regularization (0 = disabled)
         # Constraint weight for adversarial samples (L1 distance to initial)
@@ -200,13 +196,15 @@ class SAM2Base(torch.nn.Module):
         adversarial_attack_order: list[str] | None = None,  # Order of attacks, e.g., ["deform", "style"]
         # Max number of objects (for AUE tensor allocation, matches dataset sampler)
         max_num_objects: int = 11,  # Default: 10 objects + 1 background
-        # Conv-LoRA options (parameter-efficient fine-tuning)
-        use_conv_lora: bool = False,
-        conv_lora_rank: int = 8,
-        conv_lora_alpha: float = 16.0,
-        conv_lora_dropout: float = 0.0,
-        conv_lora_expert_scales: list[float] | None = None,  # e.g., [1.0, 0.5, 2.0]
-        conv_lora_target_modules: list[str] | None = None,  # e.g., ["attn.qkv", "attn.proj", "mlp"]
+        # LoRA options (parameter-efficient fine-tuning)
+        use_lora: bool = False,
+        lora_mode: str = "standard",  # "standard", "dora", "convlora"
+        lora_rank: int = 8,
+        lora_alpha: float = 16.0,
+        lora_dropout: float = 0.0,
+        lora_target_modules: list[str] | None = None,  # e.g., ["attn.qkv", "attn.proj", "mlp"]
+        lora_expert_scales: list[float] | None = None,  # Conv-LoRA only
+        lora_top_k: int = 1,  # Conv-LoRA only
     ):
         super().__init__()
         self.max_num_objects = max_num_objects
@@ -215,30 +213,67 @@ class SAM2Base(torch.nn.Module):
         # Part 1: the image backbone
         self.image_encoder = image_encoder
         
-        # Apply Conv-LoRA if enabled (parameter-efficient fine-tuning)
-        self.use_conv_lora = use_conv_lora
-        if use_conv_lora:
-            from sam2.modeling.conv_lora import inject_conv_lora
-            expert_scales = conv_lora_expert_scales or [1.0, 0.5, 2.0]
-            conv_lora_config = {
-                'rank': conv_lora_rank,
-                'alpha': conv_lora_alpha,
-                'dropout': conv_lora_dropout,
-                'expert_scales': expert_scales,
-                'target_modules': conv_lora_target_modules or [
-                    "attn.qkv", "attn.proj", "mlp.layers.0", "mlp.layers.1"
-                ],
-            }
-            # Apply to trunk (Hiera backbone) only
-            self.image_encoder.trunk = inject_conv_lora(
-                self.image_encoder.trunk,
-                conv_lora_config,
-                verbose=True
-            )
-            logging.info(
-                f"Conv-LoRA enabled: rank={conv_lora_rank}, alpha={conv_lora_alpha}, "
-                f"expert_scales={expert_scales}, targets={conv_lora_config['target_modules']}"
-            )
+        # Apply LoRA if enabled (parameter-efficient fine-tuning)
+        self.use_lora = use_lora
+        if use_lora:
+            mode = (lora_mode or "standard").lower()
+            targets = lora_target_modules or [
+                "attn.qkv", "attn.proj", "mlp.layers.0", "mlp.layers.1"
+            ]
+            if mode == "convlora":
+                from sam2.modeling.conv_lora import inject_conv_lora
+                conv_lora_config = {
+                    'rank': lora_rank,
+                    'alpha': lora_alpha,
+                    'dropout': lora_dropout,
+                    'target_modules': targets,
+                    'expert_scales': lora_expert_scales or [1.0, 0.5, 2.0],
+                    'top_k': lora_top_k,
+                }
+                self.image_encoder.trunk = inject_conv_lora(
+                    self.image_encoder.trunk,
+                    conv_lora_config,
+                    verbose=True,
+                )
+                logging.info(
+                    f"Conv-LoRA enabled: mode={mode}, rank={lora_rank}, alpha={lora_alpha}, "
+                    f"top_k={lora_top_k}, targets={targets}"
+                )
+            elif mode == "dora":
+                from sam2.modeling.lora import inject_dora
+                dora_config = {
+                    'rank': lora_rank,
+                    'alpha': lora_alpha,
+                    'dropout': lora_dropout,
+                    'target_modules': targets,
+                }
+                self.image_encoder.trunk = inject_dora(
+                    self.image_encoder.trunk,
+                    dora_config,
+                    verbose=True
+                )
+                logging.info(
+                    f"DoRA enabled: rank={lora_rank}, alpha={lora_alpha}, "
+                    f"targets={targets}"
+                )
+            else:
+                from sam2.modeling.lora import inject_lora
+                lora_config = {
+                    'rank': lora_rank,
+                    'alpha': lora_alpha,
+                    'dropout': lora_dropout,
+                    'target_modules': targets,
+                }
+                # Apply to trunk (Hiera backbone) only
+                self.image_encoder.trunk = inject_lora(
+                    self.image_encoder.trunk,
+                    lora_config,
+                    verbose=True
+                )
+                logging.info(
+                    f"LoRA enabled: rank={lora_rank}, alpha={lora_alpha}, "
+                    f"targets={targets}"
+                )
         # Use level 0, 1, 2 for high-res setting, or just level 2 for the default setting
         self.use_high_res_features_in_sam = use_high_res_features_in_sam
         self.num_feature_levels = 3 if use_high_res_features_in_sam else 1
@@ -331,10 +366,9 @@ class SAM2Base(torch.nn.Module):
         self.use_aue = bool(use_aue)
         self.aue_num_adversarial_samples = int(aue_num_adversarial_samples)
         self.aue_init_from_dataset = bool(aue_init_from_dataset)
-        self.aue_use_uncertainty = bool(aue_use_uncertainty)
-        self.aue_uncertainty_mask_threshold = aue_uncertainty_mask_threshold
         self.aue_diversity_loss_weight = float(aue_diversity_loss_weight)
         self.aue_constraint_loss_weight = float(aue_constraint_loss_weight)
+        self.aue_consistency_weight = float(aue_consistency_weight)
         # Distribution matching configuration (nested config only)
         self.aue_dist_matching_config = self._parse_dist_matching_config(aue_dist_matching_config)
         
@@ -1036,7 +1070,7 @@ class SAM2Base(torch.nn.Module):
         # 4. Compute calibration loss
         # Note: For augmented branch, we pass augmented backbone features
         # This allows domain_aware_soft_mmd to work if configured
-        calibration_loss, metrics = self._compute_uncertainty_calibration_loss(
+        calibration_loss, metrics, _ = self._compute_uncertainty_calibration_loss(
             bndl_outputs, 
             pixel_gt_prepared, 
             pixel_bndl_model,
@@ -1552,7 +1586,7 @@ class SAM2Base(torch.nn.Module):
                 # Fallback to Backbone Feature (Stride 16) - requires interpolation
                 feature_map_for_calibration = backbone_features
         
-        calibration_loss_clean, clean_metrics = self._compute_uncertainty_calibration_loss(
+        calibration_loss_clean, clean_metrics, clean_uncertainty = self._compute_uncertainty_calibration_loss(
             bndl_outputs=bndl_outputs,
             pixel_gt=pixel_gt_resized,
             pixel_bndl_model=pixel_bndl_model,
@@ -1564,6 +1598,8 @@ class SAM2Base(torch.nn.Module):
         calibration_loss_adversarial = torch.tensor(0.0, device=device, dtype=dtype)
         aug_metrics = {} # Initialize empty metrics for augmented branch
         vis_data = None  # Initialize outside try block for visualization
+        vis_refs = {}    # Initialize vis_refs
+        adv_uncertainty = None # Initialize adv_uncertainty
         
         if (self.use_deform_adv or self.use_style_adv) and backbone_features is not None:
             # Clear cache before memory-intensive adversarial branch
@@ -1572,7 +1608,7 @@ class SAM2Base(torch.nn.Module):
             # ========================================================================
             # Adversarial Augmentation Pipeline (串行: 形变 → 风格)
             # ========================================================================
-            vis_refs = {}  # Collect lightweight visualization data (CPU tensors)
+            # vis_refs = {}  # Already initialized outside
             enable_vis = getattr(self, '_enable_style_visualization', False)
             
             if enable_vis:
@@ -1593,6 +1629,7 @@ class SAM2Base(torch.nn.Module):
             # Extract adversarial calibration loss: MMD(UQ_adv, Err_adv)
             calibration_loss_adversarial = augmentation_result.get('calibration_loss_adversarial', torch.tensor(0.0, device=device, dtype=dtype))
             aug_metrics = augmentation_result['aug_metrics'] # Get augmented metrics
+            adv_uncertainty = augmentation_result.get('adv_uncertainty', None) # Get adv uncertainty
             
             if 'vis_refs' in augmentation_result:
                 vis_refs.update(augmentation_result['vis_refs'])
@@ -1628,6 +1665,23 @@ class SAM2Base(torch.nn.Module):
         
         # Aggregate metrics
         aue_metrics = {}
+
+        # Consistency Loss: MMD(UQ_clean, UQ_adv)
+        consistency_loss = torch.tensor(0.0, device=device, dtype=dtype)
+        if clean_uncertainty is not None and adv_uncertainty is not None and self.aue_consistency_weight > 0:
+             # Use distribution matcher for consistency (MMD)
+             # Note: We treat adv_uncertainty as "error" argument to reuse the interface, 
+             # effectively computing MMD(clean_uncertainty, adv_uncertainty)
+             consistency_loss, _ = self.distribution_matcher.compute_loss(
+                uncertainty=clean_uncertainty,
+                error=adv_uncertainty, 
+                use_patches=self.aue_use_patches,
+                feature_map=feature_map_for_calibration, # Use clean features for patch selection
+                tag="consistency"
+             )
+             total_loss += self.aue_consistency_weight * consistency_loss
+             aue_metrics['consistency_loss'] = consistency_loss.detach()
+        
         # Add loss values to metrics for logging (detached for logging, original used for backward pass)
         aue_metrics['calibration_loss_clean'] = calibration_loss_clean.detach() if isinstance(calibration_loss_clean, torch.Tensor) else calibration_loss_clean
         aue_metrics['calibration_loss_adversarial'] = calibration_loss_adversarial.detach() if isinstance(calibration_loss_adversarial, torch.Tensor) else calibration_loss_adversarial
@@ -1695,7 +1749,7 @@ class SAM2Base(torch.nn.Module):
         pixel_bndl_model=None,
         backbone_features: torch.Tensor | None = None,  # NEW: for domain_aware_soft_mmd
         tag: str = "unknown", # NEW: Debug tag
-    ) -> tuple[torch.Tensor, dict]:
+    ) -> tuple[torch.Tensor, dict, torch.Tensor | None]:
         """Compute uncertainty calibration loss via distribution matching.
         
         Theory: For zero-shot robustness, uncertainty distribution should match
@@ -1725,6 +1779,7 @@ class SAM2Base(torch.nn.Module):
         Returns:
             calibration_loss: MMD-based distribution matching loss
             metrics: Dict of metrics for logging (e.g. correlation)
+            uncertainty: [B, H, W] uncertainty map (for consistency loss)
         """
         # Extract fields from bndl_outputs
         pixel_logits = bndl_outputs.pixel_logits
@@ -1737,7 +1792,7 @@ class SAM2Base(torch.nn.Module):
         dtype = pixel_feat.dtype
         
         if pixel_logits is None:
-            return torch.tensor(0.0, device=device, dtype=dtype, requires_grad=True), {}
+            return torch.tensor(0.0, device=device, dtype=dtype, requires_grad=True), {}, None
         
         # 1. Compute prediction error [B, H, W] in [0, 1]
         error = self._compute_prediction_error(
@@ -1795,7 +1850,7 @@ class SAM2Base(torch.nn.Module):
         # Add MSE to metrics
         metrics['mse_loss'] = mse_loss.item()
         
-        return total_loss, metrics
+        return total_loss, metrics, uncertainty
     
     def _compute_prediction_error(
         self,
@@ -2177,7 +2232,7 @@ class SAM2Base(torch.nn.Module):
                     hyper_in_selected = hyper_in_full[batch_inds, selected_mask_index]  # [B, C']
                     bndl_outputs['hyper_in_selected'] = hyper_in_selected.detach()
             # Optional per-frame uncertainty for AUE
-            pixel_uncertainty = bndl_outputs.get("pixel_uncertainty", None) if self.aue_use_uncertainty else None
+            pixel_uncertainty = bndl_outputs.get("pixel_uncertainty", None)
             
             # Adversarial training: unified AUE loss (supports both style-based and feature-based)
             if self.training and self.use_aue and (pixel_feat is not None) and not getattr(self, "_suppress_nested_aue", False):

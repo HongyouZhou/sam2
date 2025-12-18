@@ -21,6 +21,7 @@ class CombinedSAMBNDLLoss(nn.Module):
         ur_ern_weight=1.0,
         aue_weight=1.0,
         weight_schedule: list[dict] | None = None,
+        prefix_keys: bool = True,  # New: control whether to add prefix to keys
     ):
         super().__init__()
         self.sam_loss = sam_loss
@@ -31,6 +32,7 @@ class CombinedSAMBNDLLoss(nn.Module):
         self.bndl_weight = bndl_weight
         self.ur_ern_weight = ur_ern_weight
         self.aue_weight = aue_weight
+        self.prefix_keys = prefix_keys
         self._dbg_once = False
         self._initial_weights = {
             "sam_weight": sam_weight,
@@ -80,39 +82,50 @@ class CombinedSAMBNDLLoss(nn.Module):
         # compute sam loss (always required)
         sam_losses = self.sam_loss(outs_batch, targets_batch)
         
-        # compute optional losses only if weight > 0 to avoid KeyError when components are disabled
+        # compute optional losses
+        # We compute them if the module exists, even if weight is 0 (for logging purposes)
+        # But we only add to core_loss if weight > 0
         bndl_losses = None
-        if self.bndl_weight > 0.0 and self.bndl_loss is not None:
+        if self.bndl_loss is not None:
             bndl_losses = self.bndl_loss(outs_batch, targets_batch)
         
         ur_ern_losses = None
-        if self.ur_ern_weight > 0.0 and self.ur_ern_loss is not None:
+        if self.ur_ern_loss is not None:
             ur_ern_losses = self.ur_ern_loss(outs_batch, targets_batch)
         
         aue_losses = None
-        if self.aue_weight > 0.0 and self.aue_loss is not None:
+        if self.aue_loss is not None:
             aue_losses = self.aue_loss(outs_batch, targets_batch)
 
         # merge loss
         combined_losses = {}
 
-        # add sam loss (add prefix to distinguish)
+        # add sam loss
         for k, v in sam_losses.items():
             if k == CORE_LOSS_KEY:
+                # Always add sam_core_loss for tracking
                 combined_losses["sam_core_loss"] = v * self.sam_weight
+                # If prefix_keys is False (e.g. legacy validation), we also keep the original "core_loss" key pointing to SAM loss
+                # This will be overwritten later by total sum if we are strictly following combined logic,
+                # but if weights are (1, 0, 0), it matches.
             else:
-                combined_losses[f"sam_{k}"] = v
+                key_name = f"sam_{k}" if self.prefix_keys else k
+                combined_losses[key_name] = v
 
-        # add bndl loss (add prefix to distinguish)
+        # add bndl loss
         if bndl_losses is not None:
             for k, v in bndl_losses.items():
                 if k == CORE_LOSS_KEY:
                     combined_losses["bndl_core_loss"] = v * self.bndl_weight
                 else:
-                    combined_losses[f"bndl_{k}"] = v
+                    # BNDL keys usually don't conflict with SAM keys, but good to be safe
+                    # If prefix_keys=True, use bndl_ prefix. Else keep original (e.g. kl_divergence)
+                    key_name = f"bndl_{k}" if self.prefix_keys else k
+                    combined_losses[key_name] = v
         else:
-            # BNDL disabled: add zero placeholder
-            combined_losses["bndl_core_loss"] = torch.tensor(0.0, device=sam_losses[CORE_LOSS_KEY].device, requires_grad=False)
+            # BNDL disabled: add zero placeholder if prefixing is on (for consistency)
+            if self.prefix_keys:
+                combined_losses["bndl_core_loss"] = torch.tensor(0.0, device=sam_losses[CORE_LOSS_KEY].device, requires_grad=False)
 
         # add ur_ern loss (optional)
         if ur_ern_losses is not None:
@@ -120,7 +133,8 @@ class CombinedSAMBNDLLoss(nn.Module):
                 if k == CORE_LOSS_KEY:
                     combined_losses["ur_ern_core_loss"] = v * self.ur_ern_weight
                 else:
-                    combined_losses[f"ur_ern_{k}"] = v
+                    key_name = f"ur_ern_{k}" if self.prefix_keys else k
+                    combined_losses[key_name] = v
 
         # add aue loss (optional)
         if aue_losses is not None:
@@ -128,14 +142,21 @@ class CombinedSAMBNDLLoss(nn.Module):
                 if k == CORE_LOSS_KEY:
                     combined_losses["aue_core_loss"] = v * self.aue_weight
                 else:
-                    combined_losses[f"aue_{k}"] = v
+                    key_name = f"aue_{k}" if self.prefix_keys else k
+                    combined_losses[key_name] = v
 
         # compute total core loss
-        core = combined_losses["sam_core_loss"] + combined_losses["bndl_core_loss"]
-        if "ur_ern_core_loss" in combined_losses:
+        # Start with sam component
+        core = combined_losses["sam_core_loss"]
+        
+        # Add other components if their weights are > 0
+        if "bndl_core_loss" in combined_losses and self.bndl_weight > 0:
+            core = core + combined_losses["bndl_core_loss"]
+        if "ur_ern_core_loss" in combined_losses and self.ur_ern_weight > 0:
             core = core + combined_losses["ur_ern_core_loss"]
-        if "aue_core_loss" in combined_losses:
+        if "aue_core_loss" in combined_losses and self.aue_weight > 0:
             core = core + combined_losses["aue_core_loss"]
+            
         combined_losses[CORE_LOSS_KEY] = core
 
         return combined_losses

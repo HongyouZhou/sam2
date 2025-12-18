@@ -423,12 +423,20 @@ class VisualizationUtils:
         return fig, axes
 
     @staticmethod
-    def save_and_close_figure(fig: plt.Figure, save_path: str, dpi: int = 150) -> None:
-        """保存并关闭图表"""
+    def save_and_close_figure(fig: plt.Figure, save_path: str, dpi: int = 150, close_fig: bool = True) -> None:
+        """保存并关闭图表
+        
+        Args:
+            fig: Matplotlib figure to save
+            save_path: Path to save the figure
+            dpi: DPI resolution for saving
+            close_fig: Whether to close the figure after saving (default: True)
+        """
         plt.figure(fig.number)
         plt.tight_layout()
         plt.savefig(save_path, dpi=dpi)
-        plt.close(fig)
+        if close_fig:
+            plt.close(fig)
     
     @staticmethod
     def create_ua_ratio_visualization(
@@ -491,3 +499,94 @@ class VisualizationUtils:
             logging.warning(f"Failed to create UA ratio visualization for {method_name}: {e}")
             import traceback
             logging.warning(f"Traceback: {traceback.format_exc()}")
+    
+    @staticmethod
+    def get_component_names(rows: int, has_uncertainty: bool, has_pavpu: bool, has_ratio_data: bool) -> Dict[Tuple[int, int], str]:
+        """Generate descriptive names for each subplot component.
+        
+        Args:
+            rows: Number of rows in the visualization
+            has_uncertainty: Whether uncertainty visualization is present
+            has_pavpu: Whether PAvPU overlay visualization is present
+            has_ratio_data: Whether U/A ratio visualization is present
+        
+        Returns:
+            Dict mapping (row, col) tuples to descriptive names
+        """
+        names = {
+            # Row 0: Basic parameters
+            (0, 0): "original_image",
+            (0, 1): "lambda_heatmap",
+            (0, 2): "k_heatmap",
+            # Row 1: Overlays
+            (1, 0): "lambda_overlay",
+            (1, 1): "k_overlay",
+            (1, 2): "combined_overlay",
+            # Row 2: Global parameters (spans 3 columns)
+            (2, 0): "global_params_left",
+            (2, 1): "global_params_center",
+            (2, 2): "global_params_right",
+        }
+        
+        current_row = 3
+        if has_uncertainty and rows >= 4:
+            names[(current_row, 0)] = "uncertainty_left"
+            names[(current_row, 1)] = "uncertainty_center"
+            names[(current_row, 2)] = "uncertainty_right"
+            current_row += 1
+        
+        if has_pavpu and rows >= current_row + 1:
+            names[(current_row, 0)] = "pavpu_overlay_left"
+            names[(current_row, 1)] = "pavpu_overlay_center"
+            names[(current_row, 2)] = "pavpu_overlay_right"
+            current_row += 1
+        
+        if has_ratio_data and rows >= current_row + 1:
+            names[(current_row, 0)] = "ua_ratio_left"
+            names[(current_row, 1)] = "ua_ratio_center"
+            names[(current_row, 2)] = "ua_ratio_right"
+        
+        return names
+    
+    @staticmethod
+    def save_individual_subplots(fig: plt.Figure, axes: np.ndarray, save_dir: str, component_names: Dict[Tuple[int, int], str]) -> None:
+        """Save each subplot as an individual image file.
+        
+        Args:
+            fig: Matplotlib figure object
+            axes: Array of subplot axes
+            save_dir: Directory to save individual components
+            component_names: Dict mapping (row, col) to descriptive names
+        """
+        try:
+            # Flatten axes array for easier iteration
+            if axes.ndim == 1:
+                axes_flat = axes
+                rows, cols = len(axes), 1
+            else:
+                axes_flat = axes.flatten()
+                rows, cols = axes.shape
+            
+            # Save each subplot individually
+            for idx, ax in enumerate(axes_flat):
+                row = idx // cols
+                col = idx % cols
+                
+                # Get component name
+                component_name = component_names.get((row, col), f"component_{row}_{col}")
+                
+                # Skip empty subplots
+                if not ax.has_data() and not ax.get_title() and not ax.texts:
+                    continue
+                
+                # Create a new figure for this subplot
+                extent = ax.get_window_extent().transformed(fig.dpi_scale_trans.inverted())
+                
+                # Save with some padding
+                import os
+                save_path = os.path.join(save_dir, f"{row:02d}_{col:02d}_{component_name}.png")
+                fig.savefig(save_path, bbox_inches=extent.expanded(1.1, 1.1), dpi=150)
+            
+            logging.info(f"Saved {len(component_names)} individual subplot components")
+        except Exception as e:
+            logging.warning(f"Failed to save individual subplots: {e}")

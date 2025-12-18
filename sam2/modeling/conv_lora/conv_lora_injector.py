@@ -44,6 +44,7 @@ def inject_conv_lora(
     alpha = config.get('alpha', 16.0)
     dropout = config.get('dropout', 0.0)
     expert_scales = config.get('expert_scales', [1.0, 0.5, 2.0])
+    top_k = config.get('top_k', 1)
     target_modules = config.get('target_modules', [])
     
     if not target_modules:
@@ -73,6 +74,7 @@ def inject_conv_lora(
                     alpha=alpha,
                     dropout=dropout,
                     expert_scales=expert_scales,
+                    top_k=top_k,
                 )
                 
                 setattr(module, child_name, conv_lora_layer)
@@ -95,7 +97,10 @@ def inject_conv_lora(
         logging.info(f"  Layers modified: {injection_count}")
         logging.info(f"  Total params: {total_params_before:,} → {total_params_after:,}")
         logging.info(f"  Trainable params: {trainable_params:,} ({100*trainable_params/total_params_after:.2f}%)")
-        logging.info(f"  Config: rank={rank}, alpha={alpha}, experts={len(expert_scales)} (scales={expert_scales})")
+        logging.info(
+            f"  Config: rank={rank}, alpha={alpha}, top_k={top_k}, "
+            f"experts={len(expert_scales)} (scales={expert_scales})"
+        )
         logging.info(f"{'='*60}\n")
     
     return model
