@@ -216,64 +216,52 @@ class SAM2Base(torch.nn.Module):
         # Apply LoRA if enabled (parameter-efficient fine-tuning)
         self.use_lora = use_lora
         if use_lora:
-            mode = (lora_mode or "standard").lower()
-            targets = lora_target_modules or [
-                "attn.qkv", "attn.proj", "mlp.layers.0", "mlp.layers.1"
-            ]
-            if mode == "convlora":
-                from sam2.modeling.conv_lora import inject_conv_lora
-                conv_lora_config = {
-                    'rank': lora_rank,
-                    'alpha': lora_alpha,
-                    'dropout': lora_dropout,
-                    'target_modules': targets,
-                    'expert_scales': lora_expert_scales or [1.0, 0.5, 2.0],
-                    'top_k': lora_top_k,
-                }
-                self.image_encoder.trunk = inject_conv_lora(
-                    self.image_encoder.trunk,
-                    conv_lora_config,
-                    verbose=True,
+            try:
+                from peft import LoraConfig, get_peft_model
+            except ImportError:
+                raise ImportError("Please install peft: pip install peft")
+
+            # 1. Image Encoder LoRA
+            # FS-SAM2 style: r=4, targets=['qkv', 'proj'] (from config)
+            lora_config_encoder = LoraConfig(
+                r=lora_rank,
+                lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
+                target_modules=lora_target_modules or ["qkv", "proj"],
+                bias="none",
+                inference_mode=False,
+            )
+            self.image_encoder = get_peft_model(self.image_encoder, lora_config_encoder)
+            logging.info(f"PEFT LoRA enabled for Image Encoder: rank={lora_rank}, targets={lora_target_modules}")
+            self.image_encoder.print_trainable_parameters()
+
+            # 2. Memory Attention LoRA (FS-SAM2: r=32, specific targets)
+            if memory_attention is not None:
+                lora_config_mem = LoraConfig(
+                    r=32, # Hardcoded to match FS-SAM2
+                    lora_alpha=16,
+                    lora_dropout=0.1,
+                    target_modules=['q_proj', 'v_proj', 'k_proj', 'out_proj'],
+                    bias="none",
+                    inference_mode=False,
                 )
-                logging.info(
-                    f"Conv-LoRA enabled: mode={mode}, rank={lora_rank}, alpha={lora_alpha}, "
-                    f"top_k={lora_top_k}, targets={targets}"
+                memory_attention = get_peft_model(memory_attention, lora_config_mem)
+                logging.info(f"PEFT LoRA enabled for Memory Attention: rank=32")
+                memory_attention.print_trainable_parameters()
+
+            # 3. Memory Encoder LoRA (FS-SAM2: r=32, target='out_proj')
+            if memory_encoder is not None:
+                lora_config_mem_enc = LoraConfig(
+                    r=32, # Hardcoded to match FS-SAM2
+                    lora_alpha=16,
+                    lora_dropout=0.1,
+                    target_modules=['out_proj'],
+                    bias="none",
+                    inference_mode=False,
                 )
-            elif mode == "dora":
-                from sam2.modeling.lora import inject_dora
-                dora_config = {
-                    'rank': lora_rank,
-                    'alpha': lora_alpha,
-                    'dropout': lora_dropout,
-                    'target_modules': targets,
-                }
-                self.image_encoder.trunk = inject_dora(
-                    self.image_encoder.trunk,
-                    dora_config,
-                    verbose=True
-                )
-                logging.info(
-                    f"DoRA enabled: rank={lora_rank}, alpha={lora_alpha}, "
-                    f"targets={targets}"
-                )
-            else:
-                from sam2.modeling.lora import inject_lora
-                lora_config = {
-                    'rank': lora_rank,
-                    'alpha': lora_alpha,
-                    'dropout': lora_dropout,
-                    'target_modules': targets,
-                }
-                # Apply to trunk (Hiera backbone) only
-                self.image_encoder.trunk = inject_lora(
-                    self.image_encoder.trunk,
-                    lora_config,
-                    verbose=True
-                )
-                logging.info(
-                    f"LoRA enabled: rank={lora_rank}, alpha={lora_alpha}, "
-                    f"targets={targets}"
-                )
+                memory_encoder = get_peft_model(memory_encoder, lora_config_mem_enc)
+                logging.info(f"PEFT LoRA enabled for Memory Encoder: rank=32")
+                memory_encoder.print_trainable_parameters()
         # Use level 0, 1, 2 for high-res setting, or just level 2 for the default setting
         self.use_high_res_features_in_sam = use_high_res_features_in_sam
         self.num_feature_levels = 3 if use_high_res_features_in_sam else 1
@@ -1088,6 +1076,7 @@ class SAM2Base(torch.nn.Module):
         pixel_gt: torch.Tensor,
         enable_vis: bool = False,
         uq_sample_num: int = 8,
+        memory_context: dict | None = None,
     ) -> dict:
         """
         Apply adversarial attack pipeline (cooperative or sequential).
@@ -1119,7 +1108,12 @@ class SAM2Base(torch.nn.Module):
         vis_refs = {} # Initialize vis_refs here
         
         if self.aue_attack_mode == "cooperative":
-            state = self._apply_cooperative_attack(state, enable_vis, vis_refs)
+            state = self._apply_cooperative_attack(
+                state,
+                enable_vis,
+                vis_refs,
+                memory_context=memory_context,
+            )
         else:
             # === Sequential Strategy: Predict and Apply one by one ===
             # Existing logic (legacy behavior)
@@ -1181,6 +1175,7 @@ class SAM2Base(torch.nn.Module):
         state: dict,
         enable_vis: bool,
         vis_refs: dict,
+        memory_context: dict | None = None,
     ) -> dict:
         """
         Apply cooperative adversarial attack.
@@ -1233,14 +1228,19 @@ class SAM2Base(torch.nn.Module):
                 )
                 state['img'] = styled_images
                 
-                # Re-encode (checkpointed)
+                # Re-encode (checkpointed) and optionally re-apply memory conditioning
                 backbone_out = self.forward_image(styled_images, use_checkpoint=True)
-                state['features'] = backbone_out['backbone_fpn'][-1]
-                if self.use_high_res_features_in_sam:
-                    state['high_res'] = [
-                        backbone_out['backbone_fpn'][0],
-                        backbone_out['backbone_fpn'][1]
-                    ]
+                if memory_context:
+                    recond = self._reapply_memory_conditioning(backbone_out, memory_context)
+                    state['features'] = recond["features"]
+                    state['high_res'] = recond["high_res"]
+                else:
+                    state['features'] = backbone_out['backbone_fpn'][-1]
+                    if self.use_high_res_features_in_sam:
+                        state['high_res'] = [
+                            backbone_out['backbone_fpn'][0],
+                            backbone_out['backbone_fpn'][1]
+                        ]
                     
                 # Visualization data
                 if enable_vis:
@@ -1265,6 +1265,46 @@ class SAM2Base(torch.nn.Module):
                         vis_refs['deform_offsets'] = params["image_offsets"].detach().cpu()
                         
         return state
+
+    def _reapply_memory_conditioning(
+        self,
+        backbone_out: dict,
+        memory_context: dict,
+    ) -> dict:
+        """
+        Re-run memory conditioning on newly encoded features using cached context
+        from the clean forward pass.
+        """
+        try:
+            (
+                _,
+                vision_feats,
+                vision_pos_embeds,
+                feat_sizes,
+            ) = self._prepare_backbone_features(backbone_out)
+            pix_feat_with_mem = self._prepare_memory_conditioned_features(
+                frame_idx=memory_context["frame_idx"],
+                is_init_cond_frame=memory_context["is_init_cond_frame"],
+                current_vision_feats=vision_feats,
+                current_vision_pos_embeds=vision_pos_embeds,
+                feat_sizes=feat_sizes,
+                output_dict=memory_context["output_dict"],
+                num_frames=memory_context.get("num_frames"),
+                track_in_reverse=memory_context.get("track_in_reverse", False),
+            )
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            logging.warning(
+                "AUE: failed to reapply memory conditioning on adversarial branch: %s",
+                exc,
+            )
+            pix_feat_with_mem = backbone_out["backbone_fpn"][-1]
+        high_res_features = None
+        if self.use_high_res_features_in_sam:
+            high_res_features = [
+                backbone_out["backbone_fpn"][0],
+                backbone_out["backbone_fpn"][1],
+            ]
+        return {"features": pix_feat_with_mem, "high_res": high_res_features}
 
     def _apply_single_attack(
         self,
@@ -1352,12 +1392,8 @@ class SAM2Base(torch.nn.Module):
             # Memory Optimization & Gradient Flow:
             # - We MUST allow gradients to flow through the backbone to the image
             #   so that the deformation network (adversary) can be trained.
-            # - To save memory and prevent backbone updates on this branch, we
-            #   temporarily freeze backbone parameters.
-            
-            # Re-encode (checkpointed) without updating backbone grads on adv branch
-            with torch.no_grad():
-                backbone_out = self.forward_image(augmented_img, use_checkpoint=True)
+            # Re-encode (checkpointed) so gradients can flow back to offsets/backbone
+            backbone_out = self.forward_image(augmented_img, use_checkpoint=True)
             state['features'] = backbone_out['backbone_fpn'][-1]
             if self.use_high_res_features_in_sam:
                 state['high_res'] = [
@@ -1624,6 +1660,7 @@ class SAM2Base(torch.nn.Module):
                 high_res_features=high_res_features,
                 enable_vis=enable_vis,
                 uq_sample_num=uq_sample_num,
+                memory_context=getattr(self, "_aue_memory_context", None),
             )
             
             # Extract adversarial calibration loss: MMD(UQ_adv, Err_adv)

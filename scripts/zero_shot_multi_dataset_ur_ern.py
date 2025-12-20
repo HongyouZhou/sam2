@@ -265,7 +265,8 @@ def inference_with_ur_ern(
         )
 
         # Initialize predictor state
-        state = predictor.init_state(str(video_dir))
+        max_frames_to_load = 1 if first_frame_only else None
+        state = predictor.init_state(str(video_dir), max_frames=max_frames_to_load)
         H, W = state["video_height"], state["video_width"]
 
         # Discover object ids from first frame GT

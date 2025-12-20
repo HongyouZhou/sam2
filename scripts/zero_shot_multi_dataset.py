@@ -541,7 +541,8 @@ def inference_interactive(
         video_dir = jpeg_dir / vid
         frame_names = sorted([p.stem for p in video_dir.iterdir() if p.suffix.lower() in [".jpg", ".jpeg"]], key=lambda x: int(x))
 
-        state = predictor.init_state(str(video_dir))
+        max_frames_to_load = 1 if first_frame_only else None
+        state = predictor.init_state(str(video_dir), max_frames=max_frames_to_load)
         H, W = state["video_height"], state["video_width"]
 
         first_mask_path = ann_dir / vid / f"{frame_names[0]}.png"

@@ -30,8 +30,17 @@ class BNDLVisualizer:
         self.viz_utils = VisualizationUtils()
         self.metric_calc = MetricCalculator()
 
-    def plot_parameter_and_uncertainty_overlays(self, axes, original_img: np.ndarray, lambda_img: np.ndarray, k_img: np.ndarray, bndl_outputs: dict[str, Any], step_index: int) -> None:
-        """参数和不确定性叠加图，包含PAvPU可视化"""
+    def plot_parameter_and_uncertainty_overlays(
+        self,
+        axes,
+        original_img: np.ndarray,
+        lambda_img: np.ndarray,
+        k_img: np.ndarray,
+        bndl_outputs: dict[str, Any],
+        step_index: int,
+        return_layers: bool = False,
+    ):
+        """参数和不确定性叠加图，包含PAvPU可视化。return_layers=True 时返回叠加层数据。"""
         # 优先尝试使用 hyper_in/out_w 与预测加权后的有效参数图
         lambda_eff_np = None
         k_eff_np = None
@@ -175,27 +184,36 @@ class BNDLVisualizer:
             # 归一化不确定性
             uncertainty_norm = (uncertainty - uncertainty.min()) / (uncertainty.max() - uncertainty.min() + 1e-8)
 
+        if axes is not None and len(axes) != 3:
+            raise ValueError("axes must be length 3 when provided")
+
         # Lambda叠加
-        axes[0].imshow(original_img)
-        axes[0].imshow(lambda_norm, cmap="viridis", alpha=0.6, interpolation="nearest")
-        axes[0].set_title(f"Lambda Overlay (Step {step_index})")
-        axes[0].axis("off")
+        if axes is not None:
+            axes[0].imshow(original_img)
+            axes[0].imshow(lambda_norm, cmap="viridis", alpha=0.6, interpolation="nearest")
+            axes[0].set_title(f"Lambda Overlay (Step {step_index})")
+            axes[0].axis("off")
 
         # 不确定性叠加
         if uncertainty is not None:
-            axes[1].imshow(original_img)
-            axes[1].imshow(uncertainty_norm, cmap="hot", alpha=0.7, interpolation="nearest")
-            axes[1].set_title(f"Uncertainty Overlay (Step {step_index})\nMean: {uncertainty.mean():.4f}")
-            axes[1].axis("off")
+            if axes is not None:
+                axes[1].imshow(original_img)
+                axes[1].imshow(uncertainty_norm, cmap="hot", alpha=0.7, interpolation="nearest")
+                axes[1].set_title(f"Uncertainty Overlay (Step {step_index})\nMean: {uncertainty.mean():.4f}")
+                axes[1].axis("off")
         else:
             # 如果没有不确定性，回退到K叠加
-            axes[1].imshow(original_img)
-            axes[1].imshow(k_norm, cmap="plasma", alpha=0.6, interpolation="nearest")
-            axes[1].set_title(f"K Overlay (Step {step_index})")
-            axes[1].axis("off")
+            if axes is not None:
+                axes[1].imshow(original_img)
+                axes[1].imshow(k_norm, cmap="plasma", alpha=0.6, interpolation="nearest")
+                axes[1].set_title(f"K Overlay (Step {step_index})")
+                axes[1].axis("off")
 
         # 包含PAvPU信息的组合叠加
-        axes[2].imshow(original_img)
+        combined = None
+        pavpu_text = ""
+        if axes is not None:
+            axes[2].imshow(original_img)
 
         if uncertainty is not None:
             # 创建RGB叠加: Red=uncertainty, Green=lambda, Blue=k
@@ -203,10 +221,10 @@ class BNDLVisualizer:
             combined[:, :, 0] = uncertainty_norm  # Red for uncertainty
             combined[:, :, 1] = lambda_norm  # Green for lambda
             combined[:, :, 2] = k_norm  # Blue for k
-            axes[2].imshow(combined, alpha=0.6, interpolation="nearest")
+            if axes is not None:
+                axes[2].imshow(combined, alpha=0.6, interpolation="nearest")
 
             # 如果可用，添加PAvPU文本
-            pavpu_text = ""
             if "pixel_pavpu" in bndl_outputs and bndl_outputs["pixel_pavpu"] is not None:
                 pavpu_scores = bndl_outputs["pixel_pavpu"]
                 thresholds = bndl_outputs.get("pavpu_thresholds", [0.01, 0.05, 0.1])
@@ -214,16 +232,28 @@ class BNDLVisualizer:
                 for thresh, score in zip(thresholds, pavpu_scores, strict=False):
                     pavpu_text += f"p={thresh:.2f}:{score:.1f}% "
 
-            axes[2].set_title(f"Multi-layer Overlay (Step {step_index}){pavpu_text}")
+            if axes is not None:
+                axes[2].set_title(f"Multi-layer Overlay (Step {step_index}){pavpu_text}")
         else:
             # 后备组合叠加
             combined = np.zeros((*lambda_img.shape, 3))
             combined[:, :, 1] = lambda_norm  # Green for lambda
             combined[:, :, 0] = k_norm  # Red for k
-            axes[2].imshow(combined, alpha=0.6, interpolation="nearest")
-            axes[2].set_title(f"Combined Overlay (Step {step_index})")
+            if axes is not None:
+                axes[2].imshow(combined, alpha=0.6, interpolation="nearest")
+                axes[2].set_title(f"Combined Overlay (Step {step_index})")
 
-        axes[2].axis("off")
+        if axes is not None:
+            axes[2].axis("off")
+
+        if return_layers:
+            return {
+                "lambda_norm": lambda_norm,
+                "k_norm": k_norm,
+                "uncertainty_norm": uncertainty_norm if uncertainty is not None else None,
+                "combined": combined,
+                "pavpu_text": pavpu_text,
+            }
 
     def plot_global_parameters_in_layout(self, axes, bndl_outputs: dict[str, Any], step_index: int) -> None:
         """在统一布局中绘制全局权重参数"""
@@ -355,6 +385,7 @@ class BNDLVisualizer:
             pavpu_scores = bndl_outputs.get("pixel_pavpu")
             thresholds = bndl_outputs.get("pavpu_thresholds", [0.01, 0.05, 0.1])
             uncertainty = bndl_outputs.get("pixel_uncertainty")
+            pixel_gt = bndl_outputs.get("pixel_gt")  # optional foreground mask
             
             if pavpu_scores is None or thresholds is None or uncertainty is None:
                 # No PAvPU data available
@@ -374,29 +405,58 @@ class BNDLVisualizer:
             if original_img is not None and uncertainty_vis.shape != original_img.shape[:2]:
                 uncertainty_vis = cv2.resize(uncertainty_vis, (original_img.shape[1], original_img.shape[0]), interpolation=cv2.INTER_LINEAR)
             
-            # Create overlays for different thresholds
+            # Optional foreground mask (union of GT), with dilation to reduce edge noise
+            fg_mask = None
+            if pixel_gt is not None:
+                try:
+                    if pixel_gt.ndim == 4:
+                        fg = pixel_gt[0].detach().cpu().numpy()  # [K,H,W]
+                        fg_mask = (fg > 0).any(axis=0).astype(np.uint8)
+                    elif pixel_gt.ndim == 3:
+                        fg_mask = (pixel_gt[0] > 0).detach().cpu().numpy().astype(np.uint8)
+                    if fg_mask is not None:
+                        # Dilate to match training config (default 8px)
+                        kernel = np.ones((9, 9), np.uint8)
+                        fg_mask = cv2.dilate(fg_mask, kernel, iterations=1)
+                        # Resize to match uncertainty if needed
+                        if fg_mask.shape != uncertainty_vis.shape:
+                            fg_mask = cv2.resize(fg_mask, (uncertainty_vis.shape[1], uncertainty_vis.shape[0]), interpolation=cv2.INTER_NEAREST)
+                except Exception:
+                    fg_mask = None
+            
+            # Normalize uncertainty for smoother overlays (mask optional)
+            unc_min, unc_max = uncertainty_vis.min(), uncertainty_vis.max()
+            unc_range = max(unc_max - unc_min, 1e-6)
+            unc_norm = (uncertainty_vis - unc_min) / unc_range
+            if fg_mask is not None:
+                unc_norm = unc_norm * fg_mask
+
+            # Create overlays for different thresholds (soft mask + blur to avoid blocky look)
             for i, threshold in enumerate(thresholds[:3]):  # Limit to 3 for layout
                 if i >= len(pavpu_scores):
                     axes[i].axis("off")
                     continue
                 
-                # Create binary mask for high uncertainty regions
-                high_uncertainty_mask = uncertainty_vis > threshold
+                # Soft mask: threshold on normalized uncertainty, then Gaussian blur
+                hard_mask = (unc_norm > threshold).astype(np.float32)
+                if fg_mask is not None:
+                    hard_mask = hard_mask * fg_mask
+                soft_mask = cv2.GaussianBlur(hard_mask, (0, 0), sigmaX=2, sigmaY=2)
+                soft_mask = np.clip(soft_mask, 0.0, 1.0)
                 
-                # Create overlay image
-                overlay_img = original_img.copy()
-                
-                # Apply color overlay for high uncertainty regions
-                # Use red color for high uncertainty
-                overlay_img[high_uncertainty_mask] = overlay_img[high_uncertainty_mask] * 0.6 + np.array([1.0, 0.0, 0.0]) * 0.4
+                # Create overlay image (blend with alpha = soft_mask * 0.7)
+                overlay_img = original_img.astype(np.float32) / 255.0
+                red = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+                alpha = (soft_mask * 0.7)[..., None]
+                overlay_img = overlay_img * (1 - alpha) + red * alpha
                 
                 # Display the overlay
-                axes[i].imshow(overlay_img)
+                axes[i].imshow(np.clip(overlay_img, 0.0, 1.0))
                 axes[i].set_title(f"PAvPU Overlay (t={threshold:.2f})\nScore: {pavpu_scores[i]:.1f}% (Step {step_index})")
                 axes[i].axis("off")
                 
                 # Add uncertainty percentage text
-                uncertainty_percent = np.mean(high_uncertainty_mask) * 100
+                uncertainty_percent = np.mean(hard_mask) * 100
                 axes[i].text(0.02, 0.98, f"Uncertain: {uncertainty_percent:.1f}%", 
                            transform=axes[i].transAxes, fontsize=9, 
                            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8),
@@ -842,15 +902,45 @@ class BNDLVisualizer:
         self.viz_utils.plot_parameter_heatmap(ax, k_img, f"Shape (k) Step {step_index}", "plasma")
         self.viz_utils.save_and_close_figure(fig, os.path.join(vis_dir, f"{base_filename}_k.png"))
 
-        # 4. Parameter Overlays
-        if original_img is not None and original_img.shape[:2] == lambda_img.shape:
-            # 这里 plot_parameter_and_uncertainty_overlays 需要3个axes，所以我们需要创建一个包含3个子图的figure
-            fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-            if has_uncertainty:
-                self.plot_parameter_and_uncertainty_overlays(axes, original_img, lambda_img, k_img, bndl_outputs, step_index)
-            else:
-                self.viz_utils.plot_parameter_overlays(axes, original_img, lambda_img, k_img, step_index)
-            self.viz_utils.save_and_close_figure(fig, os.path.join(vis_dir, f"{base_filename}_overlays.png"))
+        # 4. Parameter / Uncertainty Overlays
+        if original_img is not None:
+            layers = self.plot_parameter_and_uncertainty_overlays(
+                axes=None,
+                original_img=original_img,
+                lambda_img=lambda_img,
+                k_img=k_img,
+                bndl_outputs=bndl_outputs,
+                step_index=step_index,
+                return_layers=True,
+            )
+            if layers:
+                # Lambda overlay
+                fig, ax = plt.subplots(figsize=(6, 6))
+                ax.imshow(original_img)
+                ax.imshow(layers["lambda_norm"], cmap="viridis", alpha=0.6, interpolation="nearest")
+                ax.set_title(f"Lambda Overlay (Step {step_index})")
+                ax.axis("off")
+                self.viz_utils.save_and_close_figure(fig, os.path.join(vis_dir, f"{base_filename}_overlay_lambda.png"))
+
+                # Uncertainty or K overlay
+                fig, ax = plt.subplots(figsize=(6, 6))
+                ax.imshow(original_img)
+                if layers["uncertainty_norm"] is not None:
+                    ax.imshow(layers["uncertainty_norm"], cmap="hot", alpha=0.7, interpolation="nearest")
+                    ax.set_title(f"Uncertainty Overlay (Step {step_index})")
+                else:
+                    ax.imshow(layers["k_norm"], cmap="plasma", alpha=0.6, interpolation="nearest")
+                    ax.set_title(f"K Overlay (Step {step_index})")
+                ax.axis("off")
+                self.viz_utils.save_and_close_figure(fig, os.path.join(vis_dir, f"{base_filename}_overlay_uncertainty_or_k.png"))
+
+                # Combined overlay
+                fig, ax = plt.subplots(figsize=(6, 6))
+                ax.imshow(original_img)
+                ax.imshow(layers["combined"], alpha=0.6, interpolation="nearest")
+                ax.set_title(f"Combined Overlay (Step {step_index}){layers.get('pavpu_text', '')}")
+                ax.axis("off")
+                self.viz_utils.save_and_close_figure(fig, os.path.join(vis_dir, f"{base_filename}_overlay_combined.png"))
         else:
             fig, axes = plt.subplots(1, 3, figsize=(18, 6))
             self.viz_utils.plot_parameter_distributions(axes, lambda_img, k_img, step_index)

@@ -829,7 +829,8 @@ def inference_with_bndl(
         frame_names = sorted([p.stem for p in video_dir.iterdir() if p.suffix.lower() in [".jpg", ".jpeg"]], key=lambda x: int(x))
 
         # Initialize predictor state
-        state = predictor.init_state(str(video_dir))
+        max_frames_to_load = 1 if first_frame_only else None
+        state = predictor.init_state(str(video_dir), max_frames=max_frames_to_load)
         H, W = state["video_height"], state["video_width"]
 
         # Read first frame GT to determine object IDs

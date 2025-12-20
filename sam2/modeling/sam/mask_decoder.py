@@ -96,7 +96,7 @@ class MaskDecoder(nn.Module):
                 enable_external_sparse=self.bndl_hyper_in_sparse,
             )
             if self.bndl_fuse_type == "conv":
-                self.fuse_conv = nn.Conv2d(2 * num_multimask_outputs, num_multimask_outputs, 1, bias=False)
+                self.fuse_conv = nn.Conv2d(2 * self.num_mask_tokens, self.num_mask_tokens, 1, bias=False)
         #########################################################
 
         # UR-ERN (NIG evidential regression) head - mutually exclusive with BNDL
@@ -289,7 +289,7 @@ class MaskDecoder(nn.Module):
                     "pixel_feat_grad": pixel_feat if self.training else None,
                     "masks_bndl": masks_bndl.detach(),
                     "masks_hyper": masks_sam.detach(),
-                    "out_w": out_w.detach(),
+                    "out_w": out_w.detach() if out_w is not None else None,
                 }
             }
 

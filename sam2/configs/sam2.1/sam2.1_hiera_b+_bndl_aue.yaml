@@ -115,10 +115,10 @@ model:
 
   # === BNDL_CONFIG_START ===
   # BNDL
-  use_bndl_for_pixels: true
-  bndl_fuse_type: none
+  use_bndl_for_pixels: false
+  bndl_fuse_type: conv
   bndl_replace_global_with_hyper: true
-  bndl_hyper_in_sparse: true
+  bndl_hyper_in_sparse: false
   # === BNDL_CONFIG_END ===
   # Compilation flag
   # compile_image_encoder: False
@@ -142,7 +142,7 @@ model:
 
   # === AUE_GCN_CONFIG_START ===
   # AUE (Adversarial Uncertainty Estimation) with Style-based augmentation
-  use_aue: true
+  use_aue: false
   # Constraint weight for adversarial samples (L1 distance to initial)
   aue_constraint_loss_weight: 0.0  # Weight for constraint regularization (0 = disabled)
   # Attack mode: "cooperative" (parallel prediction, joint application) or "sequential" (iterative)

@@ -14,7 +14,7 @@ from argparse import ArgumentParser
 import submitit
 import torch
 
-from hydra import compose, initialize_config_module
+from hydra import compose, initialize_config_module, initialize_config_dir
 from hydra.utils import instantiate
 
 from iopath.common.file_io import g_pathmgr
@@ -245,20 +245,6 @@ def main(args) -> None:
 
 
 if __name__ == "__main__":
-    initialize_config_module("sam2", version_base="1.2")
-    
-    # Check if experiment config directory is specified via environment variable
-    # If set, add it to Hydra's config search path
-    experiment_config_dir = os.environ.get("EXPERIMENT_CONFIG_DIR")
-    if experiment_config_dir and os.path.exists(experiment_config_dir):
-        from hydra.core.global_hydra import GlobalHydra
-        gh = GlobalHydra.instance()
-        if gh.is_initialized():
-            config_loader = gh.config_loader()
-            search_path = config_loader.get_search_path()
-            # Prepend experiment config directory to search path
-            search_path.prepend("file", experiment_config_dir)
-            print(f"[train.py] Added experiment config directory to search path: {experiment_config_dir}")
     parser = ArgumentParser()
     parser.add_argument(
         "-c",
@@ -282,6 +268,16 @@ if __name__ == "__main__":
     parser.add_argument("--num-nodes", type=int, default=None, help="Number of nodes")
     # Parse known args to allow Hydra overrides (e.g., launcher.experiment_log_dir=...)
     args, unknown = parser.parse_known_args()
+
+    if os.path.isabs(args.config):
+        print(f"[train.py] Using absolute config path: {args.config}")
+        config_dir = os.path.dirname(args.config)
+        config_name = os.path.basename(args.config)
+        initialize_config_dir(config_dir=config_dir, version_base="1.2")
+        args.config = config_name
+    else:
+        initialize_config_module("sam2", version_base="1.2")
+
     args.use_cluster = bool(args.use_cluster) if args.use_cluster is not None else None
     # Pass unknown args as Hydra overrides
     args.hydra_overrides = unknown

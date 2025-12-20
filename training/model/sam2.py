@@ -96,133 +96,84 @@ class SAM2Train(SAM2Base):
         self.rng = np.random.default_rng(seed=42)
 
         if freeze_image_encoder:
-            # 1. Freeze everything by default
-            for p in self.image_encoder.parameters():
-                p.requires_grad = False
-            
-            # 1.5. Auto-unfreeze LoRA parameters if use_lora=True (PEFT)
             if hasattr(self, 'use_lora') and self.use_lora:
-                # LoRA parameters are those in LinearWithLoRA.lora or Conv2dWithLoRA.lora submodules
-                lora_params_unfrozen = 0
-                for name, module in self.image_encoder.named_modules():
-                    # Check if this is a LoRA wrapper
-                    if module.__class__.__name__ in ['LinearWithLoRA', 'Conv2dWithLoRA', 'LinearWithDoRA', 'Conv2dWithDoRA', 'LinearWithConvLoRA']:
-                        # Unfreeze only the lora submodule, keep .linear/.conv frozen
-                        if hasattr(module, 'lora'):
-                            for p in module.lora.parameters():
-                                p.requires_grad = True
-                                lora_params_unfrozen += 1
-                        # Unfreeze conv_lora submodule (for MoE Conv-LoRA)
-                        if hasattr(module, 'conv_lora'):
-                            for p in module.conv_lora.parameters():
-                                p.requires_grad = True
-                                lora_params_unfrozen += 1
-                        # Unfreeze magnitude parameter for DoRA
-                        if hasattr(module, 'm'):
-                            module.m.requires_grad = True
-                            lora_params_unfrozen += 1
-                logging.info(f"Frozen image encoder, but unfrozen {lora_params_unfrozen} LoRA parameters for PEFT")
-            
-            # 2. Unfreeze specific components
-            if "neck" in unfreeze_image_encoder_components:
-                if hasattr(self.image_encoder, "neck"):
-                    for p in self.image_encoder.neck.parameters():
-                        p.requires_grad = True
-                    logging.info("Unfrozen image encoder component: NECK")
-                else:
-                    logging.warning("Requested to unfreeze 'neck' but image_encoder has no 'neck' attribute.")
-
-            if "trunk_last_stage" in unfreeze_image_encoder_components:
-                if hasattr(self.image_encoder, "trunk") and hasattr(self.image_encoder.trunk, "blocks"):
-                    # Hiera structure: blocks are in a ModuleList
-                    # We need to find the blocks belonging to the last stage.
-                    # Hiera stores stage_ends indices.
-                    if hasattr(self.image_encoder.trunk, "stage_ends"):
-                        last_stage_end = self.image_encoder.trunk.stage_ends[-1]
-                        # The stage before the last one ends at stage_ends[-2]
-                        # If there are 4 stages, stage_ends has 4 elements.
-                        # Stage 3 (last) starts after stage_ends[2] + 1
-                        if len(self.image_encoder.trunk.stage_ends) >= 2:
-                            last_stage_start = self.image_encoder.trunk.stage_ends[-2] + 1
-                        else:
-                            last_stage_start = 0 # Fallback if only 1 stage
+                # 1. Strict Freezing Strategy (FS-SAM2 style)
+                # PEFT handles the internal freezing of the base modules (image/memory encoders/attention).
+                # We only need to ensure that everything ELSE (Mask Decoder, Prompt Encoder, etc.) is frozen.
+                logging.info("Strict Freezing Strategy Enabled (FS-SAM2): Freezing all non-LoRA components.")
+                
+                frozen_count = 0
+                total_count = 0
+                for name, param in self.named_parameters():
+                    total_count += 1
+                    # Skip the components managed by PEFT (they handle their own requires_grad)
+                    if name.startswith("image_encoder") or \
+                       name.startswith("memory_attention") or \
+                       name.startswith("memory_encoder"):
+                        continue
                         
-                        # Unfreeze blocks from start to end
-                        for i in range(last_stage_start, last_stage_end + 1):
-                            for p in self.image_encoder.trunk.blocks[i].parameters():
-                                p.requires_grad = True
-                        logging.info(f"Unfrozen image encoder component: TRUNK_LAST_STAGE (blocks {last_stage_start}-{last_stage_end})")
+                    # Force freeze everything else (Mask Decoder, Prompt Encoder, Projections, etc.)
+                    param.requires_grad = False
+                    frozen_count += 1
+                
+                logging.info(f"Frozen {frozen_count}/{total_count} additional parameters (Decoder, PromptEnc, etc.).")
+                
+                # Optional: Logging trainable status
+                if hasattr(self.image_encoder, "print_trainable_parameters"):
+                    print("Image Encoder params:")
+                    self.image_encoder.print_trainable_parameters()
+                if self.memory_attention is not None and hasattr(self.memory_attention, "print_trainable_parameters"):
+                    print("Memory Attention params:")
+                    self.memory_attention.print_trainable_parameters()
+                if self.memory_encoder is not None and hasattr(self.memory_encoder, "print_trainable_parameters"):
+                    print("Memory Encoder params:")
+                    self.memory_encoder.print_trainable_parameters()
+
+            else:
+                # 2. Original Logic for standard Fine-Tuning (non-LoRA) or manual freezing
+                # Freeze everything by default
+                for p in self.image_encoder.parameters():
+                    p.requires_grad = False
+                
+                # Unfreeze specific components
+                if "neck" in unfreeze_image_encoder_components:
+                    if hasattr(self.image_encoder, "neck"):
+                        for p in self.image_encoder.neck.parameters():
+                            p.requires_grad = True
+                        logging.info("Unfrozen image encoder component: NECK")
                     else:
-                         logging.warning("Requested to unfreeze 'trunk_last_stage' but trunk has no 'stage_ends'.")
-                else:
-                    logging.warning("Requested to unfreeze 'trunk_last_stage' but image_encoder structure is unknown.")
+                        logging.warning("Requested to unfreeze 'neck' but image_encoder has no 'neck' attribute.")
 
-            # 3. Set modes
-            # Set backbone to eval mode to disable DropPath and other training-only behaviors
-            self.image_encoder.eval()
-            
-            # If we unfreeze something, we might want to keep those parts in train mode?
-            # Usually for fine-tuning, we keep BN frozen (eval mode) but allow weights to update.
-            # DropPath should probably be disabled for stability unless we have lots of data.
-            # So keeping eval() mode is generally safer for partial fine-tuning.
-            # However, if the user explicitly wants to train the neck, maybe they want BN updates?
-            # For FPN neck, it usually has LayerNorm or GN, not BN. So eval/train mode matters less for stats,
-            # but matters for Dropout/DropPath.
-            # Let's keep it simple: Force eval() on everything to be safe (consistent with previous logic),
-            # BUT if 'neck' is unfrozen, we might want to allow it to be in train mode if it has dropout?
-            # The previous logic forced everything to eval. Let's stick to that for stability.
-            # Wait, if we use `self.image_encoder.eval()`, it sets everything to eval.
-            # If we want to train neck, we should probably set neck to train()?
-            # Let's check Hiera FPN Neck. It has LayerNorm. No BN.
-            # So eval() vs train() mainly affects Dropout (if any).
-            # Let's stick to the safe bet: Global eval(), but unfreeze weights.
-            
-            # Prevent backbone from being set back to train mode by model.train()
-            # We need to be careful: if we want to train neck, model.train() should ideally set neck to train.
-            # But the monkey patch `self.image_encoder.train = lambda ...` prevents ANY part from going to train.
-            
-            # Revised Logic:
-            # 1. Set global eval()
-            self.image_encoder.eval()
-            
-            # 2. Define custom train function
-            def custom_train(mode=True):
-                # Always keep trunk in eval
-                if hasattr(self.image_encoder, "trunk"):
-                    self.image_encoder.trunk.eval()
-                
-                # If neck is unfrozen, allow it to follow mode
-                if "neck" in unfreeze_image_encoder_components and hasattr(self.image_encoder, "neck"):
-                    self.image_encoder.neck.train(mode)
-                
-                # If last stage is unfrozen, allow it to follow mode?
-                # Hiera blocks have DropPath. Enabling DropPath (train mode) might be good for regularization
-                # but risky for stability. Let's keep trunk fully eval for now to be safe.
-                
-                return self.image_encoder
+                if "trunk_last_stage" in unfreeze_image_encoder_components:
+                    if hasattr(self.image_encoder, "trunk") and hasattr(self.image_encoder.trunk, "blocks"):
+                        if hasattr(self.image_encoder.trunk, "stage_ends"):
+                            last_stage_end = self.image_encoder.trunk.stage_ends[-1]
+                            if len(self.image_encoder.trunk.stage_ends) >= 2:
+                                last_stage_start = self.image_encoder.trunk.stage_ends[-2] + 1
+                            else:
+                                last_stage_start = 0 
+                            
+                            for i in range(last_stage_start, last_stage_end + 1):
+                                for p in self.image_encoder.trunk.blocks[i].parameters():
+                                    p.requires_grad = True
+                            logging.info(f"Unfrozen image encoder component: TRUNK_LAST_STAGE (blocks {last_stage_start}-{last_stage_end})")
+                        else:
+                             logging.warning("Requested to unfreeze 'trunk_last_stage' but trunk has no 'stage_ends'.")
+                    else:
+                        logging.warning("Requested to unfreeze 'trunk_last_stage' but image_encoder structure is unknown.")
 
-            self.image_encoder.train = custom_train
+                # Set global eval()
+                self.image_encoder.eval()
+                
+                # Define custom train function
+                def custom_train(mode=True):
+                    if hasattr(self.image_encoder, "trunk"):
+                        self.image_encoder.trunk.eval()
+                    if "neck" in unfreeze_image_encoder_components and hasattr(self.image_encoder, "neck"):
+                        self.image_encoder.neck.train(mode)
+                    return self.image_encoder
 
-        # If we are NOT freezing the encoder (joint training), we must ensure that
-        # the base weights of LoRA layers (which are frozen by default upon injection)
-        # are explicitly unfrozen.
-        if not freeze_image_encoder and hasattr(self, 'use_lora') and self.use_lora:
-            unfrozen_count = 0
-            for name, module in self.image_encoder.named_modules():
-                if module.__class__.__name__ in ['LinearWithLoRA', 'LinearWithDoRA', 'LinearWithConvLoRA']:
-                     # Unfreeze the original linear layer
-                     if hasattr(module, 'linear'):
-                         for p in module.linear.parameters():
-                             p.requires_grad = True
-                             unfrozen_count += 1
-                elif module.__class__.__name__ in ['Conv2dWithLoRA', 'Conv2dWithDoRA']:
-                     # Unfreeze the original conv layer
-                     if hasattr(module, 'conv'):
-                         for p in module.conv.parameters():
-                             p.requires_grad = True
-                             unfrozen_count += 1
-            if unfrozen_count > 0:
-                logging.info(f"Joint Training: Unfrozen {unfrozen_count} base layers within LoRA modules.")
+                self.image_encoder.train = custom_train
 
     def forward(self, input: BatchedVideoDatapoint):
         if self.training or not self.forward_backbone_per_frame_for_eval:
@@ -633,21 +584,36 @@ class SAM2Train(SAM2Base):
                 # gt_masks is [B, 1, H, W], which matches [B, K=1, H, W]
                 pixel_gt_for_aue = gt_masks
                  
-        current_out, sam_outputs, high_res_features, pix_feat = self._track_step(
-            frame_idx,
-            is_init_cond_frame,
-            current_vision_feats,
-            current_vision_pos_embeds,
-            feat_sizes,
-            point_inputs,
-            mask_inputs,
-            output_dict,
-            num_frames,
-            track_in_reverse,
-            prev_sam_mask_logits,
-            pixel_gt_for_aue=pixel_gt_for_aue,
-            current_img_batch=current_img_batch,
-        )
+        # Cache memory context for adversarial branch (used inside compute_aue_loss)
+        self._aue_memory_context = {
+            "frame_idx": frame_idx,
+            "is_init_cond_frame": is_init_cond_frame,
+            "current_vision_feats": current_vision_feats,
+            "current_vision_pos_embeds": current_vision_pos_embeds,
+            "feat_sizes": feat_sizes,
+            "output_dict": output_dict,
+            "num_frames": num_frames,
+            "track_in_reverse": track_in_reverse,
+        }
+        try:
+            current_out, sam_outputs, high_res_features, pix_feat = self._track_step(
+                frame_idx,
+                is_init_cond_frame,
+                current_vision_feats,
+                current_vision_pos_embeds,
+                feat_sizes,
+                point_inputs,
+                mask_inputs,
+                output_dict,
+                num_frames,
+                track_in_reverse,
+                prev_sam_mask_logits,
+                pixel_gt_for_aue=pixel_gt_for_aue,
+                current_img_batch=current_img_batch,
+            )
+        finally:
+            # Clear to avoid stale context on other code paths
+            self._aue_memory_context = None
 
         (
             low_res_multimasks,

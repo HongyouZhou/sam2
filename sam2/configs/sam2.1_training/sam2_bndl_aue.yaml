@@ -9,7 +9,7 @@ scratch:
   base_lr: 5.0e-6
   vision_lr: 3.0e-06
   phases_per_epoch: 1
-  num_epochs: 15
+  num_epochs: 30
 
 dataset:
   # PATHS to Dataset
@@ -79,8 +79,8 @@ trainer:
   _target_: training.trainer.Trainer
   mode: train
   max_epochs: ${times:${scratch.num_epochs},${scratch.phases_per_epoch}}
-  actual_max_epochs: 15
-  val_epoch_freq: 2
+  actual_max_epochs: 30
+  val_epoch_freq: 5
   accelerator: cuda
   seed_value: 123
   cuda:
@@ -201,27 +201,27 @@ trainer:
     use_mlp_for_obj_ptr_proj: true
     # === BNDL_CONFIG_START ===
     # BNDL
-    use_bndl_for_pixels: true
-    bndl_fuse_type: none
+    use_bndl_for_pixels: false
+    bndl_fuse_type: conv
     bndl_replace_global_with_hyper: true
-    bndl_hyper_in_sparse: true
+    bndl_hyper_in_sparse: false
     # === BNDL_CONFIG_END ===
     # Compilation flag
     # Freeze image encoder to save memory
     # === IMPORTANT: Conv-LoRA Configuration ===
-    freeze_image_encoder: false  # true = PEFT (only train LoRA, ~2-3% params), false = joint fine-tuning (train all, ~33% params)
+    freeze_image_encoder: true  # true = PEFT (only train LoRA, ~2-3% params), false = joint fine-tuning (train all, ~33% params)
     # Unfreeze specific components for adaptation (e.g. "neck", "trunk_last_stage")
     unfreeze_image_encoder_components: []
 
     # === LORA_CONFIG_START ===
     # LoRA: Parameter-efficient fine-tuning
-    use_lora: false
-    lora_rank: 8
+    use_lora: true
+    lora_rank: 4
     lora_alpha: 16.0
     lora_dropout: 0.1
-    lora_target_modules:  # Layers to inject LoRA
-      - "mlp.layers.0"
-      - "mlp.layers.1"
+    lora_target_modules:  # Layers to inject LoRA (Match FS-SAM2: qkv, proj)
+      - "qkv" 
+      - "proj"
     # === LORA_CONFIG_END ===
     
     # === MAX_OBJECTS_CONFIG_START ===
@@ -231,7 +231,7 @@ trainer:
 
     # === AUE_GCN_CONFIG_START ===
     # AUE (Adversarial Uncertainty Estimation) with Style-based augmentation
-    use_aue: true
+    use_aue: false
     # Constraint weight for adversarial samples (L1 distance to initial)
     aue_constraint_loss_weight: 0.0  # Weight for constraint regularization (0 = disabled)
     # Attack mode: "cooperative" (parallel prediction, joint application) or "sequential" (iterative)
@@ -469,41 +469,21 @@ trainer:
             start_value: 1.0e-6
             end_value: 1.0e-7
 
-        # - scheduler:
-        #     _target_: fvcore.common.param_scheduler.CosineParamScheduler
-        #     start_value: 1.0e-07
-        #     end_value: 1.0e-07
-        #   param_names:
-        #     - 'image_encoder.*'
-        #   exclude_param_names:
-        #     - '*conv_lora.*'
-
-        # # Conv-LoRA learning rate (MoE-based)
-        # - scheduler:
-        #     _target_: fvcore.common.param_scheduler.CosineParamScheduler
-        #     start_value: 5.0e-5
-        #     end_value: 1.0e-5
-        #   param_names:
-        #     - '*conv_lora.lora_A.*'
-        #     - '*conv_lora.lora_B.*'
-        #     - '*conv_lora.gating_fc.*'
-        #     - '*conv_lora.experts.*'
-
         # BNDL head: higher learning rate
-        - scheduler:
-            _target_: fvcore.common.param_scheduler.CosineParamScheduler
-            start_value: 1.0e-3
-            end_value: 1.0e-5
-          param_names:
-            - 'sam_mask_decoder.pixel_bndl.*'
-
-        # Style Adversarial Network: moderate learning rate for effective adversarial training
         - scheduler:
             _target_: fvcore.common.param_scheduler.CosineParamScheduler
             start_value: 1.0e-4
             end_value: 1.0e-5
           param_names:
-            - 'style_attacker.impl.style_net.*'
+            - 'sam_mask_decoder.pixel_bndl.*'
+
+        # Style Adversarial Network: moderate learning rate for effective adversarial training
+        # - scheduler:
+        #     _target_: fvcore.common.param_scheduler.CosineParamScheduler
+        #     start_value: 1.0e-4
+        #     end_value: 1.0e-5
+        #   param_names:
+        #     - 'style_attacker.impl.style_net.*'
 
         # GCN: moderate learning rate for rapid alpha convergence
         # - scheduler:
@@ -521,21 +501,22 @@ trainer:
         #   param_names:
         #     - 'deform_attacker.*'
 
-        # Other decoder components: very small learning rate
-        # - scheduler:
-        #     _target_: fvcore.common.param_scheduler.CosineParamScheduler
-        #     start_value: 1.0e-7
-        #     end_value: 1.0e-8
-        #   param_names:
-        #     - 'sam_mask_decoder.mask_tokens.*'
-        #     - 'sam_mask_decoder.iou_token.*'
-        #     - 'sam_mask_decoder.obj_score_token.*'
-        #     - 'sam_mask_decoder.output_upscaling.*'
-        #     - 'sam_mask_decoder.conv_s0.*'
-        #     - 'sam_mask_decoder.conv_s1.*'
-        #     - 'sam_mask_decoder.output_hypernetworks_mlps.*'
-        #     - 'sam_mask_decoder.iou_prediction_head.*'
-        #     - 'sam_mask_decoder.pred_obj_score_head.*'
+        # LoRA params: higher learning rate
+        - scheduler:
+            _target_: fvcore.common.param_scheduler.CosineParamScheduler
+            start_value: 2.0e-4
+            end_value: 2.0e-5
+          param_names:
+            - '*lora*'
+
+        - scheduler:
+            _target_: fvcore.common.param_scheduler.CosineParamScheduler
+            start_value: 1.0e-07
+            end_value: 1.0e-07
+          param_names:
+            - image_encoder.*
+          exclude_param_names:
+            - '*lora*'
 
       weight_decay:
         # 默认 weight decay
@@ -568,17 +549,17 @@ trainer:
       bndl_weight: 1.0
       aue_weight: 0.0
       weight_schedule:
-        - until_epoch: 5
+        - until_epoch: 10
           sam_weight: 1.0
           bndl_weight: 1.0
           aue_weight: 0.0
-        - until_epoch: 10
+        - until_epoch: 15
           sam_weight: 1.0
           bndl_weight: 0.8
           aue_weight: 0.005
         - until_epoch: null
           sam_weight: 1.0
-          bndl_weight: 0.5
+          bndl_weight: 0.2
           aue_weight: 0.01
     val:
       _target_: training.loss_combined.CombinedSAMBNDLLoss
@@ -620,14 +601,14 @@ trainer:
     visualize_pavpu_overlay: true
     uncertainty_sample_num: 50
     # Pixel-level PAvPU statistics configuration
-    correlation_foreground_dilation: 8
+    correlation_foreground_dilation: 4
     correlation_per_pixel: true
     correlation_use_full_image: false
 
   # initialize from a SAM 2 checkpoint
   checkpoint:
     save_dir: ${launcher.experiment_log_dir}/checkpoints
-    save_freq: 10 # 0 only last checkpoint is saved.
+    save_freq: 0 # 0 only last checkpoint is saved.
     model_weight_initializer:
       _partial_: True
       _target_: training.utils.checkpoint_utils.load_state_dict_into_model

@@ -941,10 +941,8 @@ class FeatureLevelDeformationImpl(nn.Module):
                 "valid_mask": valid_mask
             }
             
-        # Pre-compute image projection on detached backbone features to avoid
-        # sending adversarial grads into the main encoder.
-        clean_features_detached = clean_features.detach()
-        img_proj = self.img_feat_proj(clean_features_detached)
+        # Pre-compute image projection (keep gradients so backbone can adapt)
+        img_proj = self.img_feat_proj(clean_features)
         
         # Process valid objects
         for k_idx in valid_indices.tolist():
@@ -1191,13 +1189,9 @@ class FeatureBasedDeformModule(nn.Module):
             feature_offsets: [B, 2, H_feat, W_feat] Offsets in feature resolution
             image_offsets: [B, 2, H_img, W_img] Offsets in image resolution
         """
-        # 1. Detach input features
-        # Best Practice: Backbone/MemoryEncoder should not update to "fool" the offset predictor.
-        fused_features_detached = fused_features.detach()
-        
-        # 2. Predict raw offsets
+        # 1. Predict raw offsets (allow gradients to flow to backbone/encoder)
         # Range: (-1, 1) after tanh
-        raw_offsets = self.offset_net(fused_features_detached)  # [B, 2, H_feat, W_feat]
+        raw_offsets = self.offset_net(fused_features)  # [B, 2, H_feat, W_feat]
         
         # 3. Apply GRL to the offsets (OUTPUT side)
         # This ensures OffsetNet receives inverted gradients (Maximize Loss)
@@ -1321,9 +1315,6 @@ class StyleAdversarialNetwork(nn.Module):
         B, C, H, W = features.shape
         K_actual = original_styles.shape[1]
         
-        # Detach input features to prevent backbone updates from style loss
-        features_detached = features.detach()
-        
         if pixel_gt is not None:
             if pixel_gt.shape[-2:] != (H, W):
                 masks = F.interpolate(pixel_gt.float(), size=(H, W), mode='nearest')
@@ -1331,7 +1322,7 @@ class StyleAdversarialNetwork(nn.Module):
                 masks = pixel_gt.float()
             
             # Efficient Masked Pooling
-            flat_features = features_detached.flatten(2).transpose(1, 2) # [B, N, C]
+            flat_features = features.flatten(2).transpose(1, 2) # [B, N, C]
             flat_masks = masks.flatten(2) # [B, K, N]
             
             mask_sums = flat_masks.sum(dim=2, keepdim=True).clamp(min=1e-6)
@@ -1341,7 +1332,7 @@ class StyleAdversarialNetwork(nn.Module):
             
         else:
             # Fallback: Global pooling
-            global_feat = features_detached.mean(dim=[2, 3]) # [B, C]
+            global_feat = features.mean(dim=[2, 3]) # [B, C]
             object_features = global_feat.unsqueeze(1).expand(-1, K_actual, -1)
             
         style_residuals = self.object_mlp(object_features)
