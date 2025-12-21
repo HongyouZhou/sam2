@@ -307,8 +307,11 @@ class ImageLevelStyleImpl(nn.Module):
         )
         
         # 2. Predict adversarial styles using neural network + GRL
+        # Detach clean_features to prevent gradient fighting. 
+        # The backbone should not receive gradients from the GRL that attempt to maximize loss;
+        # it should only update based on the final loss minimization on the adversarial example.
         adv_styles = self.style_net(
-            clean_features, 
+            clean_features.detach(), 
             original_styles, 
             pixel_gt=pixel_gt_normalized
         )
@@ -478,13 +481,25 @@ class ImageLevelStyleImpl(nn.Module):
             model: SAM2Base model for accessing configuration
         
         Returns:
-            pixel_gt: [B, K, H, W] normalized GT masks
+            pixel_gt: [B, K, H, W] normalized GT masks (possibly merged if single-object)
             original_styles: [B, K, 6] original style statistics (detached)
         """
         # Ensure 4D: [B, K, H, W]
         if pixel_gt.ndim == 3:
             pixel_gt = pixel_gt.unsqueeze(1)
         
+        # Enforce single-object mode if requested (merge all masks)
+        if not self.use_multi_object and pixel_gt.shape[1] > 1:
+            pixel_gt = pixel_gt.sum(dim=1, keepdim=True).clamp(0, 1)  # [B, 1, H, W]
+        else:
+            # In multi-object mode, drop background channel when background attacks are disabled.
+            # Heuristic: the last channel is background if it covers the majority of pixels.
+            if not self.enable_background and pixel_gt.shape[1] > 1:
+                mask_area_ratio = pixel_gt.float().mean(dim=(2, 3))  # [B, K]
+                bg_is_last = (mask_area_ratio[:, -1] > 0.5).all()
+                if bg_is_last:
+                    pixel_gt = pixel_gt[:, :-1]  # remove background channel
+            
         B, K, H, W = pixel_gt.shape
         
         # Extract all objects' styles (vectorized)
@@ -509,7 +524,10 @@ class ImageLevelStyleImpl(nn.Module):
         gt_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
-        Apply style statistics to images using AdaIN (vectorized multi-object).
+        Apply style statistics to images using AdaIN (parallel multi-object composition).
+        
+        CRITICAL: All objects' styles are applied independently based on the SAME original image,
+        then composed together. This eliminates order-dependence issues.
         
         Args:
             img_batch: [B, 3, H, W] normalized images
@@ -524,8 +542,13 @@ class ImageLevelStyleImpl(nn.Module):
             return img_batch
         
         # Guard against NaN/Inf in inputs
-        if not torch.isfinite(img_batch).all() or not torch.isfinite(style_stats).all():
-            raise RuntimeError("Style application inputs contain NaN/Inf values")
+        if not torch.isfinite(img_batch).all():
+            raise RuntimeError("Style application inputs (img_batch) contain NaN/Inf values")
+        
+        # Sanitize style_stats to prevent 0 * NaN = NaN propagation
+        # (This can happen if an object is empty/missing, leading to NaN style stats)
+        if not torch.isfinite(style_stats).all():
+            style_stats = torch.nan_to_num(style_stats, nan=0.0, posinf=10.0, neginf=-10.0)
             
         B, C, H, W = img_batch.shape
         
@@ -539,18 +562,17 @@ class ImageLevelStyleImpl(nn.Module):
         
         K = style_stats.shape[1]
         
-        # Compute base statistics from ORIGINAL image once
-        # All objects will use this as normalization baseline to avoid cumulative shift
+        # CRITICAL FIX: Compute normalization based on ORIGINAL image ONCE
+        # All objects will use this consistent baseline
         base_means = img_batch.mean(dim=[2, 3], keepdim=True)  # [B, 3, 1, 1]
-        base_stds = img_batch.std(dim=[2, 3], keepdim=True)    # [B, 3, 1, 1]
+        base_stds = img_batch.std(dim=[2, 3], keepdim=True).clamp(min=1e-6)  # [B, 3, 1, 1]
+        normalized = (img_batch - base_means) / base_stds
         
-        # Pre-compute normalized images once to avoid repeated work inside the loop
-        normalized = (img_batch - base_means) / (base_stds + 1e-6)
-
-        # Accumulate style applications (start from original)
-        styled_images = img_batch.clone()
+        # Collect styled regions for all objects
+        styled_regions = []
+        masks_list = []
         
-        # Apply style for each object (vectorized processing)
+        # Apply style for each object independently (all based on original image)
         for k in range(K):
             object_style = style_stats[:, k]  # [B, 6]
             object_mask = gt_mask[:, k:k + 1] if gt_mask is not None else None  # [B, 1, H, W]
@@ -559,9 +581,16 @@ class ImageLevelStyleImpl(nn.Module):
             target_means = object_style[:, :3].view(B, 3, 1, 1)  # [B, 3, 1, 1]
             target_stds = object_style[:, 3:].view(B, 3, 1, 1)   # [B, 3, 1, 1]
             
+            # CRITICAL: Clamp estimated style statistics to prevent explosion/NaNs
+            target_stds = torch.clamp(target_stds, min=0.01, max=10.0) 
+            target_means = torch.clamp(target_means, min=-10.0, max=10.0)
+            
+            # Apply AdaIN with target style (based on original normalized image)
             object_styled = normalized * target_stds + target_means
             
-            # Apply mask (if provided)
+            # Clamp styled output to prevent extreme values
+            object_styled = torch.clamp(object_styled, min=-10.0, max=10.0)
+            
             if object_mask is not None:
                 # Adjust mask to image size
                 if object_mask.shape[2:] != (H, W):
@@ -572,14 +601,20 @@ class ImageLevelStyleImpl(nn.Module):
                     )
                 object_mask = object_mask.float()
                 
-                # Only apply style to object region, blend with accumulated result
-                # CRITICAL: Use img_batch (not styled_images) for background in first iteration
-                # to match eb03fdb behavior exactly
-                background = img_batch if k == 0 else styled_images
-                styled_images = object_mask * object_styled + (1 - object_mask) * background
+                # Store styled region and mask
+                styled_regions.append(object_styled)
+                masks_list.append(object_mask)
             else:
-                # Apply to full image (replace entirely)
-                styled_images = object_styled
+                # No mask: apply to full image (single-object mode)
+                styled_regions.append(object_styled)
+                masks_list.append(torch.ones(B, 1, H, W, device=img_batch.device))
+        
+        # Compose all styled regions with masks
+        # Strategy: Later objects overwrite earlier ones in overlap regions
+        styled_images = img_batch.clone()
+        
+        for k in range(K):
+            styled_images = masks_list[k] * styled_regions[k] + (1 - masks_list[k]) * styled_images
         
         # Guard against NaN/Inf in output
         if not torch.isfinite(styled_images).all():
@@ -675,7 +710,7 @@ class ImageLevelStyleImpl(nn.Module):
             valid_masks = (mask_areas > 0).sum().item()
             logging.debug(f"GCN input: pixel_gt.shape={pixel_gt.shape}, valid_masks={valid_masks}/{pixel_gt.shape[0] * pixel_gt.shape[1]}, "
                          f"edge_thresh={model.style_adv_gcn_edge_threshold}, dist_thresh={model.style_adv_gcn_distance_threshold}, "
-                         f"use_bg={model.style_adv_enable_background and model.style_adv_gcn_use_background_edges}")
+                         f"use_bg={model.adv_enable_background and model.style_adv_gcn_use_background_edges}")
         
         # Extract mask features if visual features are enabled
         # Features serve two purposes:
@@ -693,7 +728,7 @@ class ImageLevelStyleImpl(nn.Module):
             edge_threshold=model.style_adv_gcn_edge_threshold,
             use_semantic=model.style_adv_gcn_use_semantic_edges,
             use_background=(
-                model.style_adv_enable_background and model.style_adv_gcn_use_background_edges
+                model.adv_enable_background and model.style_adv_gcn_use_background_edges
             ),
             distance_threshold=model.style_adv_gcn_distance_threshold,
             use_boundary_distance=model.style_adv_gcn_use_boundary_distance,
@@ -785,12 +820,15 @@ class FeatureLevelDeformationImpl(nn.Module):
         epsilon: float = 0.15,
         use_soft_composite: bool = True,
         temperature: float = 1.0,
+        use_multi_object: bool = False,
         use_gcn: bool = False,
         gcn_num_layers: int = 2,
         num_deform_groups: int = 4,
         init_from_memory_encoder: bool = True,
         freeze_mask_encoder: bool = False,
         image_size: int = 1024,
+        zero_mean_offsets: bool = False,
+        local_offset_gain: float = 1.0,
         **kwargs
     ):
         super().__init__()
@@ -798,6 +836,7 @@ class FeatureLevelDeformationImpl(nn.Module):
         self.epsilon = epsilon
         self.use_soft_composite = use_soft_composite
         self.temperature = temperature
+        self.use_multi_object = use_multi_object
         self.use_gcn = use_gcn
         self.init_from_memory_encoder = init_from_memory_encoder
         self.freeze_mask_encoder = freeze_mask_encoder
@@ -835,6 +874,8 @@ class FeatureLevelDeformationImpl(nn.Module):
             feature_dim=feature_dim,
             epsilon=epsilon,
             image_size=image_size,
+            zero_mean_offsets=zero_mean_offsets,
+            local_offset_gain=local_offset_gain,
         )
         
         # 5. Soft compositor for multi-object overlaps
@@ -921,11 +962,12 @@ class FeatureLevelDeformationImpl(nn.Module):
         mask_areas = pixel_gt_resized.sum(dim=(0, 2, 3))
         is_empty = (mask_areas == 0)
         
-        # Background detection
+        # Background detection (only if background channel is enabled)
         area_ratios = mask_areas / (B * H_feat * W_feat)
         is_background = torch.zeros(K, dtype=torch.bool, device=device)
-        if K > 0 and area_ratios[-1] > 0.5:
-            is_background[-1] = True
+        if self.use_multi_object and getattr(model, "adv_enable_background", False):
+            if K > 0 and area_ratios[-1] > 0.5:
+                is_background[-1] = True
             
         valid_mask = ~(is_empty | is_background)
         valid_indices = torch.where(valid_mask)[0]
@@ -941,8 +983,12 @@ class FeatureLevelDeformationImpl(nn.Module):
                 "valid_mask": valid_mask
             }
             
-        # Pre-compute image projection (keep gradients so backbone can adapt)
-        img_proj = self.img_feat_proj(clean_features)
+        # Pre-compute image projection
+        # Detach features to prevent gradient fighting:
+        # The backbone should not receive gradients from the GRL (via offset_net)
+        # that attempt to maximize loss. Backbone should only adapt to the *result* 
+        # of the deformation (task loss), not try to fool the offset predictor.
+        img_proj = self.img_feat_proj(clean_features.detach())
         
         # Process valid objects
         for k_idx in valid_indices.tolist():
@@ -950,7 +996,8 @@ class FeatureLevelDeformationImpl(nn.Module):
             mask_k_resized = pixel_gt_resized[:, k_idx:k_idx + 1]
             
             # Encode mask
-            mask_features = self.mask_encoder(mask_k_original)
+            # MaskDownSampler expects floating inputs; ensure dtype aligns with weights
+            mask_features = self.mask_encoder(mask_k_original.float())
             
             # Fuse
             fused = img_proj + mask_features
@@ -1150,11 +1197,15 @@ class FeatureBasedDeformModule(nn.Module):
         feature_dim: int = 256, 
         epsilon: float = 0.15,
         image_size: int = 1024,
+        zero_mean_offsets: bool = False,
+        local_offset_gain: float = 1.0,
     ):
         super().__init__()
         self.feature_dim = feature_dim
         self.epsilon = epsilon
         self.image_size = image_size
+        self.zero_mean_offsets = zero_mean_offsets
+        self.local_offset_gain = local_offset_gain
         
         # Offset predictor: fused_features -> dense offsets (2 channels)
         self.offset_net = nn.Sequential(
@@ -1198,26 +1249,46 @@ class FeatureBasedDeformModule(nn.Module):
         raw_offsets_adv = self.grl(raw_offsets)
         
         raw_offsets_adv = torch.tanh(raw_offsets_adv)
-        
-        # Define scale factor (1024 / 64 = 16)
-        scale_factor = 16.0
-        
+
+        # Remove global shift while keeping local deformation energy
+        if self.zero_mean_offsets:
+            if object_mask is not None:
+                mask_sum = object_mask.sum(dim=(2, 3), keepdim=True).clamp(min=1e-6)
+                mean_offset = (raw_offsets_adv * object_mask).sum(dim=(2, 3), keepdim=True) / mask_sum
+            else:
+                mean_offset = raw_offsets_adv.mean(dim=(2, 3), keepdim=True)
+            raw_offsets_adv = raw_offsets_adv - mean_offset
+
+        # Optionally boost local variation after centering while keeping bounds
+        if self.local_offset_gain != 1.0:
+            raw_offsets_adv = raw_offsets_adv * self.local_offset_gain
+            raw_offsets_adv = raw_offsets_adv.clamp(min=-1.0, max=1.0)
+
+        # Use actual target resolution instead of a fixed scale factor
+        if isinstance(self.image_size, (tuple, list)):
+            target_h, target_w = self.image_size
+        else:
+            target_h = target_w = int(self.image_size)
+
+        scale_y = target_h / float(fused_features.shape[2])
+        scale_x = target_w / float(fused_features.shape[3])
+
         # 1. Compute Image-level Offsets (Target Resolution)
-        # Scale raw offsets by epsilon (defined in IMAGE pixels)
-        # We first upsample the raw field to image size to get smooth dense flow
+        # Upsample to image space, then scale offsets from feature pixels -> image pixels
         image_raw_offsets = F.interpolate(
             raw_offsets_adv,
-            scale_factor=scale_factor,
+            size=(target_h, target_w),
             mode='bilinear',
             align_corners=False
         )
-        image_offsets = image_raw_offsets * self.epsilon # [B, 2, H_img, W_img] in pixels
+        scale_tensor = torch.tensor(
+            [scale_x, scale_y], device=fused_features.device, dtype=fused_features.dtype
+        ).view(1, 2, 1, 1)
+        image_offsets = image_raw_offsets * (self.epsilon * scale_tensor)
         
-        # 2. Compute Feature-level Offsets (Source Resolution)
-        # Feature offset = Image offset / scale_factor
-        # We use the raw_offsets directly scaled by (epsilon / scale_factor)
-        # This avoids downsampling artifacts and keeps consistency
-        feature_offsets = raw_offsets_adv * (self.epsilon / scale_factor) # [B, 2, H_feat, W_feat] in feature pixels
+        # 2. Feature-level Offsets (Source Resolution)
+        # Keep offsets in feature pixel units for direct warping on the feature map
+        feature_offsets = raw_offsets_adv * self.epsilon
         
         return feature_offsets, image_offsets
 
@@ -1312,6 +1383,13 @@ class StyleAdversarialNetwork(nn.Module):
         original_styles: torch.Tensor,
         pixel_gt: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        # CRITICAL: Validate inputs to prevent NaN/Inf propagation
+        if not torch.isfinite(features).all():
+            raise RuntimeError("StyleAdversarialNetwork: input features contain NaN/Inf")
+        if not torch.isfinite(original_styles).all():
+            # Robustly handle NaN/Inf (e.g. from empty objects)
+            original_styles = torch.nan_to_num(original_styles, nan=0.0, posinf=10.0, neginf=-10.0)
+            
         B, C, H, W = features.shape
         K_actual = original_styles.shape[1]
         
@@ -1343,10 +1421,19 @@ class StyleAdversarialNetwork(nn.Module):
         
         # Handle shape mismatch if pixel_gt K != original_styles K
         if style_residuals_adv.shape[1] != K_actual:
-             if style_residuals_adv.shape[1] > K_actual:
-                 style_residuals_adv = style_residuals_adv[:, :K_actual, :]
-             else:
-                 pad_k = K_actual - style_residuals_adv.shape[1]
-                 style_residuals_adv = F.pad(style_residuals_adv, (0, 0, 0, pad_k))
+            if style_residuals_adv.shape[1] > K_actual:
+                style_residuals_adv = style_residuals_adv[:, :K_actual, :]
+            else:
+                pad_k = K_actual - style_residuals_adv.shape[1]
+                style_residuals_adv = F.pad(style_residuals_adv, (0, 0, 0, pad_k))
 
-        return original_styles + style_residuals_adv
+        # CRITICAL: Clamp final output to prevent extreme values that cause transformer NaN
+        # Style stats (mean, std): reasonable ranges are [-5, 5] for means, [0.01, 5] for stds
+        adv_styles_out = original_styles + style_residuals_adv
+        
+        # Separate clamping for means and stds
+        adv_means = adv_styles_out[:, :, :3].clamp(min=-5.0, max=5.0)
+        adv_stds = adv_styles_out[:, :, 3:].clamp(min=0.05, max=5.0)  # Prevent near-zero or huge stds
+        adv_styles_out = torch.cat([adv_means, adv_stds], dim=2)
+        
+        return adv_styles_out

@@ -212,15 +212,13 @@ class BNDLLoss(nn.Module):
 
         # 像素KL保持主导地位，prompt KL作为辅助正则化
         pixel_kl_weight = self.kl_weight
-        # 增加到0.05，但仍保持适中；无 prompt 项时为 0
-        prompt_kl_weight = self.kl_weight * 0.05 if has_prompt_terms else 0.0
+        # [Critical Fix for ZS] 提升权重以匹配主Loss量级(20.0)，强迫模型在ZS时不确定就闭嘴
+        prompt_kl_weight = self.kl_weight * 1.0 if has_prompt_terms else 0.0
         
         # 添加自适应权重调整
         if has_prompt_terms:
             # 如果prompt KL过大，降低其权重
             kl_ratio = (KL_w.abs() / (KL_x.abs() + 1e-8)).item()
-            if kl_ratio > 10.0:  # 如果prompt KL比pixel KL大10倍以上
-                prompt_kl_weight = prompt_kl_weight * 0.1  # 进一步降低权重
         
         total_loss = KL_x * pixel_kl_weight + KL_w * prompt_kl_weight
         

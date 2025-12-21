@@ -182,8 +182,8 @@ def build_task_command(
         cmd.extend(["--bndl_aue_cfg", config_path])
     
     # Optional args
-    if args.first_frame_only:
-        cmd.append("--first_frame_only")
+    if not args.first_frame_only:
+        cmd.append("--process_full_video")
     
     if args.video_limit:
         cmd.extend(["--video_limit", str(args.video_limit)])
@@ -223,8 +223,16 @@ def run_task(
     # Environment setup
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    env["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
     env["PYTHONUNBUFFERED"] = "1"
+
+    # Limit threads to prevent CPU oversubscription which causes extreme slowdowns
+    # when running multiple PyTorch processes in parallel
+    env["OMP_NUM_THREADS"] = "1"
+    env["MKL_NUM_THREADS"] = "1"
+    env["OPENBLAS_NUM_THREADS"] = "1"
+    env["VECLIB_MAXIMUM_THREADS"] = "1"
+    env["NUMEXPR_NUM_THREADS"] = "1"
     
     task_id = f"{checkpoint_name}@{dataset_name}"
     
@@ -468,7 +476,7 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--first_frame_only", action="store_true", default=True, help="Evaluate only the first frame (default: True, use --no-first_frame_only to process full video)")
     parser.add_argument("--no-first_frame_only", dest="first_frame_only", action="store_false", help="Process full video instead of just first frame")
-    parser.add_argument("--num_workers", type=int, default=0)
+    parser.add_argument("--num_workers", type=int, default=2, help="Number of workers for evaluation (default: 4)")
     parser.add_argument("--collect_bndl_stats", action="store_true")
     parser.add_argument("--aue_version", type=str, default=None)
 

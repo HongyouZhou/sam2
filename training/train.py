@@ -27,6 +27,7 @@ os.environ["HYDRA_FULL_ERROR"] = "1"
 
 def single_proc_run(local_rank, main_port, cfg, world_size):
     """Single GPU process"""
+    
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = str(main_port)
     os.environ["RANK"] = str(local_rank)

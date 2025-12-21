@@ -66,6 +66,11 @@ class CombinedSAMBNDLLoss(nn.Module):
         self.bndl_weight = stage.get("bndl_weight", self._initial_weights["bndl_weight"])
         self.ur_ern_weight = stage.get("ur_ern_weight", self._initial_weights["ur_ern_weight"])
         self.aue_weight = stage.get("aue_weight", self._initial_weights["aue_weight"])
+        
+        # Update uncertainty_weight in sam_loss if present in schedule
+        uncertainty_weight = stage.get("uncertainty_weight")
+        if uncertainty_weight is not None and hasattr(self.sam_loss, "uncertainty_weight"):
+            self.sam_loss.uncertainty_weight = float(uncertainty_weight)
 
     def apply_schedule(self, epoch: int) -> None:
         if not self._weight_schedule:

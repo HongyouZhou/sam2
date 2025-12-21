@@ -75,10 +75,11 @@ def pixel_weibull_to_entropy_uncertainty(
     # Step 1: Forward through BNDL to get Weibull parameters
     # force_sample=False ensures deterministic mode (uses expectation)
     # Use no_grad to prevent gradients from flowing back to BNDL parameters.
-    # Goal: Use uncertainty as guidance signal to train encoder/decoder,
-    # not to modify BNDL's uncertainty estimation method.
-    # Note: pixel_logits (used for error computation) is computed separately
-    # and retains gradients, allowing mask decoder to be updated.
+    
+    # SAFETY: Clamp external weights to prevent gradient explosion
+    if external_pre_out_w is not None:
+        external_pre_out_w = torch.clamp(external_pre_out_w, min=-5.0, max=5.0)
+
     with torch.no_grad():
         out, z_out, weibull_lambda, inv_k, pre_out_w, *_ = pixel_bndl_model(pixel_feat, force_sample=False, external_pre_out_w=external_pre_out_w)
     K = out.shape[-1]  # number of output classes/masks
@@ -166,7 +167,22 @@ def pixel_weibull_to_entropy_uncertainty(
 
     # Variance propagation: Var[logits_k] = Σ_i W_{ki}² * Var[Z_i]
     # (assumes independent Z_i, which is true by BNDL's design)
-    if hasattr(pixel_bndl_model, "linear_output"):
+    if external_pre_out_w is not None:
+        # Case with external weights (hyper_in)
+        # external_pre_out_w: [B, K, C'] or [C', K]
+        
+        # Use _apply_external_weights from BNDL to handle shapes for variance
+        # We need W^2 @ Var[Z]
+        w_squared = external_pre_out_w ** 2
+        var_logits = pixel_bndl_model._apply_external_weights(var_z, w_squared)
+        
+    elif hasattr(pixel_bndl_model, "linear"):
+        # Standard BNDL with internal linear layer
+        output_weight = pixel_bndl_model.linear.weight  # [K, C]
+        # Einsum: sum over C dimension with squared weights
+        var_logits = torch.einsum("bhwc,kc->bhwk", var_z, output_weight**2)
+        
+    elif hasattr(pixel_bndl_model, "linear_output"):
         output_weight = pixel_bndl_model.linear_output.weight  # [K, C]
         # Einsum: sum over C dimension with squared weights
         var_logits = torch.einsum("bhwc,kc->bhwk", var_z, output_weight**2)

@@ -7,6 +7,7 @@
 import logging
 from dataclasses import dataclass
 from contextlib import contextmanager
+from typing import Any
 
 import torch
 import torch.nn.functional as F
@@ -38,6 +39,8 @@ class AUEVisualizationData:
     # Deformation visualization data
     deform_offsets: torch.Tensor | None  # [N, K, 2, H, W] CPU (deformation offset fields)
     warped_images: torch.Tensor | None  # [N, 3, H, W] CPU (soft-composited warped images from offsets)
+    warped_object_masks: torch.Tensor | None = None  # [N, K, H, W] CPU (post-deformation masks)
+    attack_order: list[str] | None = None  # Applied adversarial order for visualization selection
     # Style visualization data (already included above via original/adversarial images and styles)
 
 
@@ -155,10 +158,11 @@ class SAM2Base(torch.nn.Module):
         # Style Adversarial options (alternative to AUE, for domain generalization)
         use_style_adv: bool = False,
         style_adv_mode: str = "image_level",  # "image_level" or "feature_level"
+        style_adv_epsilon: float = 2.0,  # Perturbation budget for style
         style_adv_use_gt_region_style: bool = False,  # Extract style only from GT region
         # Multi-object style attack control
-        style_adv_use_multi_object: bool = False,  # true=attack with all objects, false=only current loss object
-        style_adv_enable_background: bool = False,  # true=include background as K+1, false=objects only
+        adv_use_multi_object: bool = False,  # true=attack with all objects, false=only current loss object
+        adv_enable_background: bool = False,  # true=include background as K+1, false=objects only
         # Global-Local Mixed Style Adversarial
         style_adv_use_global_local_mix: bool = False,  # Enable global+local mixed style perturbation
         style_adv_global_epsilon: float = 1.5,  # Perturbation budget for global style
@@ -192,6 +196,8 @@ class SAM2Base(torch.nn.Module):
         # Feature-based deformation options
         deform_adv_init_from_memory_encoder: bool = True,  # Initialize from memory encoder
         deform_adv_freeze_mask_encoder: bool = False,  # Freeze mask encoder weights
+        deform_adv_zero_mean_offsets: bool = False,  # Remove global shift in flow fields
+        deform_adv_local_offset_gain: float = 1.0,  # Boost local deformation after centering
         # Adversarial pipeline control
         adversarial_attack_order: list[str] | None = None,  # Order of attacks, e.g., ["deform", "style"]
         # Max number of objects (for AUE tensor allocation, matches dataset sampler)
@@ -404,10 +410,11 @@ class SAM2Base(torch.nn.Module):
         # Style Adversarial components (alternative to AUE)
         self.use_style_adv = bool(use_style_adv)
         self.style_adv_mode = str(style_adv_mode)
+        self.style_adv_epsilon = float(style_adv_epsilon)
         self.style_adv_use_gt_region_style = bool(style_adv_use_gt_region_style)
         # Multi-object style attack control
-        self.style_adv_use_multi_object = bool(style_adv_use_multi_object)
-        self.style_adv_enable_background = bool(style_adv_enable_background)
+        self.adv_use_multi_object = bool(adv_use_multi_object)
+        self.adv_enable_background = bool(adv_enable_background)
         # Global-Local Mixed Style parameters
         self.style_adv_use_global_local_mix = bool(style_adv_use_global_local_mix)
         self.style_adv_global_epsilon = float(style_adv_global_epsilon)
@@ -442,6 +449,8 @@ class SAM2Base(torch.nn.Module):
         self.deform_adv_num_deform_groups = int(deform_adv_num_deform_groups)
         self.deform_adv_init_from_memory_encoder = bool(deform_adv_init_from_memory_encoder)
         self.deform_adv_freeze_mask_encoder = bool(deform_adv_freeze_mask_encoder)
+        self.deform_adv_zero_mean_offsets = bool(deform_adv_zero_mean_offsets)
+        self.deform_adv_local_offset_gain = float(deform_adv_local_offset_gain)
         if self.use_deform_adv:
             self._build_deform_adv_components()
         
@@ -460,6 +469,53 @@ class SAM2Base(torch.nn.Module):
                 fullgraph=True,
                 dynamic=False,
             )
+
+    def load_state_dict(self, state_dict: dict[str, Any], strict: bool = True):
+        """
+        Override load_state_dict to handle parameter name mismatches when using LoRA.
+        When LoRA is enabled, the model structure changes (e.g., image_encoder -> image_encoder.base_model.model),
+        but the checkpoint usually contains vanilla parameter names.
+        """
+        if self.use_lora:
+            # Map of prefixes to check and their wrapped versions
+            # Key: prefix in state_dict (vanilla), Value: prefix in model (LoRA)
+            # We assume LoRA wraps the component such that 'component.X' becomes 'component.base_model.model.X'
+            
+            # Identify which components are wrapped with LoRA
+            prefixes_to_map = []
+            
+            # Image Encoder
+            if hasattr(self.image_encoder, "peft_config"): # It's a PeftModel
+                 prefixes_to_map.append("image_encoder")
+
+            # Memory Attention
+            if self.memory_attention is not None and hasattr(self.memory_attention, "peft_config"):
+                 prefixes_to_map.append("memory_attention")
+
+            # Memory Encoder
+            if self.memory_encoder is not None and hasattr(self.memory_encoder, "peft_config"):
+                 prefixes_to_map.append("memory_encoder")
+
+            if prefixes_to_map:
+                new_state_dict = {}
+                for k, v in state_dict.items():
+                    remapped = False
+                    for prefix in prefixes_to_map:
+                        if k.startswith(f"{prefix}.") and f"{prefix}.base_model.model." not in k:
+                            # Remap vanilla key to LoRA key
+                            new_key = k.replace(f"{prefix}.", f"{prefix}.base_model.model.")
+                            new_state_dict[new_key] = v
+                            remapped = True
+                            break
+                    
+                    if not remapped:
+                        new_state_dict[k] = v
+                
+                # Use the modified state dict
+                state_dict = new_state_dict
+                logging.info(f"LoRA enabled: Remapped {len(prefixes_to_map)} components in state_dict to match PeftModel structure.")
+
+        return super().load_state_dict(state_dict, strict)
 
     def _parse_dist_matching_config(self, config: dict | None) -> dict:
         """
@@ -565,8 +621,8 @@ class SAM2Base(torch.nn.Module):
         
         # GCN module for multi-object style refinement
         if self.style_adv_use_gcn:
-            if not self.style_adv_use_multi_object:
-                raise ValueError("GCN requires style_adv_use_multi_object=True")
+            if not self.adv_use_multi_object:
+                raise ValueError("GCN requires adv_use_multi_object=True")
             if self.style_adv_use_global_local_mix:
                 raise ValueError("GCN is incompatible with style_adv_use_global_local_mix")
             
@@ -589,19 +645,21 @@ class SAM2Base(torch.nn.Module):
         self.style_attacker = AdversarialAttacker(
             mode=self.style_adv_mode,
             aug_type="style",
-            use_multi_object=self.style_adv_use_multi_object,
+            epsilon=self.style_adv_epsilon,
+            use_multi_object=self.adv_use_multi_object,
             use_gcn=self.style_adv_use_gcn,
             use_gt_region_style=self.style_adv_use_gt_region_style,
-            enable_background=self.style_adv_enable_background,
+            enable_background=self.adv_enable_background,
             use_global_local_mix=self.style_adv_use_global_local_mix,
             global_epsilon=self.style_adv_global_epsilon,
             global_weight=self.style_adv_global_weight,
-            num_objects=self.max_num_objects + (1 if self.style_adv_enable_background else 0),
+            num_objects=self.max_num_objects + (1 if self.adv_enable_background else 0),
         )
         
         logging.info(
             f"Style augmentation components built: "
-            f"mode={self.style_adv_mode}"
+            f"mode={self.style_adv_mode}, "
+            f"epsilon={self.style_adv_epsilon}"
         )
         
 
@@ -624,17 +682,21 @@ class SAM2Base(torch.nn.Module):
             epsilon=self.deform_adv_epsilon,
             use_soft_composite=self.deform_adv_use_soft_composite,
             temperature=self.deform_adv_temperature,
+            use_multi_object=self.adv_use_multi_object,
             use_gcn=self.deform_adv_use_gcn,
             gcn_num_layers=self.deform_adv_gcn_num_layers,
             num_deform_groups=self.deform_adv_num_deform_groups,
             init_from_memory_encoder=self.deform_adv_init_from_memory_encoder,
             freeze_mask_encoder=self.deform_adv_freeze_mask_encoder,
             image_size=self.image_size,  # Pass image_size for image-level offset prediction
+            zero_mean_offsets=self.deform_adv_zero_mean_offsets,
+            local_offset_gain=self.deform_adv_local_offset_gain,
         )
         
         # Load pretrained weights from memory encoder if enabled
         if self.deform_adv_init_from_memory_encoder:
-            self.deform_augmenter.impl.load_memory_encoder_weights(self.memory_encoder)
+            # Align deformation attacker with pretrained mask encoder weights
+            self.deform_attacker.impl.load_memory_encoder_weights(self.memory_encoder)
         
         logging.info(
             f"Deformation augmentation built: "
@@ -709,7 +771,14 @@ class SAM2Base(torch.nn.Module):
             indexing='ij'
         )
         
-        # Add offset (offset order is [Δx, Δy])
+        # Add offset (offset order is [Δx, Δy]); guard against malformed channels
+        if offset_field.shape[1] < 2:
+            # If only one channel is present, treat missing axis as zero shift
+            pad = torch.zeros_like(offset_field[:, :1, :, :])
+            offset_field = torch.cat([offset_field, pad], dim=1)
+        elif offset_field.shape[1] > 2:
+            offset_field = offset_field[:, :2, :, :]
+
         offset_x = offset_field[:, 0, :, :]  # [B, H, W]
         offset_y = offset_field[:, 1, :, :]  # [B, H, W]
         
@@ -730,7 +799,7 @@ class SAM2Base(torch.nn.Module):
             sampling_grid,
             mode='bilinear',
             padding_mode='border',
-            align_corners=True
+            align_corners=False
         )
         
         return warped_image
@@ -745,6 +814,8 @@ class SAM2Base(torch.nn.Module):
         adv_styles: torch.Tensor | None = None,
         deform_offsets: torch.Tensor | None = None,
         warped_images: torch.Tensor | None = None,
+        warped_masks: torch.Tensor | None = None,
+        attack_order: list[str] | None = None,
     ) -> AUEVisualizationData:
         """
         Prepare visualization data for Style AUE multi-object training.
@@ -855,6 +926,15 @@ class SAM2Base(torch.nn.Module):
                 warped_images_cpu = warped_images[:num_vis_samples].detach()
         else:
             warped_images_cpu = None
+
+        # Process warped masks if provided
+        if warped_masks is not None:
+            if warped_masks.is_cuda:
+                warped_masks_cpu = warped_masks[:num_vis_samples].detach().cpu()
+            else:
+                warped_masks_cpu = warped_masks[:num_vis_samples].detach()
+        else:
+            warped_masks_cpu = None
         
         return AUEVisualizationData(
             original_images=original_images_cpu,
@@ -869,6 +949,8 @@ class SAM2Base(torch.nn.Module):
             combined_mask_for_loss=combined_mask_for_loss,
             deform_offsets=deform_offsets_cpu,
             warped_images=warped_images_cpu,
+            warped_object_masks=warped_masks_cpu,
+            attack_order=attack_order,
         )
 
     def _cleanup_augmentation_results(self, results_to_cleanup: list) -> None:
@@ -1086,15 +1168,30 @@ class SAM2Base(torch.nn.Module):
         - Sequential: Predict and apply iteratively (legacy).
         
         Args:
-            img_batch: [B, 3, H, W]
+        warped_img = (
+            vis_data.warped_images[sample_idx]
+            if hasattr(vis_data, 'warped_images') and vis_data.warped_images is not None
+            else None
+        )
+        styled_img = (
+            vis_data.adversarial_images[sample_idx]
+            if getattr(vis_data, "adversarial_images", None) is not None
+            else None
+        )
             backbone_features: [B, C, H/4, W/4]
-            high_res_features: List of high-res features
-            pixel_gt: [B, H, W]
-            enable_vis: Whether to return visualization data
-        
-        Returns:
-            dict with keys:
-                - calibration_loss_adversarial: torch.Tensor
+        if styled_img is not None:
+            styled_denorm = self._denormalize_images(styled_img.unsqueeze(0))[0]
+            styled_np = styled_denorm.permute(1, 2, 0).cpu().numpy()
+            styled_np = np.clip(styled_np, 0, 1)
+        else:
+            styled_np = None
+
+        if warped_img is not None:
+            warped_img_denorm = self._denormalize_images(warped_img.unsqueeze(0))[0]
+            warped_np = warped_img_denorm.permute(1, 2, 0).cpu().numpy()
+            warped_np = np.clip(warped_np, 0, 1)
+        else:
+            warped_np = None
                 - vis_refs: dict (if enable_vis=True)
         """
         # === Initialize pipeline state ===
@@ -1105,7 +1202,11 @@ class SAM2Base(torch.nn.Module):
             'pixel_gt': pixel_gt,
         }
         
-        vis_refs = {} # Initialize vis_refs here
+        vis_refs = {}
+        if enable_vis:
+            vis_refs['img_batch'] = img_batch.detach().cpu()
+            vis_refs['pixel_gt'] = pixel_gt.detach().cpu()
+            vis_refs['attack_order'] = list(self.adversarial_attack_order)
         
         if self.aue_attack_mode == "cooperative":
             state = self._apply_cooperative_attack(
@@ -1114,16 +1215,6 @@ class SAM2Base(torch.nn.Module):
                 vis_refs,
                 memory_context=memory_context,
             )
-        else:
-            # === Sequential Strategy: Predict and Apply one by one ===
-            # Existing logic (legacy behavior)
-            for aug_name in self.adversarial_attack_order:
-                state = self._apply_single_attack(
-                    aug_name=aug_name,
-                    state=state,
-                    enable_vis=enable_vis,
-                    vis_refs=vis_refs,
-                )
         
         # === Compute adversarial calibration loss ===
         final_features = state['features']
@@ -1190,7 +1281,7 @@ class SAM2Base(torch.nn.Module):
         clean_features = state['features']
         pixel_gt = state['pixel_gt']
         img_batch = state['img']
-        
+         
         # === Phase 1: Predict (Parallel) ===
         for aug_name in self.adversarial_attack_order:
             attacker = getattr(self, f"{aug_name}_attacker", None)
@@ -1242,27 +1333,45 @@ class SAM2Base(torch.nn.Module):
                             backbone_out['backbone_fpn'][1]
                         ]
                     
-                # Visualization data
+                # Visualization data (always record styled images when enabled)
                 if enable_vis:
-                    vis_refs['adversarial_images'] = styled_images.detach().cpu()
+                    vis_refs['styled_images'] = styled_images.detach().cpu()
                     if attacker.aug_type == "style":
                         vis_refs['adversarial_styles'] = params.detach().cpu()
                         
             elif attacker.mode == "feature_level":
-                # Feature level attack (e.g. Deform)
-                deformed_features = attacker.apply_transform(
-                    img_batch=state['img'],
-                    clean_features=state['features'], # Use current features
-                    params=params,
-                    pixel_gt=state['pixel_gt'],
-                    model=self
+                # Feature level attack (e.g. Deform) — always warp image/GT and re-encode
+                offsets = params["image_offsets"] if isinstance(params, dict) else params
+
+                warped_img, warped_gt = self._apply_deformation_to_images(
+                    state['img'],
+                    state['pixel_gt'],
+                    offsets,
+                    enable_vis=enable_vis,
+                    vis_refs=vis_refs if enable_vis else {},
                 )
-                state['features'] = deformed_features
-                
-                # Visualization data
+                state['img'] = warped_img
+                state['pixel_gt'] = warped_gt
+
+                # Re-encode warped image (checkpointed) and optionally reapply memory conditioning
+                backbone_out = self.forward_image(warped_img, use_checkpoint=True)
+                if memory_context:
+                    recond = self._reapply_memory_conditioning(backbone_out, memory_context)
+                    state['features'] = recond["features"]
+                    state['high_res'] = recond["high_res"]
+                else:
+                    state['features'] = backbone_out['backbone_fpn'][-1]
+                    if self.use_high_res_features_in_sam:
+                        state['high_res'] = [
+                            backbone_out['backbone_fpn'][0],
+                            backbone_out['backbone_fpn'][1]
+                        ]
+
+                # Visualization payloads (already computed by _apply_deformation_to_images when enable_vis)
                 if enable_vis:
-                    if attacker.aug_type == "deformation":
-                        vis_refs['deform_offsets'] = params["image_offsets"].detach().cpu()
+                    vis_refs['deform_offsets'] = offsets.detach().cpu()
+                    vis_refs.setdefault('warped_images', warped_img.detach().cpu())
+                    vis_refs.setdefault('warped_pixel_gt', warped_gt.detach().cpu())
                         
         return state
 
@@ -1282,6 +1391,10 @@ class SAM2Base(torch.nn.Module):
                 vision_pos_embeds,
                 feat_sizes,
             ) = self._prepare_backbone_features(backbone_out)
+            # Use only the top pyramid level (consistent with clean pass)
+            vision_feats = vision_feats[-1:]
+            vision_pos_embeds = vision_pos_embeds[-1:]
+            feat_sizes = feat_sizes[-1:]
             pix_feat_with_mem = self._prepare_memory_conditioned_features(
                 frame_idx=memory_context["frame_idx"],
                 is_init_cond_frame=memory_context["is_init_cond_frame"],
@@ -1293,9 +1406,9 @@ class SAM2Base(torch.nn.Module):
                 track_in_reverse=memory_context.get("track_in_reverse", False),
             )
         except Exception as exc:  # pragma: no cover - defensive fallback
-            logging.warning(
-                "AUE: failed to reapply memory conditioning on adversarial branch: %s",
-                exc,
+            logging.exception(
+                "AUE: failed to reapply memory conditioning on adversarial branch",
+                exc_info=exc,
             )
             pix_feat_with_mem = backbone_out["backbone_fpn"][-1]
         high_res_features = None
@@ -1305,46 +1418,6 @@ class SAM2Base(torch.nn.Module):
                 backbone_out["backbone_fpn"][1],
             ]
         return {"features": pix_feat_with_mem, "high_res": high_res_features}
-
-    def _apply_single_attack(
-        self,
-        aug_name: str,
-        state: dict,
-        enable_vis: bool,
-        vis_refs: dict,
-    ) -> dict:
-        """
-        Apply a single attack and update pipeline state.
-        
-        This is a clean abstraction that:
-            1. Checks if attack is enabled
-            2. Calls the attacker with current state
-            3. Updates state based on attack result
-            4. Handles visualization
-        
-        Args:
-            aug_name: Name of attack ("deform" or "style")
-            state: Current pipeline state (img, features, high_res, pixel_gt)
-            enable_vis: Whether to save visualization data
-            vis_refs: Visualization reference dict
-        
-        Returns:
-            Updated state dict
-        """
-        if aug_name == "deform":
-            self._apply_deformation_attack(state, enable_vis, vis_refs)
-        elif aug_name == "style":
-            self._apply_style_attack(state, enable_vis, vis_refs)
-        
-        # Validate state before returning
-        assert state['features'] is not None, \
-            f"State must have features after {aug_name} attack"
-        
-        if self.use_high_res_features_in_sam:
-            assert state['high_res'] is not None, \
-                f"State must have high_res_features after {aug_name} attack when use_high_res_features_in_sam=True"
-        
-        return state
     
     def _apply_deformation_attack(
         self,
@@ -1355,13 +1428,20 @@ class SAM2Base(torch.nn.Module):
         """Apply deformation attack and update state."""
         if not (self.use_deform_adv and hasattr(self, 'deform_attacker')):
             return
+
+        # Respect adv_use_multi_object: collapse to single-object mask when disabled
+        deform_pixel_gt = state['pixel_gt']
+        if (not getattr(self, 'adv_use_multi_object', False)) and deform_pixel_gt.shape[1] > 1:
+            deform_pixel_gt = deform_pixel_gt.sum(dim=1, keepdim=True).clamp(0, 1)
         
         # Apply deformation
+        orig_img_for_vis = state['img']
+        orig_gt_for_vis = deform_pixel_gt
         deform_result = self.deform_attacker.apply(
             img_batch=state['img'],
             clean_features=state['features'],
             clean_high_res=state['high_res'],
-            pixel_gt=state['pixel_gt'],
+            pixel_gt=deform_pixel_gt,
             model=self,
         )
         
@@ -1371,7 +1451,7 @@ class SAM2Base(torch.nn.Module):
         if deform_offsets is not None:
             # Warp image and GT using predicted offsets
             augmented_img, warped_pixel_gt = self._apply_deformation_to_images(
-                state['img'], state['pixel_gt'], deform_offsets, enable_vis, vis_refs
+                state['img'], deform_pixel_gt, deform_offsets, enable_vis, vis_refs
             )
             
             state['img'] = augmented_img
@@ -1408,6 +1488,11 @@ class SAM2Base(torch.nn.Module):
         
         # Visualization
         if enable_vis and deform_offsets is not None:
+            # Cache originals and warped results for downstream visualization
+            vis_refs.setdefault('img_batch', orig_img_for_vis.detach().cpu())
+            vis_refs.setdefault('pixel_gt', orig_gt_for_vis.detach().cpu())
+            vis_refs['warped_images'] = augmented_img.detach().cpu()
+            vis_refs['warped_pixel_gt'] = warped_pixel_gt.detach().cpu()
             vis_refs['deform_offsets'] = deform_offsets.detach().cpu()
         
         # Cleanup
@@ -1441,13 +1526,15 @@ class SAM2Base(torch.nn.Module):
         state['features'] = style_result.features
         state['high_res'] = style_result.high_res_features
         
-        # Visualization
+        # Visualization (no fallback: styled_images must be recorded)
         if enable_vis:
             vis_refs['styled_images'] = state['img'].detach().cpu()
+            vis_refs.setdefault('img_batch', state['img'].detach().cpu())
+            vis_refs.setdefault('pixel_gt', state['pixel_gt'].detach().cpu())
             if hasattr(style_result, 'original_styles') and style_result.original_styles is not None:
-                vis_refs['original_styles'] = style_result.original_styles
+                vis_refs['original_styles'] = style_result.original_styles.detach().cpu()
             if hasattr(style_result, 'adversarial_styles') and style_result.adversarial_styles is not None:
-                vis_refs['adversarial_styles'] = style_result.adversarial_styles
+                vis_refs['adversarial_styles'] = style_result.adversarial_styles.detach().cpu()
         
         # Cleanup
         self._cleanup_augmentation_results([style_result])
@@ -1473,8 +1560,14 @@ class SAM2Base(torch.nn.Module):
         is_empty = (mask_areas.sum(dim=0) == 0)
         mask_area_ratio = mask_areas / (H_img * W_img)
         is_bg_per_sample = (mask_area_ratio > 0.5)
+
+        # Always keep background out of deformation. If a background slot exists (last channel
+        # dominating the image) or background deformation is explicitly enabled, mark it as BG.
+        include_background = bool(getattr(self, "adv_enable_background", False))
         is_bg = torch.zeros(K, dtype=torch.bool, device=img_batch.device)
-        is_bg[-1] = is_bg_per_sample[:, -1].all()
+        if K > 0:
+            bg_candidate = is_bg_per_sample[:, -1].all()
+            is_bg[-1] = include_background or bg_candidate
         valid_objects = ~(is_empty | is_bg)
         valid_indices = torch.where(valid_objects)[0]
         
@@ -1487,7 +1580,7 @@ class SAM2Base(torch.nn.Module):
         valid_masks_union = valid_masks.sum(dim=1, keepdim=True).clamp(0, 1)  # [B, 1, H, W]
         
         # Start with image where valid objects are removed (keep other objects + background)
-        augmented_img = img_batch * (1 - valid_masks_union)
+        base_img = img_batch * (1 - valid_masks_union)
         
         # Composite warped objects sequentially (forward order: later objects overwrite earlier ones)
         warped_imgs_list = []
@@ -1497,15 +1590,17 @@ class SAM2Base(torch.nn.Module):
             offset_k = deform_offsets[:, k_idx_scalar, :, :, :]  # [B, 2, H, W]
             mask_k = masks_float[:, k_idx_scalar, :, :].unsqueeze(1)  # [B, 1, H, W]
             
-            # Warp image and mask
-            warped_img_k = self._apply_offset_to_image(img_batch, offset_k)
+            # Warp full image then gate with warped mask to keep object content
+            warped_img_full = self._apply_offset_to_image(img_batch, offset_k)
             warped_mask_k = self._apply_offset_to_image(mask_k, offset_k)
+            warped_mask_bin = (warped_mask_k.squeeze(1) > 0.5).float().unsqueeze(1)
+            warped_obj_k = warped_img_full * warped_mask_bin
             
-            warped_imgs_list.append(warped_img_k)
-            warped_masks_list.append((warped_mask_k.squeeze(1) > 0.5).float().unsqueeze(1))
+            warped_imgs_list.append(warped_obj_k)
+            warped_masks_list.append(warped_mask_bin)
             
             # Cleanup immediately (no storage needed)
-            del offset_k, mask_k, warped_img_k, warped_mask_k
+            del offset_k, mask_k, warped_img_full, warped_obj_k, warped_mask_k, warped_mask_bin
         
         # === Compositing Strategy: Gap Filling ===
         # 1. Stack all warped images and masks
@@ -1519,7 +1614,7 @@ class SAM2Base(torch.nn.Module):
             
             # 3. Compute background part (original image where no object is present)
             # This fills the "holes" left by moving objects with the original background
-            background = img_batch * (1 - sum_mask)
+            background = base_img * (1 - sum_mask)
             
             # 4. Compute foreground part (warped objects)
             # For overlapping objects, we can use simple sum (if masks are disjoint enough)
@@ -1529,7 +1624,7 @@ class SAM2Base(torch.nn.Module):
             # 5. Combine
             augmented_img = background + foreground
         else:
-            augmented_img = img_batch.clone()
+            augmented_img = base_img.clone()
             
         # Update pixel_gt with warped masks
         # We need to map back the warped masks to their original indices
@@ -1540,6 +1635,7 @@ class SAM2Base(torch.nn.Module):
         # Save for visualization
         if enable_vis:
             vis_refs['warped_images'] = augmented_img.detach().cpu()
+            vis_refs['warped_pixel_gt'] = warped_pixel_gt.detach().cpu()
         
         # Cleanup
         del masks_float
@@ -1679,8 +1775,15 @@ class SAM2Base(torch.nn.Module):
         vis_data = None
         if vis_refs:
             with torch.no_grad():
-                # Use styled images if available, otherwise use original images
-                adv_images_for_vis = vis_refs.get('styled_images', vis_refs['img_batch'])
+                def _select_style_adv_image(vis_refs):
+                    # For style visualization, prefer pure styled outputs; fall back to warped, then clean
+                    if 'styled_images' in vis_refs and vis_refs['styled_images'] is not None:
+                        return vis_refs['styled_images']
+                    if 'warped_images' in vis_refs and vis_refs['warped_images'] is not None:
+                        return vis_refs['warped_images']
+                    return vis_refs['img_batch']
+
+                adv_images_for_vis = _select_style_adv_image(vis_refs)
                 
                 vis_data = self._prepare_aue_visualization_data(
                     img_batch=vis_refs['img_batch'],  # Original image (before deformation)
@@ -1691,6 +1794,8 @@ class SAM2Base(torch.nn.Module):
                     adv_styles=vis_refs.get('adversarial_styles'),
                     deform_offsets=vis_refs.get('deform_offsets'),
                     warped_images=vis_refs.get('warped_images'),
+                    warped_masks=vis_refs.get('warped_pixel_gt'),
+                    attack_order=vis_refs.get('attack_order'),
                 )
         
         # ========================================================================

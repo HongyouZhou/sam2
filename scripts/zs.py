@@ -2170,7 +2170,7 @@ def parse_args():
     )
     p.add_argument("--num_workers", type=int, default=None, help="Number of evaluation processes")
     p.add_argument("--output_path", default="./outputs/comparison_sam2_vs_bndl_011_01", help="Root output directory")
-    p.add_argument("--first_frame_only", action="store_true", help="Evaluate only the first frame per video")
+    p.add_argument("--process_full_video", action="store_true", help="Evaluate all frames in video (default: first frame only)")
 
     # Subset options
     p.add_argument("--video_limit", type=int, default=None, help="Limit number of videos per dataset")
@@ -2282,7 +2282,7 @@ def main():
                 score_thresh=args.score_thresh,
                 thresh_grid=args.thresh_grid,
                 prompt_method=args.prompt_method,
-                first_frame_only=args.first_frame_only,
+                first_frame_only=not args.process_full_video,
                 max_objects=args.max_objects,
                 video_limit=args.video_limit,
                 num_workers=args.num_workers,

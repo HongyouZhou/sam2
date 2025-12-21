@@ -194,8 +194,8 @@ DATASET_CONFIGS = {
 
 # Default dataset list for evaluation
 DEFAULT_DATASETS = [
-    "MOSE_train",  # Source domain (fine-tune domain for BNDL/UR-ERN, 1246 videos)
-    "MOSE_val",    # Within-domain baseline (200 videos)
+    # "MOSE_train",  # Source domain (fine-tune domain for BNDL/UR-ERN, 1246 videos)
+    # "MOSE_val",    # Within-domain baseline (200 videos)
     "TrashCan",
     "GTEA",
     "PIDRay",

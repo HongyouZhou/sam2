@@ -17,7 +17,7 @@ from training.trainer import CORE_LOSS_KEY
 from training.utils.distributed import get_world_size, is_dist_avail_and_initialized
 
 
-def dice_loss(inputs, targets, num_objects, loss_on_multimask=False):
+def dice_loss(inputs, targets, num_objects, loss_on_multimask=False, sample_weight=None):
     """
     Compute the DICE loss, similar to generalized IOU for masks
     Args:
@@ -28,6 +28,8 @@ def dice_loss(inputs, targets, num_objects, loss_on_multimask=False):
                 (0 for the negative class and 1 for the positive class).
         num_objects: Number of objects in the batch
         loss_on_multimask: True if multimask prediction is enabled
+        sample_weight: Optional float tensor of shape broadcastable to inputs (e.g. [N, 1, H, W])
+                       Used to weight the loss per pixel.
     Returns:
         Dice loss tensor
     """
@@ -38,11 +40,25 @@ def dice_loss(inputs, targets, num_objects, loss_on_multimask=False):
         # flatten spatial dimension while keeping multimask channel dimension
         inputs = inputs.flatten(2)
         targets = targets.flatten(2)
-        numerator = 2 * (inputs * targets).sum(-1)
+        
+        if sample_weight is not None:
+            sample_weight = sample_weight.flatten(2)
+            numerator = 2 * (inputs * targets * sample_weight).sum(-1)
+            denominator = (inputs * sample_weight).sum(-1) + (targets * sample_weight).sum(-1)
+        else:
+            numerator = 2 * (inputs * targets).sum(-1)
+            denominator = inputs.sum(-1) + targets.sum(-1)
     else:
         inputs = inputs.flatten(1)
-        numerator = 2 * (inputs * targets).sum(1)
-    denominator = inputs.sum(-1) + targets.sum(-1)
+        
+        if sample_weight is not None:
+            sample_weight = sample_weight.flatten(1)
+            numerator = 2 * (inputs * targets * sample_weight).sum(1)
+            denominator = (inputs * sample_weight).sum(1) + (targets * sample_weight).sum(1)
+        else:
+            numerator = 2 * (inputs * targets).sum(1)
+            denominator = inputs.sum(-1) + targets.sum(-1)
+            
     loss = 1 - (numerator + 1) / (denominator + 1)
     if loss_on_multimask:
         return loss / num_objects
@@ -56,6 +72,7 @@ def sigmoid_focal_loss(
     alpha: float = 0.25,
     gamma: float = 2,
     loss_on_multimask=False,
+    sample_weight=None,
 ):
     """
     Loss used in RetinaNet for dense detection: https://arxiv.org/abs/1708.02002.
@@ -82,6 +99,9 @@ def sigmoid_focal_loss(
     if alpha >= 0:
         alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
         loss = alpha_t * loss
+
+    if sample_weight is not None:
+        loss = loss * sample_weight
 
     if loss_on_multimask:
         # loss is [N, M, H, W] where M corresponds to multiple predicted masks
@@ -134,6 +154,7 @@ class MultiStepMultiMasksAndIous(nn.Module):
         pred_obj_scores=False,
         focal_gamma_obj_score=0.0,
         focal_alpha_obj_score=-1,
+        uncertainty_weight=0.0,
     ):
         """
         This class computes the multi-step multi-mask and IoU losses.
@@ -146,6 +167,7 @@ class MultiStepMultiMasksAndIous(nn.Module):
             pred_obj_scores: if True, compute loss for object scores
             focal_gamma_obj_score: gamma for sigmoid focal loss on object scores
             focal_alpha_obj_score: alpha for sigmoid focal loss on object scores
+            uncertainty_weight: weight for uncertainty-based loss weighting (0.0 to 1.0)
         """
 
         super().__init__()
@@ -163,6 +185,7 @@ class MultiStepMultiMasksAndIous(nn.Module):
         self.supervise_all_iou = supervise_all_iou
         self.iou_use_l1_loss = iou_use_l1_loss
         self.pred_obj_scores = pred_obj_scores
+        self.uncertainty_weight = uncertainty_weight
 
     def forward(self, outs_batch: List[Dict], targets_batch: torch.Tensor):
         assert len(outs_batch) == len(targets_batch)
@@ -179,6 +202,14 @@ class MultiStepMultiMasksAndIous(nn.Module):
             for k, v in cur_losses.items():
                 losses[k] += v
 
+        # Normalize metrics by batch size
+        batch_size = len(outs_batch)
+        if batch_size > 0:
+            if "sample_weight_mean" in losses:
+                losses["sample_weight_mean"] /= batch_size
+            if "uncertainty_mean" in losses:
+                losses["uncertainty_mean"] /= batch_size
+        
         return losses
 
     def _forward(self, outputs: Dict, targets: torch.Tensor, num_objects):
@@ -205,20 +236,77 @@ class MultiStepMultiMasksAndIous(nn.Module):
         assert len(object_score_logits_list) == len(ious_list)
 
         # accumulate the loss over prediction steps
-        losses = {"loss_mask": 0, "loss_dice": 0, "loss_iou": 0, "loss_class": 0}
-        for src_masks, ious, object_score_logits in zip(
-            src_masks_list, ious_list, object_score_logits_list
+        losses = {"loss_mask": 0, "loss_dice": 0, "loss_iou": 0, "loss_class": 0, "sample_weight_mean": 0, "uncertainty_mean": 0}
+        
+        # Get auxiliary outputs (BNDL) if available
+        # multistep_aux_outputs is a list of aux_outputs for each step
+        aux_list = outputs.get("multistep_aux_outputs", [None] * len(src_masks_list))
+        
+        cnt_uncertainty = 0
+        cnt_weight = 0
+        
+        for src_masks, ious, object_score_logits, aux_out in zip(
+            src_masks_list, ious_list, object_score_logits_list, aux_list
         ):
+            sample_weight = None
+            
+            # Check for BNDL uncertainty
+            if aux_out is not None and "bndl" in aux_out and "pixel_uncertainty" in aux_out["bndl"]:
+                pixel_uncertainty = aux_out["bndl"]["pixel_uncertainty"]    # [N, H, W]
+                losses["uncertainty_mean"] += pixel_uncertainty.mean()
+                cnt_uncertainty += 1
+                
+                # Apply weighting if enabled
+                if self.uncertainty_weight > 0:
+                    # Weight = 1.0 - alpha * U
+                    # Detach U to prevent model from maximizing uncertainty to minimize loss
+                    sample_weight = 1.0 - self.uncertainty_weight * pixel_uncertainty.detach()
+                    sample_weight = torch.clamp(sample_weight, min=0.0, max=1.0)
+                    
+                    # Log mean weight
+                    losses["sample_weight_mean"] += sample_weight.mean()
+                    cnt_weight += 1
+                    
+                    # Expand for multimask: [N, H, W] -> [N, 1, H, W] for broadcasting to [N, M, H, W]
+                    if sample_weight.dim() == 3:
+                        sample_weight = sample_weight.unsqueeze(1)
+            
+            # If no weight computed (warmup or no uncertainty), effectively weight is 1.0
+            if sample_weight is None:
+                 # We don't add 1.0 to sample_weight_mean here to avoid shifting the average of actual weights
+                 # Instead we handle the default case below
+                 pass
+            
             self._update_losses(
-                losses, src_masks, target_masks, ious, num_objects, object_score_logits
+                losses, src_masks, target_masks, ious, num_objects, object_score_logits, sample_weight
             )
+            
+        # Normalize metrics
+        if cnt_uncertainty > 0:
+            losses["uncertainty_mean"] /= cnt_uncertainty
+            
+        if cnt_weight > 0:
+            losses["sample_weight_mean"] /= cnt_weight
+        else:
+            # If no weighting was applied (e.g. warmup), the effective weight is 1.0
+            losses["sample_weight_mean"] = torch.tensor(1.0, device=targets.device)
+            
         losses[CORE_LOSS_KEY] = self.reduce_loss(losses)
         losses["sam_core_loss"] = losses[CORE_LOSS_KEY]
         return losses
 
     def _update_losses(
-        self, losses, src_masks, target_masks, ious, num_objects, object_score_logits
+        self, losses, src_masks, target_masks, ious, num_objects, object_score_logits, sample_weight=None
     ):
+        # Resize sample_weight if needed (e.g. if uncertainty map is lower res than masks)
+        if sample_weight is not None and sample_weight.shape[-2:] != src_masks.shape[-2:]:
+            sample_weight = F.interpolate(
+                sample_weight, 
+                size=src_masks.shape[-2:], 
+                mode='bilinear', 
+                align_corners=False
+            )
+
         target_masks = target_masks.expand_as(src_masks)
         # get focal, dice and iou loss on all output masks in a prediction step
         loss_multimask = sigmoid_focal_loss(
@@ -228,9 +316,10 @@ class MultiStepMultiMasksAndIous(nn.Module):
             alpha=self.focal_alpha,
             gamma=self.focal_gamma,
             loss_on_multimask=True,
+            sample_weight=sample_weight,
         )
         loss_multidice = dice_loss(
-            src_masks, target_masks, num_objects, loss_on_multimask=True
+            src_masks, target_masks, num_objects, loss_on_multimask=True, sample_weight=sample_weight
         )
         if not self.pred_obj_scores:
             loss_class = torch.tensor(
@@ -301,7 +390,10 @@ class MultiStepMultiMasksAndIous(nn.Module):
         reduced_loss = 0.0
         for loss_key, weight in self.weight_dict.items():
             if loss_key not in losses:
-                raise ValueError(f"{type(self)} doesn't compute {loss_key}")
+                # ignore missing keys (e.g. sample_weight_mean)
+                if loss_key in ["loss_mask", "loss_dice", "loss_iou", "loss_class"]:
+                     raise ValueError(f"{type(self)} doesn't compute {loss_key}")
+                continue
             if weight != 0:
                 reduced_loss += losses[loss_key] * weight
 

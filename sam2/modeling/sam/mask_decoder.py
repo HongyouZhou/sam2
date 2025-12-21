@@ -10,6 +10,7 @@ import torch
 from torch import nn
 
 from BNDL.BNDL_upload.ViT_Sparse.utils.bndl import BNDL
+from sam2.modeling.bndl_utils import pixel_weibull_to_entropy_uncertainty
 from sam2.modeling.sam2_utils import MLP, LayerNorm2d
 
 
@@ -34,6 +35,8 @@ class MaskDecoder(nn.Module):
         use_bndl_for_pixels: bool = False,
         bndl_replace_global_with_hyper: bool = False,
         bndl_fuse_type: str = "sum",
+        bndl_gate_gamma: float = 2.0,
+        bndl_gate_detach: bool = True,
         bndl_hyper_in_sparse: bool = False,
         use_multimask_token_for_obj_ptr: bool = False,
         # UR-ERN related (mutually exclusive with BNDL)
@@ -85,6 +88,8 @@ class MaskDecoder(nn.Module):
         # BNDL related
         self.use_bndl_for_pixels = use_bndl_for_pixels
         self.bndl_fuse_type = bndl_fuse_type
+        self.bndl_gate_gamma = float(bndl_gate_gamma)
+        self.bndl_gate_detach = bool(bndl_gate_detach)
         self.bndl_replace_global_with_hyper = bndl_replace_global_with_hyper
         self.bndl_hyper_in_sparse = bndl_hyper_in_sparse
         if self.use_bndl_for_pixels:
@@ -95,7 +100,7 @@ class MaskDecoder(nn.Module):
                 enable_global_sparse=not self.bndl_replace_global_with_hyper,
                 enable_external_sparse=self.bndl_hyper_in_sparse,
             )
-            if self.bndl_fuse_type == "conv":
+            if self.bndl_fuse_type in ("conv", "gated_conv"):
                 self.fuse_conv = nn.Conv2d(2 * self.num_mask_tokens, self.num_mask_tokens, 1, bias=False)
         #########################################################
 
@@ -235,12 +240,6 @@ class MaskDecoder(nn.Module):
         # Upscale mask embeddings and predict masks using the mask tokens
         src = src.transpose(1, 2).view(b, c, h, w)
         
-        # Diagnostic: check src after transformer
-        if not torch.isfinite(src).all():
-            import logging
-            num_nan = (~torch.isfinite(src)).sum().item()
-            logging.error(f"[MaskDecoder] src (AFTER transformer) contains {num_nan}/{src.numel()} NaN/Inf!")
-        
         if not self.use_high_res_features:
             upscaled_embedding = self.output_upscaling(src)
         else:
@@ -272,6 +271,14 @@ class MaskDecoder(nn.Module):
             # 重塑BNDL输出：从[B, H, W, K]到[B, K, H, W]
             masks_bndl = masks_bndl_raw.permute(0, 3, 1, 2)
 
+            # Calculate pixel-level uncertainty from BNDL parameters
+            # This is crucial for uncertainty-weighted loss (forbidding incorrect optimization)
+            pixel_uncertainty = pixel_weibull_to_entropy_uncertainty(
+                self.pixel_bndl,
+                pixel_feat,
+                external_pre_out_w=hyper_in if self.bndl_replace_global_with_hyper else None,
+            )
+
             aux_outputs = {
                 "bndl": {
                     "z_out": z_out,
@@ -280,6 +287,7 @@ class MaskDecoder(nn.Module):
                     "wei_lambda_w": wei_lambda_w,
                     "inv_k_w": inv_k_w,
                     "masks_bndl_raw": masks_bndl_raw.detach(),      # [B, H, W, K]
+                    "pixel_uncertainty": pixel_uncertainty,         # [B, H, W]
                     "pixel_logits": masks_bndl_raw if self.training else masks_bndl_raw.detach(),
                     "upscaled_shape": (b, c, h, w),
                     "hyper_in": hyper_in.detach(),
@@ -295,6 +303,10 @@ class MaskDecoder(nn.Module):
 
             if self.bndl_fuse_type in ("sum", "conv"):
                 masks = self._fuse_masks(masks_sam, masks_bndl)
+            elif self.bndl_fuse_type in ("gated_sum", "gated_conv", "gated_replace"):
+                bndl_gate = self._compute_bndl_gate(masks_sam)
+                aux_outputs["bndl"]["bndl_gate"] = bndl_gate.detach()
+                masks = self._fuse_masks(masks_sam, masks_bndl, bndl_gate=bndl_gate)
             else:
                 masks = masks_bndl
 
@@ -353,7 +365,7 @@ class MaskDecoder(nn.Module):
                 raise RuntimeError(
                     f"MaskDecoder.predict_masks: aux_outputs['bndl'] is not a dict! type: {type(bndl_data)}"
                 )
-            required_keys = ["wei_lambda", "inv_k", "masks_bndl_raw"]
+            required_keys = ["wei_lambda", "inv_k", "masks_bndl_raw", "pixel_uncertainty"]
             missing_keys = [k for k in required_keys if k not in bndl_data]
             if missing_keys:
                 raise RuntimeError(
@@ -363,13 +375,42 @@ class MaskDecoder(nn.Module):
 
         return masks, iou_pred, mask_tokens_out, object_score_logits, aux_outputs
 
-    def _fuse_masks(self, masks_hyper, masks_bndl):
+    def _compute_bndl_gate(self, masks_hyper: torch.Tensor) -> torch.Tensor:
+        """
+        Compute a spatial gate in [0,1] from SAM (hypernetwork) mask logits.
+
+        Gate is higher where SAM is uncertain (p≈0.5), and lower where SAM is confident (p≈0 or 1).
+        """
+        probs = torch.sigmoid(masks_hyper)
+        # Uncertainty proxy in [0,1]: 1 at p=0.5, 0 at p=0/1
+        gate = 1.0 - (2.0 * probs - 1.0).abs()
+        if self.bndl_gate_gamma != 1.0:
+            gate = gate.pow(self.bndl_gate_gamma)
+        if self.bndl_gate_detach:
+            gate = gate.detach()
+        return gate
+
+    def _fuse_masks(self, masks_hyper, masks_bndl, bndl_gate: torch.Tensor | None = None):
         """Fuse hypernetwork and BNDL masks."""
         if self.bndl_fuse_type == "sum":
             return masks_hyper + masks_bndl
         elif self.bndl_fuse_type == "conv":
             fused_input = torch.cat([masks_hyper, masks_bndl], dim=1)  # [B, 2*K, H, W]
             return self.fuse_conv(fused_input)  # [B, K, H, W]
+        elif self.bndl_fuse_type == "gated_sum":
+            if bndl_gate is None:
+                raise RuntimeError("bndl_gate is required for bndl_fuse_type='gated_sum'")
+            return masks_hyper + bndl_gate * masks_bndl
+        elif self.bndl_fuse_type == "gated_replace":
+            if bndl_gate is None:
+                raise RuntimeError("bndl_gate is required for bndl_fuse_type='gated_replace'")
+            return masks_hyper + bndl_gate * (masks_bndl - masks_hyper)
+        elif self.bndl_fuse_type == "gated_conv":
+            if bndl_gate is None:
+                raise RuntimeError("bndl_gate is required for bndl_fuse_type='gated_conv'")
+            fused_input = torch.cat([masks_hyper, masks_bndl], dim=1)  # [B, 2*K, H, W]
+            delta = self.fuse_conv(fused_input)  # [B, K, H, W]
+            return masks_hyper + bndl_gate * delta
         else:
             raise ValueError(f"Unknown fuse type: {self.bndl_fuse_type}")
 

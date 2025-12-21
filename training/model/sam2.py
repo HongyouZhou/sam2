@@ -306,7 +306,7 @@ class SAM2Train(SAM2Base):
         #   - Background participates in style attack
         #   - Visualization shows green dashed bbox for background
         # ============================================================
-        ENABLE_BACKGROUND_MASK = self.style_adv_enable_background
+        ENABLE_BACKGROUND_MASK = self.adv_enable_background
         
         # Use max_num_objects from config (matches dataset sampler)
         # Add 1 slot for background if enabled
@@ -331,11 +331,11 @@ class SAM2Train(SAM2Base):
         for t in range(num_frames):
             frame_masks = input.masks[t]  # [O_t, H, W]
             frame_obj_to_img = input.obj_to_frame_idx[t]  # [O_t, 2]
-            
+             
             for video_idx in range(num_videos):
                 obj_mask = (frame_obj_to_img[:, 1] == video_idx)
                 obj_indices = obj_mask.nonzero(as_tuple=True)[0]
-                K_actual = len(obj_indices)
+                K_actual = len(obj_indices)                
 
                 if ENABLE_BACKGROUND_MASK:
                     # Reserve final slot for background, fill foreground up to max_num_objects - 1
@@ -546,13 +546,13 @@ class SAM2Train(SAM2Base):
         # Set style_aug_use_multi_object = True to attack with all objects in the video
         # Set style_aug_use_multi_object = False to disable AUE (no pixel_gt_for_aue)
         # ============================================================
-        USE_MULTI_OBJECT_AUE = self.style_adv_use_multi_object
+        USE_MULTI_OBJECT_AUE = self.adv_use_multi_object
         
         # DO NOT initialize pixel_gt_for_aue with gt_masks!
         # gt_masks is reserved for prompt sampling only
         pixel_gt_for_aue = None
-        if self.use_aue and is_init_cond_frame:
-            if USE_MULTI_OBJECT_AUE and hasattr(self, '_current_backbone_out'):
+        if self.use_aue:
+            if USE_MULTI_OBJECT_AUE and is_init_cond_frame and hasattr(self, '_current_backbone_out'):
                 backbone_out = self._current_backbone_out
                 if "mask_all_objs_for_aue" in backbone_out:
                     mask_all_objs = backbone_out["mask_all_objs_for_aue"][frame_idx]  # [B_videos, K, H, W]
@@ -563,6 +563,9 @@ class SAM2Train(SAM2Base):
                     O_t = len(obj_to_frame)
                     K = mask_all_objs.shape[1]
                     H, W = mask_all_objs.shape[2:]
+                    
+                    # # DEBUG: Log mask construction
+                    # print(f"DEBUG: AUE Track: Frame {frame_idx}, O_t={O_t}, K={K}")
                     
                     multi_obj_masks = torch.zeros(
                         O_t, K, H, W,
@@ -576,12 +579,14 @@ class SAM2Train(SAM2Base):
                         # Copy all non-empty masks from mask_all_objs (includes foreground + background if enabled)
                         # Background is at slot K-1 (e.g., index 10 when K=11), not necessarily in [:K_actual]
                         multi_obj_masks[i] = mask_all_objs[video_idx]
+                        
+                        # if i == 0 and logging.getLogger().isEnabledFor(logging.DEBUG):
+                        #      logging.debug(f"AUE Track: Obj 0 (Video {video_idx}), K_actual={K_actual}, Mask sum={multi_obj_masks[i].sum().item()}")
                     
                     # Use multi-object masks
                     pixel_gt_for_aue = multi_obj_masks
             elif not USE_MULTI_OBJECT_AUE and gt_masks is not None:
-                # Single-object mode: use the current object's GT mask
-                # gt_masks is [B, 1, H, W], which matches [B, K=1, H, W]
+                # Single-object mode: always use current frame GT mask (all frames)
                 pixel_gt_for_aue = gt_masks
                  
         # Cache memory context for adversarial branch (used inside compute_aue_loss)

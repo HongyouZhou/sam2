@@ -39,6 +39,7 @@ Dynamic GPU Task Scheduler for Zero-Shot Evaluation
 """
 
 import argparse
+import gc
 import json
 import os
 import re
@@ -187,19 +188,24 @@ class ProgressMonitor:
             # 为此任务创建子进度条
             if RICH_AVAILABLE and total_videos > 0:
                 task_id = f"{method}@{dataset}"
-                color_map = {
-                    "SAM": "blue",
-                    "UCTTA": "green", 
-                    "BNDL_AUE": "yellow",
-                    "BNDL": "cyan",
-                    "UR-ERN": "magenta",
-                }
-                color = color_map.get(method, "white")
-                sub_task = self.progress.add_task(
-                    f"[{color}]GPU{gpu_id} {task_id}",
-                    total=total_videos
-                )
-                self.task_progress_bars[task_id] = sub_task
+                if task_id in self.task_progress_bars:
+                    # 复用已存在的进度条（例如任务重试时）
+                    sub_task = self.task_progress_bars[task_id]
+                    self.progress.reset(sub_task, total=total_videos, completed=0, visible=True)
+                else:
+                    color_map = {
+                        "SAM": "blue",
+                        "UCTTA": "green", 
+                        "BNDL_AUE": "yellow",
+                        "BNDL": "cyan",
+                        "UR-ERN": "magenta",
+                    }
+                    color = color_map.get(method, "white")
+                    sub_task = self.progress.add_task(
+                        f"[{color}]GPU{gpu_id} {task_id}",
+                        total=total_videos
+                    )
+                    self.task_progress_bars[task_id] = sub_task
     
     def update_task_progress(self, dataset: str, method: str, current: int, total: int):
         """更新任务的视频处理进度"""
@@ -410,9 +416,17 @@ def run_task(
     # 设置环境变量指定GPU
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
-    env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    env["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
     # 强制子进程的 Python 使用无缓冲输出，确保进度信息实时传递
     env["PYTHONUNBUFFERED"] = "1"
+    
+    # Limit threads to prevent CPU oversubscription which causes extreme slowdowns
+    # when running multiple PyTorch processes in parallel
+    env["OMP_NUM_THREADS"] = "1"
+    env["MKL_NUM_THREADS"] = "1"
+    env["OPENBLAS_NUM_THREADS"] = "1"
+    env["VECLIB_MAXIMUM_THREADS"] = "1"
+    env["NUMEXPR_NUM_THREADS"] = "1"
     
     color = METHOD_CONFIGS[method]["color"]
     task_id = f"{method}@{dataset_name}"
@@ -467,146 +481,179 @@ def run_task(
     
     # 运行
     start_time = time.time()
-    total_videos = 0
-    task_started = False
-    process = None
+    retry_count = 0
+    returncode = 0
     
     # 获取项目根目录（确保工作目录正确，这样 Hydra 才能正确解析相对路径）
     project_root = Path(__file__).parent.parent.parent
     
-    try:
-        # 使用Popen实时捕获输出，同时写入日志文件
-        with open(log_file, "w") as f:
-            process = subprocess.Popen(
-                cmd,
-                env=env,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,  # Line buffered
-                errors="replace",  # 防止编码错误导致崩溃
-                cwd=str(project_root),  # 设置工作目录为项目根目录，确保 Hydra 能正确解析配置路径
-            )
-            
-            # 实时读取并显示输出
-            try:
-                for line in process.stdout:
-                    # 写入日志文件
-                    f.write(line)
+    while True:
+        total_videos = 0
+        task_started = False
+        process = None
+
+        try:
+            # 使用Popen实时捕获输出，同时写入日志文件
+            with open(log_file, "w") as f:
+                process = subprocess.Popen(
+                    cmd,
+                    env=env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,  # Line buffered
+                    errors="replace",  # 防止编码错误导致崩溃
+                    cwd=str(project_root),  # 设置工作目录为项目根目录，确保 Hydra 能正确解析配置路径
+                )
+                
+                # 实时读取并显示输出
+                try:
+                    for line in process.stdout:
+                        # 写入日志文件
+                        f.write(line)
+                        f.flush()
+                        
+                        line_stripped = line.strip()
+                        
+                        # 尝试提取总视频数（用于初始化进度条）
+                        if not task_started and progress_monitor:
+                            total_match = total_videos_pattern.search(line_stripped)
+                            if total_match:
+                                total_videos = int(total_match.group(1))
+                                progress_monitor.start_task(gpu_id, dataset_name, method, total_videos)
+                                task_started = True
+                            else:
+                                # 兼容：如果没有打印 "inference on X videos"，
+                                # 则从第一条 Progress: a/b 中提取总数并初始化
+                                progress_match_early = progress_pattern.search(line_stripped)
+                                if progress_match_early:
+                                    current_early = int(progress_match_early.group(1))
+                                    total_videos = int(progress_match_early.group(2))
+                                    if total_videos > 0:
+                                        progress_monitor.start_task(gpu_id, dataset_name, method, total_videos)
+                                        task_started = True
+                                        # 立即更新一次当前进度
+                                        progress_monitor.update_task_progress(dataset_name, method, current_early, total_videos)
+                        
+                        # 尝试解析进度更新
+                        if progress_monitor and task_started:
+                            progress_match = progress_pattern.search(line_stripped)
+                            if progress_match:
+                                current = int(progress_match.group(1))
+                                total = int(progress_match.group(2))
+                                progress_monitor.update_task_progress(dataset_name, method, current, total)
+                        
+                        # 实时显示关键进度（只在无progress_monitor时，否则进度条已显示）
+                        if not progress_monitor and line_stripped and any(keyword in line_stripped for keyword in [
+                            'Processing', 'Evaluating', 'video', 'Progress', 
+                            'Completed', 'Dataset', 'Inference', '✓', '✗', '⚠️'
+                        ]):
+                            print(f"{color}[{task_id}] {line_stripped}{RESET_COLOR}")
+                except (BrokenPipeError, OSError):
+                    # stdout被关闭（进程可能被kill），但继续等待进程退出
+                    f.write("\n⚠️  Warning: stdout was closed unexpectedly (process may have been killed)\n")
                     f.flush()
-                    
-                    line_stripped = line.strip()
-                    
-                    # 尝试提取总视频数（用于初始化进度条）
-                    if not task_started and progress_monitor:
-                        total_match = total_videos_pattern.search(line_stripped)
-                        if total_match:
-                            total_videos = int(total_match.group(1))
-                            progress_monitor.start_task(gpu_id, dataset_name, method, total_videos)
-                            task_started = True
-                        else:
-                            # 兼容：如果没有打印 "inference on X videos"，
-                            # 则从第一条 Progress: a/b 中提取总数并初始化
-                            progress_match_early = progress_pattern.search(line_stripped)
-                            if progress_match_early:
-                                current_early = int(progress_match_early.group(1))
-                                total_videos = int(progress_match_early.group(2))
-                                if total_videos > 0:
-                                    progress_monitor.start_task(gpu_id, dataset_name, method, total_videos)
-                                    task_started = True
-                                    # 立即更新一次当前进度
-                                    progress_monitor.update_task_progress(dataset_name, method, current_early, total_videos)
-                    
-                    # 尝试解析进度更新
-                    if progress_monitor and task_started:
-                        progress_match = progress_pattern.search(line_stripped)
-                        if progress_match:
-                            current = int(progress_match.group(1))
-                            total = int(progress_match.group(2))
-                            progress_monitor.update_task_progress(dataset_name, method, current, total)
-                    
-                    # 实时显示关键进度（只在无progress_monitor时，否则进度条已显示）
-                    if not progress_monitor and line_stripped and any(keyword in line_stripped for keyword in [
-                        'Processing', 'Evaluating', 'video', 'Progress', 
-                        'Completed', 'Dataset', 'Inference', '✓', '✗', '⚠️'
-                    ]):
-                        print(f"{color}[{task_id}] {line_stripped}{RESET_COLOR}")
-            except (BrokenPipeError, OSError):
-                # stdout被关闭（进程可能被kill），但继续等待进程退出
-                f.write("\n⚠️  Warning: stdout was closed unexpectedly (process may have been killed)\n")
+                
+                # 确保所有输出都已读取完毕，并等待进程完全退出
+                # 注意：for line in process.stdout 循环结束时，stdout 已关闭，
+                # 但进程可能还在运行（特别是如果它还在写 stderr 或其他操作）
+                # 必须调用 wait() 确保进程完全退出后才能获取正确的返回码
+                returncode = process.wait()
+                
+                # 记录退出代码和可能的信号信息
+                f.write(f"\nProcess finished with return code {returncode}\n")
+                if returncode < 0:
+                    import signal
+                    sig = -returncode
+                    try:
+                        sig_name = signal.Signals(sig).name
+                        f.write(f"Process was killed by signal: {sig_name} ({sig})\n")
+                        if sig == signal.SIGKILL:
+                            f.write("⚠️  Process was killed by SIGKILL (likely OOM killer or manual kill)\n")
+                        elif sig == signal.SIGTERM:
+                            f.write("⚠️  Process was terminated by SIGTERM\n")
+                    except (ValueError, AttributeError):
+                        f.write(f"Process was killed by unknown signal: {sig}\n")
                 f.flush()
             
-            # 确保所有输出都已读取完毕，并等待进程完全退出
-            # 注意：for line in process.stdout 循环结束时，stdout 已关闭，
-            # 但进程可能还在运行（特别是如果它还在写 stderr 或其他操作）
-            # 必须调用 wait() 确保进程完全退出后才能获取正确的返回码
-            returncode = process.wait()
+            # 检查是否成功
+            if returncode == 0:
+                break
             
-            # 记录退出代码和可能的信号信息
-            f.write(f"\nProcess finished with return code {returncode}\n")
-            if returncode < 0:
-                import signal
-                sig = -returncode
-                try:
-                    sig_name = signal.Signals(sig).name
-                    f.write(f"Process was killed by signal: {sig_name} ({sig})\n")
-                    if sig == signal.SIGKILL:
-                        f.write("⚠️  Process was killed by SIGKILL (likely OOM killer or manual kill)\n")
-                    elif sig == signal.SIGTERM:
-                        f.write("⚠️  Process was terminated by SIGTERM\n")
-                except (ValueError, AttributeError):
-                    f.write(f"Process was killed by unknown signal: {sig}\n")
-            f.flush()
-        
-        elapsed = time.time() - start_time
-        
-        # 完成任务
-        if progress_monitor:
-            progress_monitor.complete_task(gpu_id, dataset_name, method, returncode == 0)
-        
-        # 使用 Rich Console 或传统输出
-        if returncode == 0:
-            if progress_monitor and RICH_AVAILABLE:
-                progress_monitor.console.log(f"✓ [{task_id}] Completed in {elapsed:.1f}s on GPU {gpu_id}")
-            else:
-                print(f"{color}[{task_id}] ✓ Completed in {elapsed:.1f}s on GPU {gpu_id}{RESET_COLOR}")
-        else:
-            # 错误信息始终显示（重要）
-            if progress_monitor and RICH_AVAILABLE:
-                progress_monitor.console.log(f"[red]✗ [{task_id}] Failed (code {returncode}) on GPU {gpu_id}[/red]")
-            else:
-                print(f"{color}[{task_id}] ✗ Failed (code {returncode}) on GPU {gpu_id}{RESET_COLOR}")
-            
-            # 检查OOM错误
-            with open(log_file) as f:
-                log_content = f.read()
-                if 'CUDA out of memory' in log_content or 'OutOfMemoryError' in log_content:
-                    if progress_monitor and RICH_AVAILABLE:
-                        progress_monitor.console.log(f"[yellow]⚠️  [{task_id}] CUDA OOM detected[/yellow]")
-                    else:
-                        print(f"{color}[{task_id}] ⚠️  CUDA OOM detected{RESET_COLOR}")
-        
-        return dataset_name, method, returncode, elapsed, output_dir
-        
-    except Exception as e:
-        # 确保进程被终止
-        if process and process.poll() is None:
+            # 检查是否是 OOM
+            is_oom = False
             try:
-                process.terminate()
-                process.wait(timeout=5)
+                with open(log_file) as f:
+                    log_content = f.read()
+                    if 'CUDA out of memory' in log_content or 'OutOfMemoryError' in log_content:
+                        is_oom = True
             except:
-                process.kill()
+                pass
+            
+            if is_oom:
+                retry_count += 1
+                msg = f"⚠️  [{task_id}] CUDA OOM detected on GPU {gpu_id}. Retrying ({retry_count})..."
+                if progress_monitor and RICH_AVAILABLE:
+                    progress_monitor.console.log(f"[yellow]{msg}[/yellow]")
+                else:
+                    print(f"{color}{msg}{RESET_COLOR}")
                 
-        elapsed = time.time() - start_time
-        if progress_monitor and task_started:
-            progress_monitor.complete_task(gpu_id, dataset_name, method, False)
-        
-        # 异常信息使用 Rich Console 或传统输出
+                # 等待一会儿再重试
+                import gc
+                gc.collect()
+                time.sleep(5)
+                continue
+            
+            # 非OOM的失败，直接退出
+            break
+            
+        except Exception as e:
+            # 确保进程被终止
+            if process and process.poll() is None:
+                try:
+                    process.terminate()
+                    process.wait(timeout=5)
+                except:
+                    process.kill()
+                    
+            # 异常信息使用 Rich Console 或传统输出
+            if progress_monitor and RICH_AVAILABLE:
+                progress_monitor.console.log(f"[red]✗ [{task_id}] Exception: {e}[/red]")
+            else:
+                print(f"{color}[{task_id}] ✗ Exception: {e}{RESET_COLOR}")
+            
+            returncode = -1
+            break
+    
+    elapsed = time.time() - start_time
+    
+    # 完成任务
+    if progress_monitor:
+        progress_monitor.complete_task(gpu_id, dataset_name, method, returncode == 0)
+    
+    # 使用 Rich Console 或传统输出
+    if returncode == 0:
         if progress_monitor and RICH_AVAILABLE:
-            progress_monitor.console.log(f"[red]✗ [{task_id}] Exception: {e}[/red]")
+            progress_monitor.console.log(f"✓ [{task_id}] Completed in {elapsed:.1f}s on GPU {gpu_id}")
         else:
-            print(f"{color}[{task_id}] ✗ Exception: {e}{RESET_COLOR}")
-        return dataset_name, method, -1, elapsed, output_dir
+            print(f"{color}[{task_id}] ✓ Completed in {elapsed:.1f}s on GPU {gpu_id}{RESET_COLOR}")
+    else:
+        # 错误信息始终显示（重要）
+        if progress_monitor and RICH_AVAILABLE:
+            progress_monitor.console.log(f"[red]✗ [{task_id}] Failed (code {returncode}) on GPU {gpu_id}[/red]")
+        else:
+            print(f"{color}[{task_id}] ✗ Failed (code {returncode}) on GPU {gpu_id}{RESET_COLOR}")
+            
+        # 检查OOM错误
+        with open(log_file) as f:
+            log_content = f.read()
+            if 'CUDA out of memory' in log_content or 'OutOfMemoryError' in log_content:
+                if progress_monitor and RICH_AVAILABLE:
+                    progress_monitor.console.log(f"[yellow]⚠️  [{task_id}] CUDA OOM detected (Final)[/yellow]")
+                else:
+                    print(f"{color}[{task_id}] ⚠️  CUDA OOM detected (Final){RESET_COLOR}")
+
+    return dataset_name, method, returncode, elapsed, output_dir
 
 
 def check_task_completed(output_dir: Path, method: str, dataset: str) -> tuple[bool, str]:
@@ -1380,8 +1427,8 @@ def main():
     parser.add_argument("--max_objects", type=int, default=256)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--first_frame_only", action="store_true", help="只评估第一帧（快速模式）")
-    parser.add_argument("--video_limit", type=int, default=None)
-    parser.add_argument("--num_workers", type=int, default=None)
+    parser.add_argument("--video_limit", type=int, default=1000)
+    parser.add_argument("--num_workers", type=int, default=2)
     
     # UCTTA参数
     parser.add_argument("--uctta_steps", type=int, default=2)

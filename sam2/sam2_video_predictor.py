@@ -394,12 +394,23 @@ class SAM2VideoPredictor(SAM2Base):
         if any_res_masks.shape[-2:] == (video_H, video_W):
             video_res_masks = any_res_masks
         else:
-            video_res_masks = torch.nn.functional.interpolate(
-                any_res_masks,
-                size=(video_H, video_W),
-                mode="bilinear",
-                align_corners=False,
-            )
+            try:
+                video_res_masks = torch.nn.functional.interpolate(
+                    any_res_masks,
+                    size=(video_H, video_W),
+                    mode="bilinear",
+                    align_corners=False,
+                )
+            except torch.cuda.OutOfMemoryError:
+                # Fallback to CPU if OOM occurs during interpolation
+                print("Warning: OOM during interpolation, falling back to CPU")
+                torch.cuda.empty_cache()
+                video_res_masks = torch.nn.functional.interpolate(
+                    any_res_masks.cpu(),
+                    size=(video_H, video_W),
+                    mode="bilinear",
+                    align_corners=False,
+                ).to(device)
         if self.non_overlap_masks:
             video_res_masks = self._apply_non_overlapping_constraints(video_res_masks)
         return any_res_masks, video_res_masks
@@ -468,12 +479,23 @@ class SAM2VideoPredictor(SAM2Base):
                 consolidated_pred_masks[obj_idx : obj_idx + 1] = obj_mask
             else:
                 # Resize first if temporary object mask has a different resolution
-                resized_obj_mask = torch.nn.functional.interpolate(
-                    obj_mask,
-                    size=consolidated_pred_masks.shape[-2:],
-                    mode="bilinear",
-                    align_corners=False,
-                )
+                try:
+                    resized_obj_mask = torch.nn.functional.interpolate(
+                        obj_mask,
+                        size=consolidated_pred_masks.shape[-2:],
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                except torch.cuda.OutOfMemoryError:
+                    # Fallback to CPU if OOM occurs during interpolation
+                    print("Warning: OOM during interpolation, falling back to CPU")
+                    torch.cuda.empty_cache()
+                    resized_obj_mask = torch.nn.functional.interpolate(
+                        obj_mask.cpu(),
+                        size=consolidated_pred_masks.shape[-2:],
+                        mode="bilinear",
+                        align_corners=False,
+                    ).to(obj_mask.device)
                 consolidated_pred_masks[obj_idx : obj_idx + 1] = resized_obj_mask
 
         return consolidated_out

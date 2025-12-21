@@ -201,21 +201,21 @@ trainer:
     use_mlp_for_obj_ptr_proj: true
     # === BNDL_CONFIG_START ===
     # BNDL
-    use_bndl_for_pixels: false
-    bndl_fuse_type: conv
+    use_bndl_for_pixels: true
+    bndl_fuse_type: none
     bndl_replace_global_with_hyper: true
     bndl_hyper_in_sparse: false
     # === BNDL_CONFIG_END ===
     # Compilation flag
     # Freeze image encoder to save memory
     # === IMPORTANT: Conv-LoRA Configuration ===
-    freeze_image_encoder: true  # true = PEFT (only train LoRA, ~2-3% params), false = joint fine-tuning (train all, ~33% params)
+    freeze_image_encoder: false  # true = PEFT (only train LoRA, ~2-3% params), false = joint fine-tuning (train all, ~33% params)
     # Unfreeze specific components for adaptation (e.g. "neck", "trunk_last_stage")
     unfreeze_image_encoder_components: []
 
     # === LORA_CONFIG_START ===
     # LoRA: Parameter-efficient fine-tuning
-    use_lora: true
+    use_lora: false
     lora_rank: 4
     lora_alpha: 16.0
     lora_dropout: 0.1
@@ -231,7 +231,7 @@ trainer:
 
     # === AUE_GCN_CONFIG_START ===
     # AUE (Adversarial Uncertainty Estimation) with Style-based augmentation
-    use_aue: false
+    use_aue: true
     # Constraint weight for adversarial samples (L1 distance to initial)
     aue_constraint_loss_weight: 0.0  # Weight for constraint regularization (0 = disabled)
     # Attack mode: "cooperative" (parallel prediction, joint application) or "sequential" (iterative)
@@ -239,17 +239,18 @@ trainer:
     # Style Adversarial options (alternative to AUE, for domain generalization)
     use_style_adv: true
     style_adv_mode: "image_level"  # "image_level" or "feature_level"
+    style_adv_epsilon: 2.0  # Perturbation budget for style
     style_adv_use_gt_region_style: true
     
     # Consistency Regularization: MMD(U_clean, U_adv)
-    aue_consistency_weight: 0.5  # Weight for consistency loss (0.3-0.7 recommended)
+    aue_consistency_weight: 0.1  # Weight for consistency loss (0.3-0.7 recommended)
     
     # Multi-object style attack control
-    style_adv_use_multi_object: true
-    style_adv_enable_background: false
+    adv_use_multi_object: true
+    adv_enable_background: true
     
     # Global-Local Mixed Style Adversarial
-    style_adv_use_global_local_mix: true
+    style_adv_use_global_local_mix: false
     style_adv_global_epsilon: 0.5
     style_adv_global_weight: 0.5
 
@@ -266,7 +267,7 @@ trainer:
     style_adv_gcn_feature_dim: 256  # Feature dimension (matches backbone_fpn[-1] d_model)
     
     # Deformation Adversarial (feature-level, memory encoder based)
-    use_deform_adv: false  # Disabled for style-only ablation
+    use_deform_adv: false # Disabled for style-only ablation
     deform_adv_epsilon: 5.0  # Reduced from 10.0 to 5.0 for mild spatial perturbation
     deform_adv_use_soft_composite: true
     deform_adv_temperature: 1.0
@@ -275,9 +276,11 @@ trainer:
     deform_adv_num_deform_groups: 4
     deform_adv_init_from_memory_encoder: true  # Initialize from pretrained memory encoder
     deform_adv_freeze_mask_encoder: false  # Allow fine-tuning
+    deform_adv_zero_mean_offsets: true  # Remove global translation while keeping local warps
+    deform_adv_local_offset_gain: 1.3  # Boost local deformation after centering
     
     # Adversarial Pipeline Ordering
-    adversarial_attack_order: ["style"]  # Only style attack for this ablation
+    adversarial_attack_order: ["style"]
     
     # Distribution matching configuration for AUE calibration loss (nested config)
     aue_dist_matching_config:
@@ -478,18 +481,18 @@ trainer:
             - 'sam_mask_decoder.pixel_bndl.*'
 
         # Style Adversarial Network: moderate learning rate for effective adversarial training
-        # - scheduler:
-        #     _target_: fvcore.common.param_scheduler.CosineParamScheduler
-        #     start_value: 1.0e-4
-        #     end_value: 1.0e-5
-        #   param_names:
-        #     - 'style_attacker.impl.style_net.*'
+        - scheduler:
+            _target_: fvcore.common.param_scheduler.CosineParamScheduler
+            start_value: 1.0e-4
+            end_value: 1.0e-5
+          param_names:
+            - 'style_attacker.impl.style_net.*'
 
         # GCN: moderate learning rate for rapid alpha convergence
         # - scheduler:
         #     _target_: fvcore.common.param_scheduler.CosineParamScheduler
-        #     start_value: 1.0e-4
-        #     end_value: 1.0e-5
+        #     start_value: 1.0e-5
+        #     end_value: 1.0e-6
         #   param_names:
         #     - 'style_gcn.*'
 
@@ -502,12 +505,12 @@ trainer:
         #     - 'deform_attacker.*'
 
         # LoRA params: higher learning rate
-        - scheduler:
-            _target_: fvcore.common.param_scheduler.CosineParamScheduler
-            start_value: 2.0e-4
-            end_value: 2.0e-5
-          param_names:
-            - '*lora*'
+        # - scheduler:
+        #     _target_: fvcore.common.param_scheduler.CosineParamScheduler
+        #     start_value: 2.0e-4
+        #     end_value: 2.0e-5
+        #   param_names:
+        #     - '*lora*'
 
         - scheduler:
             _target_: fvcore.common.param_scheduler.CosineParamScheduler
@@ -515,8 +518,8 @@ trainer:
             end_value: 1.0e-07
           param_names:
             - image_encoder.*
-          exclude_param_names:
-            - '*lora*'
+          # exclude_param_names:
+          #   - '*lora*'
 
       weight_decay:
         # 默认 weight decay
@@ -553,14 +556,17 @@ trainer:
           sam_weight: 1.0
           bndl_weight: 1.0
           aue_weight: 0.0
+          uncertainty_weight: 0.0
         - until_epoch: 15
           sam_weight: 1.0
           bndl_weight: 0.8
-          aue_weight: 0.005
+          aue_weight: 0.05
+          uncertainty_weight: 0.0
         - until_epoch: null
           sam_weight: 1.0
           bndl_weight: 0.2
-          aue_weight: 0.01
+          aue_weight: 0.1
+          uncertainty_weight: 0.0
     val:
       _target_: training.loss_combined.CombinedSAMBNDLLoss
       sam_loss: ${trainer.loss.all.sam_loss}

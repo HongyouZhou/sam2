@@ -541,6 +541,11 @@ def inference_interactive(
         video_dir = jpeg_dir / vid
         frame_names = sorted([p.stem for p in video_dir.iterdir() if p.suffix.lower() in [".jpg", ".jpeg"]], key=lambda x: int(x))
 
+        # Check if video is already processed
+        if (out_dir / vid / "query_prompts.json").exists():
+            print(f"Skipping video {vid} - already processed (found query_prompts.json)")
+            continue
+
         max_frames_to_load = 1 if first_frame_only else None
         state = predictor.init_state(str(video_dir), max_frames=max_frames_to_load)
         H, W = state["video_height"], state["video_width"]

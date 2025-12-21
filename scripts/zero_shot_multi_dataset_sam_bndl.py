@@ -769,6 +769,9 @@ def inference_with_bndl(
     # 打印格式要与其他方法一致，以便 parallel_compare.py 的进度监控器能正确捕获
     print(f"BNDL ({click_protocol}) inference on {len(video_names)} videos")
 
+    # Initial cleanup
+    cleanup_gpu_memory(predictor)
+
     # Optional seeding
     if seed is not None:
         np.random.seed(int(seed))
@@ -812,6 +815,10 @@ def inference_with_bndl(
                 distributed=False,  # Single process for zero-shot evaluation
                 rank=0,
                 world_size=1,
+                # Align with training configuration for PAvPU calculation
+                foreground_dilation=4,
+                use_full_image=False,
+                per_pixel_statistics=True,
             )
             logger.info(f"Dataset evaluator initialized with save_dir: {dataset_evaluator.save_dir}")
         except Exception as e:
@@ -821,6 +828,9 @@ def inference_with_bndl(
             dataset_evaluator = None
 
     for v_idx, vid in enumerate(video_names, 1):
+        # Cleanup before each video
+        cleanup_gpu_memory(predictor)
+        
         print(f"\n{'=' * 60}")
         print(f"📹 Processing video [{v_idx:03}/{len(video_names)}]: {vid}")
         print(f"   Progress: {v_idx}/{len(video_names)} ({100.0 * v_idx / len(video_names):.1f}%)")
@@ -828,9 +838,20 @@ def inference_with_bndl(
         video_dir = jpeg_dir / vid
         frame_names = sorted([p.stem for p in video_dir.iterdir() if p.suffix.lower() in [".jpg", ".jpeg"]], key=lambda x: int(x))
 
+        # Check if video is already processed (resumability)
+        # We use query_prompts.json as a completion marker as it's saved last
+        if (out_dir / vid / "query_prompts.json").exists():
+            print(f"Skipping video {vid} - already processed (found query_prompts.json)")
+            continue
+
         # Initialize predictor state
         max_frames_to_load = 1 if first_frame_only else None
-        state = predictor.init_state(str(video_dir), max_frames=max_frames_to_load)
+        state = predictor.init_state(
+            str(video_dir), 
+            max_frames=max_frames_to_load,
+            offload_video_to_cpu=True,
+            offload_state_to_cpu=True,
+        )
         H, W = state["video_height"], state["video_width"]
 
         # Read first frame GT to determine object IDs
@@ -911,6 +932,12 @@ def inference_with_bndl(
         video_statistics = {} if collect_statistics else None
 
         for f_idx, out_obj_ids, out_logits in predictor.propagate_in_video(state, start_frame_idx=0, max_frame_num_to_track=max_frames):
+            # Double safety: break if first_frame_only is requested and we have processed one frame
+            if first_frame_only and f_idx > 0:
+                print(f"Breaking video propagation after frame {f_idx} (first_frame_only=True)")
+                del out_logits
+                break
+
             seg = {}
             for i, oid in enumerate(out_obj_ids):
                 mask_logits = out_logits[i]

@@ -1249,8 +1249,8 @@ class Trainer:
         # Denormalize images
         # If warped images are available (from deformation), use them as "before" for StyleAUE
         # This shows: deformed image -> styled image (the actual StyleAUE input/output)
-        original_images = vis_data.warped_images if (hasattr(vis_data, 'warped_images') and vis_data.warped_images is not None) else vis_data.original_images
-        original_denorm = self._denormalize_images(original_images)
+        # Use the stored original and styled images directly (no fallback)
+        original_denorm = self._denormalize_images(vis_data.original_images)
         adv_denorm = self._denormalize_images(vis_data.adversarial_images)
         
         # Use stored styles if available, otherwise extract from images
@@ -1344,8 +1344,8 @@ class Trainer:
     
     def _denormalize_images(self, images):
         """Denormalize images from ImageNet normalization."""
-        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
-        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        mean = torch.tensor([0.485, 0.456, 0.406], device=images.device, dtype=images.dtype).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225], device=images.device, dtype=images.dtype).view(1, 3, 1, 1)
         denorm = images * std + mean
         return torch.clamp(denorm, 0, 1)
     
@@ -1366,6 +1366,16 @@ class Trainer:
         sample_combined_mask = combined_mask[sample_idx, 0] if combined_mask is not None else None
         sample_area_ratios = area_ratios[sample_idx] if area_ratios is not None else None
         sample_epsilon_weights = epsilon_weights[sample_idx] if epsilon_weights is not None else None
+
+        # For single-object visualization, also pass bbox/mask so TensorBoard overlay can highlight the attack region
+        single_obj_bbox = None
+        single_obj_mask = None
+        if sample_masks is not None and sample_masks.shape[0] >= 1:
+            single_obj_mask = sample_masks[0]
+        elif sample_combined_mask is not None:
+            single_obj_mask = sample_combined_mask
+        if sample_bboxes is not None and sample_bboxes.shape[0] >= 1:
+            single_obj_bbox = sample_bboxes[0]
         
         # Call unified visualization
         self._log_style_statistics_overlay(
@@ -1375,8 +1385,8 @@ class Trainer:
             adv_style,
             sample_idx,
             step,
-            bbox=None,  # Legacy single-object, not used
-            gt_mask=None,  # Legacy single-object, not used
+            bbox=single_obj_bbox,
+            gt_mask=single_obj_mask,
             all_bboxes=sample_bboxes,
             all_masks=sample_masks,
             combined_mask=sample_combined_mask,
@@ -1436,50 +1446,74 @@ class Trainer:
         import matplotlib.pyplot as plt
         import matplotlib.patches as patches
         import numpy as np
+
+        model = unwrap_ddp_if_wrapped(self.model)
+        include_background = bool(getattr(model, "adv_enable_background", False))
         
         # Extract multi-object data from vis_data
         if hasattr(vis_data, 'all_bboxes'):
             all_bboxes = vis_data.all_bboxes
-            all_masks = vis_data.all_object_masks
+            orig_masks = vis_data.all_object_masks
+            warped_masks_all = getattr(vis_data, 'warped_object_masks', None)
             area_ratios = vis_data.area_ratios
             epsilon_weights = vis_data.epsilon_weights
         else:
             all_bboxes = None
-            all_masks = None
+            orig_masks = None
+            warped_masks_all = None
             area_ratios = None
             epsilon_weights = None
         
         # Extract data for this sample
         sample_bboxes = all_bboxes[sample_idx] if all_bboxes is not None else None
-        sample_masks = all_masks[sample_idx] if all_masks is not None else None
+        sample_masks_orig = orig_masks[sample_idx] if orig_masks is not None else None
+        sample_masks_warped = warped_masks_all[sample_idx] if warped_masks_all is not None else None
         sample_area_ratios = area_ratios[sample_idx] if area_ratios is not None else None
         sample_epsilon_weights = epsilon_weights[sample_idx] if epsilon_weights is not None else None
         
         # Get deformation data
         offsets = vis_data.deform_offsets[sample_idx] if vis_data.deform_offsets is not None else None  # [K, 2, H, W]
-        warped_img = vis_data.warped_images[sample_idx] if hasattr(vis_data, 'warped_images') and vis_data.warped_images is not None else None
+        warped_img = (
+            vis_data.warped_images[sample_idx]
+            if hasattr(vis_data, 'warped_images') and vis_data.warped_images is not None
+            else None
+        )
+        styled_img = (
+            vis_data.adversarial_images[sample_idx]
+            if getattr(vis_data, "adversarial_images", None) is not None
+            else None
+        )
+        attack_order = getattr(vis_data, "attack_order", None)
         
         # Get GT masks for overlay
-        gt_masks = sample_masks  # [K, H, W]
-        K = gt_masks.shape[0] if gt_masks is not None else 0
+        # Use original masks for "before" overlay; warped masks for "after" if available
+        gt_masks_orig = sample_masks_orig  # [K, H, W]
+        gt_masks_warped = sample_masks_warped if sample_masks_warped is not None else sample_masks_orig
+        K = gt_masks_orig.shape[0] if gt_masks_orig is not None else 0
         
         # Convert to numpy
         orig_np = original_img.permute(1, 2, 0).cpu().numpy()
         orig_np = np.clip(orig_np, 0, 1)
         H, W = orig_np.shape[0], orig_np.shape[1]
         
-        # Convert warped image to numpy if available (denormalize first!)
+        # Convert styled/warped image to numpy if available (denormalize first!)
+        if styled_img is not None:
+            styled_img_denorm = self._denormalize_images(styled_img.unsqueeze(0))[0]
+            styled_np = styled_img_denorm.permute(1, 2, 0).cpu().numpy()
+            styled_np = np.clip(styled_np, 0, 1)
+        else:
+            styled_np = None
+
         if warped_img is not None:
-            # Denormalize warped image (same as original_img)
-            warped_img_denorm = self._denormalize_images(warped_img.unsqueeze(0))[0]  # Add batch dim, then remove
+            warped_img_denorm = self._denormalize_images(warped_img.unsqueeze(0))[0]
             warped_np = warped_img_denorm.permute(1, 2, 0).cpu().numpy()
             warped_np = np.clip(warped_np, 0, 1)
         else:
             warped_np = None
         
-        # Convert GT masks to numpy if available
-        if gt_masks is not None:
-            gt_masks_np = gt_masks.cpu().numpy()  # [K, H, W]
+        # Convert GT masks to numpy if available (before deformation)
+        if gt_masks_orig is not None:
+            gt_masks_np = gt_masks_orig.cpu().numpy()  # [K, H, W]
         else:
             gt_masks_np = None
         
@@ -1504,7 +1538,11 @@ class Trainer:
                     continue
                 
                 # Check if background (last object slot with large area)
-                is_background = (k == K - 1 and mask_k.sum() > H * W * 0.5)
+                is_background = (
+                    include_background
+                    and k == K - 1
+                    and mask_k.sum() > H * W * 0.5
+                )
                 
                 # Draw mask contour
                 from skimage import measure
@@ -1573,14 +1611,50 @@ class Trainer:
                        family='monospace',
                        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
         
-        # Row 1, Col 0: Warped Image (After Deformation)
-        if warped_np is not None:
-            axes[1, 0].imshow(warped_np)
-            axes[1, 0].set_title('After Deformation (Warped)', fontsize=12, fontweight='bold')
+        # Row 1, Col 0: After attacks (respect configured order)
+        def _pick_display_np(attack_order, warped_np, styled_np):
+            mapping = {
+                'style': styled_np,
+                'deform': warped_np,
+            }
+            if attack_order is None:
+                return warped_np or styled_np
+            for name in reversed(attack_order):
+                candidate = mapping.get(name)
+                if candidate is not None:
+                    return candidate
+            return warped_np or styled_np
+
+        display_np = _pick_display_np(attack_order, warped_np, styled_np)
+        if display_np is not None:
+            axes[1, 0].imshow(display_np)
+            if attack_order:
+                title_suffix = "→".join([n.capitalize() for n in attack_order])
+            else:
+                title_suffix = "Deformation" if warped_np is not None else "Style"
+            axes[1, 0].set_title(f'After {title_suffix}', fontsize=12, fontweight='bold')
         else:
             axes[1, 0].imshow(orig_np)
-            axes[1, 0].set_title('After Deformation (Not Available)', fontsize=12, fontweight='bold')
+            axes[1, 0].set_title('After Attacks (Not Available)', fontsize=12, fontweight='bold')
         axes[1, 0].axis('off')
+        # Overlay warped masks if available (fallback to original masks)
+        if gt_masks_warped is not None:
+            gt_masks_warped_np = gt_masks_warped.cpu().numpy()
+        else:
+            gt_masks_warped_np = gt_masks_np
+        if gt_masks_warped_np is not None:
+            for k in range(gt_masks_warped_np.shape[0]):
+                mask_k = gt_masks_warped_np[k]
+                if mask_k.max() <= 0:
+                    continue
+                is_background = (
+                    include_background
+                    and k == gt_masks_warped_np.shape[0] - 1
+                    and mask_k.sum() > H * W * 0.5
+                )
+                if is_background:
+                    continue  # skip background contour in warped view
+                axes[1, 0].contour(mask_k, levels=[0.5], colors='lime', linewidths=1.5)
         
         # Row 1, Col 1: Offset Magnitude Overlay
         if offsets is not None:
@@ -1668,6 +1742,9 @@ class Trainer:
         import matplotlib.patches as patches
         import matplotlib.cm as cm
         import numpy as np
+
+        model = unwrap_ddp_if_wrapped(self.model)
+        include_background = bool(getattr(model, "adv_enable_background", False))
         
         # Detect if multi-object mode
         is_multi_object = all_masks is not None and all_masks.shape[0] > 1
@@ -1694,17 +1771,8 @@ class Trainer:
             axes[0, 0].set_title(f'Original Image (Sample {sample_id})', fontsize=12, fontweight='bold')
             axes[0, 0].axis('off')
             
-            # Determine which object is used for loss
-            # In multi-object training, loss typically uses combined_mask (all objects merged)
-            # But we can identify the primary object as the one with largest area or first non-empty
+            # Determine primary object: always object 0 (foreground), background lives in last slot
             primary_obj_idx = 0
-            max_area = 0
-            for k in range(K):
-                mask_k = all_masks[k].cpu().numpy()
-                area = mask_k.sum()
-                if area > max_area:
-                    max_area = area
-                    primary_obj_idx = k
             
             for k in range(K):
                 mask_k = all_masks[k].cpu().numpy()
@@ -1712,7 +1780,7 @@ class Trainer:
                     continue
                 
                 # Check if this is background mask (last slot in K)
-                is_background = (k == K - 1 and mask_k.sum() > 0)
+                is_background = include_background and (k == K - 1 and mask_k.sum() > 0)
                 
                 # Draw mask contour
                 from skimage import measure
@@ -1793,7 +1861,7 @@ class Trainer:
                     continue
                 
                 # Check if this is background mask (last slot in K)
-                is_background = (k == K - 1 and mask_k.sum() > 0)
+                is_background = include_background and (k == K - 1 and mask_k.sum() > 0)
                 
                 # Draw mask contour
                 from skimage import measure
@@ -1869,13 +1937,14 @@ class Trainer:
         else:
             # Single-object visualization (original 2x3 layout)
             fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+            from skimage import measure  # Needed for contour drawing in single-object view
             
             # Row 1: Original image and its styles
             axes[0, 0].imshow(orig_np)
             axes[0, 0].set_title('Original Image', fontsize=12, fontweight='bold')
             axes[0, 0].axis('off')
             
-            # Draw bbox on original image if available
+            # Draw bbox and mask on original image if available
             if bbox is not None:
                 bbox_np = bbox.cpu().numpy() if hasattr(bbox, 'cpu') else bbox
                 x1, y1, x2, y2 = bbox_np
@@ -1889,6 +1958,11 @@ class Trainer:
                     color='red', fontsize=10, fontweight='bold',
                     bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.7)
                 )
+            if gt_mask is not None:
+                mask_np = gt_mask.cpu().numpy() if hasattr(gt_mask, 'cpu') else gt_mask
+                contours = measure.find_contours(mask_np, 0.5)
+                for contour in contours:
+                    axes[0, 0].plot(contour[:, 1], contour[:, 0], color='cyan', linewidth=2, linestyle='-', alpha=0.7)
             
             # Original style - means
             axes[0, 1].bar(['R', 'G', 'B'], orig_style_np[:3], color=['red', 'green', 'blue'], alpha=0.7)
@@ -1909,7 +1983,7 @@ class Trainer:
             axes[1, 0].set_title('Adversarial Image (Style-Augmented)', fontsize=12, fontweight='bold')
             axes[1, 0].axis('off')
             
-            # Draw bbox on adversarial image if available
+            # Draw bbox and mask on adversarial image if available
             if bbox is not None:
                 bbox_np = bbox.cpu().numpy() if hasattr(bbox, 'cpu') else bbox
                 x1, y1, x2, y2 = bbox_np
@@ -1923,6 +1997,12 @@ class Trainer:
                     color='lime', fontsize=10, fontweight='bold',
                     bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.7)
                 )
+            if gt_mask is not None:
+                from skimage import measure
+                mask_np = gt_mask.cpu().numpy() if hasattr(gt_mask, 'cpu') else gt_mask
+                contours = measure.find_contours(mask_np, 0.5)
+                for contour in contours:
+                    axes[1, 0].plot(contour[:, 1], contour[:, 0], color='cyan', linewidth=2, linestyle='-', alpha=0.7)
             
             # Adversarial style - means
             axes[1, 1].bar(['R', 'G', 'B'], adv_style_np[:3], color=['red', 'green', 'blue'], alpha=0.7)
