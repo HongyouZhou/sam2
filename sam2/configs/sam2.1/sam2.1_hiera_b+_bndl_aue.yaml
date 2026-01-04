@@ -114,11 +114,8 @@ model:
   compile_image_encoder: False
 
   # === BNDL_CONFIG_START ===
-  # BNDL
+  # BNDL (always uses hyper_in only mode)
   use_bndl_for_pixels: true
-  bndl_fuse_type: none
-  bndl_replace_global_with_hyper: true
-  bndl_hyper_in_sparse: false
   # === BNDL_CONFIG_END ===
   # Compilation flag
   # compile_image_encoder: False
@@ -142,19 +139,16 @@ model:
 
   # === AUE_GCN_CONFIG_START ===
   # AUE (Adversarial Uncertainty Estimation) with Style-based augmentation
-  use_aue: true
+  use_aue: false
   # Constraint weight for adversarial samples (L1 distance to initial)
   aue_constraint_loss_weight: 0.0  # Weight for constraint regularization (0 = disabled)
   # Attack mode: "cooperative" (parallel prediction, joint application) or "sequential" (iterative)
   aue_attack_mode: "cooperative"
   # Style Adversarial options (alternative to AUE, for domain generalization)
-  use_style_adv: true
+  use_style_adv: false
   style_adv_mode: "image_level"  # "image_level" or "feature_level"
-  style_adv_epsilon: 2.0  # Perturbation budget for style
+  style_adv_epsilon: 1.1  # Perturbation budget for style
   style_adv_use_gt_region_style: true
-    
-  # Consistency Regularization: MMD(U_clean, U_adv)
-  aue_consistency_weight: 0.1  # Weight for consistency loss (0.3-0.7 recommended)
     
   # Multi-object style attack control
   adv_use_multi_object: true
@@ -167,6 +161,7 @@ model:
 
   # GCN-based multi-object style refinement
   style_adv_use_gcn: false  # Not needed for global-only style
+  style_adv_gcn_grl_alpha: 0.4  # GRL alpha for GCN path (lower = more stable)
   style_adv_gcn_hidden_dim: 64
   style_adv_gcn_num_layers: 2
   style_adv_gcn_edge_threshold: 0.0
@@ -174,35 +169,34 @@ model:
   style_adv_gcn_use_background_edges: true
   style_adv_gcn_distance_threshold: 1.0
   style_adv_gcn_use_boundary_distance: true
-  style_adv_gcn_use_visual_features: true  # Enable visual features in GCN for content-aware refinement
+  style_adv_gcn_use_visual_features: true
   style_adv_gcn_feature_dim: 256  # Feature dimension (matches backbone_fpn[-1] d_model)
     
   # Deformation Adversarial (feature-level, memory encoder based)
-  use_deform_adv: false # Disabled for style-only ablation
-  deform_adv_epsilon: 5.0  # Reduced from 10.0 to 5.0 for mild spatial perturbation
+  use_deform_adv: false
+  deform_adv_epsilon: 3.0  # Reduced from 10.0 to 5.0 for mild spatial perturbation
   deform_adv_use_soft_composite: true
   deform_adv_temperature: 1.0
   deform_adv_use_gcn: false
   deform_adv_gcn_num_layers: 2
   deform_adv_num_deform_groups: 4
   deform_adv_init_from_memory_encoder: true  # Initialize from pretrained memory encoder
-  deform_adv_freeze_mask_encoder: false  # Allow fine-tuning
+  deform_adv_freeze_encoder_components: true  # Freeze all encoder components (mask_encoder, img_feat_proj, fuser) to prevent GRL gradient instability
   deform_adv_zero_mean_offsets: true  # Remove global translation while keeping local warps
   deform_adv_local_offset_gain: 1.3  # Boost local deformation after centering
+  deform_adv_grl_alpha: 0.3  # GRL alpha for deformation offsets (lower = more stable)
     
   # Adversarial Pipeline Ordering
-  adversarial_attack_order: ["style"]
+  adversarial_attack_order: ["style", "deform"]
     
   # Distribution matching configuration for AUE calibration loss (nested config)
   aue_dist_matching_config:
-    # Current method: Baseline Hard-Aware MMD (error-based Top-K mining)
-    method: "mmd"  # Options: "mmd", "cka", "gram", "mmd_hard_aware", "domain_aware_soft_mmd"
-        
-    # To use NEW theory-driven method, change to:
-    # method: "domain_aware_soft_mmd"
-        
+    mse_weight: 0.08  # Reduced from 0.3
     use_patches: true  # Ignored for hard-aware methods (inherently patch-based)
     patch_size: 32  # Patch size for patch-based methods
+
+    # Current method: Baseline Hard-Aware MMD (error-based Top-K mining)
+    method: "mmd"  # Options: "mmd", "cka", "gram", "mmd_hard_aware", "domain_aware_soft_mmd"  
         
     # Method-specific parameters (only active when method is selected)
     mmd:
@@ -219,9 +213,9 @@ model:
     # NEW: Domain-Aware Soft MMD (theory-driven: OOD detection + MaxEnt)
     # Combines error (aleatoric) + feature diversity (epistemic) with soft weighting
     domain_aware_soft_mmd:
-      diversity_weight: 0.25       # Reduced from 0.4 to 0.25 (less emphasis on epistemic diversity)
+      diversity_weight: 0.30       # Reduced from 0.4 to 0.25 (less emphasis on epistemic diversity)
       temperature: 0.2             # Increased from 0.1 to 0.2 (smoother sample selection, less aggressive)
-      max_samples: 8192
+      max_samples: 4096
       diversity_method: "channel_std"  # "channel_std" (faster) | "spatial_var"
       enable_monitoring: false     # Disable monitoring to save memory and ignore low correlation for now
         

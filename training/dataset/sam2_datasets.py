@@ -123,7 +123,7 @@ class TorchTrainMixedDataset:
             dataset_prob = torch.tensor(dataset_prob)
 
         logging.info(f"Dataset mixing probabilities: {dataset_prob.tolist()}")
-        assert dataset_prob.sum().item() == 1.0, "Probabilities should sum to 1.0"
+        assert torch.isclose(dataset_prob.sum(), torch.tensor(1.0), atol=1e-6), f"Probabilities should sum to 1.0, got {dataset_prob.sum().item()}"
         self.dataset_prob = dataset_prob
 
     def _set_dataset_epoch(self, dataset, epoch: int) -> None:

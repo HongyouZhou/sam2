@@ -219,7 +219,6 @@ def inference_with_ur_ern(
     dataset_name: str = "unknown",
     collect_statistics: bool = True,
     max_objects: int | None = None,
-    prompt_method: str = "gt_box",
     first_frame_only: bool = False,
     reuse_prompts_root: Path | None = None,
     # Protocol controls (no GT box fallback)
@@ -425,6 +424,9 @@ def inference_with_ur_ern(
 
             video_segments[f_idx] = seg
 
+        # Determine if per-object PNG files are needed (e.g. for SA-V dataset)
+        per_obj_png_file = "sav" in (dataset_name or "").lower()
+
         # Save PNG masks to disk (same as baseline)
         for f_idx in list(video_segments.keys()):
             frame_name = frame_names[f_idx]
@@ -435,7 +437,7 @@ def inference_with_ur_ern(
                 per_obj_output_mask=video_segments[f_idx],
                 height=H,
                 width=W,
-                per_obj_png_file=False,
+                per_obj_png_file=per_obj_png_file,
                 output_palette=DAVIS_PALETTE,
             )
         
@@ -575,7 +577,6 @@ def inference_with_ur_ern(
     
     return None
 
-
 def run_single_dataset_with_ur_ern(
     dataset_name: str,
     predictor,
@@ -585,7 +586,6 @@ def run_single_dataset_with_ur_ern(
     num_workers: int | None = None,
     video_subset: list[str] | None = None,
     save_ur_ern_vis: bool = True,
-    prompt_method: str = "gt_box",
     first_frame_only: bool = False,
     max_objects: int | None = None,
     collect_statistics: bool = False,
@@ -596,99 +596,38 @@ def run_single_dataset_with_ur_ern(
     downsample_max_samples: int = 100000,
 ) -> tuple[float, float, float, dict[str, Any] | None]:
     """Run evaluation on a single dataset using UR-ERN and return J&F/J/F and statistics.
-
-    This mirrors zero_shot_multi_dataset.run_single_dataset, but uses UR-ERN for uncertainty estimation.
     
-    Returns:
-        Tuple of (j_f_val, j_val, f_val, ur_ern_statistics)
+    This is a thin wrapper around zs_dataset_runner.run_single_dataset_generic
+    that passes UR-ERN-specific parameters.
     """
-    config = DATASET_CONFIGS[dataset_name]
-    if split is None:
-        split = config["default_split"]
-
-    if isinstance(split, list):
-        split = split[0]
-
-    assert isinstance(split, str)
-
-    root = Path(config["root"])
-    if config["has_split_subdir"]:
-        jpeg_dir = root / split / "JPEGImages"
-        ann_dir = root / split / "Annotations"
-    else:
-        jpeg_dir = root / "JPEGImages"
-        ann_dir = root / "Annotations"
-
-    if not jpeg_dir.is_dir() or not ann_dir.is_dir():
-        raise FileNotFoundError(f"JPEGImages or Annotations not found for {dataset_name}: {jpeg_dir}, {ann_dir}")
-
-    out_dir = output_path / f"{dataset_name.lower()}_pred"
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"\n{'=' * 60}")
-    print(f"Running {dataset_name} dataset evaluation (SAM-2 + UR-ERN)")
-    print(f"{'=' * 60}")
-
-    # Handle file_list_txt if present
-    if "file_list_txt" in config:
-        file_list_path = Path(config["file_list_txt"])
-        if file_list_path.exists():
-            with open(file_list_path, "r") as f:
-                names = [line.strip() for line in f if line.strip()]
-            video_subset = [v for v in (video_subset or names) if v in names]
-
-    # Execute inference with UR-ERN
-    t0 = time.time()
-    ur_ern_stats = inference_with_ur_ern(
-        predictor,
-        jpeg_dir,
-        ann_dir,
-        out_dir,
-        score_thresh=score_thresh,
-        video_names=video_subset,
-        max_objects=max_objects,
-        prompt_method=prompt_method,
-        save_ur_ern_vis=save_ur_ern_vis,
-        collect_statistics=True,
+    from zs_dataset_runner import run_single_dataset_generic
+    
+    return run_single_dataset_generic(
         dataset_name=dataset_name,
-        reuse_prompts_root=reuse_prompts_root,
+        predictor=predictor,
+        output_path=output_path,
+        inference_fn=inference_with_ur_ern,
+        method_name="UR-ERN",
+        split=split,
+        video_subset=video_subset,
+        num_workers=num_workers,
         first_frame_only=first_frame_only,
+        score_thresh=score_thresh,
+        max_objects=max_objects,
+        reuse_prompts_root=reuse_prompts_root,
         click_protocol=click_protocol,
         min_click_dist=min_click_dist,
         seed=seed,
+        collect_statistics=True,
         downsample_max_samples=downsample_max_samples,
+        # UR-ERN-specific kwargs
+        save_ur_ern_vis=save_ur_ern_vis,
     )
-    t_infer = time.time() - t0
-
-    # Use unified evaluation pipeline (with symlinks for better performance)
-    t1 = time.time()
-    try:
-        j_f_val, j_val, f_val = run_benchmark_evaluation(
-            gt_dir=ann_dir,
-            pred_dir=out_dir,
-            dataset_config=config,
-            video_subset=video_subset,
-            first_frame_only=first_frame_only,
-            num_workers=num_workers,
-            output_path=output_path,
-            use_symlinks=True,  # Use symlinks for 10-100x speed improvement
-            dataset_name=dataset_name,  # Pass dataset name for proper temp directory naming
-        )
-    except Exception as e:
-        print(f"Error during evaluation of {dataset_name}: {e}")
-        import traceback
-        traceback.print_exc()
-        return 0.0, 0.0, 0.0, None
-    t_eval = time.time() - t1
-
-    print(f"Inference time (UR-ERN): {t_infer:.2f}s")
-    print(f"Evaluation time: {t_eval:.2f}s")
-
-    return j_f_val, j_val, f_val, ur_ern_stats
 
 
 # Moved to shared_evaluation_utils.py to eliminate duplication
 from shared_evaluation_utils import build_predictor_with_overrides, create_append_shard_to_eval_callback
+
 
 
 def parse_args():
@@ -704,7 +643,6 @@ def parse_args():
     
     # Evaluation parameters
     parser.add_argument("--score_thresh", type=float, default=0.0)
-    parser.add_argument("--prompt_method", default="gt_box", choices=["gt_box", "three_clicks"])
     parser.add_argument("--first_frame_only", action="store_true")
     parser.add_argument("--max_objects", type=int, default=256)
     parser.add_argument("--num_workers", type=int, default=None)
@@ -763,7 +701,6 @@ def main():
             score_thresh=args.score_thresh,
             num_workers=args.num_workers,
             save_ur_ern_vis=args.save_ur_ern_vis,
-            prompt_method=args.prompt_method,
             first_frame_only=args.first_frame_only,
             max_objects=args.max_objects,
             collect_statistics=args.collect_statistics,

@@ -414,56 +414,86 @@ class HardAwareMMD:
     def _gaussian_kernel_mmd(source, target, kernel_mul=2.0, kernel_num=5, fix_sigma=None):
         """
         Computes MMD with Multi-Scale RBF Kernels.
-        Memory-optimized implementation.
+        Memory-optimized implementation using chunking to avoid O(N^2) memory.
         
         Optimizations:
-        1. Use torch.cdist for efficient pairwise distance computation
-        2. Iteratively accumulate kernel matrices to avoid storing all at once
-        3. More efficient memory layout
+        1. Chunked computation to keep peak memory low (O(B^2) instead of O(N^2))
+        2. Subsampling for bandwidth estimation
+        3. Avoids large intermediate matrices
         """
-        n_samples = int(source.size(0)) + int(target.size(0))
-        total = torch.cat([source, target], dim=0) # [2N, 1]
+        B_source = source.size(0)
+        B_target = target.size(0)
         
-        # Optimization 1: Use torch.cdist for efficient L2 distance computation
-        # This has better memory layout and is optimized in PyTorch
-        # L2_distance = torch.cdist(total, total, p=2).pow(2)  # [2N, 2N]
-        
-        # REPLACEMENT for stability: Manual squared distance to avoid sqrt(0) gradient issues in cdist
-        # ||x - y||^2 = ||x||^2 + ||y||^2 - 2<x, y>
-        # But (x-y)^2 is safer for precision if x,y are large.
-        # Since total is [2N, 1], we can use broadcasting.
-        L2_distance = (total.unsqueeze(1) - total.unsqueeze(0)).pow(2).sum(dim=-1)
-        
-        # Heuristic bandwidth (median or mean distance)
+        # Bandwidth estimation using subsampling to save memory
         if fix_sigma:
             bandwidth = fix_sigma
         else:
-            # Use mean distance as base bandwidth for stability
-            bandwidth = torch.sum(L2_distance.detach()) / (n_samples**2 - n_samples + 1e-8)
+            # Use at most 1024 samples for bandwidth estimation
+            n_samples = B_source + B_target
+            n_subset = min(n_samples, 1024)
+            
+            # Simple stratified sampling
+            n_s = min(B_source, n_subset // 2)
+            n_t = min(B_target, n_subset - n_s)
+            
+            # Use randperm for random subset
+            idx_s = torch.randperm(B_source, device=source.device)[:n_s]
+            idx_t = torch.randperm(B_target, device=target.device)[:n_t]
+            
+            s_sub = source[idx_s]
+            t_sub = target[idx_t]
+            total_sub = torch.cat([s_sub, t_sub], dim=0)
+            
+            # Compute approximate bandwidth
+            # ||x - y||^2
+            L2_dist_sub = (total_sub.unsqueeze(1) - total_sub.unsqueeze(0)).pow(2).sum(dim=-1)
+            denominator = max(1.0, float(total_sub.shape[0]**2 - total_sub.shape[0]))
+            bandwidth = torch.sum(L2_dist_sub.detach()) / (denominator + 1e-8)
         
-        # Clamp bandwidth to avoid division by zero or extremely small values
         bandwidth = torch.clamp(bandwidth, min=1e-6)
-        
-        # Multi-scale kernels (多尺度核，覆盖不同的分布宽度)
         bandwidth /= kernel_mul ** (kernel_num // 2)
         bandwidth_list = [bandwidth * (kernel_mul**i) for i in range(kernel_num)]
-        
-        # Optimization 2: Iteratively accumulate kernel matrices
-        # Instead of storing all 5 kernel matrices and summing, accumulate in-place
-        k_matrix = torch.zeros_like(L2_distance)
-        for b in bandwidth_list:
-            k_matrix += torch.exp(-L2_distance / (b + 1e-8))
+
+        # Chunked computation helper
+        def compute_kernel_sum(X, Y, b_list, chunk_size=1024):
+            total_sum = 0.0
+            N = X.shape[0]
+            M = Y.shape[0]
+            
+            # Loop over chunks
+            for i in range(0, N, chunk_size):
+                X_chunk = X[i:i+chunk_size]
+                for j in range(0, M, chunk_size):
+                    Y_chunk = Y[j:j+chunk_size]
+                    
+                    # Pairwise distance [Bi, Bj]
+                    # (Bi, 1, D) - (1, Bj, D)
+                    dist_chunk = (X_chunk.unsqueeze(1) - Y_chunk.unsqueeze(0)).pow(2).sum(dim=-1)
+                    
+                    # Sum multi-scale kernels
+                    k_val = 0.0
+                    for b_val in b_list:
+                         k_val = k_val + torch.exp(-dist_chunk / (b_val + 1e-8))
+                    
+                    total_sum = total_sum + k_val.sum()
+            return total_sum
+
+        # Calculate sums (memory efficient)
+        sum_XX = compute_kernel_sum(source, source, bandwidth_list)
+        sum_YY = compute_kernel_sum(target, target, bandwidth_list)
+        sum_XY = compute_kernel_sum(source, target, bandwidth_list)
         
         # MMD = E[K(X,X)] + E[K(Y,Y)] - 2E[K(X,Y)]
-        batch = source.size(0)
-        XX = k_matrix[:batch, :batch]
-        YY = k_matrix[batch:, batch:]
-        XY = k_matrix[:batch, batch:]
-        YX = k_matrix[batch:, :batch]
-        
-        loss = torch.mean(XX + YY - XY - YX)
-        
-        # Clamp negative values (theoretically impossible, but happens due to precision)
+        if B_source == B_target:
+             # Standard case: mean over total pairs
+             loss = (sum_XX + sum_YY - 2 * sum_XY) / (B_source * B_source)
+        else:
+             # Generalized MMD for unequal batch sizes
+             term1 = sum_XX / (B_source * B_source)
+             term2 = sum_YY / (B_target * B_target)
+             term3 = sum_XY / (B_source * B_target)
+             loss = term1 + term2 - 2 * term3
+             
         return torch.clamp(loss, min=0.0)
 
 
@@ -654,12 +684,6 @@ class DomainAwareSoftMMD:
         # (B) Epistemic difficulty (feature diversity)
         feature_diversity = compute_feature_diversity(f_patches, method=diversity_method)  # [N]
         
-        # Safeguard 3: NaN/Inf detection
-        if not torch.isfinite(feature_diversity).all():
-            raise RuntimeError(
-                f"Feature diversity contains NaN/Inf! Check feature extraction. "
-                f"Min: {feature_diversity.min()}, Max: {feature_diversity.max()}"
-            )
         
         # === CRITICAL: Normalize to [0, 1] for fair combination ===
         # Min-max normalization

@@ -11,10 +11,11 @@ The GCN coordinates perturbations between spatially or semantically related obje
 making adversarial attacks more natural while preserving effectiveness.
 """
 
+import logging
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Tuple, Optional
 
 
 class AdversarialStyleGCN(nn.Module):
@@ -54,6 +55,11 @@ class AdversarialStyleGCN(nn.Module):
         
         # Node dimension: style + projected features (both style_dim)
         self.node_dim = style_dim * 2 if feature_dim > 0 else style_dim
+        
+        # Fixed residual scale: GCN refinement is small compared to identity
+        # This is CRITICAL for stability with GRL - prevents large initial perturbations
+        # Using register_buffer so it's not a learnable parameter (avoids GRL destabilization)
+        self.register_buffer('residual_scale', torch.tensor(0.1))
 
         # Feature projection MLP: project high-dim features to style_dim
         # This balances the contribution of features and styles (both become 6-dim)
@@ -100,8 +106,15 @@ class AdversarialStyleGCN(nn.Module):
 
     def forward(self, style_deltas: torch.Tensor, edge_index: torch.Tensor, edge_weight: torch.Tensor,
                 mask_features: torch.Tensor | None = None) -> torch.Tensor:
-        """Forward pass of GCN for refining style perturbations."""
+        """Forward pass of GCN for refining style perturbations.
+        
+        Uses residual connection: output = input + scale * GCN(input)
+        This ensures near-identity behavior initially, critical for GRL stability.
+        """
         B, num_nodes, _ = style_deltas.shape
+        
+        # Save input for residual connection
+        style_deltas_input = style_deltas
 
         # Fuse visual features with style deltas if provided
         if mask_features is not None and self.feature_projection is not None:
@@ -115,6 +128,7 @@ class AdversarialStyleGCN(nn.Module):
         # Apply GCN layers: Transform -> Aggregate -> Activate
         for layer_idx, (linear, norm) in enumerate(zip(self.layers, self.layer_norms)):
             x = linear(x)
+            
             x = self._graph_conv(x, edge_index, edge_weight, B, num_nodes)
             
             if layer_idx < self.num_layers - 1:
@@ -123,6 +137,11 @@ class AdversarialStyleGCN(nn.Module):
                 x = F.dropout(x, p=self.dropout, training=self.training)
 
         x = x.reshape(B, num_nodes, self.style_dim)
+        
+        # Residual connection with fixed scale: output = input + scale * gcn_output
+        # scale is fixed at 0.1, ensuring stability while allowing GCN to provide refinement
+        x = style_deltas_input + self.residual_scale * x
+ 
         return x
     
     def project_features(self, mask_features: torch.Tensor) -> torch.Tensor:
@@ -168,6 +187,12 @@ class AdversarialStyleGCN(nn.Module):
         edge_weight = edge_weight.to(dtype=x.dtype)
         weighted_features = src_features * edge_weight.unsqueeze(1)
         out.index_add_(0, tgt, weighted_features)
+        
+        # Normalize by in-degree to prevent value explosion from aggregation
+        # Count how many edges point to each node (in-degree)
+        in_degree = x.new_zeros(x.size(0))
+        in_degree.index_add_(0, tgt, edge_weight)
+        out = out / in_degree.unsqueeze(1)
         
         return out
 
@@ -219,16 +244,16 @@ def compute_boundary_distance(
 
 def build_object_graph(
     masks: torch.Tensor,
-    img_batch: Optional[torch.Tensor] = None,
-    labels: Optional[torch.Tensor] = None,
+    img_batch: torch.Tensor | None = None,
+    labels: torch.Tensor | None = None,
     edge_threshold: float = 0.3,
     use_semantic: bool = True,
     use_background: bool = False,
     distance_threshold: float | None = None,
     use_boundary_distance: bool = False,
-    mask_features: Optional[torch.Tensor] = None,
+    mask_features: torch.Tensor | None = None,
     feature_sim_threshold: float = 0.5,
-) -> Tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, float]]:
     """Build object graph from masks for GCN message passing."""
     if masks.ndim == 5:
         masks = masks.squeeze(2)
@@ -297,10 +322,7 @@ def build_object_graph(
             continue
 
         # Debug log for first batch only
-        if b == 0:
-            import logging
-
-            if logging.getLogger().isEnabledFor(logging.DEBUG):
+        if b == 0 and logging.getLogger().isEnabledFor(logging.DEBUG):
                 # Show detailed mask area info
                 mask_area_list = [f"{i}:{mask_areas[b, i].item():.0f}" for i in range(K)]
                 logging.debug(f"GCN batch {b}: mask_areas=[{', '.join(mask_area_list)}]")
@@ -341,10 +363,10 @@ def build_object_graph(
                     continue
 
                 # Debug log for first IoU edge found in first batch
-                if b == 0 and stats["edges_iou"] == 0:
-                    import logging
-
-                    logging.debug(f"GCN: First IoU edge found: obj_{i} <-> obj_{j}, iou={iou:.3f}, threshold={edge_threshold}")
+                if b == 0 and stats["edges_iou"] == 0 and logging.getLogger().isEnabledFor(logging.DEBUG):
+                    logging.debug(
+                        f"GCN: First IoU edge found: obj_{i} <-> obj_{j}, iou={iou:.3f}, threshold={edge_threshold}"
+                    )
 
                 node_i = b * nodes_per_batch + i
                 node_j = b * nodes_per_batch + j
@@ -379,10 +401,11 @@ def build_object_graph(
                             continue
 
                         # Debug log for first boundary distance edge found in first batch
-                        if b == 0 and stats["edges_distance"] == 0:
-                            import logging
-
-                            logging.debug(f"GCN: First boundary distance edge found: obj_{i} <-> obj_{j}, norm_dist={norm_dist:.3f}, threshold={distance_threshold}")
+                        if b == 0 and stats["edges_distance"] == 0 and logging.getLogger().isEnabledFor(logging.DEBUG):
+                            logging.debug(
+                                f"GCN: First boundary distance edge found: obj_{i} <-> obj_{j}, "
+                                f"norm_dist={norm_dist:.3f}, threshold={distance_threshold}"
+                            )
 
                         # Weight decreases linearly with normalized distance, minimum epsilon
                         weight = max(1e-6, (distance_threshold - norm_dist) / distance_threshold)
@@ -416,10 +439,11 @@ def build_object_graph(
                             continue
 
                         # Debug log for first distance edge found in first batch
-                        if b == 0 and stats["edges_distance"] == 0:
-                            import logging
-
-                            logging.debug(f"GCN: First centroid distance edge found: obj_{i} <-> obj_{j}, norm_dist={norm_dist:.3f}, threshold={distance_threshold}")
+                        if b == 0 and stats["edges_distance"] == 0 and logging.getLogger().isEnabledFor(logging.DEBUG):
+                            logging.debug(
+                                f"GCN: First centroid distance edge found: obj_{i} <-> obj_{j}, "
+                                f"norm_dist={norm_dist:.3f}, threshold={distance_threshold}"
+                            )
 
                         # Weight decreases linearly with normalized distance, minimum epsilon
                         weight = max(1e-6, (distance_threshold - norm_dist) / distance_threshold)
@@ -444,9 +468,11 @@ def build_object_graph(
                         continue
                     
                     # Debug log for first semantic edge found in first batch
-                    if b == 0 and stats["edges_semantic"] == 0:
-                        import logging
-                        logging.debug(f"GCN: First semantic edge found: obj_{i} <-> obj_{j}, similarity={similarity:.3f}, threshold={feature_sim_threshold}")
+                    if b == 0 and stats["edges_semantic"] == 0 and logging.getLogger().isEnabledFor(logging.DEBUG):
+                        logging.debug(
+                            f"GCN: First semantic edge found: obj_{i} <-> obj_{j}, "
+                            f"similarity={similarity:.3f}, threshold={feature_sim_threshold}"
+                        )
                     
                     # Use similarity as edge weight
                     node_j = b * nodes_per_batch + j
@@ -466,20 +492,19 @@ def build_object_graph(
                 stats["edges_background"] += 2
 
             # Debug log for first batch
-            if b == 0:
-                import logging
-
-                logging.debug(f"GCN: Added {len(object_indices) * 2} background edges connecting {len(object_indices)} objects to background node {background_idx}")
-        elif b == 0:
-            import logging
-
-            logging.debug(f"GCN: No background edges - background_idx={background_idx}, object_indices={object_indices}")
+            if b == 0 and logging.getLogger().isEnabledFor(logging.DEBUG):
+                logging.debug(
+                    f"GCN: Added {len(object_indices) * 2} background edges connecting {len(object_indices)} "
+                    f"objects to background node {background_idx}"
+                )
+        elif b == 0 and logging.getLogger().isEnabledFor(logging.DEBUG):
+            logging.debug(
+                f"GCN: No background edges - background_idx={background_idx}, object_indices={object_indices}"
+            )
 
     if len(edge_src) == 0:
         # Debug: log why no edges were created despite having stats
         if stats["graphs"] > 0 or stats["nodes_total"] > 0:
-            import logging
-
             # Only warn if there are foreground nodes; pure background is expected for non-cond frames
             if stats["nodes_foreground"] > 0:
                 logging.warning(
@@ -522,7 +547,6 @@ def build_object_graph(
         stats["avg_degree"] = 0.0
         stats["avg_fg_degree"] = 0.0
 
-    degree = torch.clamp(degree, min=1e-6)
     normalized_weights = edge_wgt_t / degree[edge_tgt_t]
 
     # convert stats to floats for logging

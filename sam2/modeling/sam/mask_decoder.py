@@ -33,11 +33,6 @@ class MaskDecoder(nn.Module):
         pred_obj_scores_mlp: bool = False,
         # BNDL related
         use_bndl_for_pixels: bool = False,
-        bndl_replace_global_with_hyper: bool = False,
-        bndl_fuse_type: str = "sum",
-        bndl_gate_gamma: float = 2.0,
-        bndl_gate_detach: bool = True,
-        bndl_hyper_in_sparse: bool = False,
         use_multimask_token_for_obj_ptr: bool = False,
         # UR-ERN related (mutually exclusive with BNDL)
         use_ur_ern_for_pixels: bool = False,
@@ -87,21 +82,13 @@ class MaskDecoder(nn.Module):
 
         # BNDL related
         self.use_bndl_for_pixels = use_bndl_for_pixels
-        self.bndl_fuse_type = bndl_fuse_type
-        self.bndl_gate_gamma = float(bndl_gate_gamma)
-        self.bndl_gate_detach = bool(bndl_gate_detach)
-        self.bndl_replace_global_with_hyper = bndl_replace_global_with_hyper
-        self.bndl_hyper_in_sparse = bndl_hyper_in_sparse
         if self.use_bndl_for_pixels:
             pixel_feat_dim = transformer_dim // 8  # C' after up-scaling
             self.pixel_bndl = BNDL(
                 pixel_feat_dim,
                 self.num_mask_tokens,
-                enable_global_sparse=not self.bndl_replace_global_with_hyper,
-                enable_external_sparse=self.bndl_hyper_in_sparse,
             )
-            if self.bndl_fuse_type in ("conv", "gated_conv"):
-                self.fuse_conv = nn.Conv2d(2 * self.num_mask_tokens, self.num_mask_tokens, 1, bias=False)
+
         #########################################################
 
         # UR-ERN (NIG evidential regression) head - mutually exclusive with BNDL
@@ -204,7 +191,7 @@ class MaskDecoder(nn.Module):
         high_res_features: Optional[List[torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Predicts masks. See 'forward' for more details."""
-        
+
         # Concatenate output tokens
         s = 0
         if self.pred_obj_scores:
@@ -232,20 +219,29 @@ class MaskDecoder(nn.Module):
         assert image_pe.size(0) == 1, "image_pe should have size 1 in batch dim (from `get_dense_pe()`)"
         pos_src = torch.repeat_interleave(image_pe, tokens.shape[0], dim=0)
         b, c, h, w = src.shape
- 
+
         hs, src = self.transformer(src, pos_src, tokens)
         iou_token_out = hs[:, s, :]
         mask_tokens_out = hs[:, s + 1 : (s + 1 + self.num_mask_tokens), :]
 
+        # Calculate object_score_logits using the object score token (index 0 if present)
+        if self.pred_obj_scores:
+            assert s == 1
+            obj_token = hs[:, 0, :]  # [B, 256]
+            object_score_logits = self.pred_obj_score_head(obj_token)
+        else:
+            # Obj scores logits - default to 10.0, i.e. assuming the object is present, sigmoid(10)=1
+            object_score_logits = 10.0 * iou_token_out.new_ones(iou_token_out.shape[0], 1)
+
         # Upscale mask embeddings and predict masks using the mask tokens
         src = src.transpose(1, 2).view(b, c, h, w)
-        
+
         if not self.use_high_res_features:
             upscaled_embedding = self.output_upscaling(src)
         else:
             dc1, ln1, act1, dc2, act2 = self.output_upscaling
             feat_s0, feat_s1 = high_res_features
-             
+
             upscaled_embedding = act1(ln1(dc1(src) + feat_s1))
             upscaled_embedding = act2(dc2(upscaled_embedding) + feat_s0)
 
@@ -254,61 +250,60 @@ class MaskDecoder(nn.Module):
         for i in range(self.num_mask_tokens):
             hyper_in_list.append(self.output_hypernetworks_mlps[i](mask_tokens_out[:, i, :]))
         hyper_in = torch.stack(hyper_in_list, dim=1)
-        b, c, h, w = upscaled_embedding.shape
+
+        masks_sam = None
+        if not self.use_bndl_for_pixels:
+            b, c, h, w = upscaled_embedding.shape
+            masks_sam = (hyper_in @ upscaled_embedding.view(b, c, h * w)).view(b, -1, h, w)
+            masks = masks_sam
 
         aux_outputs = None
-        masks_sam = (hyper_in @ upscaled_embedding.view(b, c, h * w)).view(b, -1, h, w)
-        masks = masks_sam
-
         if self.use_bndl_for_pixels:
             pixel_feat = upscaled_embedding.permute(0, 2, 3, 1)  # [B, C, H, W] -> [B, H, W, C]
 
-            masks_bndl_raw, z_out, wei_lambda, inv_k, out_w, wei_lambda_w, inv_k_w = self.pixel_bndl(
+            masks_bndl_raw, z_out, wei_lambda, kappa, out_w, wei_lambda_w, kappa_w, lgamma_cache = self.pixel_bndl(
                 pixel_feat,
-                external_pre_out_w=hyper_in if self.bndl_replace_global_with_hyper else None,
+                external_pre_out_w=hyper_in,
+                factor_w=1.0,
             )
 
-            # 重塑BNDL输出：从[B, H, W, K]到[B, K, H, W]
             masks_bndl = masks_bndl_raw.permute(0, 3, 1, 2)
 
-            # Calculate pixel-level uncertainty from BNDL parameters
-            # This is crucial for uncertainty-weighted loss (forbidding incorrect optimization)
+            # Use per_channel=True to get per-mask uncertainty [B, H, W, K]
+            # This ensures each mask has its own pixel-level uncertainty
             pixel_uncertainty = pixel_weibull_to_entropy_uncertainty(
                 self.pixel_bndl,
                 pixel_feat,
-                external_pre_out_w=hyper_in if self.bndl_replace_global_with_hyper else None,
+                external_pre_out_w=hyper_in,
+                per_channel=True,  # Return [B, H, W, K] instead of [B, H, W]
             )
 
             aux_outputs = {
                 "bndl": {
                     "z_out": z_out,
                     "wei_lambda": wei_lambda,
-                    "inv_k": inv_k,
+                    "kappa": kappa,  # Renamed from inv_k (now returns kappa directly)
                     "wei_lambda_w": wei_lambda_w,
-                    "inv_k_w": inv_k_w,
-                    "masks_bndl_raw": masks_bndl_raw.detach(),      # [B, H, W, K]
-                    "pixel_uncertainty": pixel_uncertainty,         # [B, H, W]
+                    "kappa_w": kappa_w,  # Renamed from inv_k_w
+                    "lgamma_cache": lgamma_cache,  # For reuse in bndl_utils to avoid recomputation
+                    "masks_bndl_raw": masks_bndl_raw.detach(),  # [B, H, W, K]
+                    "pixel_uncertainty": pixel_uncertainty,  # [B, H, W, K] - per-mask uncertainty
                     "pixel_logits": masks_bndl_raw if self.training else masks_bndl_raw.detach(),
                     "upscaled_shape": (b, c, h, w),
-                    "hyper_in": hyper_in.detach(),
+                    # hyper_in: [B, K, 32D] - the projected tokens for AUE uncertainty calculation
+                    # Keep gradients during training for AUE adversarial branch backprop
+                    "hyper_in": hyper_in if self.training else hyper_in.detach(),
                     "mask_tokens_out": mask_tokens_out.detach(),
                     "pixel_feat": pixel_feat.detach(),
                     # Provide gradient-carrying pixel features for auxiliary losses during training
                     "pixel_feat_grad": pixel_feat if self.training else None,
                     "masks_bndl": masks_bndl.detach(),
-                    "masks_hyper": masks_sam.detach(),
+                    "masks_hyper": masks_sam.detach() if masks_sam is not None else None,
                     "out_w": out_w.detach() if out_w is not None else None,
                 }
             }
 
-            if self.bndl_fuse_type in ("sum", "conv"):
-                masks = self._fuse_masks(masks_sam, masks_bndl)
-            elif self.bndl_fuse_type in ("gated_sum", "gated_conv", "gated_replace"):
-                bndl_gate = self._compute_bndl_gate(masks_sam)
-                aux_outputs["bndl"]["bndl_gate"] = bndl_gate.detach()
-                masks = self._fuse_masks(masks_sam, masks_bndl, bndl_gate=bndl_gate)
-            else:
-                masks = masks_bndl
+            masks = masks_bndl
 
         # UR-ERN evidential outputs (NIG) using upscaled feature map; independent of BNDL branch
         if self.use_ur_ern_for_pixels:
@@ -325,30 +320,25 @@ class MaskDecoder(nn.Module):
             # var = beta * (1 + v) / (v * (alpha - 1))
             # aleatoric = beta / (alpha - 1)
             # epistemic = beta / (v * (alpha - 1))
-            denom = (alpha - 1.0)
+            denom = alpha - 1.0
             aleatoric = beta / denom
             epistemic = beta / (v * denom)
             var = (beta * (1.0 + v)) / (v * denom)
 
             # Pack into aux dict (fixed top-level key with method namespace)
-            aux_outputs = {"ur_ern": {
-                "nig_mu": mu,
-                "nig_v": v,
-                "nig_alpha": alpha,
-                "nig_beta": beta,
-                "nig_var": var,
-                "nig_aleatoric": aleatoric,
-                "nig_epistemic": epistemic,
-            }}
+            aux_outputs = {
+                "ur_ern": {
+                    "nig_mu": mu,
+                    "nig_v": v,
+                    "nig_alpha": alpha,
+                    "nig_beta": beta,
+                    "nig_var": var,
+                    "nig_aleatoric": aleatoric,
+                    "nig_epistemic": epistemic,
+                }
+            }
 
-        # Generate mask quality predictions
         iou_pred = self.iou_prediction_head(iou_token_out)
-        if self.pred_obj_scores:
-            assert s == 1
-            object_score_logits = self.pred_obj_score_head(hs[:, 0, :])
-        else:
-            # Obj scores logits - default to 10.0, i.e. assuming the object is present, sigmoid(10)=1
-            object_score_logits = 10.0 * iou_pred.new_ones(iou_pred.shape[0], 1)
 
         if aux_outputs is None:
             aux_outputs = {}
@@ -356,63 +346,16 @@ class MaskDecoder(nn.Module):
         # Check: if use_bndl_for_pixels=True, aux_outputs must contain valid BNDL data
         if self.use_bndl_for_pixels:
             if "bndl" not in aux_outputs:
-                raise RuntimeError(
-                    "MaskDecoder.predict_masks: use_bndl_for_pixels=True but aux_outputs does not contain 'bndl'! "
-                    f"aux_outputs keys: {list(aux_outputs.keys())}"
-                )
+                raise RuntimeError(f"MaskDecoder.predict_masks: use_bndl_for_pixels=True but aux_outputs does not contain 'bndl'! aux_outputs keys: {list(aux_outputs.keys())}")
             bndl_data = aux_outputs["bndl"]
             if not isinstance(bndl_data, dict):
-                raise RuntimeError(
-                    f"MaskDecoder.predict_masks: aux_outputs['bndl'] is not a dict! type: {type(bndl_data)}"
-                )
-            required_keys = ["wei_lambda", "inv_k", "masks_bndl_raw", "pixel_uncertainty"]
+                raise RuntimeError(f"MaskDecoder.predict_masks: aux_outputs['bndl'] is not a dict! type: {type(bndl_data)}")
+            required_keys = ["wei_lambda", "kappa", "masks_bndl_raw", "pixel_uncertainty"]
             missing_keys = [k for k in required_keys if k not in bndl_data]
             if missing_keys:
-                raise RuntimeError(
-                    f"MaskDecoder.predict_masks: aux_outputs['bndl'] missing required keys: {missing_keys}. "
-                    f"Available keys: {list(bndl_data.keys())}"
-                )
+                raise RuntimeError(f"MaskDecoder.predict_masks: aux_outputs['bndl'] missing required keys: {missing_keys}. Available keys: {list(bndl_data.keys())}")
 
         return masks, iou_pred, mask_tokens_out, object_score_logits, aux_outputs
-
-    def _compute_bndl_gate(self, masks_hyper: torch.Tensor) -> torch.Tensor:
-        """
-        Compute a spatial gate in [0,1] from SAM (hypernetwork) mask logits.
-
-        Gate is higher where SAM is uncertain (p≈0.5), and lower where SAM is confident (p≈0 or 1).
-        """
-        probs = torch.sigmoid(masks_hyper)
-        # Uncertainty proxy in [0,1]: 1 at p=0.5, 0 at p=0/1
-        gate = 1.0 - (2.0 * probs - 1.0).abs()
-        if self.bndl_gate_gamma != 1.0:
-            gate = gate.pow(self.bndl_gate_gamma)
-        if self.bndl_gate_detach:
-            gate = gate.detach()
-        return gate
-
-    def _fuse_masks(self, masks_hyper, masks_bndl, bndl_gate: torch.Tensor | None = None):
-        """Fuse hypernetwork and BNDL masks."""
-        if self.bndl_fuse_type == "sum":
-            return masks_hyper + masks_bndl
-        elif self.bndl_fuse_type == "conv":
-            fused_input = torch.cat([masks_hyper, masks_bndl], dim=1)  # [B, 2*K, H, W]
-            return self.fuse_conv(fused_input)  # [B, K, H, W]
-        elif self.bndl_fuse_type == "gated_sum":
-            if bndl_gate is None:
-                raise RuntimeError("bndl_gate is required for bndl_fuse_type='gated_sum'")
-            return masks_hyper + bndl_gate * masks_bndl
-        elif self.bndl_fuse_type == "gated_replace":
-            if bndl_gate is None:
-                raise RuntimeError("bndl_gate is required for bndl_fuse_type='gated_replace'")
-            return masks_hyper + bndl_gate * (masks_bndl - masks_hyper)
-        elif self.bndl_fuse_type == "gated_conv":
-            if bndl_gate is None:
-                raise RuntimeError("bndl_gate is required for bndl_fuse_type='gated_conv'")
-            fused_input = torch.cat([masks_hyper, masks_bndl], dim=1)  # [B, 2*K, H, W]
-            delta = self.fuse_conv(fused_input)  # [B, K, H, W]
-            return masks_hyper + bndl_gate * delta
-        else:
-            raise ValueError(f"Unknown fuse type: {self.bndl_fuse_type}")
 
     def _get_stability_scores(self, mask_logits):
         """

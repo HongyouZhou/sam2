@@ -70,6 +70,15 @@ def generate_click_prompts(
             points=pts,
             labels=lbl,
         )
+        
+        # DEBUG: Check mask quality after first click
+        cur_idx = obj_ids_after.index(obj_id)
+        mask_logits_check = masks[cur_idx, 0] if masks.dim() == 4 else (masks[0] if masks.dim() == 3 else masks.squeeze())
+        fg_ratio = (mask_logits_check > 0).float().mean().item()
+        if fg_ratio > 0.9:
+            print(f"⚠️ [CLICK1 ANOMALY] obj={obj_id}, fg_ratio={fg_ratio:.4f}")
+            print(f"   logits: min={mask_logits_check.min().item():.2f}, max={mask_logits_check.max().item():.2f}")
+        
         used_pts.extend([(cx, cy)])
         used_labels.extend([1])
         if neg_xy is not None:

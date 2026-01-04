@@ -381,6 +381,22 @@ class CheckpointManager:
             print()
 
 
+class TensorEncoder(json.JSONEncoder):
+    """Custom JSON encoder for PyTorch Tensors and NumPy arrays."""
+    def default(self, obj):
+        if isinstance(obj, torch.Tensor):
+            if obj.numel() == 1:
+                return obj.item()
+            return obj.tolist()
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, (np.float32, np.float64)):
+            return float(obj)
+        elif isinstance(obj, (np.int32, np.int64)):
+            return int(obj)
+        return super().default(obj)
+
+
 class StatisticsCheckpointManager(CheckpointManager):
     """Specialized checkpoint manager for JSON-serializable statistics."""
     
@@ -416,7 +432,7 @@ class StatisticsCheckpointManager(CheckpointManager):
         )
         
         with open(checkpoint_file, "w") as f:
-            json.dump(data, f)
+            json.dump(data, f, cls=TensorEncoder)
         
         self.checkpoint_files.append(checkpoint_file)
         return checkpoint_file
@@ -437,7 +453,7 @@ class StatisticsCheckpointManager(CheckpointManager):
         """Merge all statistics checkpoints.
         
         Returns:
-            Merged statistics dictionary
+             Merged statistics dictionary
         """
         if not self.checkpoint_files:
             return {}

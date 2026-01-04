@@ -80,86 +80,46 @@ except ImportError:
 sys.path.insert(0, str(Path(__file__).parent))
 
 from dataset_configs import DATASET_CONFIGS, DEFAULT_DATASETS
-from zs import create_comprehensive_comparison_plots, create_ua_shift_analysis_plots
+# Note: zs functions are imported lazily to avoid importing sam2 at module load time
+# This allows the subprocess to set PYTHONPATH before importing sam2
 
 
-# 方法配置
-METHOD_CONFIGS = {
-    "SAM": {
-        "flags": ["--run_sam"],
-        "color": "\033[94m",  # Blue
-        "output_suffix": "sam",
-    },
-    "SAM_FT": {
-        "flags": ["--run_sam"],  # Reuse SAM's testing logic
-        "color": "\033[34m",  # Dark Blue
-        "output_suffix": "sam_ft",
-    },
-    "UCTTA": {
-        "flags": ["--run_uctta"],
-        "color": "\033[92m",  # Green
-        "output_suffix": "uctta",
-    },
-    "BNDL_AUE": {
-        "flags": ["--run_bndl_aue"],
-        "color": "\033[93m",  # Yellow
-        "output_suffix": "bndl_aue",
-    },
-    "BNDL": {
-        "flags": ["--run_bndl"],
-        "color": "\033[96m",  # Cyan
-        "output_suffix": "bndl",
-    },
-    "UR-ERN": {
-        "flags": ["--run_ur_ern"],
-        "color": "\033[95m",  # Magenta
-        "output_suffix": "ur_ern",
-    },
-}
+# 方法配置 - 从 zs_method_registry 导入，保持单一数据源
+from zs_method_registry import (
+    METHOD_REGISTRY,
+    ALL_METHODS,
+    RESET_COLOR,
+    get_method_configs_dict,
+    get_method_result_keys,
+    get_method_stats_keys,
+)
 
-ALL_METHODS = ["SAM", "SAM_FT", "UCTTA", "BNDL_AUE", "BNDL", "UR-ERN"]
-RESET_COLOR = "\033[0m"
-
-# 方法名到JSON键的映射（避免重复定义）
-METHOD_RESULT_KEYS = {
-    "SAM": "sam2_results",
-    "SAM_FT": "sam2_results",  # SAM_FT uses same result key as SAM
-    "UCTTA": "uctta_results",
-    "BNDL_AUE": "bndl_aue_results",
-    "BNDL": "bndl_results",
-    "UR-ERN": "ur_ern_results",
-}
-
-METHOD_STATS_KEYS = {
-    "SAM": "sam2_statistics",
-    "SAM_FT": "sam2_statistics",  # SAM_FT uses same stats key as SAM
-    "UCTTA": "uctta_statistics",
-    "BNDL_AUE": "bndl_aue_statistics",
-    "BNDL": "bndl_statistics",
-    "UR-ERN": "ur_ern_statistics",
-}
+# 兼容性别名：使用 registry 生成的 dict（与原格式完全一致）
+METHOD_CONFIGS = get_method_configs_dict()
+METHOD_RESULT_KEYS = get_method_result_keys()
+METHOD_STATS_KEYS = get_method_stats_keys()
 
 
 class ProgressMonitor:
     """Rich进度监控器 - 实时显示任务执行状态（支持子任务进度）"""
-    
+
     def __init__(self, total_tasks: int, gpu_ids: list[int]):
         """初始化进度监控器
-        
+
         Args:
             total_tasks: 总任务数
             gpu_ids: GPU ID列表
         """
         self.total_tasks = total_tasks
         self.gpu_ids = gpu_ids
-        
+
         # 任务状态跟踪
         self.completed = 0
         self.running_tasks = {}  # {gpu_id: (dataset, method)}
         self.task_status = {}  # {(dataset, method): status}
         self.task_progress_bars = {}  # {task_id: progress_task_id} 子任务进度条
         self.lock = Lock()
-        
+
         # Rich组件（Progress 和 Console 必须绑定）
         if RICH_AVAILABLE:
             self.console = Console()
@@ -172,19 +132,17 @@ class ProgressMonitor:
                 TimeRemainingColumn(),
                 console=self.console,  # 绑定 Console，确保输出同步
             )
-            self.main_task = self.progress.add_task(
-                "[cyan]Overall Progress", total=total_tasks
-            )
+            self.main_task = self.progress.add_task("[cyan]Overall Progress", total=total_tasks)
         else:
             self.console = None
             self.progress = None
-    
+
     def start_task(self, gpu_id: int, dataset: str, method: str, total_videos: int = 0):
         """标记任务开始并创建子进度条"""
         with self.lock:
             self.running_tasks[gpu_id] = (dataset, method)
             self.task_status[(dataset, method)] = "running"
-            
+
             # 为此任务创建子进度条
             if RICH_AVAILABLE and total_videos > 0:
                 task_id = f"{method}@{dataset}"
@@ -195,18 +153,15 @@ class ProgressMonitor:
                 else:
                     color_map = {
                         "SAM": "blue",
-                        "UCTTA": "green", 
+                        "UCTTA": "green",
                         "BNDL_AUE": "yellow",
                         "BNDL": "cyan",
                         "UR-ERN": "magenta",
                     }
                     color = color_map.get(method, "white")
-                    sub_task = self.progress.add_task(
-                        f"[{color}]GPU{gpu_id} {task_id}",
-                        total=total_videos
-                    )
+                    sub_task = self.progress.add_task(f"[{color}]GPU{gpu_id} {task_id}", total=total_videos)
                     self.task_progress_bars[task_id] = sub_task
-    
+
     def update_task_progress(self, dataset: str, method: str, current: int, total: int):
         """更新任务的视频处理进度"""
         task_id = f"{method}@{dataset}"
@@ -214,7 +169,7 @@ class ProgressMonitor:
             if RICH_AVAILABLE and task_id in self.task_progress_bars:
                 sub_task = self.task_progress_bars[task_id]
                 self.progress.update(sub_task, completed=current)
-    
+
     def complete_task(self, gpu_id: int, dataset: str, method: str, success: bool):
         """标记任务完成并移除子进度条"""
         with self.lock:
@@ -222,24 +177,24 @@ class ProgressMonitor:
                 del self.running_tasks[gpu_id]
             self.task_status[(dataset, method)] = "completed" if success else "failed"
             self.completed += 1
-            
+
             # 移除子进度条
             task_id = f"{method}@{dataset}"
             if RICH_AVAILABLE and task_id in self.task_progress_bars:
                 sub_task = self.task_progress_bars[task_id]
                 self.progress.update(sub_task, visible=False)
                 del self.task_progress_bars[task_id]
-            
+
             if RICH_AVAILABLE:
                 self.progress.update(self.main_task, advance=1)
-    
+
     def generate_status_table(self) -> Table:
         """生成GPU状态表格"""
         table = Table(title="GPU Task Status", show_header=True, header_style="bold magenta")
         table.add_column("GPU", style="cyan", width=6)
         table.add_column("Status", width=12)
         table.add_column("Current Task", width=40)
-        
+
         for gpu_id in self.gpu_ids:
             if gpu_id in self.running_tasks:
                 dataset, method = self.running_tasks[gpu_id]
@@ -248,17 +203,17 @@ class ProgressMonitor:
             else:
                 status = Text("💤 Idle", style="dim")
                 task_desc = "-"
-            
+
             table.add_row(f"GPU {gpu_id}", status, task_desc)
-        
+
         return table
-    
+
     def generate_summary_panel(self) -> Panel:
         """生成汇总面板"""
         completed_count = self.completed
         running_count = len(self.running_tasks)
         pending_count = self.total_tasks - completed_count - running_count
-        
+
         summary_text = f"""
 [bold cyan]Progress Summary[/bold cyan]
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -268,16 +223,16 @@ class ProgressMonitor:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Progress: {completed_count / self.total_tasks * 100:.1f}%
         """
-        
+
         return Panel(summary_text, title="📊 Task Overview", border_style="blue")
-    
+
     def __enter__(self):
         """Context manager entry"""
         return self
-    
+
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Context manager exit"""
-        if RICH_AVAILABLE and hasattr(self, 'progress'):
+        if RICH_AVAILABLE and hasattr(self, "progress"):
             self.progress.stop()
         return False
 
@@ -290,14 +245,14 @@ def build_task_command(
     args: argparse.Namespace,
 ) -> list[str]:
     """构建单个(数据集, 方法)任务的命令
-    
+
     Args:
         dataset: 数据集名称
         method: 方法名称
         gpu_id: GPU ID
         output_dir: 输出目录
         args: 全局参数
-    
+
     Returns:
         命令列表
     """
@@ -311,73 +266,95 @@ def build_task_command(
         "--device",
         "cuda",
     ]
-    
+
     # 添加方法特定的flags
     cmd.extend(METHOD_CONFIGS[method]["flags"])
-    
+
     # SAM-2配置 (所有方法都需要)
     # SAM_FT uses its own checkpoint, otherwise use standard SAM checkpoint
     if method == "SAM_FT":
-        cmd.extend(["--sam2_cfg", args.sam_ft_cfg if hasattr(args, 'sam_ft_cfg') and args.sam_ft_cfg else args.sam2_cfg])
+        cmd.extend(["--sam2_cfg", args.sam_ft_cfg if hasattr(args, "sam_ft_cfg") and args.sam_ft_cfg else args.sam2_cfg])
         cmd.extend(["--sam2_checkpoint", args.sam_ft_checkpoint])
     else:
         cmd.extend(["--sam2_cfg", args.sam2_cfg])
         cmd.extend(["--sam2_checkpoint", args.sam2_checkpoint])
-    
+
     # BNDL+AUE配置
     if method == "BNDL_AUE":
         cmd.extend(["--bndl_aue_cfg", args.bndl_aue_cfg])
         cmd.extend(["--bndl_aue_checkpoint", args.bndl_aue_checkpoint])
-    
+
     # BNDL (pure)配置
     if method == "BNDL":
         cmd.extend(["--bndl_cfg", args.bndl_cfg])
         cmd.extend(["--bndl_checkpoint", args.bndl_checkpoint])
-    
+
     # UR-ERN配置
     if method == "UR-ERN":
         cmd.extend(["--ur_ern_cfg", args.ur_ern_cfg])
         cmd.extend(["--ur_ern_checkpoint", args.ur_ern_checkpoint])
-    
+
     # 评估参数
-    cmd.extend([
-        "--score_thresh", str(args.score_thresh),
-        "--click_protocol", args.click_protocol,
-        "--max_objects", str(args.max_objects),
-        "--seed", str(args.seed),
-    ])
-    
+    cmd.extend(
+        [
+            "--score_thresh",
+            str(args.score_thresh),
+            "--click_protocol",
+            args.click_protocol,
+            "--max_objects",
+            str(args.max_objects),
+            "--seed",
+            str(args.seed),
+        ]
+    )
+
     # 可选参数
-    if args.first_frame_only:
-        cmd.append("--first_frame_only")
-    
+    # zs.py uses --process_full_video (opposite logic of first_frame_only)
+    if not args.first_frame_only:
+        cmd.append("--process_full_video")
+
     if args.video_limit:
         cmd.extend(["--video_limit", str(args.video_limit)])
-    
+
     if args.num_workers:
         cmd.extend(["--num_workers", str(args.num_workers)])
-    
+
     # UCTTA特定参数
     if method == "UCTTA":
-        cmd.extend([
-            "--uctta_steps", str(args.uctta_steps),
-            "--uctta_lr", str(args.uctta_lr),
-        ])
+        cmd.extend(
+            [
+                "--uctta_steps",
+                str(args.uctta_steps),
+                "--uctta_lr",
+                str(args.uctta_lr),
+            ]
+        )
         if args.uctta_enable_bn:
             cmd.append("--uctta_enable_bn")
-    
+
     # AUE版本后缀（用于BNDL_AUE方法）
-    if method == "BNDL_AUE" and hasattr(args, 'bndl_aue_version'):
+    if method == "BNDL_AUE" and hasattr(args, "bndl_aue_version"):
         cmd.extend(["--aue_version", args.bndl_aue_version])
-    
+
     # BNDL/BNDL_AUE/UR-ERN特定参数
     if method in ["BNDL", "BNDL_AUE", "UR-ERN"] and args.collect_bndl_stats:
         cmd.append("--collect_bndl_stats")
-    
+
+    # 可视化输出（SAM 和 BNDL_AUE 均支持，用于论文对比）
+    if method in ["SAM", "SAM_FT", "BNDL_AUE"] and hasattr(args, "save_vis") and args.save_vis:
+        cmd.append("--save_vis")
+        # Paper figure generation options
+        if hasattr(args, "max_vis_per_video"):
+            cmd.extend(["--max_vis_per_video", str(args.max_vis_per_video)])
+
     # 降采样参数（所有方法）
-    if hasattr(args, 'downsample_max_samples'):
+    if hasattr(args, "downsample_max_samples"):
         cmd.extend(["--downsample_max_samples", str(args.downsample_max_samples)])
-    
+
+    # Optional mask saving optimization
+    if hasattr(args, "no_save_masks") and args.no_save_masks:
+        cmd.append("--no_save_masks")
+
     return cmd
 
 
@@ -390,7 +367,7 @@ def run_task(
     progress_monitor: ProgressMonitor | None = None,
 ) -> tuple[str, str, int, float, Path]:
     """在指定GPU上运行单个(数据集, 方法)任务（支持Rich子进度条）
-    
+
     Args:
         task: (dataset_name, method_name) 元组
         gpu_id: 分配的GPU ID
@@ -398,28 +375,28 @@ def run_task(
         args: 命令行参数
         method_versions: 方法版本映射
         progress_monitor: 进度监控器（可选）
-    
+
     Returns:
         (dataset, method, return_code, elapsed_time, output_dir)
     """
     dataset_name, method = task
     version = method_versions[method]
-    
+
     # 按方法组织目录: METHOD_VERSION/DATASET/
     method_dir = output_base / f"{method}_{version}"
     output_dir = method_dir / dataset_name
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     # 构建命令
     cmd = build_task_command(dataset_name, method, gpu_id, output_dir, args)
-    
+
     # 设置环境变量指定GPU
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
     env["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
     # 强制子进程的 Python 使用无缓冲输出，确保进度信息实时传递
     env["PYTHONUNBUFFERED"] = "1"
-    
+
     # Limit threads to prevent CPU oversubscription which causes extreme slowdowns
     # when running multiple PyTorch processes in parallel
     env["OMP_NUM_THREADS"] = "1"
@@ -427,44 +404,77 @@ def run_task(
     env["OPENBLAS_NUM_THREADS"] = "1"
     env["VECLIB_MAXIMUM_THREADS"] = "1"
     env["NUMEXPR_NUM_THREADS"] = "1"
-    
+
     color = METHOD_CONFIGS[method]["color"]
     task_id = f"{method}@{dataset_name}"
-    
-    # 从 checkpoint 路径推断实验配置目录（如果还没有设置）
-    if "EXPERIMENT_CONFIG_DIR" not in env:
-        # 根据方法类型选择对应的 checkpoint 路径
-        checkpoint_path = None
-        if method == "SAM_FT" and hasattr(args, 'sam_ft_checkpoint') and args.sam_ft_checkpoint:
-            checkpoint_path = args.sam_ft_checkpoint
-        elif method == "BNDL_AUE" and hasattr(args, 'bndl_aue_checkpoint') and args.bndl_aue_checkpoint:
-            checkpoint_path = args.bndl_aue_checkpoint
-        elif method == "BNDL" and hasattr(args, 'bndl_checkpoint') and args.bndl_checkpoint:
-            checkpoint_path = args.bndl_checkpoint
-        elif method == "UR-ERN" and hasattr(args, 'ur_ern_checkpoint') and args.ur_ern_checkpoint:
-            checkpoint_path = args.ur_ern_checkpoint
-        
-        # 尝试推断实验配置目录
-        # checkpoint 路径格式: .../sam2_bndl_aue_XXX/log/checkpoints/checkpoint.pt
-        # 实验配置目录: .../sam2_bndl_aue_XXX/sam2/sam2/ (NOT .../configs, because Hydra will append configs/...)
-        if checkpoint_path:
-            checkpoint_path_obj = Path(checkpoint_path)
-            # 检查是否是实验目录结构
-            if checkpoint_path_obj.parent.name == "checkpoints" and checkpoint_path_obj.parent.parent.name == "log":
-                experiment_root = checkpoint_path_obj.parent.parent.parent
-                # Point to sam2/sam2/ directory, NOT sam2/sam2/configs/
-                # Hydra will search for "configs/sam2.1/..." relative to this directory
-                experiment_config_dir = experiment_root / "sam2" / "sam2"
-                if experiment_config_dir.exists():
-                    env["EXPERIMENT_CONFIG_DIR"] = str(experiment_config_dir.resolve())
-                    if progress_monitor and RICH_AVAILABLE:
-                        progress_monitor.console.log(f"[{task_id}] Inferred EXPERIMENT_CONFIG_DIR: {experiment_config_dir}")
-                    else:
-                        print(f"[{task_id}] Inferred EXPERIMENT_CONFIG_DIR: {experiment_config_dir}")
-    
+
+    # 从 checkpoint 路径推断实验目录
+    # 根据方法类型选择对应的 checkpoint 路径
+    checkpoint_path = None
+    if method == "SAM_FT" and hasattr(args, "sam_ft_checkpoint") and args.sam_ft_checkpoint:
+        checkpoint_path = args.sam_ft_checkpoint
+    elif method == "BNDL_AUE" and hasattr(args, "bndl_aue_checkpoint") and args.bndl_aue_checkpoint:
+        checkpoint_path = args.bndl_aue_checkpoint
+    elif method == "BNDL" and hasattr(args, "bndl_checkpoint") and args.bndl_checkpoint:
+        checkpoint_path = args.bndl_checkpoint
+    elif method == "UR-ERN" and hasattr(args, "ur_ern_checkpoint") and args.ur_ern_checkpoint:
+        checkpoint_path = args.ur_ern_checkpoint
+
+    # 尝试推断实验目录
+    # checkpoint 路径格式: .../sam2_bndl_aue_XXX/log/checkpoints/checkpoint.pt
+    # 实验目录结构:
+    #   .../sam2_bndl_aue_XXX/sam2/sam2/  - Hydra 配置目录
+    #   .../sam2_bndl_aue_XXX/src/        - 源代码副本 (sam2/, BNDL/)
+    if checkpoint_path:
+        checkpoint_path_obj = Path(checkpoint_path)
+        # 检查是否是实验目录结构
+        if checkpoint_path_obj.parent.name == "checkpoints" and checkpoint_path_obj.parent.parent.name == "log":
+            experiment_root = checkpoint_path_obj.parent.parent.parent
+
+            # 1. 设置 Hydra 配置目录
+            # Point to sam2/sam2/ directory, NOT sam2/sam2/configs/
+            # Hydra will search for "configs/sam2.1/..." relative to this directory
+            experiment_config_dir = experiment_root / "sam2" / "sam2"
+            if experiment_config_dir.exists():
+                env["EXPERIMENT_CONFIG_DIR"] = str(experiment_config_dir.resolve())
+                if progress_monitor and RICH_AVAILABLE:
+                    progress_monitor.console.log(f"[{task_id}] Inferred EXPERIMENT_CONFIG_DIR: {experiment_config_dir}")
+                else:
+                    print(f"[{task_id}] Inferred EXPERIMENT_CONFIG_DIR: {experiment_config_dir}")
+
+            # 2. 设置 PYTHONPATH 使用实验目录中的源代码
+            # 实验目录结构: src/sam2/ (sam2 仓库), src/BNDL/ (BNDL 仓库)
+            # Python 包路径: src/sam2/ (包含 sam2/ 子目录作为包)
+            experiment_src_dir = experiment_root / "src"
+            experiment_sam2_dir = experiment_src_dir / "sam2"  # sam2 仓库根目录
+            if experiment_sam2_dir.exists():
+                # 构建 PYTHONPATH: sam2仓库根目录 + src目录 (用于 BNDL)
+                pythonpath_parts = [
+                    str(experiment_sam2_dir.resolve()),  # sam2 包所在目录
+                    str(experiment_src_dir.resolve()),  # BNDL 等其他包
+                ]
+                existing_pythonpath = env.get("PYTHONPATH", "")
+                if existing_pythonpath:
+                    pythonpath_parts.append(existing_pythonpath)
+                env["PYTHONPATH"] = os.pathsep.join(pythonpath_parts)
+                if progress_monitor and RICH_AVAILABLE:
+                    progress_monitor.console.log(f"[{task_id}] Using experiment source code: {experiment_sam2_dir}")
+                else:
+                    print(f"[{task_id}] Using experiment source code: {experiment_sam2_dir}")
+
+    # 🧪 EXPERIMENTAL: Set config/checkpoint env vars for per-video model reinitialization
+    # This allows zero_shot_multi_dataset_sam_bndl.py to rebuild the predictor for each video
+    if method == "BNDL_AUE":
+        if hasattr(args, "bndl_aue_cfg") and args.bndl_aue_cfg:
+            env["BNDL_AUE_CFG"] = args.bndl_aue_cfg
+        if hasattr(args, "bndl_aue_checkpoint") and args.bndl_aue_checkpoint:
+            env["BNDL_AUE_CKPT"] = args.bndl_aue_checkpoint
+        if progress_monitor and RICH_AVAILABLE:
+            progress_monitor.console.log(f"[{task_id}] Set BNDL_AUE config env vars for per-video model reload")
+
     # 日志文件
     log_file = output_dir / f"{dataset_name.lower()}_{method.lower()}_run.log"
-    
+
     # 使用 Rich Console 避免破坏进度条显示
     # Rich Console.log() 会在进度条上方正确输出，不会错位
     if progress_monitor and RICH_AVAILABLE:
@@ -474,19 +484,19 @@ def run_task(
         print(f"\n{color}{'=' * 80}{RESET_COLOR}")
         print(f"{color}[{task_id}] Starting on GPU {gpu_id}{RESET_COLOR}")
         print(f"{color}{'=' * 80}{RESET_COLOR}")
-    
+
     # 正则表达式匹配进度信息: "Progress: 5/28 (17.9%)"
-    progress_pattern = re.compile(r'Progress:\s*(\d+)/(\d+)\s*\([\d.]+%\)')
-    total_videos_pattern = re.compile(r'inference on (\d+) videos')
-    
+    progress_pattern = re.compile(r"Progress:\s*(\d+)/(\d+)\s*\([\d.]+%\)")
+    total_videos_pattern = re.compile(r"inference on (\d+) videos")
+
     # 运行
     start_time = time.time()
     retry_count = 0
     returncode = 0
-    
+
     # 获取项目根目录（确保工作目录正确，这样 Hydra 才能正确解析相对路径）
     project_root = Path(__file__).parent.parent.parent
-    
+
     while True:
         total_videos = 0
         task_started = False
@@ -505,16 +515,16 @@ def run_task(
                     errors="replace",  # 防止编码错误导致崩溃
                     cwd=str(project_root),  # 设置工作目录为项目根目录，确保 Hydra 能正确解析配置路径
                 )
-                
+
                 # 实时读取并显示输出
                 try:
                     for line in process.stdout:
                         # 写入日志文件
                         f.write(line)
                         f.flush()
-                        
+
                         line_stripped = line.strip()
-                        
+
                         # 尝试提取总视频数（用于初始化进度条）
                         if not task_started and progress_monitor:
                             total_match = total_videos_pattern.search(line_stripped)
@@ -534,7 +544,7 @@ def run_task(
                                         task_started = True
                                         # 立即更新一次当前进度
                                         progress_monitor.update_task_progress(dataset_name, method, current_early, total_videos)
-                        
+
                         # 尝试解析进度更新
                         if progress_monitor and task_started:
                             progress_match = progress_pattern.search(line_stripped)
@@ -542,28 +552,30 @@ def run_task(
                                 current = int(progress_match.group(1))
                                 total = int(progress_match.group(2))
                                 progress_monitor.update_task_progress(dataset_name, method, current, total)
-                        
+
                         # 实时显示关键进度（只在无progress_monitor时，否则进度条已显示）
-                        if not progress_monitor and line_stripped and any(keyword in line_stripped for keyword in [
-                            'Processing', 'Evaluating', 'video', 'Progress', 
-                            'Completed', 'Dataset', 'Inference', '✓', '✗', '⚠️'
-                        ]):
+                        if (
+                            not progress_monitor
+                            and line_stripped
+                            and any(keyword in line_stripped for keyword in ["Processing", "Evaluating", "video", "Progress", "Completed", "Dataset", "Inference", "✓", "✗", "⚠️"])
+                        ):
                             print(f"{color}[{task_id}] {line_stripped}{RESET_COLOR}")
                 except (BrokenPipeError, OSError):
                     # stdout被关闭（进程可能被kill），但继续等待进程退出
                     f.write("\n⚠️  Warning: stdout was closed unexpectedly (process may have been killed)\n")
                     f.flush()
-                
+
                 # 确保所有输出都已读取完毕，并等待进程完全退出
                 # 注意：for line in process.stdout 循环结束时，stdout 已关闭，
                 # 但进程可能还在运行（特别是如果它还在写 stderr 或其他操作）
                 # 必须调用 wait() 确保进程完全退出后才能获取正确的返回码
                 returncode = process.wait()
-                
+
                 # 记录退出代码和可能的信号信息
                 f.write(f"\nProcess finished with return code {returncode}\n")
                 if returncode < 0:
                     import signal
+
                     sig = -returncode
                     try:
                         sig_name = signal.Signals(sig).name
@@ -575,21 +587,21 @@ def run_task(
                     except (ValueError, AttributeError):
                         f.write(f"Process was killed by unknown signal: {sig}\n")
                 f.flush()
-            
+
             # 检查是否成功
             if returncode == 0:
                 break
-            
+
             # 检查是否是 OOM
             is_oom = False
             try:
                 with open(log_file) as f:
                     log_content = f.read()
-                    if 'CUDA out of memory' in log_content or 'OutOfMemoryError' in log_content:
+                    if "CUDA out of memory" in log_content or "OutOfMemoryError" in log_content:
                         is_oom = True
             except:
                 pass
-            
+
             if is_oom:
                 retry_count += 1
                 msg = f"⚠️  [{task_id}] CUDA OOM detected on GPU {gpu_id}. Retrying ({retry_count})..."
@@ -597,16 +609,17 @@ def run_task(
                     progress_monitor.console.log(f"[yellow]{msg}[/yellow]")
                 else:
                     print(f"{color}{msg}{RESET_COLOR}")
-                
+
                 # 等待一会儿再重试
                 import gc
+
                 gc.collect()
                 time.sleep(5)
                 continue
-            
+
             # 非OOM的失败，直接退出
             break
-            
+
         except Exception as e:
             # 确保进程被终止
             if process and process.poll() is None:
@@ -615,22 +628,22 @@ def run_task(
                     process.wait(timeout=5)
                 except:
                     process.kill()
-                    
+
             # 异常信息使用 Rich Console 或传统输出
             if progress_monitor and RICH_AVAILABLE:
                 progress_monitor.console.log(f"[red]✗ [{task_id}] Exception: {e}[/red]")
             else:
                 print(f"{color}[{task_id}] ✗ Exception: {e}{RESET_COLOR}")
-            
+
             returncode = -1
             break
-    
+
     elapsed = time.time() - start_time
-    
+
     # 完成任务
     if progress_monitor:
         progress_monitor.complete_task(gpu_id, dataset_name, method, returncode == 0)
-    
+
     # 使用 Rich Console 或传统输出
     if returncode == 0:
         if progress_monitor and RICH_AVAILABLE:
@@ -643,11 +656,11 @@ def run_task(
             progress_monitor.console.log(f"[red]✗ [{task_id}] Failed (code {returncode}) on GPU {gpu_id}[/red]")
         else:
             print(f"{color}[{task_id}] ✗ Failed (code {returncode}) on GPU {gpu_id}{RESET_COLOR}")
-            
+
         # 检查OOM错误
         with open(log_file) as f:
             log_content = f.read()
-            if 'CUDA out of memory' in log_content or 'OutOfMemoryError' in log_content:
+            if "CUDA out of memory" in log_content or "OutOfMemoryError" in log_content:
                 if progress_monitor and RICH_AVAILABLE:
                     progress_monitor.console.log(f"[yellow]⚠️  [{task_id}] CUDA OOM detected (Final)[/yellow]")
                 else:
@@ -658,18 +671,18 @@ def run_task(
 
 def check_task_completed(output_dir: Path, method: str, dataset: str) -> tuple[bool, str]:
     """智能检测任务是否真正完成
-    
+
     检查标准：
     1. detailed_results.json 文件存在
     2. JSON 中包含对应方法的结果键
     3. JSON 中包含对应数据集的数据
     4. 数据有效（J&F > 0）
-    
+
     Args:
         output_dir: 任务输出目录
         method: 方法名称
         dataset: 数据集名称
-    
+
     Returns:
         (is_completed, reason): 是否完成和原因说明
     """
@@ -677,42 +690,42 @@ def check_task_completed(output_dir: Path, method: str, dataset: str) -> tuple[b
     json_files = list(output_dir.glob("**/detailed_results.json"))
     if not json_files:
         return False, "结果文件不存在"
-    
+
     try:
         with open(json_files[0]) as f:
             data = json.load(f)
-        
+
         # 检查方法对应的结果键是否存在
         result_key = METHOD_RESULT_KEYS.get(method)
         if not result_key:
             return False, f"未知方法: {method}"
-        
+
         if result_key not in data:
             return False, f"结果中缺少 {result_key}"
-        
+
         method_results = data[result_key]
-        
+
         # 检查数据集是否存在且有效
         if dataset not in method_results:
             return False, f"结果中缺少数据集 {dataset}"
-        
+
         dataset_metrics = method_results[dataset]
         if not isinstance(dataset_metrics, dict):
             return False, "数据格式错误"
-        
+
         # 检查 J&F 值是否有效（> 0）
         jf_value = dataset_metrics.get("jf", 0)
         if not isinstance(jf_value, (int, float)):
             return False, "J&F 值类型错误"
-        
+
         if jf_value <= 0:
             return False, f"J&F={jf_value:.2f} 无效"
-        
+
         # 所有检查通过 - 显示结果
         j_value = dataset_metrics.get("j", 0)
         f_value = dataset_metrics.get("f", 0)
         return True, f"J&F={jf_value:.2f}, J={j_value:.2f}, F={f_value:.2f}"
-        
+
     except Exception as e:
         # 任何解析错误都视为未完成
         return False, f"解析错误: {str(e)[:30]}"
@@ -723,11 +736,11 @@ def generate_all_tasks(
     methods: list[str],
 ) -> list[tuple[str, str]]:
     """生成所有(数据集, 方法)任务组合
-    
+
     Args:
         datasets: 数据集列表
         methods: 方法列表
-    
+
     Returns:
         任务列表 [(dataset, method), ...]
     """
@@ -747,13 +760,13 @@ def schedule_tasks_on_gpus(
     reuse_cached: bool = False,
 ) -> tuple[dict, float]:
     """智能调度任务到GPU池（动态任务队列策略）
-    
+
     调度策略：
     - 创建共享任务队列，包含所有待执行任务
     - 每个GPU一个专用Worker线程
     - Worker从队列中动态获取任务，完成后立即取下一个
     - 优势：避免静态分配导致的GPU空闲，最大化利用率
-    
+
     Args:
         tasks: 所有任务列表
         gpu_ids: 可用GPU ID列表
@@ -761,7 +774,7 @@ def schedule_tasks_on_gpus(
         args: 命令行参数
         method_versions: 方法版本映射
         reuse_cached: 是否复用缓存结果
-    
+
     Returns:
         (结果字典, 实际执行时间)
         - 结果字典: {(dataset, method): (returncode, elapsed, output_dir)}
@@ -774,28 +787,28 @@ def schedule_tasks_on_gpus(
     print(f"可用GPU: {len(gpu_ids)} ({gpu_ids})")
     print(f"并发度: {min(len(tasks), len(gpu_ids))}")
     print("=" * 80 + "\n")
-    
+
     # 智能检查并跳过已完成的任务
     tasks_to_run = []
     skipped_tasks = []
-    
+
     if reuse_cached:
         print("\n" + "=" * 80)
         print("🔍 智能任务续跑检测（自动跳过已完成任务）")
         print("=" * 80)
-        
+
         for task in tasks:
             dataset, method = task
             version = method_versions[method]
             method_dir = output_base / f"{method}_{version}"
             output_dir = method_dir / dataset
-            
+
             # 智能检查任务是否真正完成（版本已包含在路径中）
             is_completed, reason = check_task_completed(output_dir, method, dataset)
-            
+
             # 显示方法版本信息
             method_with_ver = f"{method}_{version}"
-            
+
             if is_completed:
                 print(f"   ✓ 跳过: {method_with_ver:18s} @ {dataset:15s} - {reason}")
                 skipped_tasks.append(task)
@@ -803,7 +816,7 @@ def schedule_tasks_on_gpus(
                 if reason:
                     print(f"   ⚙️  待运行: {method_with_ver:18s} @ {dataset:15s} - {reason}")
                 tasks_to_run.append(task)
-        
+
         print("=" * 80)
         print(f"📊 检测结果: 已完成 {len(skipped_tasks)}/{len(tasks)}, 待运行 {len(tasks_to_run)}/{len(tasks)}")
         if len(tasks_to_run) == 0:
@@ -811,7 +824,7 @@ def schedule_tasks_on_gpus(
         print("=" * 80 + "\n")
     else:
         tasks_to_run = tasks
-    
+
     # 如果所有任务都已完成，直接返回
     if len(tasks_to_run) == 0:
         print("所有任务都已完成，直接使用缓存结果。\n")
@@ -827,7 +840,7 @@ def schedule_tasks_on_gpus(
                 "cached": True,
             }
         return results, 0.0
-    
+
     # 显示初始状态
     if RICH_AVAILABLE:
         console = Console()
@@ -842,19 +855,19 @@ def schedule_tasks_on_gpus(
     else:
         print(f"\n待运行: {len(tasks_to_run)} 任务")
         print(f"已缓存: {len(skipped_tasks)} 任务\n")
-    
+
     # ✅ 动态任务队列：GPU完成一个任务后立即取下一个，最大化利用率
     # 创建共享任务队列
     task_queue = Queue()
     for task in tasks_to_run:
         task_queue.put(task)
-    
+
     print("动态任务调度模式:")
     print(f"  共享任务队列: {len(tasks_to_run)} 个任务")
     print(f"  可用GPU: {len(gpu_ids)} 个")
     print("  调度策略: 动态分配（GPU空闲时自动取下一个任务）")
     print()
-    
+
     # 使用每GPU一个专用Worker（线程），动态从共享队列获取任务
     results = {}
     results_lock = Lock()
@@ -865,22 +878,21 @@ def schedule_tasks_on_gpus(
     def gpu_worker(gpu_id: int, task_queue: Queue, monitor):
         """GPU worker: 持续从队列中取任务执行，直到队列为空"""
         from queue import Empty
+
         local_results = []
         while True:
             try:
                 task = task_queue.get_nowait()
             except Empty:
                 break
-            
+
             try:
                 # 统一使用 run_task，传递 monitor 参数
-                dataset, method, returncode, elapsed, output_dir = run_task(
-                    task, gpu_id, output_base, args, method_versions, monitor
-                )
+                dataset, method, returncode, elapsed, output_dir = run_task(task, gpu_id, output_base, args, method_versions, monitor)
                 local_results.append((task, returncode, elapsed, output_dir))
             finally:
                 task_queue.task_done()
-        
+
         return local_results
 
     if tasks_to_run:
@@ -892,14 +904,12 @@ def schedule_tasks_on_gpus(
             context_manager = progress_monitor.progress
         else:
             from contextlib import nullcontext
+
             context_manager = nullcontext()
-        
+
         with context_manager, ThreadPoolExecutor(max_workers=max_workers) as executor:
             # 提交所有GPU workers
-            future_to_gpu = {
-                executor.submit(gpu_worker, gpu_id, task_queue, progress_monitor): gpu_id
-                for gpu_id in gpu_ids
-            }
+            future_to_gpu = {executor.submit(gpu_worker, gpu_id, task_queue, progress_monitor): gpu_id for gpu_id in gpu_ids}
 
             # 收集结果
             completed = 0
@@ -917,9 +927,9 @@ def schedule_tasks_on_gpus(
                         if not progress_monitor:
                             progress_pct = completed / total_tasks * 100
                             print(f"进度: {completed}/{total_tasks} ({progress_pct:.1f}%)")
-    
+
     total_time = time.time() - start_time
-    
+
     # 显示完成信息
     if RICH_AVAILABLE:
         console = Console()
@@ -929,7 +939,7 @@ def schedule_tasks_on_gpus(
         print(f"\n{'=' * 80}")
         print(f"✓ 所有任务完成！总时间: {total_time:.1f}s")
         print(f"{'=' * 80}\n")
-    
+
     # 添加跳过的任务到结果
     for task in skipped_tasks:
         dataset, method = task
@@ -941,19 +951,19 @@ def schedule_tasks_on_gpus(
             "output_dir": output_dir,
             "cached": True,
         }
-    
+
     return results, total_time
 
 
 def parse_results_from_output(output_dir: Path, method: str, dataset: str, json_cache: dict = None) -> dict:
     """从输出目录解析结果（支持缓存）
-    
+
     Args:
         output_dir: 输出目录
         method: 方法名称
         dataset: 数据集名称
         json_cache: JSON数据缓存字典（避免重复读取）
-    
+
     Returns:
         结果字典 {dataset: {J&F, J, F}}
     """
@@ -961,9 +971,9 @@ def parse_results_from_output(output_dir: Path, method: str, dataset: str, json_
     if not json_files:
         # 不打印警告，避免刷屏（在merge阶段批量打印）
         return {}
-    
+
     json_path = json_files[0]
-    
+
     # 使用缓存避免重复读取
     if json_cache is not None and json_path in json_cache:
         data = json_cache[json_path]
@@ -972,13 +982,13 @@ def parse_results_from_output(output_dir: Path, method: str, dataset: str, json_
             data = json.load(f)
         if json_cache is not None:
             json_cache[json_path] = data
-    
+
     json_key = METHOD_RESULT_KEYS.get(method)
     if not json_key or json_key not in data:
         return {}
-    
+
     method_data = data[json_key]
-    
+
     # 提取当前数据集的结果
     if dataset in method_data and isinstance(method_data[dataset], dict):
         metrics = method_data[dataset]
@@ -989,7 +999,7 @@ def parse_results_from_output(output_dir: Path, method: str, dataset: str, json_
                 "F": metrics.get("f", 0),
             }
         }
-    
+
     return {}
 
 
@@ -998,9 +1008,9 @@ def parse_statistics_from_output(output_dir: Path, method: str, json_cache: dict
     json_files = list(output_dir.glob("**/detailed_results.json"))
     if not json_files:
         return {}
-    
+
     json_path = json_files[0]
-    
+
     # 使用缓存避免重复读取
     if json_cache is not None and json_path in json_cache:
         data = json_cache[json_path]
@@ -1009,7 +1019,7 @@ def parse_statistics_from_output(output_dir: Path, method: str, json_cache: dict
             data = json.load(f)
         if json_cache is not None:
             json_cache[json_path] = data
-    
+
     stats_key = METHOD_STATS_KEYS.get(method)
     return data.get(stats_key, {}) if stats_key else {}
 
@@ -1020,12 +1030,12 @@ def merge_results_by_method(
     method_versions: dict[str, str],
 ) -> tuple[dict[str, dict], dict[str, dict], dict[str, float]]:
     """合并所有任务结果，按方法组织（带缓存和进度提示）
-    
+
     Args:
         task_results: 任务结果字典
         output_base: 输出基础路径
         method_versions: 方法版本映射
-    
+
     Returns:
         (all_results, all_statistics, times)
         - all_results: {method: {dataset: {J&F, J, F}}}
@@ -1035,23 +1045,23 @@ def merge_results_by_method(
     print("\n" + "=" * 80)
     print("📊 阶段 1/3: 合并任务结果...")
     print("=" * 80)
-    
+
     all_results = {method: {} for method in ALL_METHODS}
     all_statistics = {method: {} for method in ALL_METHODS}
     times = {}
-    
+
     # 创建JSON缓存，避免重复读取同一个文件
     json_cache = {}
-    
+
     total_tasks = len(task_results)
-    
+
     for completed_tasks, ((dataset, method), result) in enumerate(task_results.items(), 1):
         output_dir = result["output_dir"]
         returncode = result["returncode"]
         elapsed = result["elapsed"]
-        
+
         times[(dataset, method)] = elapsed
-        
+
         if returncode == 0:
             # 解析结果（使用缓存）
             method_results = parse_results_from_output(output_dir, method, dataset, json_cache)
@@ -1059,15 +1069,15 @@ def merge_results_by_method(
                 all_results[method].update(method_results)
             else:
                 print(f"  ⚠️  [{method}@{dataset}] 无法解析结果")
-            
+
             # 解析统计数据（使用缓存）
             method_statistics = parse_statistics_from_output(output_dir, method, json_cache)
             if method_statistics and dataset in method_statistics:
                 all_statistics[method][dataset] = method_statistics[dataset]
-        
+
         if completed_tasks % 5 == 0 or completed_tasks == total_tasks:
             print(f"  进度: {completed_tasks}/{total_tasks} ({completed_tasks / total_tasks * 100:.1f}%)")
-    
+
     print(f"✓ 结果合并完成！共缓存 {len(json_cache)} 个JSON文件")
     return all_results, all_statistics, times
 
@@ -1083,7 +1093,7 @@ def create_comprehensive_summary(
     method_versions: dict[str, str] = None,
 ):
     """创建综合汇总报告
-    
+
     Args:
         all_results: 所有方法的结果
         times: 每个任务的运行时间
@@ -1101,7 +1111,7 @@ def create_comprehensive_summary(
     if method_versions:
         print("方法版本: " + ", ".join([f"{m}_{method_versions[m]}" for m in methods if m in method_versions]))
     print("=" * 80 + "\n")
-    
+
     # 创建DataFrame（列名包含版本信息）
     data = []
     for dataset in datasets:
@@ -1112,7 +1122,7 @@ def create_comprehensive_summary(
                 col_prefix = f"{method}_{method_versions[method]}"
             else:
                 col_prefix = method
-            
+
             if method in all_results and dataset in all_results[method]:
                 metrics = all_results[method][dataset]
                 row[f"{col_prefix}_J&F"] = f"{metrics['J&F']:.2f}"
@@ -1123,7 +1133,7 @@ def create_comprehensive_summary(
                 row[f"{col_prefix}_J"] = "N/A"
                 row[f"{col_prefix}_F"] = "N/A"
         data.append(row)
-    
+
     # 添加时间统计行
     time_row = {"Dataset": "Avg Time (s)"}
     for method in methods:
@@ -1132,7 +1142,7 @@ def create_comprehensive_summary(
             col_prefix = f"{method}_{method_versions[method]}"
         else:
             col_prefix = method
-        
+
         method_times = [times.get((d, method), 0) for d in datasets]
         valid_times = [t for t in method_times if t > 0]
         if valid_times:
@@ -1145,14 +1155,14 @@ def create_comprehensive_summary(
             time_row[f"{col_prefix}_J"] = "-"
             time_row[f"{col_prefix}_F"] = "-"
     data.append(time_row)
-    
+
     df = pd.DataFrame(data)
-    
+
     # 保存CSV（包含版本信息）
     csv_file = output_path / "parallel_results_summary.csv"
-    
+
     # 添加版本信息作为注释
-    with open(csv_file, 'w') as f:
+    with open(csv_file, "w") as f:
         if method_versions:
             f.write("# Method Versions:\n")
             for method in methods:
@@ -1161,37 +1171,35 @@ def create_comprehensive_summary(
             f.write("#\n")
         # 写入DataFrame
         df.to_csv(f, index=False)
-    
+
     # 打印表格
     print(df.to_string(index=False))
     print(f"\n✓ Results saved to: {csv_file}")
-    
+
     # 打印时间统计
     print("\n" + "=" * 80)
     print("任务执行时间统计")
     print("=" * 80)
-    
+
     # 按方法统计
     print("\n按方法统计:")
     for method in methods:
         method_times = [times.get((d, method), 0) for d in datasets if times.get((d, method), 0) > 0]
         if method_times:
-            print(f"  {method:12s}: 平均 {sum(method_times) / len(method_times):.1f}s, "
-                  f"最小 {min(method_times):.1f}s, 最大 {max(method_times):.1f}s")
-    
+            print(f"  {method:12s}: 平均 {sum(method_times) / len(method_times):.1f}s, 最小 {min(method_times):.1f}s, 最大 {max(method_times):.1f}s")
+
     # 按数据集统计
     print("\n按数据集统计:")
     for dataset in datasets:
         dataset_times = [times.get((dataset, m), 0) for m in methods if times.get((dataset, m), 0) > 0]
         if dataset_times:
-            print(f"  {dataset:12s}: 平均 {sum(dataset_times) / len(dataset_times):.1f}s, "
-                  f"总计 {sum(dataset_times):.1f}s")
-    
+            print(f"  {dataset:12s}: 平均 {sum(dataset_times) / len(dataset_times):.1f}s, 总计 {sum(dataset_times):.1f}s")
+
     # 总体统计
     all_times = [t for t in times.values() if t > 0]
     if all_times:
         total_sequential = sum(all_times)
-        
+
         # 使用实际的墙上时间，如果未提供则使用理论最大值（每个GPU队列的最大时间）
         if actual_parallel_time is not None and actual_parallel_time > 0:
             total_parallel = actual_parallel_time
@@ -1206,9 +1214,9 @@ def create_comprehensive_summary(
                     gpu_times[gpu_id] = 0
                 gpu_times[gpu_id] += elapsed
             total_parallel = max(gpu_times.values()) if gpu_times else max(all_times)
-        
+
         speedup = total_sequential / total_parallel if total_parallel > 0 else 1
-        
+
         print("\n总体统计:")
         print(f"  顺序执行（预估）: {total_sequential:.1f}s ({total_sequential / 60:.1f}min)")
         print(f"  并行执行（实际）: {total_parallel:.1f}s ({total_parallel / 60:.1f}min)")
@@ -1226,7 +1234,7 @@ def merge_detailed_results(
     method_versions: dict[str, str] = None,
 ):
     """合并所有详细结果并生成可视化
-    
+
     Args:
         all_results: 所有方法的结果
         all_statistics: 所有统计数据
@@ -1238,34 +1246,31 @@ def merge_detailed_results(
     print("\n" + "=" * 80)
     print("🎨 阶段 3/3: 生成可视化...")
     print("=" * 80)
-    
+
     if skip_plots:
         print("⏭️  跳过可视化生成（--skip_plots 已启用）")
         print("   提示: 如需生成图表，可稍后运行 zs.py --plot_only")
         return
-    
+
     # 转换结果格式为zs.py期望的格式
     print("  • 转换结果格式...")
-    
+
     def convert_results(method: str) -> dict:
         if method not in all_results:
             return {}
-        return {
-            dataset: (metrics["J&F"], metrics["J"], metrics["F"]) 
-            for dataset, metrics in all_results[method].items()
-        }
-    
+        return {dataset: (metrics["J&F"], metrics["J"], metrics["F"]) for dataset, metrics in all_results[method].items()}
+
     sam_results = convert_results("SAM")
     uctta_results = convert_results("UCTTA")
     bndl_aue_results = convert_results("BNDL_AUE")
     bndl_results = convert_results("BNDL")
     ur_ern_results = convert_results("UR-ERN")
-    
+
     # 获取统计数据
     uctta_statistics = all_statistics.get("UCTTA", {})
     bndl_aue_statistics = all_statistics.get("BNDL_AUE", {})
     bndl_statistics = all_statistics.get("BNDL", {})
-    
+
     # 生成可视化（带详细进度）
     plot_count = 0
     total_plots = 0
@@ -1273,12 +1278,15 @@ def merge_detailed_results(
         total_plots += 1
     if bndl_aue_statistics and bndl_aue_results and sam_results:
         total_plots += 1
-    
+
     if sam_results and bndl_aue_results:
         try:
             plot_count += 1
             print(f"\n  [{plot_count}/{total_plots}] 生成综合对比图...")
             print("    正在绘制多方法性能对比（可能需要30-60秒）...")
+            # Lazy import to avoid loading sam2 at module import time
+            from zs import create_comprehensive_comparison_plots
+
             # 从method_versions获取AUE版本号用于文件名后缀
             aue_version_suffix = None
             if method_versions and "BNDL_AUE" in method_versions:
@@ -1296,27 +1304,25 @@ def merge_detailed_results(
             print("    ✓ 综合对比图已生成")
         except Exception as e:
             print(f"    ⚠️  警告: 无法生成综合对比图: {e}")
-    
+
     # 生成UA shift分析
     if bndl_aue_statistics and bndl_aue_results and sam_results:
         try:
             plot_count += 1
             print(f"\n  [{plot_count}/{total_plots}] 生成UA shift分析图...")
             print("    正在分析不确定性和准确度关系（可能需要30-60秒）...")
-            
+
             # 智能选择源域
             available_datasets = list(bndl_aue_results.keys())
-            source_domain = "MOSE_train" if "MOSE_train" in available_datasets else (
-                available_datasets[0] if available_datasets else "MOSE_train"
-            )
-            
+            source_domain = "MOSE_train" if "MOSE_train" in available_datasets else (available_datasets[0] if available_datasets else "MOSE_train")
+
             # 构建root路径映射
             sam2_root = None
             bndl_aue_root = None
             uctta_root = None
             ur_ern_root = None
             bndl_root = None
-            
+
             for key, output_dir in method_to_output.items():
                 # 提取方法名（兼容两种键类型）
                 method = key[1] if isinstance(key, tuple) else key if isinstance(key, str) else None
@@ -1333,12 +1339,15 @@ def merge_detailed_results(
                     ur_ern_root = output_dir / "sam2_ur_ern_results"
                 elif method == "BNDL":
                     bndl_root = output_dir / "bndl_results"
-            
+
             # 获取AUE版本号
             aue_version_suffix = None
             if method_versions and "BNDL_AUE" in method_versions:
                 aue_version_suffix = method_versions["BNDL_AUE"]
-            
+
+            # Lazy import to avoid loading sam2 at module import time
+            from zs import create_ua_shift_analysis_plots
+
             create_ua_shift_analysis_plots(
                 bndl_statistics=bndl_aue_statistics,
                 sam2_results=sam_results,
@@ -1361,17 +1370,16 @@ def merge_detailed_results(
         except Exception as e:
             print(f"    ⚠️  警告: 无法生成UA shift分析: {e}")
             import traceback
+
             traceback.print_exc()
-    
+
     if total_plots > 0:
         print(f"\n✓ 所有可视化完成！共生成 {total_plots} 组图表")
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="智能GPU任务调度器 - 动态并行评估(数据集, 方法)组合"
-    )
-    
+    parser = argparse.ArgumentParser(description="智能GPU任务调度器 - 动态并行评估(数据集, 方法)组合")
+
     # Dataset selection
     parser.add_argument(
         "--datasets",
@@ -1380,7 +1388,7 @@ def main():
         choices=list(DATASET_CONFIGS.keys()),
         help="要评估的数据集列表",
     )
-    
+
     # Method selection
     parser.add_argument(
         "--methods",
@@ -1389,7 +1397,7 @@ def main():
         choices=ALL_METHODS,
         help="要运行的方法列表（默认：所有方法）",
     )
-    
+
     # GPU配置
     parser.add_argument(
         "--gpu_ids",
@@ -1398,29 +1406,29 @@ def main():
         default=[0, 1, 2, 3, 4, 5, 6, 7],
         help="可用GPU ID列表（默认：0-7）",
     )
-    
+
     # SAM-2配置
     # 注意：Hydra 的搜索路径是 pkg://sam2，指向 sam2/sam2/ 目录
     # 所以配置路径应该是相对于 sam2/sam2/ 的，即 configs/sam2.1/...
     parser.add_argument("--sam2_cfg", default="configs/sam2.1/sam2.1_hiera_b+.yaml")
     parser.add_argument("--sam2_checkpoint", default="/home/hongyou/dev/ada_samp/sam2/checkpoints/sam2.1_hiera_base_plus.pt")
-    
+
     # SAM_FT配置 (fine-tuned SAM)
     parser.add_argument("--sam_ft_cfg", default=None, help="SAM FT config (defaults to sam2_cfg if not specified)")
     parser.add_argument("--sam_ft_checkpoint", default=None, help="SAM FT checkpoint path")
-    
+
     # BNDL+AUE配置
     parser.add_argument("--bndl_aue_cfg", default="configs/sam2.1/sam2.1_hiera_b+_bndl_aue.yaml")
     parser.add_argument("--bndl_aue_checkpoint", default="/home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_aue_017_12/checkpoints/checkpoint_4.pt")
-    
+
     # BNDL (pure)配置
     parser.add_argument("--bndl_cfg", default="configs/sam2.1/sam2.1_hiera_b+_bndl.yaml")
     parser.add_argument("--bndl_checkpoint", default="/home/hongyou/dev/ada_samp/logs/sam2/sam2_bndl_013_01/checkpoints/checkpoint.pt")
-    
+
     # UR-ERN配置
     parser.add_argument("--ur_ern_cfg", default="configs/sam2.1/sam2.1_hiera_b+_ur_ern.yaml")
     parser.add_argument("--ur_ern_checkpoint", default="/home/hongyou/dev/ada_samp/logs/sam2/sam2_ur_ern_001_01/checkpoints/checkpoint.pt")
-    
+
     # 评估参数
     parser.add_argument("--score_thresh", type=float, default=0.0)
     parser.add_argument("--click_protocol", default="3click", choices=["1click", "3click", "5click"])
@@ -1429,27 +1437,29 @@ def main():
     parser.add_argument("--first_frame_only", action="store_true", help="只评估第一帧（快速模式）")
     parser.add_argument("--video_limit", type=int, default=1000)
     parser.add_argument("--num_workers", type=int, default=2)
-    
+
     # UCTTA参数
     parser.add_argument("--uctta_steps", type=int, default=2)
     parser.add_argument("--uctta_lr", type=float, default=3e-4)
     parser.add_argument("--uctta_enable_bn", action="store_true", default=True)
     parser.add_argument("--uctta_fisher_reg", action="store_true", default=True)
-    
-    # BNDL参数
-    parser.add_argument("--collect_bndl_stats", action="store_true", default=True)
-    
-    # 降采样参数
+
+    # BNDL参数 - 默认禁用统计收集以加速评估，需要时手动启用
+    parser.add_argument("--collect_bndl_stats", action="store_true", default=False, help="启用BNDL统计收集（PAvPU等）。默认禁用以加速评估。")
+
+    # 可视化输出（SAM 和 BNDL_AUE 均支持）
     parser.add_argument(
-        "--downsample_max_samples",
-        type=int,
-        default=1000000,
-        help="PAvPU样本降采样的最大数量（默认: 1000000）。增大可保留更多数据点，减小可加速checkpoint合并"
+        "--save_vis", action="store_true", default=False, help="启用可视化输出。SAM输出原图+预测mask+prompts；BNDL_AUE额外输出不确定性热力图等。格式一致便于论文对比。默认禁用以加速评估。"
     )
-    
+
+    # 降采样参数
+    parser.add_argument("--downsample_max_samples", type=int, default=1000000, help="PAvPU样本降采样的最大数量（默认: 1000000）。增大可保留更多数据点，减小可加速checkpoint合并")
+
+    # Paper figure generation options
+    parser.add_argument("--max_vis_per_video", type=int, default=2, help="每个视频最多保存的可视化数量（默认: 2，用于论文可设置更大值如10-50）")
     # 输出
     parser.add_argument("--output_path", type=Path, default=Path("./outputs/parallel_smart"))
-    
+
     # 版本号配置
     parser.add_argument("--sam_version", type=str, default="001_01")
     parser.add_argument("--sam_ft_version", type=str, default="017_sam_ft", help="SAM FT version string")
@@ -1457,35 +1467,28 @@ def main():
     parser.add_argument("--bndl_aue_version", type=str, default="017_bndl_lora")
     parser.add_argument("--bndl_version", type=str, default="013_01")
     parser.add_argument("--ur_ern_version", type=str, default="001_01")
-    
+
     # 智能续跑功能
-    parser.add_argument(
-        "--reuse_cached", 
-        action="store_true", 
-        default=False,
-        help="智能续跑模式：自动检测并跳过已完成的(方法,数据集)组合，中途中断后可续跑"
-    )
-    
+    parser.add_argument("--reuse_cached", action="store_true", default=False, help="智能续跑模式：自动检测并跳过已完成的(方法,数据集)组合，中途中断后可续跑")
+
     # 可视化控制
-    parser.add_argument(
-        "--skip_plots",
-        action="store_true",
-        default=False,
-        help="跳过可视化生成（加快完成速度）。可稍后运行 zs.py --plot_only 单独生成图表"
-    )
-    
+    parser.add_argument("--skip_plots", action="store_true", default=False, help="跳过可视化生成（加快完成速度）。可稍后运行 zs.py --plot_only 单独生成图表")
+
+    # Optimization
+    parser.add_argument("--no_save_masks", action="store_true", default=False, help="禁用保存预测mask以加速评估")
+
     args = parser.parse_args()
-    
+
     # 创建输出目录
     args.output_path.mkdir(parents=True, exist_ok=True)
-    
+
     # 打印配置
     print("=" * 80)
     print("智能GPU任务调度器")
     print("=" * 80)
     print(f"数据集: {args.datasets} ({len(args.datasets)}个)")
     print(f"方法: {args.methods} ({len(args.methods)}个)")
-    
+
     # 方法版本映射
     method_versions = {
         "SAM": args.sam_version,
@@ -1495,14 +1498,14 @@ def main():
         "BNDL": args.bndl_version,
         "UR-ERN": args.ur_ern_version,
     }
-    
+
     # 显示当前运行使用的方法版本
     print("\n方法版本配置（当前运行）:")
     for method in args.methods:
         if method in method_versions:
             version = method_versions[method]
             print(f"  • {method:12s} → 版本 {version}")
-    
+
     print(f"\n总任务数: {len(args.datasets)} × {len(args.methods)} = {len(args.datasets) * len(args.methods)}")
     print(f"可用GPU: {len(args.gpu_ids)} ({args.gpu_ids})")
     print(f"输出目录: {args.output_path}")
@@ -1510,17 +1513,17 @@ def main():
     print(f"智能续跑: {'启用 - 将跳过已完成任务' if args.reuse_cached else '禁用 - 将运行所有任务'}")
     print(f"可视化: {'跳过 - 仅生成CSV汇总' if args.skip_plots else '启用 - 将生成所有图表'}")
     print("=" * 80 + "\n")
-    
+
     # 生成所有任务
     all_tasks = generate_all_tasks(args.datasets, args.methods)
-    
+
     print(f"生成的任务列表（共{len(all_tasks)}个）:")
     for i, (dataset, method) in enumerate(all_tasks, 1):
         version = method_versions[method]
         method_with_ver = f"{method}_{version}"
         print(f"  {i:2d}. {method_with_ver:18s} @ {dataset}")
     print()
-    
+
     # 智能调度任务到GPU
     task_results, actual_parallel_time = schedule_tasks_on_gpus(
         tasks=all_tasks,
@@ -1530,7 +1533,7 @@ def main():
         method_versions=method_versions,
         reuse_cached=args.reuse_cached,
     )
-    
+
     # 合并结果
     # 注意：all_results 只包含当前运行指定版本的结果
     # 版本号已嵌入在 output_dir 路径中（METHOD_VERSION/DATASET/）
@@ -1539,7 +1542,7 @@ def main():
         args.output_path,
         method_versions,
     )
-    
+
     # 创建method_to_output映射（用于可视化函数）
     # 注意：这里的 output_dir 包含版本号，例如：
     #   outputs/parallel_smart/BNDL_AUE_012_06/GTEA/
@@ -1550,7 +1553,7 @@ def main():
             method_to_output[method] = result["output_dir"]
         # 也保存完整的(dataset, method)映射
         method_to_output[(dataset, method)] = result["output_dir"]
-    
+
     # 创建综合汇总
     create_comprehensive_summary(
         all_results,
@@ -1562,7 +1565,7 @@ def main():
         actual_parallel_time,
         method_versions,  # 传递版本信息
     )
-    
+
     # 生成可视化
     if all_results:
         merge_detailed_results(
@@ -1573,7 +1576,7 @@ def main():
             skip_plots=args.skip_plots,
             method_versions=method_versions,
         )
-    
+
     print("\n" + "=" * 80)
     print("✅ 智能并行评估完成！")
     print("=" * 80)

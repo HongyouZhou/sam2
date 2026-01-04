@@ -4,9 +4,11 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import atexit
 import logging
 import os
 import random
+import signal
 import sys
 import traceback
 from argparse import ArgumentParser
@@ -24,9 +26,50 @@ from training.utils.train_utils import makedir, register_omegaconf_resolvers
 
 os.environ["HYDRA_FULL_ERROR"] = "1"
 
+# Global reference for cleanup
+_wandb_run = None
+_cleanup_done = False
+
+
+def _cleanup_wandb():
+    """Ensure wandb is properly closed to prevent zombie processes."""
+    global _wandb_run, _cleanup_done
+    if _cleanup_done:
+        return
+    _cleanup_done = True
+    
+    if _wandb_run is not None:
+        try:
+            _wandb_run.finish(quiet=True)
+        except Exception:
+            pass
+    else:
+        # Try to finish any active wandb run
+        try:
+            import wandb
+            if wandb.run is not None:
+                wandb.finish(quiet=True)
+        except Exception:
+            pass
+
+
+def _signal_handler(signum, frame):
+    """Handle termination signals gracefully."""
+    logging.info(f"Received signal {signum}, cleaning up...")
+    _cleanup_wandb()
+    # Re-raise to allow normal termination
+    sys.exit(128 + signum)
+
+
+# Register cleanup handlers
+atexit.register(_cleanup_wandb)
+signal.signal(signal.SIGTERM, _signal_handler)
+signal.signal(signal.SIGINT, _signal_handler)
+
 
 def single_proc_run(local_rank, main_port, cfg, world_size):
     """Single GPU process"""
+    global _wandb_run
     
     os.environ["MASTER_ADDR"] = "localhost"
     os.environ["MASTER_PORT"] = str(main_port)
@@ -38,8 +81,24 @@ def single_proc_run(local_rank, main_port, cfg, world_size):
     except Exception as e:
         logging.info(e)
 
-    trainer = instantiate(cfg.trainer, _recursive_=False)
-    trainer.run()
+    # Initialize wandb once when sweep logging is requested
+    if os.environ.get("WANDB_SWEEP_LOGGING", "") == "1":
+        try:
+            import wandb
+
+            if wandb.run is None:
+                _wandb_run = wandb.init(project=os.environ.get("WANDB_PROJECT", "sam2-aue-sweep"))
+        except ImportError:
+            pass
+        except Exception as e:
+            logging.warning(f"Failed to initialize wandb: {e}")
+
+    try:
+        trainer = instantiate(cfg.trainer, _recursive_=False)
+        trainer.run()
+    finally:
+        # Ensure wandb run is closed to avoid agent marking crash
+        _cleanup_wandb()
 
 
 def single_node_runner(cfg, main_port: int):

@@ -155,6 +155,7 @@ class LoggingConf:
     style_aue_visual_frequency: int = 100  # Log Style AUE visualization every N steps
     uncertainty_metric: set = field(default_factory=lambda: {"entropy"})  # Options: {"entropy"}, {"nll"}, {"sampling"}, {"entropy", "nll"}, {"entropy", "nll", "sampling"}, etc.
     visualize_pavpu_overlay: bool = True  # Enable PAvPU overlay visualization on original images
+    enable_pavpu_eval: bool = True  # Enable PAvPU evaluator computation during validation
     uncertainty_sample_num: int = 50
     correlation_foreground_dilation: int = 0  # Foreground dilation radius (pixels), 0 means no dilation (only used when use_full_image=False)
     correlation_per_pixel: bool = True  # Use per-pixel statistics (vs per-image)
@@ -457,11 +458,10 @@ class Trainer:
     ):
         # Enable style visualization periodically BEFORE forward pass
         _model = unwrap_ddp_if_wrapped(self.model)
-        style_aue_freq = getattr(self.logging_conf, 'style_aue_visual_frequency', 100)
-        enable_vis = (phase == "train" and self.steps[phase] % style_aue_freq == 0)
+        style_aue_freq = getattr(self.logging_conf, "style_aue_visual_frequency", 100)
+        enable_vis = phase == "train" and self.steps[phase] % style_aue_freq == 0
         _model._enable_style_visualization = enable_vis
-        
-        
+
         outputs = model(batch)
         targets = batch.masks
         batch_size = len(batch.img_batch)
@@ -474,7 +474,7 @@ class Trainer:
 
         # loss contains multiple sub-components we wish to log
         step_losses = {}
-        
+
         # Log BNDL statistics from model outputs if available (only if BNDL is enabled)
         if getattr(_model, "use_bndl_for_pixels", False):
             bndl_outputs, step_index, frame_index = self._extract_bndl_outputs(outputs)
@@ -505,37 +505,51 @@ class Trainer:
                     ):
                         val = aue_metrics.get(metric)
                         if isinstance(val, torch.Tensor):
-                            step_losses[
-                                f"Losses/{phase}_{key}_aue_{metric}"
-                            ] = val
+                            step_losses[f"Losses/{phase}_{key}_aue_{metric}"] = val
 
                     pixel_nll = bndl_outputs.get("pixel_nll")
                     if isinstance(pixel_nll, torch.Tensor):
                         step_losses[f"Losses/{phase}_{key}_bndl_nll"] = pixel_nll
-        
+
         # Log Style AUE visualization if available and enabled (only on rank 0)
-        if (phase == "train" and 
-            self.distributed_rank == 0 and
-            getattr(self.logging_conf, 'visualize_aue', False) and
-            hasattr(_model, 'use_style_adv') and _model.use_style_adv and
-            _model._enable_style_visualization):
+        if (
+            phase == "train"
+            and self.distributed_rank == 0
+            and getattr(self.logging_conf, "visualize_aue", False)
+            and hasattr(_model, "use_style_adv")
+            and _model.use_style_adv
+            and _model._enable_style_visualization
+        ):
             self._log_style_aue_visualization(outputs, self.steps[phase])
-        
+
         # Log Deformation AUE visualization if available and enabled (only on rank 0)
-        if (phase == "train" and 
-            self.distributed_rank == 0 and
-            getattr(self.logging_conf, 'visualize_aue', False) and
-            hasattr(_model, 'use_deform_adv') and _model.use_deform_adv and
-            _model._enable_style_visualization):
+        if (
+            phase == "train"
+            and self.distributed_rank == 0
+            and getattr(self.logging_conf, "visualize_aue", False)
+            and hasattr(_model, "use_deform_adv")
+            and _model.use_deform_adv
+            and _model._enable_style_visualization
+        ):
             self._log_deform_aue_visualization(outputs, self.steps[phase])
 
         if isinstance(loss, dict):
             if CORE_LOSS_KEY not in loss:
                 raise KeyError(f"Missing {CORE_LOSS_KEY} in loss dict for phase={phase}, key={key}")
 
-            step_losses.update(
-                {f"Losses/{phase}_{key}_{k}": v for k, v in loss.items() if k != CORE_LOSS_KEY}
-            )
+            # Separate normal losses and refinement metrics
+            for k, v in loss.items():
+                if k == CORE_LOSS_KEY:
+                    continue
+
+                if k.startswith("_refinement_"):
+                    # Route refinement metrics to Refinement/ prefix
+                    metric_name = k[1:]  # Remove underscore
+                    step_losses[f"Refinement/{phase}_{key}_{metric_name}"] = v
+                else:
+                    # Normal losses go to Losses/ prefix
+                    step_losses[f"Losses/{phase}_{key}_{k}"] = v
+
             loss = self._log_loss_detailed_and_return_core_loss(loss, loss_log_str, self.steps[phase])
 
         if self.steps[phase] % self.logging_conf.log_scalar_frequency == 0:
@@ -646,6 +660,49 @@ class Trainer:
             ) as f:
                 f.write(json.dumps(outs) + "\n")
 
+            # WandB logging for sweep early stopping (Hyperband)
+            # Enabled via WANDB_SWEEP_LOGGING=1 environment variable
+            if os.environ.get("WANDB_SWEEP_LOGGING", "") == "1":
+                self._log_to_wandb(outs, step=int(self.epoch))
+
+    def _log_to_wandb(self, outs: dict, step: int):
+        """Log metrics to wandb for sweep early stopping."""
+        try:
+            import wandb
+
+            if wandb.run is None:
+                return
+
+            def _get_val_metric(metric_name: str):
+                """Return the first matching val metric key if present."""
+                candidates = [
+                    f"Losses/val_val_{metric_name}",
+                    f"Losses/val_{metric_name}",
+                    f"Losses/val_all_{metric_name}",
+                ]
+                for k in candidates:
+                    if k in outs:
+                        return outs[k]
+                return None
+
+            # Extract key metrics for sweep comparison (robust to key naming)
+            wandb_metrics = {
+                "val/loss_dice": _get_val_metric("loss_dice"),
+                "val/loss_mask": _get_val_metric("loss_mask"),
+                "val/loss_iou": _get_val_metric("loss_iou"),
+                "val/loss_class": _get_val_metric("loss_class"),
+                "val/core_loss": _get_val_metric("core_loss"),
+                "epoch": step,
+            }
+            # Filter None values
+            wandb_metrics = {k: v for k, v in wandb_metrics.items() if v is not None}
+            if wandb_metrics:
+                wandb.log(wandb_metrics, step=step)
+        except ImportError:
+            pass
+        except Exception as e:
+            logging.warning(f"WandB logging failed: {e}")
+
     def val_epoch(self, val_loader, phase):
         batch_time = AverageMeter("Batch Time", self.device, ":.2f")
         data_time = AverageMeter("Data Time", self.device, ":.2f")
@@ -707,7 +764,11 @@ class Trainer:
                     for k, v in extra_losses.items():
                         if k not in extra_loss_mts:
                             extra_loss_mts[k] = AverageMeter(k, self.device, ":.2e")
-                        extra_loss_mts[k].update(v.item(), batch_size)
+                        if torch.is_tensor(v):
+                            update_val = v.item()
+                        else:
+                            update_val = v
+                        extra_loss_mts[k].update(update_val, batch_size)
 
             # measure elapsed time
             batch_time.update(time.time() - end)
@@ -734,11 +795,7 @@ class Trainer:
             # CRITICAL FIX: Run forward pass on ALL ranks to avoid SyncBatchNorm deadlock
             # Use deterministic sampling based on step count instead of random.random()
             vis_interval = int(1.0 / max(self.logging_conf.bndl_vis_sample_rate, 0.001))
-            should_visualize = (
-                self.logging_conf.visualize_bndl
-                and getattr(unwrap_ddp_if_wrapped(self.model), "use_bndl_for_pixels", False)
-                and (data_iter % vis_interval == 0)
-            )
+            should_visualize = self.logging_conf.visualize_bndl and getattr(unwrap_ddp_if_wrapped(self.model), "use_bndl_for_pixels", False) and (data_iter % vis_interval == 0)
 
             if should_visualize:
                 # Extract BNDL outputs for visualization
@@ -748,7 +805,7 @@ class Trainer:
                     # Must run on ALL ranks to keep SyncBatchNorm in sync
                     with torch.no_grad():
                         outputs_for_vis = _model(batch)
-                    
+
                     # Visualization only on rank 0
                     if self.distributed_rank == 0:
                         bndl_outputs, step_index, frame_index = self._extract_bndl_outputs(outputs_for_vis)
@@ -888,6 +945,25 @@ class Trainer:
                     self.scaler.unscale_(self.optim.optimizer)
                     self.gradient_clipper(model=self.model)
 
+                # Debug: Check for NaN gradients after clipping
+                has_nan_grad = False
+                nan_param_names = []
+                for name, param in self.model.named_parameters():
+                    if param.grad is not None and not torch.isfinite(param.grad).all():
+                        has_nan_grad = True
+                        nan_count = torch.isnan(param.grad).sum().item()
+                        inf_count = torch.isinf(param.grad).sum().item()
+                        nan_param_names.append(f"{name}: nan={nan_count}, inf={inf_count}")
+                        if len(nan_param_names) >= 10:  # Limit to first 10
+                            break
+
+                if has_nan_grad:
+                    logging.error(f"[Trainer] NaN/Inf gradients detected after gradient clipping! First 10 problematic params: {nan_param_names}")
+                    # Skip optimizer step to prevent corrupting weights
+                    self.optim.zero_grad(set_to_none=True)
+                    logging.warning("[Trainer] Skipping optimizer step due to NaN gradients")
+                    continue  # Skip to next iteration
+
                 if self.gradient_logger is not None:
                     self.gradient_logger(self.model, rank=self.distributed_rank, where=self.where)
 
@@ -986,10 +1062,12 @@ class Trainer:
         loss_mts[loss_key].update(loss.item(), batch_size)
         for extra_loss_key, extra_loss in extra_losses.items():
             if extra_loss_key not in extra_loss_mts:
-                extra_loss_mts[extra_loss_key] = AverageMeter(
-                    extra_loss_key, self.device, ":.2e"
-                )
-            extra_loss_mts[extra_loss_key].update(extra_loss.item(), batch_size)
+                extra_loss_mts[extra_loss_key] = AverageMeter(extra_loss_key, self.device, ":.2e")
+            if torch.is_tensor(extra_loss):
+                update_val = extra_loss.item()
+            else:
+                update_val = extra_loss
+            extra_loss_mts[extra_loss_key].update(update_val, batch_size)
 
     def _log_meters_and_save_best_ckpts(self, phases: List[str]):
         logging.info("Synchronizing meters")
@@ -1085,7 +1163,7 @@ class Trainer:
         self.model = instantiate(self.model_conf, _convert_="all")
 
         # Style-based AUE: no initialization needed (styles extracted on-the-fly)
-        
+
         print_model_summary(self.model)
 
         self.loss = None
@@ -1113,6 +1191,12 @@ class Trainer:
 
     def _setup_evaluators(self):
         """Setup separate evaluators for training and validation phases"""
+        if not getattr(self.logging_conf, "enable_pavpu_eval", True):
+            self.train_evaluator = None
+            self.val_evaluator = None
+            logging.info("PAvPU evaluator disabled by config (logging.enable_pavpu_eval=False).")
+            return
+
         # Get configuration
         foreground_dilation = getattr(self.logging_conf, "correlation_foreground_dilation", 0)
         per_pixel = getattr(self.logging_conf, "correlation_per_pixel", True)
@@ -1161,6 +1245,8 @@ class Trainer:
             logging.warning(f"Failed to add data to evaluator: {e}")
 
     def _construct_optimizers(self):
+        # Enable anomaly detection to debug NaN gradients
+        # torch.autograd.set_detect_anomaly(True)
         self.optim = construct_optimizer(
             self.model,
             self.optim_conf.optimizer,
@@ -1172,7 +1258,12 @@ class Trainer:
         core_loss = loss.pop(CORE_LOSS_KEY)
         if step % self.logging_conf.log_scalar_frequency == 0:
             for k in loss:
-                log_str = os.path.join(loss_str, k)
+                # Log refinement stability metrics under dedicated namespace
+                if k.startswith("_refinement_"):
+                    metric_name = k[1:]  # Remove leading underscore
+                    log_str = os.path.join("Refinement", metric_name)
+                else:
+                    log_str = os.path.join(loss_str, k)
                 self.logger.log(log_str, loss[k], step)
         return core_loss
 
@@ -1189,9 +1280,9 @@ class Trainer:
             return
 
         # Pixel-level parameters (lambda and k)
-        if "wei_lambda" in bndl_outputs and "inv_k" in bndl_outputs and bndl_outputs["wei_lambda"] is not None and bndl_outputs["inv_k"] is not None:
+        if "wei_lambda" in bndl_outputs and "kappa" in bndl_outputs and bndl_outputs["wei_lambda"] is not None and bndl_outputs["kappa"] is not None:
             lambda_mean = bndl_outputs["wei_lambda"].mean().detach()
-            k_mean = (1.0 / (bndl_outputs["inv_k"] + 1e-6)).mean().detach()
+            k_mean = bndl_outputs["kappa"].mean().detach()  # kappa is already the shape parameter
             self.logger.log(f"Stats/{phase}_lambda_pixel", lambda_mean, step)
             self.logger.log(f"Stats/{phase}_k_pixel", k_mean, step)
 
@@ -1201,9 +1292,9 @@ class Trainer:
                 self.logger.log(f"Stats/{phase}_pixel_uncertainty", uncertainty_mean, step)
 
         # Global w statistics (original BNDL)
-        if "wei_lambda_w" in bndl_outputs and "inv_k_w" in bndl_outputs and bndl_outputs["wei_lambda_w"] is not None and bndl_outputs["inv_k_w"] is not None:
+        if "wei_lambda_w" in bndl_outputs and "kappa_w" in bndl_outputs and bndl_outputs["wei_lambda_w"] is not None and bndl_outputs["kappa_w"] is not None:
             lambda_w_mean = bndl_outputs["wei_lambda_w"].mean().detach()
-            k_w_mean = (1.0 / (bndl_outputs["inv_k_w"] + 1e-6)).mean().detach()
+            k_w_mean = bndl_outputs["kappa_w"].mean().detach()  # kappa_w is already the shape parameter
             self.logger.log(f"Stats/{phase}_lambda_w", lambda_w_mean, step)
             self.logger.log(f"Stats/{phase}_k_w", k_w_mean, step)
 
@@ -1217,7 +1308,7 @@ class Trainer:
                     value = aue_metrics[key]
                     val = value.item() if isinstance(value, torch.Tensor) else value
                     self.logger.log(f"AUE_Losses/{phase}_{key}", val, step)
-            
+
             # Log clean/ and aug/ prefixed metrics
             for key, value in aue_metrics.items():
                 if key == "aue_visualization" or key in loss_keys:
@@ -1245,14 +1336,14 @@ class Trainer:
         vis_data = self._extract_vis_data_from_outputs(outputs)
         if vis_data is None:
             return
-        
+
         # Denormalize images
         # If warped images are available (from deformation), use them as "before" for StyleAUE
         # This shows: deformed image -> styled image (the actual StyleAUE input/output)
         # Use the stored original and styled images directly (no fallback)
         original_denorm = self._denormalize_images(vis_data.original_images)
         adv_denorm = self._denormalize_images(vis_data.adversarial_images)
-        
+
         # Use stored styles if available, otherwise extract from images
         if vis_data.original_styles is not None and vis_data.adversarial_styles is not None:
             original_styles = vis_data.original_styles  # [N, K, 6]
@@ -1263,103 +1354,99 @@ class Trainer:
             adv_styles_global = adv_styles.mean(dim=1)
         else:
             from sam2.modeling.style_utils import extract_style_statistics
+
             original_styles_global = extract_style_statistics(vis_data.original_images)
             adv_styles_global = extract_style_statistics(vis_data.adversarial_images)
-        
-        # Visualize first sample only (for performance)
+
+        # Visualize random sample (for performance)
+        batch_size = original_denorm.shape[0]
+        sample_idx = random.randint(0, batch_size - 1)
         self._visualize_style_single_sample(
-            original_denorm[0],
-            adv_denorm[0],
-            original_styles_global[0],
-            adv_styles_global[0],
-            vis_data,
-            sample_idx=0,
-            step=step
+            original_denorm[sample_idx], adv_denorm[sample_idx], original_styles_global[sample_idx], adv_styles_global[sample_idx], vis_data, sample_idx=sample_idx, step=step
         )
-        
+
         # Log style perturbation statistics
         self._log_style_perturbations(original_styles_global, adv_styles_global, step)
-        
+
         # Log GCN parameters if available
         self._log_gcn_parameters(step)
-    
+
     def _extract_vis_data_from_outputs(self, outputs):
         """Extract visualization data from model outputs."""
         import logging
+
         outputs_iter = [outputs] if isinstance(outputs, dict) else outputs
-        
+
         if logging.getLogger().isEnabledFor(logging.DEBUG):
             logging.debug(f"DeformAUE: _extract_vis_data_from_outputs - outputs type={type(outputs)}, is_dict={isinstance(outputs, dict)}")
-        
+
         for outs in outputs_iter:
             if "multistep_aux_outputs" not in outs:
                 if logging.getLogger().isEnabledFor(logging.DEBUG):
                     logging.debug("DeformAUE: No 'multistep_aux_outputs' in outputs")
                 continue
-            
+
             aux_list = outs["multistep_aux_outputs"]
             if logging.getLogger().isEnabledFor(logging.DEBUG):
                 logging.debug(f"DeformAUE: Found multistep_aux_outputs with {len(aux_list)} entries")
-            
+
             for aux in reversed(aux_list):
                 if aux is None or not isinstance(aux, dict):
                     continue
-                
+
                 bndl_outputs = aux.get("bndl", None)
                 if bndl_outputs is None:
                     if logging.getLogger().isEnabledFor(logging.DEBUG):
                         logging.debug("DeformAUE: No 'bndl' in aux_outputs")
                     continue
-                
+
                 # Use aue_metrics directly
                 aue_metrics = bndl_outputs.get("aue_metrics")
                 if aue_metrics is None:
                     if logging.getLogger().isEnabledFor(logging.DEBUG):
                         logging.debug(f"DeformAUE: No 'aue_metrics' in bndl_outputs, keys={list(bndl_outputs.keys())}")
                     continue
-                
+
                 vis_data = aue_metrics.get("aue_visualization", None)
-                
+
                 if logging.getLogger().isEnabledFor(logging.DEBUG):
                     logging.debug(f"DeformAUE: aue_metrics keys={list(aue_metrics.keys())}, vis_data={'✓' if vis_data is not None else '✗'}")
-                
+
                 # Check if vis_data is AUEVisualizationData or dict
                 if vis_data is not None:
                     # If it's a dataclass, check if it has data
-                    if hasattr(vis_data, 'original_images'):
+                    if hasattr(vis_data, "original_images"):
                         # Debug: log what data is available
                         import logging
+
                         if logging.getLogger().isEnabledFor(logging.DEBUG):
-                            has_deform_offsets = hasattr(vis_data, 'deform_offsets') and vis_data.deform_offsets is not None
-                            logging.debug(
-                                f"DeformAUE: vis_data found - "
-                                f"deform_offsets={'✓' if has_deform_offsets else '✗'}"
-                            )
+                            has_deform_offsets = hasattr(vis_data, "deform_offsets") and vis_data.deform_offsets is not None
+                            logging.debug(f"DeformAUE: vis_data found - deform_offsets={'✓' if has_deform_offsets else '✗'}")
                         return vis_data
                     # If it's a dict (legacy), check for keys
                     elif isinstance(vis_data, dict) and "original_images" in vis_data:
                         return vis_data
-        
+
         return None
-    
+
     def _denormalize_images(self, images):
         """Denormalize images from ImageNet normalization."""
         mean = torch.tensor([0.485, 0.456, 0.406], device=images.device, dtype=images.dtype).view(1, 3, 1, 1)
         std = torch.tensor([0.229, 0.224, 0.225], device=images.device, dtype=images.dtype).view(1, 3, 1, 1)
         denorm = images * std + mean
         return torch.clamp(denorm, 0, 1)
-    
-    def _visualize_style_single_sample(self, original_img, adv_img, original_style, adv_style, vis_data, sample_idx, step):
+
+    def _visualize_style_single_sample(self, original_img, adv_img, original_style, adv_style, vis_data, sample_idx, step, pred_mask=None):
         """Visualize a single sample for Style AUE with multi-object support."""
         # Extract multi-object data from vis_data (support both dataclass and dict)
-        if hasattr(vis_data, 'all_bboxes'):
+        if hasattr(vis_data, "all_bboxes"):
             # Dataclass
             all_bboxes = vis_data.all_bboxes
             all_masks = vis_data.all_object_masks
             combined_mask = vis_data.combined_mask_for_loss
             area_ratios = vis_data.area_ratios
             epsilon_weights = vis_data.epsilon_weights
-        
+
         # Extract data for this sample
         sample_bboxes = all_bboxes[sample_idx] if all_bboxes is not None else None
         sample_masks = all_masks[sample_idx] if all_masks is not None else None
@@ -1367,16 +1454,24 @@ class Trainer:
         sample_area_ratios = area_ratios[sample_idx] if area_ratios is not None else None
         sample_epsilon_weights = epsilon_weights[sample_idx] if epsilon_weights is not None else None
 
+        # Extract loss_object_idx for this sample (the object being trained)
+        sample_loss_obj_idx = None
+        if hasattr(vis_data, "loss_object_indices") and vis_data.loss_object_indices is not None:
+            if sample_idx < len(vis_data.loss_object_indices):
+                idx_val = vis_data.loss_object_indices[sample_idx]
+                sample_loss_obj_idx = idx_val.item() if hasattr(idx_val, "item") else int(idx_val)
+
         # For single-object visualization, also pass bbox/mask so TensorBoard overlay can highlight the attack region
         single_obj_bbox = None
         single_obj_mask = None
-        if sample_masks is not None and sample_masks.shape[0] >= 1:
-            single_obj_mask = sample_masks[0]
+        primary_idx = sample_loss_obj_idx if sample_loss_obj_idx is not None else 0
+        if sample_masks is not None and sample_masks.shape[0] > primary_idx:
+            single_obj_mask = sample_masks[primary_idx]
         elif sample_combined_mask is not None:
             single_obj_mask = sample_combined_mask
-        if sample_bboxes is not None and sample_bboxes.shape[0] >= 1:
-            single_obj_bbox = sample_bboxes[0]
-        
+        if sample_bboxes is not None and sample_bboxes.shape[0] > primary_idx:
+            single_obj_bbox = sample_bboxes[primary_idx]
+
         # Call unified visualization
         self._log_style_statistics_overlay(
             original_img,
@@ -1391,20 +1486,22 @@ class Trainer:
             all_masks=sample_masks,
             combined_mask=sample_combined_mask,
             area_ratios=sample_area_ratios,
-            epsilon_weights=sample_epsilon_weights
+            epsilon_weights=sample_epsilon_weights,
+            loss_object_idx=sample_loss_obj_idx,
+            pred_mask=pred_mask,
         )
-    
+
     def _log_style_perturbations(self, original_styles, adv_styles, step):
         """Log style perturbation statistics."""
         style_diff = (adv_styles - original_styles).abs().mean(dim=0)  # [6]
-        channels = ['R_mean', 'G_mean', 'B_mean', 'R_std', 'G_std', 'B_std']
+        channels = ["R_mean", "G_mean", "B_mean", "R_std", "G_std", "B_std"]
         for j, channel in enumerate(channels):
             self.logger.log(f"StyleAUE/perturbation_{channel}", style_diff[j].item(), step)
-    
+
     def _log_deform_aue_visualization(self, outputs, step):
         """Log Deformation AUE visualization: before/after predictions with offset fields"""
         import logging
-        
+
         # Debug: Check all conditions
         _model = unwrap_ddp_if_wrapped(self.model)
         if logging.getLogger().isEnabledFor(logging.DEBUG):
@@ -1415,33 +1512,34 @@ class Trainer:
                 f"_enable_style_visualization={getattr(_model, '_enable_style_visualization', False)}, "
                 f"distributed_rank={self.distributed_rank}"
             )
-        
+
         # Extract visualization data from outputs
         vis_data = self._extract_vis_data_from_outputs(outputs)
         if vis_data is None:
             logging.debug("DeformAUE: vis_data is None, skipping visualization")
             return
-        
+
         # Check if deformation data is available (we need offsets for visualization)
         if vis_data.deform_offsets is None:
             logging.debug("DeformAUE: deform_offsets not available, skipping visualization")
             return
-        
+
         # Denormalize images
         original_denorm = self._denormalize_images(vis_data.original_images)
-        
-        # Visualize first sample only (for performance)
-        self._visualize_deform_single_sample(
-            original_denorm[0],
-            vis_data,
-            sample_idx=0,
-            step=step
-        )
-        
+
+        # Visualize random sample (for performance)
+        batch_size = original_denorm.shape[0]
+        sample_idx = random.randint(0, batch_size - 1)
+
+        # Extract prediction for this sample
+        pred_mask = self._extract_prediction(outputs, batch_idx=sample_idx)
+
+        self._visualize_deform_single_sample(original_denorm[sample_idx], vis_data, sample_idx=sample_idx, step=step, pred_mask=pred_mask)
+
         # Log deformation statistics (offsets are guaranteed to exist at this point)
         self._log_deform_statistics(vis_data.deform_offsets, step)
-    
-    def _visualize_deform_single_sample(self, original_img, vis_data, sample_idx, step):
+
+    def _visualize_deform_single_sample(self, original_img, vis_data, sample_idx, step, pred_mask=None):
         """Visualize deformation with 2x2 layout (matching StyleAUE format)."""
         import matplotlib.pyplot as plt
         import matplotlib.patches as patches
@@ -1449,12 +1547,12 @@ class Trainer:
 
         model = unwrap_ddp_if_wrapped(self.model)
         include_background = bool(getattr(model, "adv_enable_background", False))
-        
+
         # Extract multi-object data from vis_data
-        if hasattr(vis_data, 'all_bboxes'):
+        if hasattr(vis_data, "all_bboxes"):
             all_bboxes = vis_data.all_bboxes
             orig_masks = vis_data.all_object_masks
-            warped_masks_all = getattr(vis_data, 'warped_object_masks', None)
+            warped_masks_all = getattr(vis_data, "warped_object_masks", None)
             area_ratios = vis_data.area_ratios
             epsilon_weights = vis_data.epsilon_weights
         else:
@@ -1463,39 +1561,31 @@ class Trainer:
             warped_masks_all = None
             area_ratios = None
             epsilon_weights = None
-        
+
         # Extract data for this sample
         sample_bboxes = all_bboxes[sample_idx] if all_bboxes is not None else None
         sample_masks_orig = orig_masks[sample_idx] if orig_masks is not None else None
         sample_masks_warped = warped_masks_all[sample_idx] if warped_masks_all is not None else None
         sample_area_ratios = area_ratios[sample_idx] if area_ratios is not None else None
         sample_epsilon_weights = epsilon_weights[sample_idx] if epsilon_weights is not None else None
-        
+
         # Get deformation data
         offsets = vis_data.deform_offsets[sample_idx] if vis_data.deform_offsets is not None else None  # [K, 2, H, W]
-        warped_img = (
-            vis_data.warped_images[sample_idx]
-            if hasattr(vis_data, 'warped_images') and vis_data.warped_images is not None
-            else None
-        )
-        styled_img = (
-            vis_data.adversarial_images[sample_idx]
-            if getattr(vis_data, "adversarial_images", None) is not None
-            else None
-        )
+        warped_img = vis_data.warped_images[sample_idx] if hasattr(vis_data, "warped_images") and vis_data.warped_images is not None else None
+        styled_img = vis_data.adversarial_images[sample_idx] if getattr(vis_data, "adversarial_images", None) is not None else None
         attack_order = getattr(vis_data, "attack_order", None)
-        
+
         # Get GT masks for overlay
         # Use original masks for "before" overlay; warped masks for "after" if available
         gt_masks_orig = sample_masks_orig  # [K, H, W]
         gt_masks_warped = sample_masks_warped if sample_masks_warped is not None else sample_masks_orig
         K = gt_masks_orig.shape[0] if gt_masks_orig is not None else 0
-        
+
         # Convert to numpy
         orig_np = original_img.permute(1, 2, 0).cpu().numpy()
         orig_np = np.clip(orig_np, 0, 1)
         H, W = orig_np.shape[0], orig_np.shape[1]
-        
+
         # Convert styled/warped image to numpy if available (denormalize first!)
         if styled_img is not None:
             styled_img_denorm = self._denormalize_images(styled_img.unsqueeze(0))[0]
@@ -1510,112 +1600,57 @@ class Trainer:
             warped_np = np.clip(warped_np, 0, 1)
         else:
             warped_np = None
-        
+
         # Convert GT masks to numpy if available (before deformation)
         if gt_masks_orig is not None:
             gt_masks_np = gt_masks_orig.cpu().numpy()  # [K, H, W]
         else:
             gt_masks_np = None
-        
-        # Determine primary object (largest area ratio or first non-empty)
-        primary_obj_idx = 0
-        if sample_area_ratios is not None:
-            primary_obj_idx = sample_area_ratios.argmax().item()
-        
+
+        # Determine primary object (the one being trained for loss computation)
+        # Priority: 1) loss_object_indices from vis_data, 2) default to 0
+        # (Matching StyleAUE behavior - sample_idx=0 corresponds to object 0 in the video)
+        sample_loss_obj_idx = None
+        if hasattr(vis_data, "loss_object_indices") and vis_data.loss_object_indices is not None:
+            sample_loss_obj_idx = vis_data.loss_object_indices[sample_idx] if sample_idx < len(vis_data.loss_object_indices) else None
+
+        if sample_loss_obj_idx is not None:
+            primary_obj_idx = sample_loss_obj_idx.item() if hasattr(sample_loss_obj_idx, "item") else int(sample_loss_obj_idx)
+        else:
+            primary_obj_idx = 0
+
         # Create visualization: 2x2 layout (matching StyleAUE format)
         fig, axes = plt.subplots(2, 2, figsize=(12, 12))
-        
+
         # Row 0, Col 0: Original Image with GT masks and bboxes (Before Deformation)
-        axes[0, 0].imshow(orig_np)
-        axes[0, 0].set_title(f'Before Deformation (Sample {sample_idx})', fontsize=12, fontweight='bold')
-        axes[0, 0].axis('off')
-        
-        # Overlay GT masks and bboxes
-        if gt_masks_np is not None:
-            for k in range(K):
-                mask_k = gt_masks_np[k]
-                if mask_k.sum() == 0:
-                    continue
-                
-                # Check if background (last object slot with large area)
-                is_background = (
-                    include_background
-                    and k == K - 1
-                    and mask_k.sum() > H * W * 0.5
-                )
-                
-                # Draw mask contour
-                from skimage import measure
-                contours = measure.find_contours(mask_k, 0.5)
-                
-                # Determine colors based on object type
-                if is_background:
-                    edge_color = 'lime'
-                    linewidth = 2
-                    linestyle = '--'
-                    label = f'BG'
-                    label_color = 'lime'
-                elif k == primary_obj_idx:
-                    edge_color = 'red'
-                    linewidth = 4
-                    linestyle = '-'
-                    label = f'O{k+1}*'
-                    label_color = 'red'
-                else:
-                    edge_color = 'cyan'
-                    linewidth = 2
-                    linestyle = '-'
-                    label = f'O{k+1}'
-                    label_color = 'cyan'
-                
-                # Draw contours
-                for contour in contours:
-                    axes[0, 0].plot(contour[:, 1], contour[:, 0], color=edge_color, 
-                                    linewidth=linewidth, linestyle=linestyle, alpha=0.8)
-                
-                # Draw bbox
-                if sample_bboxes is not None:
-                    bbox_k = sample_bboxes[k].cpu().numpy()
-                    x1, y1, x2, y2 = bbox_k
-                    if x2 > x1 and y2 > y1:
-                        rect = patches.Rectangle(
-                            (x1, y1), x2 - x1, y2 - y1,
-                            linewidth=linewidth, edgecolor=edge_color,
-                            facecolor='none', linestyle=linestyle, alpha=0.5
-                        )
-                        axes[0, 0].add_patch(rect)
-                        axes[0, 0].text(
-                            x1, y1 - 5, label,
-                            color=label_color, fontsize=9, fontweight='bold',
-                            bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.8)
-                        )
-        
+        # Row 0, Col 0: Original Image with GT masks and bboxes (Before Deformation)
+        self._plot_image_with_bboxes(orig_np, sample_bboxes, primary_obj_idx, include_background=include_background, K=K, masks=gt_masks_orig, ax=axes[0, 0])
+        axes[0, 0].set_title(f"Before Deformation (Sample {sample_idx})", fontsize=12, fontweight="bold")
+
         # Row 0, Col 1: Statistics (Top Right)
-        axes[0, 1].axis('off')
+        axes[0, 1].axis("off")
         stats_text = f"Deformation Statistics:\n\n"
         stats_text += f"Objects: {K}\n"
         if sample_area_ratios is not None:
-            stats_text += f"Primary Object: O{primary_obj_idx+1}\n"
+            stats_text += f"Primary Object: O{primary_obj_idx + 1}\n"
             stats_text += f"Area Ratios:\n"
             for k in range(min(K, 5)):  # Show first 5 objects
                 ratio = sample_area_ratios[k].item()
-                stats_text += f"  O{k+1}: {ratio:.3f}\n"
+                stats_text += f"  O{k + 1}: {ratio:.3f}\n"
         if offsets is not None:
             offsets_np = offsets.cpu().numpy()  # [K, 2, H, W]
-            offset_magnitude = np.sqrt(offsets_np[:, 0]**2 + offsets_np[:, 1]**2)
+            offset_magnitude = np.sqrt(offsets_np[:, 0] ** 2 + offsets_np[:, 1] ** 2)
             stats_text += f"\nOffset Statistics:\n"
             stats_text += f"  Max: {offset_magnitude.max():.4f}\n"
             stats_text += f"  Mean: {offset_magnitude.mean():.4f}\n"
             stats_text += f"  Std: {offset_magnitude.std():.4f}\n"
-        axes[0, 1].text(0.1, 0.5, stats_text, fontsize=11, verticalalignment='center',
-                       family='monospace',
-                       bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-        
+        axes[0, 1].text(0.1, 0.5, stats_text, fontsize=11, verticalalignment="center", family="monospace", bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5))
+
         # Row 1, Col 0: After attacks (respect configured order)
         def _pick_display_np(attack_order, warped_np, styled_np):
             mapping = {
-                'style': styled_np,
-                'deform': warped_np,
+                "style": styled_np,
+                "deform": warped_np,
             }
             if attack_order is None:
                 return warped_np or styled_np
@@ -1626,103 +1661,302 @@ class Trainer:
             return warped_np or styled_np
 
         display_np = _pick_display_np(attack_order, warped_np, styled_np)
-        if display_np is not None:
-            axes[1, 0].imshow(display_np)
-            if attack_order:
-                title_suffix = "→".join([n.capitalize() for n in attack_order])
-            else:
-                title_suffix = "Deformation" if warped_np is not None else "Style"
-            axes[1, 0].set_title(f'After {title_suffix}', fontsize=12, fontweight='bold')
-        else:
-            axes[1, 0].imshow(orig_np)
-            axes[1, 0].set_title('After Attacks (Not Available)', fontsize=12, fontweight='bold')
-        axes[1, 0].axis('off')
         # Overlay warped masks if available (fallback to original masks)
         if gt_masks_warped is not None:
             gt_masks_warped_np = gt_masks_warped.cpu().numpy()
         else:
             gt_masks_warped_np = gt_masks_np
-        if gt_masks_warped_np is not None:
-            for k in range(gt_masks_warped_np.shape[0]):
-                mask_k = gt_masks_warped_np[k]
-                if mask_k.max() <= 0:
-                    continue
-                is_background = (
-                    include_background
-                    and k == gt_masks_warped_np.shape[0] - 1
-                    and mask_k.sum() > H * W * 0.5
-                )
-                if is_background:
-                    continue  # skip background contour in warped view
-                axes[1, 0].contour(mask_k, levels=[0.5], colors='lime', linewidths=1.5)
-        
+        if display_np is not None:
+            self._plot_image_with_bboxes(
+                display_np,
+                None,
+                primary_obj_idx,  # No bboxes on warped result?
+                include_background=include_background,
+                K=gt_masks_warped_np.shape[0] if gt_masks_warped_np is not None else K,
+                masks=gt_masks_warped,
+                ax=axes[1, 0],
+            )
+            axes[1, 0].set_title("After Attacks (Combined)", fontsize=12, fontweight="bold")
+        else:
+            axes[1, 0].imshow(orig_np)
+            axes[1, 0].set_title("After Attacks (Not Available)", fontsize=12, fontweight="bold")
+            axes[1, 0].axis("off")
+
         # Row 1, Col 1: Offset Magnitude Overlay
         if offsets is not None:
             offsets_np = offsets.cpu().numpy()  # [K, 2, H, W]
-            offset_magnitude = np.sqrt(offsets_np[:, 0]**2 + offsets_np[:, 1]**2)  # [K, H, W]
+            offset_magnitude = np.sqrt(offsets_np[:, 0] ** 2 + offsets_np[:, 1] ** 2)  # [K, H, W]
             offset_mag_combined = offset_magnitude.sum(axis=0)  # [H, W]
-            
+
             axes[1, 1].imshow(orig_np)
-            im = axes[1, 1].imshow(offset_mag_combined, alpha=0.6, cmap='hot')
-            axes[1, 1].set_title('Offset Magnitude (Overlay)', fontsize=12, fontweight='bold')
-            axes[1, 1].axis('off')
+            im = axes[1, 1].imshow(offset_mag_combined, alpha=0.6, cmap="hot")
+            axes[1, 1].set_title("Offset Magnitude (Overlay)", fontsize=12, fontweight="bold")
+            axes[1, 1].axis("off")
             plt.colorbar(im, ax=axes[1, 1])
         else:
-            axes[1, 1].axis('off')
-        
+            axes[1, 1].axis("off")
+
         # Add overall title
-        fig.suptitle(f'Deformation Augmentation ({K} objects)', fontsize=14, fontweight='bold')
+        fig.suptitle(f"Deformation Augmentation ({K} objects)", fontsize=14, fontweight="bold")
         plt.tight_layout()
-        
+
         # Convert figure to image and log to TensorBoard
         fig.canvas.draw()
         width, height = fig.canvas.get_width_height()
         img_array = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
         img_array = img_array.reshape(height, width, 4)[:, :, :3]
         img_tensor = torch.from_numpy(img_array).permute(2, 0, 1).float() / 255.0
-        
+
         # Log to TensorBoard
         if self.logger.tb_logger and self.logger.tb_logger._writer:
-            self.logger.tb_logger._writer.add_image(
-                f"DeformAUE/sample_{sample_idx}",
-                img_tensor,
-                step
-            )
-        
+            self.logger.tb_logger._writer.add_image(f"DeformAUE/sample_{sample_idx}", img_tensor, step)
+            # === Paper-quality individual images (no statistics overlay) ===
+            # Log original image only
+            orig_tensor = torch.from_numpy(orig_np).permute(2, 0, 1).float()
+            orig_tensor = torch.clamp(orig_tensor, 0, 1)
+            self.logger.tb_logger._writer.add_image(f"DeformAUE/original_sample_{sample_idx}", orig_tensor, step)
+
+            # Log original image with bbox overlays (for showing attack region)
+            # Color scheme: Red = primary object (for loss), cyan = other objects
+            if sample_bboxes is not None:
+                orig_with_bbox = self._plot_image_with_bboxes(
+                    orig_np, sample_bboxes, primary_obj_idx, include_background=include_background, K=K, masks=gt_masks_orig, ax=None
+                )  # ax=None -> returns uint8 image
+                orig_bbox_tensor = torch.from_numpy(orig_with_bbox).permute(2, 0, 1).float() / 255.0
+                self.logger.tb_logger._writer.add_image(f"DeformAUE/original_with_bbox_sample_{sample_idx}", orig_bbox_tensor, step)
+
+            # Log warped/styled image (the final result after all attacks)
+            if display_np is not None:
+                display_tensor = torch.from_numpy(display_np).permute(2, 0, 1).float()
+                display_tensor = torch.clamp(display_tensor, 0, 1)
+                self.logger.tb_logger._writer.add_image(f"DeformAUE/deformed_sample_{sample_idx}", display_tensor, step)
+
+                # Log deformed image with bbox (same color scheme)
+                if sample_bboxes is not None:
+                    display_with_bbox = self._plot_image_with_bboxes(display_np, sample_bboxes, primary_obj_idx, include_background=include_background, K=K, masks=gt_masks_warped, ax=None)
+                    display_bbox_tensor = torch.from_numpy(display_with_bbox).permute(2, 0, 1).float() / 255.0
+                    self.logger.tb_logger._writer.add_image(f"DeformAUE/deformed_with_bbox_sample_{sample_idx}", display_bbox_tensor, step)
+
+            # Log offset magnitude as heatmap
+            if offsets is not None:
+                offsets_np = offsets.cpu().numpy()  # [K, 2, H, W]
+                offset_magnitude = np.sqrt(offsets_np[:, 0] ** 2 + offsets_np[:, 1] ** 2)  # [K, H, W]
+                offset_mag_combined = offset_magnitude.sum(axis=0)  # [H, W]
+
+                # Normalize and convert to colormap image
+                if offset_mag_combined.max() > 0:
+                    offset_normalized = offset_mag_combined / offset_mag_combined.max()
+                else:
+                    offset_normalized = offset_mag_combined
+
+                # Apply 'hot' colormap
+                import matplotlib.cm as cm_local
+
+                cmap = cm_local.get_cmap("hot")
+                offset_colored = cmap(offset_normalized)[:, :, :3]  # [H, W, 3]
+                offset_tensor = torch.from_numpy(offset_colored).permute(2, 0, 1).float()
+                self.logger.tb_logger._writer.add_image(f"DeformAUE/offset_heatmap_sample_{sample_idx}", offset_tensor, step)
+
+            # Log GT Mask (Standalone)
+            if gt_masks_orig is not None:
+                gt_vis_np = np.zeros((*gt_masks_orig.shape[-2:], 3), dtype=np.uint8)
+                gt_masks_np = gt_masks_orig.cpu().numpy()
+                colors = [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0], [0, 255, 255]]
+                for k in range(gt_masks_np.shape[0]):
+                    mask_k = gt_masks_np[k] > 0.5
+                    color = colors[k % len(colors)]
+                    for c in range(3):
+                        gt_vis_np[..., c] = np.where(mask_k, color[c], gt_vis_np[..., c])
+
+                gt_tensor = torch.from_numpy(gt_vis_np).permute(2, 0, 1).float() / 255.0
+                self.logger.tb_logger._writer.add_image(f"DeformAUE/gt_mask_sample_{sample_idx}", gt_tensor, step)
+
+            # Log Prediction Mask (Standalone)
+            if pred_mask is not None:
+                pred_np = pred_mask.cpu().numpy()
+                pred_bin = pred_np > 0.0
+                pred_vis_np = np.zeros((*pred_bin.shape[-2:], 3), dtype=np.uint8)
+                colors = [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0], [0, 255, 255]]
+                for k in range(pred_bin.shape[0]):
+                    mask_k = pred_bin[k]
+                    color = colors[k % len(colors)]
+                    for c in range(3):
+                        pred_vis_np[..., c] = np.where(mask_k, color[c], pred_vis_np[..., c])
+
+                pred_tensor = torch.from_numpy(pred_vis_np).permute(2, 0, 1).float() / 255.0
+                self.logger.tb_logger._writer.add_image(f"DeformAUE/pred_mask_sample_{sample_idx}", pred_tensor, step)
+
         plt.close(fig)
-    
+
     def _log_deform_statistics(self, deform_offsets, step):
         """Log deformation offset statistics."""
         # deform_offsets: [N, K, 2, H, W]
-        offset_magnitude = torch.sqrt(deform_offsets[:, :, 0]**2 + deform_offsets[:, :, 1]**2)  # [N, K, H, W]
+        offset_magnitude = torch.sqrt(deform_offsets[:, :, 0] ** 2 + deform_offsets[:, :, 1] ** 2)  # [N, K, H, W]
         max_offset = offset_magnitude.max().item()
         mean_offset = offset_magnitude.mean().item()
         std_offset = offset_magnitude.std().item()
-        
+
         self.logger.log("DeformAUE/max_offset", max_offset, step)
         self.logger.log("DeformAUE/mean_offset", mean_offset, step)
         self.logger.log("DeformAUE/std_offset", std_offset, step)
-    
+
+    def _plot_image_with_bboxes(self, img_np, bboxes=None, primary_idx=0, include_background=False, K=None, masks=None, epsilon_weights=None, ax=None):
+        """Standardized plotting function for image with bboxes/masks using Matplotlib.
+
+        This logic is shared between combined visualization and standalone paper images.
+        """
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as patches
+        from skimage import measure
+
+        # If no ax provided, create a standalone figure (for paper images)
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(6, 6))
+            standalone = True
+        else:
+            fig = ax.figure
+            standalone = False
+
+        ax.imshow(img_np)
+        ax.axis("off")
+
+        # If no metadata, just return the image
+        if bboxes is None and masks is None:
+            if standalone:
+                plt.tight_layout(pad=0)
+                fig.canvas.draw()
+                w, h = fig.canvas.get_width_height()
+                img_out = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8).reshape(h, w, 4)[:, :, :3]
+                plt.close(fig)
+                return img_out
+            return
+
+        # Draw Objects
+        n_objs = 0
+        if bboxes is not None:
+            n_objs = bboxes.shape[0]
+        elif masks is not None:
+            n_objs = masks.shape[0]
+
+        if K is None:
+            K = n_objs
+
+        # Handle tensor inputs
+        if bboxes is not None and hasattr(bboxes, "cpu"):
+            bboxes = bboxes.cpu().numpy()
+        if masks is not None and hasattr(masks, "cpu"):
+            masks = masks  # .cpu().numpy() # Keep tensor for sum() check sometimes, convert when needed
+
+        for k in range(n_objs):
+            # Skip empty masks if masks provided
+            if masks is not None:
+                mask_k = masks[k]
+                if hasattr(mask_k, "cpu"):
+                    mask_k = mask_k.cpu().numpy()
+                if mask_k.sum() == 0:
+                    continue
+
+            # Determine logic
+            is_valid_bbox = False
+            if bboxes is not None:
+                x1, y1, x2, y2 = bboxes[k]
+                if x2 > x1 and y2 > y1:
+                    is_valid_bbox = True
+
+            if not is_valid_bbox and masks is None:
+                continue
+
+            # Style Configuration
+            is_bg_obj = include_background and (k == K - 1)
+
+            if is_bg_obj:
+                color = "lime"
+                linestyle = "--"
+                linewidth = 2
+                label_suffix = " (BG)"
+            elif k == primary_idx:
+                color = "red"
+                linestyle = "-"
+                linewidth = 3  # Thicker for primary
+                label_suffix = "*"
+            else:
+                color = "cyan"
+                linestyle = "-"
+                linewidth = 2
+                label_suffix = ""
+
+            # Add epsilon info if available
+            if epsilon_weights is not None:
+                eps = epsilon_weights[k].item()
+                label_suffix += f" ε{eps:.2f}"
+
+            # Draw BBox
+            if is_valid_bbox:
+                rect = patches.Rectangle((x1, y1), x2 - x1, y2 - y1, linewidth=linewidth, edgecolor=color, facecolor="none", linestyle=linestyle, alpha=0.8)
+                ax.add_patch(rect)
+
+                # Add label (optional, maybe make configurable?)
+                # ax.text(x1, y1-2, f"O{k}{label_suffix}", color=color, fontsize=8, fontweight='bold',
+                #        bbox=dict(facecolor='black', alpha=0.5, pad=0, edgecolor='none'))
+
+            # Draw Contour (if masks provided)
+            if masks is not None:
+                mask_k = masks[k]
+                if hasattr(mask_k, "cpu"):
+                    mask_k = mask_k.cpu().numpy()
+                contours = measure.find_contours(mask_k, 0.5)
+                for contour in contours:
+                    ax.plot(contour[:, 1], contour[:, 0], color=color, linewidth=linewidth, linestyle=linestyle, alpha=0.6)
+
+        # Return logic
+        if standalone:
+            plt.subplots_adjust(top=1, bottom=0, right=1, left=0, hspace=0, wspace=0)
+            plt.margins(0, 0)
+            ax.xaxis.set_major_locator(plt.NullLocator())
+            ax.yaxis.set_major_locator(plt.NullLocator())
+
+            fig.canvas.draw()
+            w, h = fig.canvas.get_width_height()
+            img_out = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8).reshape(h, w, 4)[:, :, :3]
+            plt.close(fig)
+            return img_out
+
     def _log_gcn_parameters(self, step):
         """Log GCN layer weight statistics if GCN is enabled."""
-        model = self.model.module if hasattr(self.model, 'module') else self.model
-        if hasattr(model, 'style_gcn') and model.style_gcn is not None:
+        model = self.model.module if hasattr(self.model, "module") else self.model
+        if hasattr(model, "style_gcn") and model.style_gcn is not None:
             gcn = model.style_gcn
             # Log statistics for each GCN layer
             for layer_idx, layer in enumerate(gcn.layers):
-                if hasattr(layer, 'weight') and layer.weight is not None:
+                if hasattr(layer, "weight") and layer.weight is not None:
                     weight_mean = layer.weight.mean().item()
                     weight_std = layer.weight.std().item()
                     weight_norm = layer.weight.norm().item()
                     self.logger.log(f"GCN/layer_{layer_idx}_weight_mean", weight_mean, step)
                     self.logger.log(f"GCN/layer_{layer_idx}_weight_std", weight_std, step)
                     self.logger.log(f"GCN/layer_{layer_idx}_weight_norm", weight_norm, step)
-    
-    def _log_style_statistics_overlay(self, original_img, adv_img, original_style, adv_style, sample_id, step, 
-                                       bbox=None, gt_mask=None, all_bboxes=None, all_masks=None, combined_mask=None,
-                                       area_ratios=None, epsilon_weights=None):
+
+    def _log_style_statistics_overlay(
+        self,
+        original_img,
+        adv_img,
+        original_style,
+        adv_style,
+        sample_id,
+        step,
+        bbox=None,
+        gt_mask=None,
+        all_bboxes=None,
+        all_masks=None,
+        combined_mask=None,
+        area_ratios=None,
+        epsilon_weights=None,
+        length=None,
+        loss_object_idx=None,
+        pred_mask=None,
+    ):
         """Create visualization with style statistics overlaid on images (supports both single and multi-object)
-        
+
         Args:
             original_img: [3, H, W] original image tensor
             adv_img: [3, H, W] adversarial image tensor
@@ -1737,6 +1971,7 @@ class Trainer:
             combined_mask: [H, W] combined mask for loss (for multi-object mode, optional)
             area_ratios: [K] area ratio for each object (for multi-object mode, optional)
             epsilon_weights: [K] epsilon weight for each object (for multi-object mode, optional)
+            loss_object_idx: int, the object index being trained (for primary object highlighting)
         """
         import matplotlib.pyplot as plt
         import matplotlib.patches as patches
@@ -1745,297 +1980,243 @@ class Trainer:
 
         model = unwrap_ddp_if_wrapped(self.model)
         include_background = bool(getattr(model, "adv_enable_background", False))
-        
+
         # Detect if multi-object mode
         is_multi_object = all_masks is not None and all_masks.shape[0] > 1
-        
+
         # Convert tensors to numpy
         orig_np = original_img.cpu().numpy().transpose(1, 2, 0)  # [H, W, 3]
         adv_np = adv_img.cpu().numpy().transpose(1, 2, 0)
         orig_style_np = original_style.cpu().numpy()  # [6]
         adv_style_np = adv_style.cpu().numpy()
-        
+
         if is_multi_object:
             # Multi-object visualization with 2x3 layout
             K = all_masks.shape[0]
             H, W = all_masks.shape[1:]
-            
+
+            # Determine primary object (the one being trained)
+            # Priority: 1) loss_object_idx parameter, 2) default to 0
+            if loss_object_idx is not None:
+                primary_obj_idx = loss_object_idx
+            else:
+                primary_obj_idx = 0
+
             # Define distinct colors for each object (non-primary: blue, primary for loss: red)
-            colors = cm.get_cmap('tab10', K)
+            colors = cm.get_cmap("tab10", K)
             object_colors = [colors(i)[:3] for i in range(K)]
-            
+
             fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-            
-            # Top-left: Original with all object bboxes (NO mask overlay)
-            axes[0, 0].imshow(orig_np)
-            axes[0, 0].set_title(f'Original Image (Sample {sample_id})', fontsize=12, fontweight='bold')
-            axes[0, 0].axis('off')
-            
-            # Determine primary object: always object 0 (foreground), background lives in last slot
-            primary_obj_idx = 0
-            
-            for k in range(K):
-                mask_k = all_masks[k].cpu().numpy()
-                if mask_k.sum() == 0:
-                    continue
-                
-                # Check if this is background mask (last slot in K)
-                is_background = include_background and (k == K - 1 and mask_k.sum() > 0)
-                
-                # Draw mask contour
-                from skimage import measure
-                contours = measure.find_contours(mask_k, 0.5)
-                
-                # Get epsilon weight if available (simplified label)
-                eps_info = ""
-                if epsilon_weights is not None:
-                    eps_weight = epsilon_weights[k].item()
-                    eps_info = f" ε{eps_weight:.2f}"
-                
-                # Determine colors based on object type
-                if is_background:
-                    # Background: green dashed bbox
-                    edge_color = 'lime'
-                    linewidth = 2
-                    linestyle = '--'
-                    label = f'BG{eps_info}'
-                    label_color = 'lime'
-                elif k == primary_obj_idx:
-                    # Primary object (for loss): RED, thick
-                    edge_color = 'red'
-                    linewidth = 4
-                    linestyle = '-'
-                    label = f'O{k+1}*{eps_info}'
-                    label_color = 'red'
-                else:
-                    # Other objects: cyan, thin
-                    edge_color = 'cyan'
-                    linewidth = 2
-                    linestyle = '-'
-                    label = f'O{k+1}{eps_info}'
-                    label_color = 'cyan'
-                
-                # Draw contours
-                for contour in contours:
-                    axes[0, 0].plot(contour[:, 1], contour[:, 0], color=edge_color, 
-                                    linewidth=linewidth, linestyle=linestyle, alpha=0.8)
-                
-                # Draw bbox
-                if all_bboxes is not None:
-                    bbox_k = all_bboxes[k].cpu().numpy()
-                    x1, y1, x2, y2 = bbox_k
-                    if x2 > x1 and y2 > y1:
-                        rect = patches.Rectangle(
-                            (x1, y1), x2 - x1, y2 - y1,
-                            linewidth=linewidth, edgecolor=edge_color, 
-                            facecolor='none', linestyle=linestyle, alpha=0.5
-                        )
-                        axes[0, 0].add_patch(rect)
-                        axes[0, 0].text(
-                            x1, y1 - 5, label,
-                            color=label_color, fontsize=9, fontweight='bold',
-                            bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.8)
-                        )
-            
+
+            self._plot_image_with_bboxes(orig_np, all_bboxes, primary_obj_idx, include_background=include_background, K=K, masks=all_masks, epsilon_weights=epsilon_weights, ax=axes[0, 0])
+            axes[0, 0].set_title(f"Original Image (Sample {sample_id})", fontsize=12, fontweight="bold")
+
             # Top-middle: Original style stats
-            axes[0, 1].bar(['R', 'G', 'B'], orig_style_np[:3], color=['red', 'green', 'blue'], alpha=0.7)
-            axes[0, 1].set_title('Original Mean', fontsize=10)
-            axes[0, 1].set_ylabel('Mean Value')
+            axes[0, 1].bar(["R", "G", "B"], orig_style_np[:3], color=["red", "green", "blue"], alpha=0.7)
+            axes[0, 1].set_title("Original Mean", fontsize=10)
+            axes[0, 1].set_ylabel("Mean Value")
             axes[0, 1].set_ylim([orig_style_np[:3].min() - 0.1, orig_style_np[:3].max() + 0.1])
             axes[0, 1].grid(True, alpha=0.3)
-            
-            axes[0, 2].bar(['R', 'G', 'B'], orig_style_np[3:], color=['red', 'green', 'blue'], alpha=0.7)
-            axes[0, 2].set_title('Original Std', fontsize=10)
-            axes[0, 2].set_ylabel('Std Value')
+
+            axes[0, 2].bar(["R", "G", "B"], orig_style_np[3:], color=["red", "green", "blue"], alpha=0.7)
+            axes[0, 2].set_title("Original Std", fontsize=10)
+            axes[0, 2].set_ylabel("Std Value")
             axes[0, 2].set_ylim([orig_style_np[3:].min() - 0.05, orig_style_np[3:].max() + 0.05])
             axes[0, 2].grid(True, alpha=0.3)
-            
+
             # Bottom-left: Adversarial with all object bboxes (NO mask overlay)
-            axes[1, 0].imshow(adv_np)
-            axes[1, 0].set_title('Adversarial (Multi-Object Style)', fontsize=12, fontweight='bold')
-            axes[1, 0].axis('off')
-            
-            for k in range(K):
-                mask_k = all_masks[k].cpu().numpy()
-                if mask_k.sum() == 0:
-                    continue
-                
-                # Check if this is background mask (last slot in K)
-                is_background = include_background and (k == K - 1 and mask_k.sum() > 0)
-                
-                # Draw mask contour
-                from skimage import measure
-                contours = measure.find_contours(mask_k, 0.5)
-                
-                # Get epsilon weight if available (simplified label)
-                eps_info = ""
-                if epsilon_weights is not None:
-                    eps_weight = epsilon_weights[k].item()
-                    eps_info = f" ε{eps_weight:.2f}"
-                
-                # Determine colors based on object type
-                if is_background:
-                    # Background: green dashed bbox
-                    edge_color = 'lime'
-                    linewidth = 2
-                    linestyle = '--'
-                    label = f'BG{eps_info}'
-                    label_color = 'lime'
-                elif k == primary_obj_idx:
-                    # Primary object (for loss): RED, thick
-                    edge_color = 'red'
-                    linewidth = 4
-                    linestyle = '-'
-                    label = f'O{k+1}*{eps_info}'
-                    label_color = 'red'
-                else:
-                    # Other objects: cyan, thin
-                    edge_color = 'cyan'
-                    linewidth = 2
-                    linestyle = '-'
-                    label = f'O{k+1}{eps_info}'
-                    label_color = 'cyan'
-                
-                # Draw contours
-                for contour in contours:
-                    axes[1, 0].plot(contour[:, 1], contour[:, 0], color=edge_color, 
-                                    linewidth=linewidth, linestyle=linestyle, alpha=0.8)
-                
-                # Draw bbox
-                if all_bboxes is not None:
-                    bbox_k = all_bboxes[k].cpu().numpy()
-                    x1, y1, x2, y2 = bbox_k
-                    if x2 > x1 and y2 > y1:
-                        rect = patches.Rectangle(
-                            (x1, y1), x2 - x1, y2 - y1,
-                            linewidth=linewidth, edgecolor=edge_color, 
-                            facecolor='none', linestyle=linestyle, alpha=0.5
-                        )
-                        axes[1, 0].add_patch(rect)
-                        axes[1, 0].text(
-                            x1, y1 - 5, label,
-                            color=label_color, fontsize=9, fontweight='bold',
-                            bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.8)
-                        )
-            
+            # Bottom-left: Adversarial with all object bboxes
+            self._plot_image_with_bboxes(adv_np, all_bboxes, primary_obj_idx, include_background=include_background, K=K, masks=all_masks, epsilon_weights=epsilon_weights, ax=axes[1, 0])
+            axes[1, 0].set_title("Adversarial (Multi-Object Style)", fontsize=12, fontweight="bold")
+
             # Bottom-middle & right: Adversarial style stats
-            axes[1, 1].bar(['R', 'G', 'B'], adv_style_np[:3], color=['red', 'green', 'blue'], alpha=0.7)
-            axes[1, 1].set_title('Adversarial Mean', fontsize=10)
-            axes[1, 1].set_ylabel('Mean Value')
+            axes[1, 1].bar(["R", "G", "B"], adv_style_np[:3], color=["red", "green", "blue"], alpha=0.7)
+            axes[1, 1].set_title("Adversarial Mean", fontsize=10)
+            axes[1, 1].set_ylabel("Mean Value")
             axes[1, 1].set_ylim([adv_style_np[:3].min() - 0.1, adv_style_np[:3].max() + 0.1])
             axes[1, 1].grid(True, alpha=0.3)
-            
-            axes[1, 2].bar(['R', 'G', 'B'], adv_style_np[3:], color=['red', 'green', 'blue'], alpha=0.7)
-            axes[1, 2].set_title('Adversarial Std', fontsize=10)
-            axes[1, 2].set_ylabel('Std Value')
+
+            axes[1, 2].bar(["R", "G", "B"], adv_style_np[3:], color=["red", "green", "blue"], alpha=0.7)
+            axes[1, 2].set_title("Adversarial Std", fontsize=10)
+            axes[1, 2].set_ylabel("Std Value")
             axes[1, 2].set_ylim([adv_style_np[3:].min() - 0.05, adv_style_np[3:].max() + 0.05])
             axes[1, 2].grid(True, alpha=0.3)
-            
+
             # Add overall title
-            fig.suptitle(f'Multi-Object Style Attack ({K} objects)', fontsize=14, fontweight='bold')
-            
+            fig.suptitle(f"Multi-Object Style Attack ({K} objects)", fontsize=14, fontweight="bold")
+
         else:
             # Single-object visualization (original 2x3 layout)
             fig, axes = plt.subplots(2, 3, figsize=(15, 10))
             from skimage import measure  # Needed for contour drawing in single-object view
-            
+
             # Row 1: Original image and its styles
             axes[0, 0].imshow(orig_np)
-            axes[0, 0].set_title('Original Image', fontsize=12, fontweight='bold')
-            axes[0, 0].axis('off')
-            
+            axes[0, 0].set_title("Original Image", fontsize=12, fontweight="bold")
+            axes[0, 0].axis("off")
+
             # Draw bbox and mask on original image if available
             if bbox is not None:
-                bbox_np = bbox.cpu().numpy() if hasattr(bbox, 'cpu') else bbox
+                bbox_np = bbox.cpu().numpy() if hasattr(bbox, "cpu") else bbox
                 x1, y1, x2, y2 = bbox_np
-                rect = patches.Rectangle(
-                    (x1, y1), x2 - x1, y2 - y1,
-                    linewidth=3, edgecolor='red', facecolor='none', linestyle='-'
-                )
+                rect = patches.Rectangle((x1, y1), x2 - x1, y2 - y1, linewidth=3, edgecolor="red", facecolor="none", linestyle="-")
                 axes[0, 0].add_patch(rect)
-                axes[0, 0].text(
-                    x1, y1 - 5, 'Attack Region',
-                    color='red', fontsize=10, fontweight='bold',
-                    bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.7)
-                )
+                axes[0, 0].text(x1, y1 - 5, "Attack Region", color="red", fontsize=10, fontweight="bold", bbox=dict(boxstyle="round,pad=0.3", facecolor="yellow", alpha=0.7))
             if gt_mask is not None:
-                mask_np = gt_mask.cpu().numpy() if hasattr(gt_mask, 'cpu') else gt_mask
+                mask_np = gt_mask.cpu().numpy() if hasattr(gt_mask, "cpu") else gt_mask
                 contours = measure.find_contours(mask_np, 0.5)
                 for contour in contours:
-                    axes[0, 0].plot(contour[:, 1], contour[:, 0], color='cyan', linewidth=2, linestyle='-', alpha=0.7)
-            
+                    axes[0, 0].plot(contour[:, 1], contour[:, 0], color="cyan", linewidth=2, linestyle="-", alpha=0.7)
+
             # Original style - means
-            axes[0, 1].bar(['R', 'G', 'B'], orig_style_np[:3], color=['red', 'green', 'blue'], alpha=0.7)
-            axes[0, 1].set_title('Original Mean (per channel)', fontsize=10)
-            axes[0, 1].set_ylabel('Mean Value')
+            axes[0, 1].bar(["R", "G", "B"], orig_style_np[:3], color=["red", "green", "blue"], alpha=0.7)
+            axes[0, 1].set_title("Original Mean (per channel)", fontsize=10)
+            axes[0, 1].set_ylabel("Mean Value")
             axes[0, 1].set_ylim([orig_style_np[:3].min() - 0.1, orig_style_np[:3].max() + 0.1])
             axes[0, 1].grid(True, alpha=0.3)
-            
+
             # Original style - stds
-            axes[0, 2].bar(['R', 'G', 'B'], orig_style_np[3:], color=['red', 'green', 'blue'], alpha=0.7)
-            axes[0, 2].set_title('Original Std (per channel)', fontsize=10)
-            axes[0, 2].set_ylabel('Std Value')
+            axes[0, 2].bar(["R", "G", "B"], orig_style_np[3:], color=["red", "green", "blue"], alpha=0.7)
+            axes[0, 2].set_title("Original Std (per channel)", fontsize=10)
+            axes[0, 2].set_ylabel("Std Value")
             axes[0, 2].set_ylim([orig_style_np[3:].min() - 0.05, orig_style_np[3:].max() + 0.05])
             axes[0, 2].grid(True, alpha=0.3)
-            
+
             # Row 2: Adversarial image and its styles
             axes[1, 0].imshow(adv_np)
-            axes[1, 0].set_title('Adversarial Image (Style-Augmented)', fontsize=12, fontweight='bold')
-            axes[1, 0].axis('off')
-            
+            axes[1, 0].set_title("Adversarial Image (Style-Augmented)", fontsize=12, fontweight="bold")
+            axes[1, 0].axis("off")
+
             # Draw bbox and mask on adversarial image if available
             if bbox is not None:
-                bbox_np = bbox.cpu().numpy() if hasattr(bbox, 'cpu') else bbox
+                bbox_np = bbox.cpu().numpy() if hasattr(bbox, "cpu") else bbox
                 x1, y1, x2, y2 = bbox_np
-                rect = patches.Rectangle(
-                    (x1, y1), x2 - x1, y2 - y1,
-                    linewidth=3, edgecolor='lime', facecolor='none', linestyle='-'
-                )
+                rect = patches.Rectangle((x1, y1), x2 - x1, y2 - y1, linewidth=3, edgecolor="lime", facecolor="none", linestyle="-")
                 axes[1, 0].add_patch(rect)
-                axes[1, 0].text(
-                    x1, y1 - 5, 'Attack Region (Styled)',
-                    color='lime', fontsize=10, fontweight='bold',
-                    bbox=dict(boxstyle='round,pad=0.3', facecolor='black', alpha=0.7)
-                )
+                axes[1, 0].text(x1, y1 - 5, "Attack Region (Styled)", color="lime", fontsize=10, fontweight="bold", bbox=dict(boxstyle="round,pad=0.3", facecolor="black", alpha=0.7))
             if gt_mask is not None:
                 from skimage import measure
-                mask_np = gt_mask.cpu().numpy() if hasattr(gt_mask, 'cpu') else gt_mask
+
+                mask_np = gt_mask.cpu().numpy() if hasattr(gt_mask, "cpu") else gt_mask
                 contours = measure.find_contours(mask_np, 0.5)
                 for contour in contours:
-                    axes[1, 0].plot(contour[:, 1], contour[:, 0], color='cyan', linewidth=2, linestyle='-', alpha=0.7)
-            
+                    axes[1, 0].plot(contour[:, 1], contour[:, 0], color="cyan", linewidth=2, linestyle="-", alpha=0.7)
+
             # Adversarial style - means
-            axes[1, 1].bar(['R', 'G', 'B'], adv_style_np[:3], color=['red', 'green', 'blue'], alpha=0.7)
-            axes[1, 1].set_title('Adversarial Mean (per channel)', fontsize=10)
-            axes[1, 1].set_ylabel('Mean Value')
+            axes[1, 1].bar(["R", "G", "B"], adv_style_np[:3], color=["red", "green", "blue"], alpha=0.7)
+            axes[1, 1].set_title("Adversarial Mean (per channel)", fontsize=10)
+            axes[1, 1].set_ylabel("Mean Value")
             axes[1, 1].set_ylim([adv_style_np[:3].min() - 0.1, adv_style_np[:3].max() + 0.1])
             axes[1, 1].grid(True, alpha=0.3)
-            
+
             # Adversarial style - stds
-            axes[1, 2].bar(['R', 'G', 'B'], adv_style_np[3:], color=['red', 'green', 'blue'], alpha=0.7)
-            axes[1, 2].set_title('Adversarial Std (per channel)', fontsize=10)
-            axes[1, 2].set_ylabel('Std Value')
+            axes[1, 2].bar(["R", "G", "B"], adv_style_np[3:], color=["red", "green", "blue"], alpha=0.7)
+            axes[1, 2].set_title("Adversarial Std (per channel)", fontsize=10)
+            axes[1, 2].set_ylabel("Std Value")
             axes[1, 2].set_ylim([adv_style_np[3:].min() - 0.05, adv_style_np[3:].max() + 0.05])
             axes[1, 2].grid(True, alpha=0.3)
-        
+
         plt.tight_layout()
-        
+
         # Convert figure to image and log
         fig.canvas.draw()
         width, height = fig.canvas.get_width_height()
         img_array = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
         img_array = img_array.reshape(height, width, 4)[:, :, :3]
         img_tensor = torch.from_numpy(img_array).permute(2, 0, 1).float() / 255.0
-        
+
         # Log to TensorBoard
         if self.logger.tb_logger and self.logger.tb_logger._writer:
             tag_suffix = "multi_object" if is_multi_object else "single_object"
-            self.logger.tb_logger._writer.add_image(
-                f"StyleAUE/{tag_suffix}_sample_{sample_id}",
-                img_tensor,
-                step
-            )
-        
+            self.logger.tb_logger._writer.add_image(f"StyleAUE/{tag_suffix}_sample_{sample_id}", img_tensor, step)
+            # === Paper-quality individual images (no statistics overlay) ===
+            # Log original image only
+            orig_tensor = torch.from_numpy(orig_np).permute(2, 0, 1).float()
+            orig_tensor = torch.clamp(orig_tensor, 0, 1)
+            self.logger.tb_logger._writer.add_image(f"StyleAUE/original_sample_{sample_id}", orig_tensor, step)
+
+            # Log original image with bbox overlays (for showing attack region)
+            # Color scheme: Red = primary object (for loss), cyan = other objects
+            # Use loss_object_idx if available (passed from training), otherwise default to 0
+            primary_obj_idx = loss_object_idx if loss_object_idx is not None else 0
+
+            if all_bboxes is not None:
+                K_val = all_bboxes.shape[0]
+                orig_with_bbox = self._plot_image_with_bboxes(orig_np, all_bboxes, primary_obj_idx, include_background=include_background, K=K_val, masks=all_masks, ax=None)
+                orig_bbox_tensor = torch.from_numpy(orig_with_bbox).permute(2, 0, 1).float() / 255.0
+                self.logger.tb_logger._writer.add_image(f"StyleAUE/original_with_bbox_sample_{sample_id}", orig_bbox_tensor, step)
+            elif bbox is not None:
+                # Single bbox - wrap in array for helper function
+                single_bbox = bbox.unsqueeze(0) if hasattr(bbox, "unsqueeze") else np.expand_dims(bbox, 0)
+                orig_with_bbox = self._plot_image_with_bboxes(
+                    orig_np,
+                    single_bbox,
+                    0,
+                    include_background=False,
+                    K=1,
+                    masks=gt_mask.unsqueeze(0) if hasattr(gt_mask, "unsqueeze") else np.expand_dims(gt_mask, 0) if gt_mask is not None else None,
+                    ax=None,
+                )
+                orig_bbox_tensor = torch.from_numpy(orig_with_bbox).permute(2, 0, 1).float() / 255.0
+                self.logger.tb_logger._writer.add_image(f"StyleAUE/original_with_bbox_sample_{sample_id}", orig_bbox_tensor, step)
+
+            # Log adversarial image only
+            adv_tensor = torch.from_numpy(adv_np).permute(2, 0, 1).float()
+            adv_tensor = torch.clamp(adv_tensor, 0, 1)
+            self.logger.tb_logger._writer.add_image(f"StyleAUE/adversarial_sample_{sample_id}", adv_tensor, step)
+
+            # Log adversarial image with bbox overlays (same color scheme)
+            if all_bboxes is not None:
+                K_val = all_bboxes.shape[0]
+                adv_with_bbox = self._plot_image_with_bboxes(adv_np, all_bboxes, primary_obj_idx, include_background=include_background, K=K_val, masks=all_masks, ax=None)
+                adv_bbox_tensor = torch.from_numpy(adv_with_bbox).permute(2, 0, 1).float() / 255.0
+                self.logger.tb_logger._writer.add_image(f"StyleAUE/adversarial_with_bbox_sample_{sample_id}", adv_bbox_tensor, step)
+
+            # Log difference image (amplified for visibility)
+            diff = np.abs(adv_np - orig_np)
+            diff_amplified = np.clip(diff * 5.0, 0, 1)  # Amplify by 5x
+            diff_tensor = torch.from_numpy(diff_amplified).permute(2, 0, 1).float()
+            self.logger.tb_logger._writer.add_image(f"StyleAUE/difference_sample_{sample_id}", diff_tensor, step)
+
+            # Log GT Mask (Standalone)
+            if all_masks is not None:
+                gt_masks_np = all_masks.cpu().numpy()
+                gt_vis_np = np.zeros((*gt_masks_np.shape[-2:], 3), dtype=np.uint8)
+                colors = [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0], [0, 255, 255]]
+                for k in range(gt_masks_np.shape[0]):
+                    mask_k = gt_masks_np[k] > 0.5
+                    color = colors[k % len(colors)]
+                    for c in range(3):
+                        gt_vis_np[..., c] = np.where(mask_k, color[c], gt_vis_np[..., c])
+
+                gt_tensor = torch.from_numpy(gt_vis_np).permute(2, 0, 1).float() / 255.0
+                self.logger.tb_logger._writer.add_image(f"StyleAUE/gt_mask_sample_{sample_id}", gt_tensor, step)
+            elif gt_mask is not None:
+                # Single mask
+                gt_mask_np = gt_mask.cpu().numpy() if hasattr(gt_mask, "cpu") else gt_mask
+                gt_vis_np = np.zeros((*gt_mask_np.shape[-2:], 3), dtype=np.uint8)
+                mask_k = gt_mask_np > 0.5
+                # Use cyan for single mask
+                gt_vis_np[..., 1] = np.where(mask_k, 255, 0)
+                gt_vis_np[..., 2] = np.where(mask_k, 255, 0)
+                gt_tensor = torch.from_numpy(gt_vis_np).permute(2, 0, 1).float() / 255.0
+                self.logger.tb_logger._writer.add_image(f"StyleAUE/gt_mask_sample_{sample_id}", gt_tensor, step)
+
+            # Log Prediction Mask (Standalone)
+            if pred_mask is not None:
+                pred_np = pred_mask.cpu().numpy()
+                pred_bin = pred_np > 0.0
+                pred_vis_np = np.zeros((*pred_bin.shape[-2:], 3), dtype=np.uint8)
+                colors = [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0], [0, 255, 255]]
+                for k in range(pred_bin.shape[0]):
+                    mask_k = pred_bin[k]
+                    color = colors[k % len(colors)]
+                    for c in range(3):
+                        pred_vis_np[..., c] = np.where(mask_k, color[c], pred_vis_np[..., c])
+
+                pred_tensor = torch.from_numpy(pred_vis_np).permute(2, 0, 1).float() / 255.0
+                self.logger.tb_logger._writer.add_image(f"StyleAUE/pred_mask_sample_{sample_id}", pred_tensor, step)
+
         plt.close(fig)
 
     def _extract_pixel_bndl_model(self, model):
@@ -2253,7 +2434,6 @@ class Trainer:
             else:
                 bndl_outputs["uncertainty_type"] = "sampling"
 
-
             # Clear cache after uncertainty calculation to free up memory
             torch.cuda.empty_cache()
 
@@ -2261,15 +2441,14 @@ class Trainer:
 
     def _has_global_params(self, bndl_outputs):
         """检查是否有全局权重参数"""
-        return "wei_lambda_w" in bndl_outputs and "inv_k_w" in bndl_outputs and bndl_outputs["wei_lambda_w"] is not None and bndl_outputs["inv_k_w"] is not None
+        return "wei_lambda_w" in bndl_outputs and "kappa_w" in bndl_outputs and bndl_outputs["wei_lambda_w"] is not None and bndl_outputs["kappa_w"] is not None
 
     def _extract_pixel_params(self, bndl_outputs, batch_idx=0):
         """提取并处理像素级参数"""
         b, c, h, w = bndl_outputs["upscaled_shape"]
 
         lambda_vals = bndl_outputs["wei_lambda"].detach().cpu().numpy()  # [B, H, W, C]
-        inv_k_vals = bndl_outputs["inv_k"].detach().cpu().numpy()  # [B, H, W, C]
-        k_vals = 1.0 / (inv_k_vals + 1e-6)
+        k_vals = bndl_outputs["kappa"].detach().cpu().numpy()  # kappa is already the shape parameter
 
         # Extract specific batch - now working with [B, H, W, C] format
         lambda_batch = lambda_vals[batch_idx]  # [H, W, C]
@@ -2285,12 +2464,13 @@ class Trainer:
 
         return lambda_img, k_img
 
-    def _extract_mask_prompt_info(self, outputs_for_vis, step_index=0):
+    def _extract_mask_prompt_info(self, outputs_for_vis, step_index=0, batch_idx=0):
         """从 mask_inputs 提取边界框或轮廓点用于可视化
 
         Args:
             outputs_for_vis: 模型输出列表
             step_index: 帧索引
+            batch_idx: batch索引
 
         Returns:
             prompt_info 字典（包含 mask 的 bounding box）或 None
@@ -2313,7 +2493,12 @@ class Trainer:
 
             # mask_inputs 通常是 [B, 1, H, W] 格式
             if hasattr(mask_inputs, "shape") and len(mask_inputs.shape) >= 3:
-                mask = mask_inputs[0, 0] if len(mask_inputs.shape) == 4 else mask_inputs[0]  # [H, W]
+                # Use batch_idx
+                if len(mask_inputs.shape) == 4:
+                    idx = min(batch_idx, mask_inputs.shape[0] - 1)
+                    mask = mask_inputs[idx, 0]
+                else:
+                    mask = mask_inputs[0]  # Fallback if no batch dim
 
                 # 转换为 numpy
                 if hasattr(mask, "cpu"):
@@ -2354,12 +2539,13 @@ class Trainer:
         except Exception:
             return None
 
-    def _extract_prompt_info(self, outputs_for_vis, step_index=0):
+    def _extract_prompt_info(self, outputs_for_vis, step_index=0, batch_idx=0):
         """从模型输出中提取prompt信息（优先从第一帧）
 
         Args:
             outputs_for_vis: 模型输出列表，每个元素是一帧的输出字典
             step_index: 帧索引
+            batch_idx: batch索引
 
         Returns:
             prompt_info字典，包含point_coords和point_labels，或None
@@ -2399,6 +2585,15 @@ class Trainer:
             labels = final_point_inputs.get("point_labels", None)
 
             if coords is not None and labels is not None:
+                # Slice specific batch index if available
+                # coords: [B, N, 2], labels: [B, N]
+                if hasattr(coords, "shape") and coords.ndim == 3 and coords.shape[0] > 1:
+                    idx = min(batch_idx, coords.shape[0] - 1)
+                    coords_slice = coords[idx : idx + 1]  # Keep batch dim [1, N, 2]
+                    labels_slice = labels[idx : idx + 1]  # Keep batch dim [1, N]
+
+                    return {"point_coords": coords_slice, "point_labels": labels_slice, "is_box": final_point_inputs.get("is_box", False)}
+
                 return final_point_inputs
 
             return None
@@ -2453,6 +2648,53 @@ class Trainer:
         except Exception:
             return None
 
+    def _extract_prediction(self, outputs, batch_idx, frame_idx=0):
+        """Extract predicted mask for a specific batch index."""
+        try:
+            # If outputs is a list of frames, get the specific frame
+            if isinstance(outputs, list):
+                if frame_idx < len(outputs):
+                    outputs = outputs[frame_idx]
+                else:
+                    outputs = outputs[0]  # Fallback
+
+            # Check for pred_masks in dict
+            if isinstance(outputs, dict) and "pred_masks" in outputs:
+                pred_masks = outputs["pred_masks"]  # [B, K, H, W]
+                if pred_masks is not None and batch_idx < pred_masks.shape[0]:
+                    return pred_masks[batch_idx]
+
+            return None
+        except Exception:
+            return None
+
+    def _extract_gt_mask(self, batch, batch_idx, frame_index=0):
+        """Extract Ground Truth mask for validation visualization."""
+        try:
+            if not hasattr(batch, "masks"):
+                return None
+
+            masks = batch.masks  # [T, B, K, H, W] or [B, K, H, W] or [B, H, W]
+
+            if hasattr(masks, "cpu"):
+                masks = masks.cpu().numpy()
+
+            # Handle Temporal dimension
+            if len(masks.shape) == 5:  # [T, B, K, H, W]
+                # Default to frame_index, but check bounds
+                t_idx = min(frame_index, masks.shape[0] - 1)
+                masks = masks[t_idx]  # [B, K, H, W]
+
+            # Handle Batch dimension
+            if len(masks.shape) >= 2:  # At least [B, ...]
+                if batch_idx < masks.shape[0]:
+                    mask_b = masks[batch_idx]  # [K, H, W] or [H, W]
+                    return mask_b
+
+            return None
+        except Exception:
+            return None
+
     def _upsample_params_to_image_size(self, lambda_img, k_img, target_shape):
         """将参数图上采样到目标图像尺寸"""
         target_h, target_w = target_shape[:2]
@@ -2470,16 +2712,30 @@ class Trainer:
         # 初始化可视化器
         bndl_viz = BNDLVisualizer()
 
+        # Determine batch size from batch.img_batch
+        batch_size = 1
+        if hasattr(batch, "img_batch"):
+            img_batch = batch.img_batch
+            if hasattr(img_batch, "shape"):
+                if len(img_batch.shape) == 5:  # [T, B, C, H, W]
+                    batch_size = img_batch.shape[1]
+                elif len(img_batch.shape) == 4:  # [B, C, H, W]
+                    batch_size = img_batch.shape[0]
+
+        # Select random batch index
+        batch_idx = random.randint(0, max(0, batch_size - 1))
+
         # 提取参数和图像
-        lambda_img, k_img = self._extract_pixel_params(bndl_outputs)
-        original_img = self._extract_original_image(batch, frame_idx=frame_index)
+        lambda_img, k_img = self._extract_pixel_params(bndl_outputs, batch_idx=batch_idx)
+        original_img = self._extract_original_image(batch, frame_idx=frame_index, batch_idx=batch_idx)
+        gt_mask = self._extract_gt_mask(batch, batch_idx=batch_idx, frame_index=frame_index)
 
         # 提取prompt信息 - 总是从第一帧（frame 0）提取，因为第一帧是 init_cond_frame，有初始 prompts
-        prompt_info = self._extract_prompt_info(outputs_for_vis, step_index=0)
+        prompt_info = self._extract_prompt_info(outputs_for_vis, step_index=0, batch_idx=batch_idx)
 
         # 如果没有 point prompts，尝试从 mask_inputs 提取轮廓用于可视化
         if prompt_info is None:
-            prompt_info = self._extract_mask_prompt_info(outputs_for_vis, step_index=0)
+            prompt_info = self._extract_mask_prompt_info(outputs_for_vis, step_index=0, batch_idx=batch_idx)
 
         if original_img is not None:
             lambda_img, k_img = self._upsample_params_to_image_size(lambda_img, k_img, original_img.shape)
@@ -2499,8 +2755,10 @@ class Trainer:
             save_unified=True,
             visualize_pavpu_overlay=self.logging_conf.visualize_pavpu_overlay,
             uncertainty_metric=self.logging_conf.uncertainty_metric,
-            epoch=self.epoch
+            epoch=self.epoch,
+            gt_mask=gt_mask,
         )
+
 
 def print_model_summary(model: torch.nn.Module, log_dir: str = ""):
     """

@@ -17,6 +17,7 @@ import torch.nn.functional as F
 from PIL import Image
 
 from sam2.build_sam import build_sam2_video_predictor
+from tools.vos_inference import DAVIS_PALETTE, save_masks_to_dir
 
 
 # ============================================================================
@@ -250,3 +251,23 @@ def select_single_mask_from_multimask(
     # Already 2D or other format
     return mask_logits if mask_logits.ndim == 2 else mask_logits.squeeze()
 
+    # Already 2D or other format
+    return mask_logits if mask_logits.ndim == 2 else mask_logits.squeeze()
+
+
+def save_single_mask_helper(f_idx, seg, vid, frame_names, out_dir, H, W, per_obj_png_file=False):
+    """Helper function for parallel mask saving.
+    
+    Moved from local scope to module level for better pickling and code organization.
+    """
+    save_masks_to_dir(
+        output_mask_dir=str(out_dir),
+        video_name=vid,
+        frame_name=frame_names[f_idx],
+        per_obj_output_mask=seg,
+        height=H,
+        width=W,
+        per_obj_png_file=per_obj_png_file,
+        output_palette=DAVIS_PALETTE,
+    )
+    return f_idx

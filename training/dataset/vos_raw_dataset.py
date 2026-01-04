@@ -65,6 +65,7 @@ class PNGRawDataset(VOSRawDataset):
         single_object_mode=False,
         truncate_video=-1,
         frames_sampling_mult=False,
+        max_videos=None,  # Limit number of videos for fast validation
     ):
         self.img_folder = img_folder
         self.gt_folder = gt_folder
@@ -91,6 +92,10 @@ class PNGRawDataset(VOSRawDataset):
         self.video_names = sorted(
             [video_name for video_name in subset if video_name not in excluded_files]
         )
+
+        # Limit number of videos for fast validation
+        if max_videos is not None and max_videos > 0:
+            self.video_names = self.video_names[:max_videos]
 
         if self.single_object_mode:
             # single object mode

@@ -423,18 +423,35 @@ class VisualizationUtils:
         return fig, axes
 
     @staticmethod
-    def save_and_close_figure(fig: plt.Figure, save_path: str, dpi: int = 150, close_fig: bool = True) -> None:
+    def save_and_close_figure(fig: plt.Figure, save_path: str, dpi: int = 150, close_fig: bool = True, save_pdf: bool = False) -> None:
         """保存并关闭图表
         
         Args:
             fig: Matplotlib figure to save
-            save_path: Path to save the figure
-            dpi: DPI resolution for saving
+            save_path: Path to save the figure (can be .png or .pdf)
+            dpi: DPI resolution for saving (default: 150, use 300 for paper-quality)
             close_fig: Whether to close the figure after saving (default: True)
+            save_pdf: If True, save both PNG and PDF versions (PDF at 300 DPI for paper)
         """
+        import os
         plt.figure(fig.number)
         plt.tight_layout()
-        plt.savefig(save_path, dpi=dpi)
+        
+        # Determine output format based on extension
+        base_path, ext = os.path.splitext(save_path)
+        
+        if ext.lower() == '.pdf':
+            # If explicitly PDF, save as PDF only with 300 DPI
+            plt.savefig(save_path, dpi=300, format='pdf', bbox_inches='tight')
+        else:
+            # Save PNG
+            plt.savefig(save_path, dpi=dpi)
+            
+            # Optionally also save PDF for paper figures
+            if save_pdf:
+                pdf_path = base_path + '.pdf'
+                plt.savefig(pdf_path, dpi=300, format='pdf', bbox_inches='tight')
+        
         if close_fig:
             plt.close(fig)
     

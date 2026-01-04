@@ -9,6 +9,7 @@ from typing import Any
 
 import cv2
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
@@ -21,6 +22,44 @@ except ImportError:
     # Fallback for when imported as standalone module
     from metric_calculator import MetricCalculator
     from visualization_utils import VisualizationUtils
+
+
+def get_object_colors(n_colors: int = 20):
+    """Get a list of distinct colors for multi-object visualization.
+
+    Uses colorcet's glasbey palette if available (up to 256 colors),
+    otherwise falls back to matplotlib's tab20 (20 colors).
+
+    Args:
+        n_colors: Number of colors needed
+
+    Returns:
+        List of RGB tuples normalized to [0, 1]
+    """
+    try:
+        import colorcet as cc
+
+        # glasbey provides up to 256 perceptually distinct colors (as hex strings)
+        hex_colors = cc.glasbey_dark[: min(n_colors, 256)]
+        # Convert hex to RGB tuples normalized to [0, 1]
+        colors = []
+        for hex_color in hex_colors:
+            hex_color = hex_color.lstrip("#")
+            r, g, b = tuple(int(hex_color[i : i + 2], 16) / 255.0 for i in (0, 2, 4))
+            colors.append((r, g, b))
+        return colors
+    except (ImportError, AttributeError):
+        pass
+
+    # Fallback to matplotlib's tab20 colormap (20 distinct colors)
+    import matplotlib.cm as cm
+
+    cmap = cm.get_cmap("tab20")
+    return [cmap(i / 20)[:3] for i in range(min(n_colors, 20))]
+
+
+# Pre-generate 20 colors for common use
+OBJECT_COLORS = get_object_colors(20)
 
 
 class BNDLVisualizer:
@@ -46,26 +85,25 @@ class BNDLVisualizer:
         k_eff_np = None
 
         wei_lambda = bndl_outputs.get("wei_lambda")
-        inv_k = bndl_outputs.get("inv_k")
+        kappa = bndl_outputs.get("kappa")  # Now returns kappa directly, not inv_k
         out_w = bndl_outputs.get("out_w")
         logits = bndl_outputs.get("masks_bndl_raw") if bndl_outputs.get("masks_bndl_raw") is not None else bndl_outputs.get("mean_pixel_logits")
 
-        if wei_lambda is not None and inv_k is not None:
+        if wei_lambda is not None and kappa is not None:
             # 转为torch并在CPU上计算
             wl = wei_lambda.detach().float().cpu()  # [B,H,W,C']
-            invk = inv_k.detach().float().cpu()     # [B,H,W,1] 或 [B,H,W,C']
-            k_val = 1.0 / (invk + 1e-6)
-            
-            # 处理形状不一致：inv_k 可能是 [B,H,W,1]，需要广播到 [B,H,W,C']
+            k_val = kappa.detach().float().cpu()  # [B,H,W,1] 或 [B,H,W,C'] - now kappa directly
+
+            # 处理形状不一致：kappa 可能是 [B,H,W,1]，需要广播到 [B,H,W,C']
             logging.debug(f"Shape check - wl: {wl.shape}, k_val: {k_val.shape}")
             if k_val.shape[-1] == 1 and wl.shape[-1] > 1:
                 # 广播 k_val 到与 wl 相同的通道数
                 k_val = k_val.expand_as(wl)
                 logging.debug(f"Broadcasted k_val from [B,H,W,1] to {k_val.shape}")
             elif wl.shape != k_val.shape:
-                logging.error(f"Shape mismatch between wei_lambda {wl.shape} and inv_k {k_val.shape} cannot be resolved")
-                raise ValueError(f"Incompatible shapes: wei_lambda {wl.shape} vs inv_k {k_val.shape}")
-            
+                logging.error(f"Shape mismatch between wei_lambda {wl.shape} and kappa {k_val.shape} cannot be resolved")
+                raise ValueError(f"Incompatible shapes: wei_lambda {wl.shape} vs kappa {k_val.shape}")
+
             # 处理权重矩阵：优先使用 out_w；若无则尝试 hyper_in
             w = None
             if out_w is not None:
@@ -94,7 +132,7 @@ class BNDLVisualizer:
                         k_flat = k_val.view(B, H * W, C)
                         w_bt = w_norm.transpose(1, 2)  # [B,C',K]
                         lambda_w_flat = torch.bmm(wl_flat, w_bt)  # [B,HW,K]
-                        k_w_flat = torch.bmm(k_flat, w_bt)        # [B,HW,K]
+                        k_w_flat = torch.bmm(k_flat, w_bt)  # [B,HW,K]
                         lambda_w = lambda_w_flat.view(B, H, W, K)
                         k_w = k_w_flat.view(B, H, W, K)
                     else:
@@ -117,7 +155,7 @@ class BNDLVisualizer:
                         B, H, W, C = wl.shape
                         if w_ck.shape[0] == C:
                             w_sum = w_ck.sum(dim=0, keepdim=True) + 1e-8  # [1,K]
-                            w_norm = w_ck / w_sum                           # [C',K]
+                            w_norm = w_ck / w_sum  # [C',K]
                             wl_flat = wl.view(B * H * W, C)
                             k_flat = k_val.view(B * H * W, C)
                             lambda_w_flat = torch.matmul(wl_flat, w_norm)  # [BHW,K]
@@ -259,7 +297,8 @@ class BNDLVisualizer:
         """在统一布局中绘制全局权重参数"""
         try:
             lambda_w = bndl_outputs["wei_lambda_w"].detach().cpu().numpy()
-            k_w = (1.0 / (bndl_outputs["inv_k_w"] + 1e-6)).detach().cpu().numpy()
+            # kappa_w is now returned directly (not inv_k_w)
+            k_w = bndl_outputs["kappa_w"].detach().cpu().numpy()
             out_w = bndl_outputs.get("out_w")
             if out_w is not None and hasattr(out_w, "detach"):
                 out_w = out_w.detach().cpu().numpy()
@@ -348,17 +387,17 @@ class BNDLVisualizer:
         """绘制多不确定性度量对比可视化"""
         multi_uncertainty = bndl_outputs["multi_uncertainty"]
         uncertainty_types = list(multi_uncertainty.keys())
-        
+
         # Plot individual uncertainty maps
         for i, uncertainty_type in enumerate(uncertainty_types[:3]):  # Limit to 3 for layout
             uncertainty_data = multi_uncertainty[uncertainty_type]
             uncertainty_vis = uncertainty_data.detach().cpu().numpy()
-            
+
             if len(uncertainty_vis.shape) == 4:  # [B, H, W, C]
                 uncertainty_vis = uncertainty_vis[0].mean(axis=-1)
             elif len(uncertainty_vis.shape) == 3:  # [B, H, W]
                 uncertainty_vis = uncertainty_vis[0]
-            
+
             # Choose colormap based on uncertainty type
             if uncertainty_type == "nll":
                 cmap = "viridis"
@@ -369,12 +408,12 @@ class BNDLVisualizer:
             else:  # sampling
                 cmap = "plasma"
                 title_prefix = "Sampling Uncertainty"
-            
+
             im = axes[i].imshow(uncertainty_vis, cmap=cmap, interpolation="nearest")
             axes[i].set_title(f"{title_prefix} (Step {step_index})\nMean: {uncertainty_vis.mean():.4f}")
             axes[i].axis("off")
             plt.colorbar(im, ax=axes[i], fraction=0.046, pad=0.04)
-        
+
         # Fill remaining axes if we have fewer than 3 uncertainty types
         for i in range(len(uncertainty_types), 3):
             axes[i].axis("off")
@@ -386,7 +425,7 @@ class BNDLVisualizer:
             thresholds = bndl_outputs.get("pavpu_thresholds", [0.01, 0.05, 0.1])
             uncertainty = bndl_outputs.get("pixel_uncertainty")
             pixel_gt = bndl_outputs.get("pixel_gt")  # optional foreground mask
-            
+
             if pavpu_scores is None or thresholds is None or uncertainty is None:
                 # No PAvPU data available
                 for i in range(3):
@@ -394,17 +433,17 @@ class BNDLVisualizer:
                     axes[i].set_title(f"PAvPU Overlay {i + 1} (Step {step_index})")
                     axes[i].axis("off")
                 return
-            
+
             uncertainty_vis = uncertainty.detach().cpu().numpy()
             if len(uncertainty_vis.shape) == 4:  # [B, H, W, C]
                 uncertainty_vis = uncertainty_vis[0].mean(axis=-1)
             elif len(uncertainty_vis.shape) == 3:  # [B, H, W]
                 uncertainty_vis = uncertainty_vis[0]
-            
+
             # Resize uncertainty to match original image if needed
             if original_img is not None and uncertainty_vis.shape != original_img.shape[:2]:
                 uncertainty_vis = cv2.resize(uncertainty_vis, (original_img.shape[1], original_img.shape[0]), interpolation=cv2.INTER_LINEAR)
-            
+
             # Optional foreground mask (union of GT), with dilation to reduce edge noise
             fg_mask = None
             if pixel_gt is not None:
@@ -423,7 +462,7 @@ class BNDLVisualizer:
                             fg_mask = cv2.resize(fg_mask, (uncertainty_vis.shape[1], uncertainty_vis.shape[0]), interpolation=cv2.INTER_NEAREST)
                 except Exception:
                     fg_mask = None
-            
+
             # Normalize uncertainty for smoother overlays (mask optional)
             unc_min, unc_max = uncertainty_vis.min(), uncertainty_vis.max()
             unc_range = max(unc_max - unc_min, 1e-6)
@@ -436,36 +475,41 @@ class BNDLVisualizer:
                 if i >= len(pavpu_scores):
                     axes[i].axis("off")
                     continue
-                
+
                 # Soft mask: threshold on normalized uncertainty, then Gaussian blur
                 hard_mask = (unc_norm > threshold).astype(np.float32)
                 if fg_mask is not None:
                     hard_mask = hard_mask * fg_mask
                 soft_mask = cv2.GaussianBlur(hard_mask, (0, 0), sigmaX=2, sigmaY=2)
                 soft_mask = np.clip(soft_mask, 0.0, 1.0)
-                
+
                 # Create overlay image (blend with alpha = soft_mask * 0.7)
                 overlay_img = original_img.astype(np.float32) / 255.0
                 red = np.array([1.0, 0.0, 0.0], dtype=np.float32)
                 alpha = (soft_mask * 0.7)[..., None]
                 overlay_img = overlay_img * (1 - alpha) + red * alpha
-                
+
                 # Display the overlay
                 axes[i].imshow(np.clip(overlay_img, 0.0, 1.0))
                 axes[i].set_title(f"PAvPU Overlay (t={threshold:.2f})\nScore: {pavpu_scores[i]:.1f}% (Step {step_index})")
                 axes[i].axis("off")
-                
+
                 # Add uncertainty percentage text
                 uncertainty_percent = np.mean(hard_mask) * 100
-                axes[i].text(0.02, 0.98, f"Uncertain: {uncertainty_percent:.1f}%", 
-                           transform=axes[i].transAxes, fontsize=9, 
-                           bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8),
-                           verticalalignment="top")
-            
+                axes[i].text(
+                    0.02,
+                    0.98,
+                    f"Uncertain: {uncertainty_percent:.1f}%",
+                    transform=axes[i].transAxes,
+                    fontsize=9,
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8),
+                    verticalalignment="top",
+                )
+
             # Fill remaining axes if we have fewer than 3 thresholds
             for i in range(len(thresholds), 3):
                 axes[i].axis("off")
-                
+
         except Exception as e:
             logging.warning(f"PAvPU overlay visualization failed: {e}")
             for i in range(3):
@@ -475,7 +519,7 @@ class BNDLVisualizer:
 
     def plot_uncertainty_accuracy_ratio_visualization(self, axes, bndl_outputs: dict[str, Any], original_img: np.ndarray, step_index: int, ratio_type: str = "U/A") -> None:
         """绘制不确定性/准确性比值在原图上的overlay可视化
-        
+
         Args:
             axes: matplotlib axes数组
             bndl_outputs: BNDL输出字典
@@ -485,7 +529,7 @@ class BNDLVisualizer:
         """
         uncertainty = bndl_outputs.get("pixel_uncertainty")
         pixel_logits = bndl_outputs.get("mean_pixel_logits")
-        
+
         if uncertainty is None or pixel_logits is None:
             # No uncertainty or logits data available
             for i in range(3):
@@ -493,30 +537,30 @@ class BNDLVisualizer:
                 axes[i].set_title(f"{ratio_type} Ratio {i + 1} (Step {step_index})")
                 axes[i].axis("off")
             return
-        
+
         # 处理uncertainty数据
         uncertainty_vis = uncertainty.detach().cpu().numpy()
         if len(uncertainty_vis.shape) == 4:  # [B, H, W, C]
             uncertainty_vis = uncertainty_vis[0].mean(axis=-1)
         elif len(uncertainty_vis.shape) == 3:  # [B, H, W]
             uncertainty_vis = uncertainty_vis[0]
-        
+
         # 计算像素级准确性
         pixel_logits_vis = pixel_logits.detach().cpu().numpy()
         if len(pixel_logits_vis.shape) == 4:  # [B, H, W, K]
             pixel_logits_vis = pixel_logits_vis[0]
-        
+
         # 计算准确性：使用sigmoid后的概率作为"软"准确性度量
         pred_probs = 1.0 / (1.0 + np.exp(-pixel_logits_vis))  # sigmoid
         # 对于多通道，取最大概率作为该像素的"置信度"
         accuracy_vis = np.max(pred_probs, axis=-1)
-        
+
         # 调整尺寸以匹配原图
         if original_img is not None:
             target_shape = original_img.shape[:2]
             uncertainty_vis = cv2.resize(uncertainty_vis, (target_shape[1], target_shape[0]), interpolation=cv2.INTER_LINEAR)
             accuracy_vis = cv2.resize(accuracy_vis, (target_shape[1], target_shape[0]), interpolation=cv2.INTER_LINEAR)
-        
+
         # 计算比值
         eps = 1e-6
         if ratio_type == "U/A":
@@ -531,18 +575,14 @@ class BNDLVisualizer:
             # 对于A/U，高比值表示确定
             cmap = "viridis"
             overlay_color = np.array([0.0, 1.0, 0.0])  # 绿色表示高确定性
-        
+
         # 创建三种不同的可视化：全部用 heatmap 形式
-        ratio_methods = [
-            ("Linear", "linear"),
-            ("Log", "log"),
-            ("Normalized", "normalized")
-        ]
-        
+        ratio_methods = [("Linear", "linear"), ("Log", "log"), ("Normalized", "normalized")]
+
         for i, (method_name, method_type) in enumerate(ratio_methods):
             if i >= len(axes):
                 break
-            
+
             # 根据方法类型处理比值
             if method_type == "linear":
                 display_ratio = ratio_vis
@@ -553,32 +593,29 @@ class BNDLVisualizer:
             else:  # normalized
                 display_ratio = (ratio_vis - ratio_vis.min()) / (ratio_vis.max() - ratio_vis.min() + eps)
                 vmin, vmax = 0, 1
-            
+
             # 直接显示比值热图
-            im = axes[i].imshow(display_ratio, cmap=cmap, vmin=vmin, vmax=vmax, interpolation='nearest')
+            im = axes[i].imshow(display_ratio, cmap=cmap, vmin=vmin, vmax=vmax, interpolation="nearest")
             plt.colorbar(im, ax=axes[i], fraction=0.046, pad=0.04)
-            
+
             # 设置标题和统计信息
             mean_ratio = np.mean(ratio_vis)
             std_ratio = np.std(ratio_vis)
             median_ratio = np.median(ratio_vis)
             axes[i].set_title(f"{title_prefix} ({method_name})\nMean: {mean_ratio:.3f}, Median: {median_ratio:.3f}, Std: {std_ratio:.3f}")
             axes[i].axis("off")
-            
+
             # 添加更详细的统计信息文本
             percentile_90 = np.percentile(ratio_vis, 90)
             percentile_10 = np.percentile(ratio_vis, 10)
             info_text = f"P10: {percentile_10:.3f}\nP90: {percentile_90:.3f}\nRange: [{ratio_vis.min():.3f}, {ratio_vis.max():.3f}]"
-            
-            axes[i].text(0.02, 0.98, info_text, 
-                       transform=axes[i].transAxes, fontsize=8, 
-                       bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8),
-                       verticalalignment="top")
-        
+
+            axes[i].text(0.02, 0.98, info_text, transform=axes[i].transAxes, fontsize=8, bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8), verticalalignment="top")
+
         # 填充剩余的axes
         for i in range(len(ratio_methods), len(axes)):
             axes[i].axis("off")
-                
+
     def plot_uncertainty_visualization(self, axes, bndl_outputs: dict[str, Any], step_index: int) -> None:
         """绘制不确定性和PAvPU可视化"""
         try:
@@ -606,7 +643,7 @@ class BNDLVisualizer:
                     title_prefix = "Pixel Uncertainty"
                     cmap = "hot"
                     colorbar_label = "Uncertainty"
-                
+
                 # 不确定性热图
                 im1 = axes[0].imshow(uncertainty_vis, cmap=cmap, interpolation="nearest")
                 axes[0].set_title(f"{title_prefix} (Step {step_index})\nMean: {uncertainty_vis.mean():.4f}")
@@ -845,62 +882,104 @@ class BNDLVisualizer:
         save_unified: bool = True,
         visualize_pavpu_overlay: bool = False,
         uncertainty_metric: list = None,
-        epoch: int = None
+        epoch: int = None,
+        gt_mask: np.ndarray = None,
+        save_pdf: bool = False,  # Also save PDF versions for paper (300 DPI)
     ):
         """
         创建统一的可视化，支持保存单独的图和组合图
+
+        Args:
+            save_pdf: If True, also save PDF versions alongside PNG (300 DPI for paper)
         """
         if uncertainty_metric is None:
             uncertainty_metric = ["entropy"]
 
         has_uncertainty = "pixel_uncertainty" in bndl_outputs and bndl_outputs["pixel_uncertainty"] is not None
         has_pavpu = visualize_pavpu_overlay and "pixel_pavpu" in bndl_outputs and bndl_outputs["pixel_pavpu"] is not None
-        
+
         # 检查是否有数据支持比值可视化
         has_ratio_data = (
-            "pixel_uncertainty" in bndl_outputs and 
-            "mean_pixel_logits" in bndl_outputs and 
-            bndl_outputs["pixel_uncertainty"] is not None and 
-            bndl_outputs["mean_pixel_logits"] is not None
+            "pixel_uncertainty" in bndl_outputs and "mean_pixel_logits" in bndl_outputs and bndl_outputs["pixel_uncertainty"] is not None and bndl_outputs["mean_pixel_logits"] is not None
         )
 
         # 1. 保存单独的图
         if save_individual:
             self._save_individual_plots(
-                vis_dir, data_iter, step_index, original_img, lambda_img, k_img, 
-                bndl_outputs, prompt_info, has_uncertainty, has_pavpu, has_ratio_data, uncertainty_metric, epoch
+                vis_dir,
+                data_iter,
+                step_index,
+                original_img,
+                lambda_img,
+                k_img,
+                bndl_outputs,
+                prompt_info,
+                has_uncertainty,
+                has_pavpu,
+                has_ratio_data,
+                uncertainty_metric,
+                epoch,
+                gt_mask=gt_mask,
+                save_pdf=save_pdf,
             )
 
         # 2. 保存组合图
         if save_unified:
             self._save_unified_plot(
-                vis_dir, data_iter, step_index, original_img, lambda_img, k_img, 
-                bndl_outputs, prompt_info, layout_type, has_uncertainty, has_pavpu, has_ratio_data, uncertainty_metric, epoch
+                vis_dir,
+                data_iter,
+                step_index,
+                original_img,
+                lambda_img,
+                k_img,
+                bndl_outputs,
+                prompt_info,
+                layout_type,
+                has_uncertainty,
+                has_pavpu,
+                has_ratio_data,
+                uncertainty_metric,
+                epoch,
+                save_pdf=save_pdf,
             )
 
     def _save_individual_plots(
-        self, vis_dir, data_iter, step_index, original_img, lambda_img, k_img, 
-        bndl_outputs, prompt_info, has_uncertainty, has_pavpu, has_ratio_data, uncertainty_metric, epoch=None
+        self,
+        vis_dir,
+        data_iter,
+        step_index,
+        original_img,
+        lambda_img,
+        k_img,
+        bndl_outputs,
+        prompt_info,
+        has_uncertainty,
+        has_pavpu,
+        has_ratio_data,
+        uncertainty_metric,
+        epoch=None,
+        gt_mask=None,
+        save_pdf: bool = False,
     ):
         if epoch is not None:
             base_filename = f"epoch_{epoch}_iter_{data_iter}_step_{step_index}"
         else:
             base_filename = f"iter_{data_iter}_step_{step_index}"
-        
+
         # 1. Original Image
         fig, ax = plt.subplots(figsize=(6, 6))
         self.viz_utils.plot_original_image(ax, original_img, prompt_info=prompt_info)
-        self.viz_utils.save_and_close_figure(fig, os.path.join(vis_dir, f"{base_filename}_original.png"))
+        self.viz_utils.save_and_close_figure(fig, os.path.join(vis_dir, f"{base_filename}_original.png"), save_pdf=save_pdf)
 
         # 2. Lambda Heatmap
         fig, ax = plt.subplots(figsize=(6, 6))
         self.viz_utils.plot_parameter_heatmap(ax, lambda_img, f"Lambda (λ) Step {step_index}", "viridis")
-        self.viz_utils.save_and_close_figure(fig, os.path.join(vis_dir, f"{base_filename}_lambda.png"))
+        self.viz_utils.save_and_close_figure(fig, os.path.join(vis_dir, f"{base_filename}_lambda.png"), save_pdf=save_pdf)
 
         # 3. K Heatmap
         fig, ax = plt.subplots(figsize=(6, 6))
         self.viz_utils.plot_parameter_heatmap(ax, k_img, f"Shape (k) Step {step_index}", "plasma")
-        self.viz_utils.save_and_close_figure(fig, os.path.join(vis_dir, f"{base_filename}_k.png"))
+        self.viz_utils.save_and_close_figure(fig, os.path.join(vis_dir, f"{base_filename}_k.png"), save_pdf=save_pdf)
 
         # 4. Parameter / Uncertainty Overlays
         if original_img is not None:
@@ -920,7 +999,7 @@ class BNDLVisualizer:
                 ax.imshow(layers["lambda_norm"], cmap="viridis", alpha=0.6, interpolation="nearest")
                 ax.set_title(f"Lambda Overlay (Step {step_index})")
                 ax.axis("off")
-                self.viz_utils.save_and_close_figure(fig, os.path.join(vis_dir, f"{base_filename}_overlay_lambda.png"))
+                self.viz_utils.save_and_close_figure(fig, os.path.join(vis_dir, f"{base_filename}_overlay_lambda.png"), save_pdf=save_pdf)
 
                 # Uncertainty or K overlay
                 fig, ax = plt.subplots(figsize=(6, 6))
@@ -932,7 +1011,7 @@ class BNDLVisualizer:
                     ax.imshow(layers["k_norm"], cmap="plasma", alpha=0.6, interpolation="nearest")
                     ax.set_title(f"K Overlay (Step {step_index})")
                 ax.axis("off")
-                self.viz_utils.save_and_close_figure(fig, os.path.join(vis_dir, f"{base_filename}_overlay_uncertainty_or_k.png"))
+                self.viz_utils.save_and_close_figure(fig, os.path.join(vis_dir, f"{base_filename}_overlay_uncertainty_or_k.png"), save_pdf=save_pdf)
 
                 # Combined overlay
                 fig, ax = plt.subplots(figsize=(6, 6))
@@ -940,16 +1019,141 @@ class BNDLVisualizer:
                 ax.imshow(layers["combined"], alpha=0.6, interpolation="nearest")
                 ax.set_title(f"Combined Overlay (Step {step_index}){layers.get('pavpu_text', '')}")
                 ax.axis("off")
-                self.viz_utils.save_and_close_figure(fig, os.path.join(vis_dir, f"{base_filename}_overlay_combined.png"))
+                self.viz_utils.save_and_close_figure(fig, os.path.join(vis_dir, f"{base_filename}_overlay_combined.png"), save_pdf=save_pdf)
+
+                # B. Original with Predicted Mask Overlay
+                if "mean_pixel_logits" in bndl_outputs and bndl_outputs["mean_pixel_logits"] is not None:
+                    fig, ax = plt.subplots(figsize=(6, 6))
+                    ax.imshow(original_img)
+
+                    # Get predicted mask from logits
+                    pred_logits = bndl_outputs["mean_pixel_logits"].detach().cpu().numpy()
+                    if len(pred_logits.shape) == 4:  # [B, H, W, K]
+                        pred_logits = pred_logits[0]
+                    if len(pred_logits.shape) == 3:  # [H, W, K]
+                        pred_mask = (pred_logits > 0).any(axis=-1).astype(np.float32)
+                    else:
+                        pred_mask = (pred_logits > 0).astype(np.float32)
+
+                    # Resize mask to match image if needed
+                    if pred_mask.shape != original_img.shape[:2]:
+                        pred_mask = cv2.resize(pred_mask, (original_img.shape[1], original_img.shape[0]), interpolation=cv2.INTER_NEAREST)
+
+                    # Create colored overlay (cyan for prediction)
+                    mask_overlay = np.zeros((*pred_mask.shape, 4))
+                    mask_overlay[..., 0] = 0.0  # R
+                    mask_overlay[..., 1] = 0.8  # G (cyan)
+                    mask_overlay[..., 2] = 0.8  # B (cyan)
+                    mask_overlay[..., 3] = pred_mask * 0.5  # Alpha
+
+                    ax.imshow(mask_overlay)
+                    ax.set_title(f"Predicted Mask Overlay (Step {step_index})")
+                    ax.axis("off")
+                    self.viz_utils.save_and_close_figure(fig, os.path.join(vis_dir, f"{base_filename}_original_with_pred.png"), save_pdf=save_pdf)
+
+                    # B2. Standalone Prediction Mask (binary visualization, matching SAM format)
+                    fig, ax = plt.subplots(figsize=(6, 6))
+
+                    # Create cyan colored mask on black background
+                    mask_vis = np.zeros((*pred_mask.shape[:2], 3))
+                    mask_vis[pred_mask > 0, 0] = 0.0  # R
+                    mask_vis[pred_mask > 0, 1] = 0.9  # G (cyan)
+                    mask_vis[pred_mask > 0, 2] = 0.9  # B (cyan)
+
+                    ax.imshow(mask_vis)
+                    ax.set_title(f"Predicted Mask (Step {step_index})")
+                    ax.axis("off")
+                    self.viz_utils.save_and_close_figure(fig, os.path.join(vis_dir, f"{base_filename}_pred_mask.png"), save_pdf=save_pdf)
+
+                # B3. Ground Truth Mask (Standalone)
+                if gt_mask is not None:
+                    fig, ax = plt.subplots(figsize=(6, 6))
+
+                    if hasattr(gt_mask, "cpu"):
+                        gt_mask_np = gt_mask.cpu().numpy()
+                    else:
+                        gt_mask_np = gt_mask
+
+                    # Handle Multi-channel (pick first or max) or just ensure 2D/3D
+                    if gt_mask_np.ndim == 3:  # [K, H, W]
+                        gt_mask_vis = (gt_mask_np.max(axis=0) > 0).astype(np.float32)
+                    elif gt_mask_np.ndim == 2:  # [H, W]
+                        gt_mask_vis = (gt_mask_np > 0).astype(np.float32)
+                    else:
+                        gt_mask_vis = gt_mask_np.astype(np.float32)
+
+                    # Resize if needed
+                    if original_img is not None and gt_mask_vis.shape != original_img.shape[:2]:
+                        gt_mask_vis = cv2.resize(gt_mask_vis, (original_img.shape[1], original_img.shape[0]), interpolation=cv2.INTER_NEAREST)
+
+                    # Create green colored mask
+                    mask_vis = np.zeros((*gt_mask_vis.shape, 3))
+                    mask_vis[gt_mask_vis > 0, 0] = 0.0  # R
+                    mask_vis[gt_mask_vis > 0, 1] = 1.0  # G (green)
+                    mask_vis[gt_mask_vis > 0, 2] = 0.0  # B
+
+                    ax.imshow(mask_vis)
+                    ax.set_title(f"Ground Truth Mask (Step {step_index})")
+                    ax.axis("off")
+                    self.viz_utils.save_and_close_figure(fig, os.path.join(vis_dir, f"{base_filename}_gt_mask.png"), save_pdf=save_pdf)
+
+                # C. Original with Prompts Visualization
+                if prompt_info is not None:
+                    fig, ax = plt.subplots(figsize=(6, 6))
+                    ax.imshow(original_img)
+
+                    # Draw prompt points with different colors based on position and label
+                    # Click order in 3click protocol:
+                    #   1st: positive (lime)
+                    #   2nd: negative (red)
+                    #   3rd+: error-based (yellow for both FN/FP correction)
+                    if "point_coords" in prompt_info and prompt_info["point_coords"] is not None:
+                        point_coords = prompt_info["point_coords"]
+                        point_labels = prompt_info.get("point_labels", None)
+
+                        # Handle different formats
+                        if hasattr(point_coords, "cpu"):
+                            point_coords = point_coords.cpu().numpy()
+                        if hasattr(point_labels, "cpu"):
+                            point_labels = point_labels.cpu().numpy()
+
+                        # Flatten if needed
+                        if len(point_coords.shape) == 3:  # [B, N, 2]
+                            point_coords = point_coords[0]
+                        if point_labels is not None and len(point_labels.shape) == 2:  # [B, N]
+                            point_labels = point_labels[0]
+
+                        # Draw each point with appropriate color
+                        for i, (x, y) in enumerate(point_coords):
+                            label = point_labels[i] if point_labels is not None and i < len(point_labels) else 1
+
+                            if i == 0:
+                                # First click: always positive (green)
+                                color = "lime"
+                                marker = "o"
+                            elif i == 1 and label == 0:
+                                # Second click: negative (red)
+                                color = "red"
+                                marker = "x"
+                            else:
+                                # 3rd+ clicks: error-based (yellow)
+                                color = "gold"  # Yellow for error-based
+                                marker = "*" if label == 1 else "x"
+
+                            ax.scatter(x, y, c=color, s=200, marker=marker, edgecolors="white", linewidths=2)
+
+                    ax.set_title(f"Input Prompts (Step {step_index})")
+                    ax.axis("off")
+                    self.viz_utils.save_and_close_figure(fig, os.path.join(vis_dir, f"{base_filename}_original_with_prompts.png"), save_pdf=save_pdf)
         else:
             fig, axes = plt.subplots(1, 3, figsize=(18, 6))
             self.viz_utils.plot_parameter_distributions(axes, lambda_img, k_img, step_index)
-            self.viz_utils.save_and_close_figure(fig, os.path.join(vis_dir, f"{base_filename}_distributions.png"))
+            self.viz_utils.save_and_close_figure(fig, os.path.join(vis_dir, f"{base_filename}_distributions.png"), save_pdf=save_pdf)
 
         # 5. Global Parameters
         fig, axes = plt.subplots(1, 3, figsize=(18, 6))
         self.plot_global_parameters_in_layout(axes, bndl_outputs, step_index)
-        self.viz_utils.save_and_close_figure(fig, os.path.join(vis_dir, f"{base_filename}_global_params.png"))
+        self.viz_utils.save_and_close_figure(fig, os.path.join(vis_dir, f"{base_filename}_global_params.png"), save_pdf=save_pdf)
 
         # 6. Uncertainty Visualization
         if has_uncertainty:
@@ -958,23 +1162,37 @@ class BNDLVisualizer:
                 self.plot_multi_uncertainty_visualization(axes, bndl_outputs, step_index)
             else:
                 self.plot_uncertainty_visualization(axes, bndl_outputs, step_index)
-            self.viz_utils.save_and_close_figure(fig, os.path.join(vis_dir, f"{base_filename}_uncertainty.png"))
+            self.viz_utils.save_and_close_figure(fig, os.path.join(vis_dir, f"{base_filename}_uncertainty.png"), save_pdf=save_pdf)
 
         # 7. PAvPU Overlay
         if has_pavpu:
             fig, axes = plt.subplots(1, 3, figsize=(18, 6))
             self.plot_pavpu_overlay_visualization(axes, bndl_outputs, original_img, step_index)
-            self.viz_utils.save_and_close_figure(fig, os.path.join(vis_dir, f"{base_filename}_pavpu.png"))
+            self.viz_utils.save_and_close_figure(fig, os.path.join(vis_dir, f"{base_filename}_pavpu.png"), save_pdf=save_pdf)
 
         # 8. U/A Ratio
         if has_ratio_data:
             fig, axes = plt.subplots(1, 3, figsize=(18, 6))
             self.plot_uncertainty_accuracy_ratio_visualization(axes, bndl_outputs, original_img, step_index, ratio_type="U/A")
-            self.viz_utils.save_and_close_figure(fig, os.path.join(vis_dir, f"{base_filename}_ua_ratio.png"))
+            self.viz_utils.save_and_close_figure(fig, os.path.join(vis_dir, f"{base_filename}_ua_ratio.png"), save_pdf=save_pdf)
 
     def _save_unified_plot(
-        self, vis_dir, data_iter, step_index, original_img, lambda_img, k_img, 
-        bndl_outputs, prompt_info, layout_type, has_uncertainty, has_pavpu, has_ratio_data, uncertainty_metric, epoch=None
+        self,
+        vis_dir,
+        data_iter,
+        step_index,
+        original_img,
+        lambda_img,
+        k_img,
+        bndl_outputs,
+        prompt_info,
+        layout_type,
+        has_uncertainty,
+        has_pavpu,
+        has_ratio_data,
+        uncertainty_metric,
+        epoch=None,
+        save_pdf: bool = False,
     ):
         # 根据布局类型决定行数
         if layout_type == "full" and has_uncertainty:
@@ -1028,6 +1246,6 @@ class BNDLVisualizer:
             filename = f"epoch_{epoch}_iter_{data_iter}_step_{step_index}_unified_{layout_type}.png"
         else:
             filename = f"iter_{data_iter}_step_{step_index}_unified_{layout_type}.png"
-            
+
         save_path = os.path.join(vis_dir, filename)
-        self.viz_utils.save_and_close_figure(fig, save_path, dpi=150)
+        self.viz_utils.save_and_close_figure(fig, save_path, dpi=150, save_pdf=save_pdf)

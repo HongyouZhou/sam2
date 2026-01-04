@@ -256,7 +256,6 @@ def inference_with_uctta(
     score_thresh: float = 0.0,
     video_names: Optional[list[str]] = None,
     max_objects: Optional[int] = None,
-    prompt_method: str = "gt_box",
     uctta_steps: int = 2,
     uctta_lr: float = 3e-4,
     collect_statistics: bool = True,
@@ -739,7 +738,6 @@ def run_single_dataset_with_uctta(
     score_thresh: float = 0.0,
     num_workers: int | None = None,
     video_subset: list[str] | None = None,
-    prompt_method: str = "gt_box",
     first_frame_only: bool = False,
     max_objects: int | None = None,
     uctta_steps: int = 2,
@@ -756,106 +754,41 @@ def run_single_dataset_with_uctta(
     selection_p: float = 0.1,
     downsample_max_samples: int = 100000,
 ) -> tuple[float, float, float, dict[str, Any] | None]:
-    """Run evaluation on a single dataset using UCTTA (temperature adaptation) and return J&F/J/F and statistics.
-
-    This mirrors zero_shot_multi_dataset.run_single_dataset, but swaps inference for UCTTA.
+    """Run evaluation on a single dataset using UCTTA and return J&F/J/F and statistics.
     
-    Returns:
-        Tuple of (j_f_val, j_val, f_val, uctta_statistics)
+    This is a thin wrapper around zs_dataset_runner.run_single_dataset_generic
+    that passes UCTTA-specific parameters.
     """
-    config = DATASET_CONFIGS[dataset_name]
-    if split is None:
-        split = config["default_split"]
-
-    if isinstance(split, list):
-        split = split[0]
-
-    assert isinstance(split, str)
-
-    root = Path(config["root"])
-    if config["has_split_subdir"]:
-        jpeg_dir = root / split / "JPEGImages"
-        ann_dir = root / split / "Annotations"
-    else:
-        jpeg_dir = root / "JPEGImages"
-        ann_dir = root / "Annotations"
-
-    if not jpeg_dir.is_dir() or not ann_dir.is_dir():
-        raise FileNotFoundError(f"JPEGImages or Annotations not found for {dataset_name}: {jpeg_dir}, {ann_dir}")
-
-    out_dir = output_path / f"{dataset_name.lower()}_pred"
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"\n{'=' * 60}")
-    print(f"Running {dataset_name} dataset evaluation (SAM-2 + UCTTA)")
-    print(f"{'=' * 60}")
-
-    # Handle file_list_txt if present
-    if "file_list_txt" in config:
-        file_list_path = Path(config["file_list_txt"])
-        if file_list_path.exists():
-            with open(file_list_path, "r") as f:
-                names = [line.strip() for line in f if line.strip()]
-            video_subset = [v for v in (video_subset or names) if v in names]
-
-    # Execute inference with UCTTA
-    t0 = time.time()
-    uctta_stats = inference_with_uctta(
-        predictor,
-        jpeg_dir,
-        ann_dir,
-        out_dir,
-        score_thresh=score_thresh,
-        video_names=video_subset,
-        max_objects=max_objects,
-        prompt_method=prompt_method,
-        uctta_steps=uctta_steps,
-        uctta_lr=uctta_lr,
-        collect_statistics=True,
+    from zs_dataset_runner import run_single_dataset_generic
+    
+    return run_single_dataset_generic(
         dataset_name=dataset_name,
-        reuse_prompts_root=reuse_prompts_root,
+        predictor=predictor,
+        output_path=output_path,
+        inference_fn=inference_with_uctta,
+        method_name="UCTTA",
+        split=split,
+        video_subset=video_subset,
+        num_workers=num_workers,
         first_frame_only=first_frame_only,
+        score_thresh=score_thresh,
+        max_objects=max_objects,
+        reuse_prompts_root=reuse_prompts_root,
         click_protocol=click_protocol,
         min_click_dist=min_click_dist,
         seed=seed,
-        # Full UCTTA parameters
+        collect_statistics=True,
+        downsample_max_samples=downsample_max_samples,
+        # UCTTA-specific kwargs
+        uctta_steps=uctta_steps,
+        uctta_lr=uctta_lr,
         enable_bn_adapt=enable_bn_adapt,
         use_fisher_reg=use_fisher_reg,
         fisher_alpha=fisher_alpha,
         entropy_threshold=entropy_threshold,
         selection_p=selection_p,
-        downsample_max_samples=downsample_max_samples,
     )
-    t_infer = time.time() - t0
-
-    # Use unified evaluation pipeline (with symlinks for better performance)
-    t1 = time.time()
-    try:
-        j_f_val, j_val, f_val = run_benchmark_evaluation(
-            gt_dir=ann_dir,
-            pred_dir=out_dir,
-            dataset_config=config,
-            video_subset=video_subset,
-            first_frame_only=first_frame_only,
-            num_workers=num_workers,
-            output_path=output_path,
-            use_symlinks=True,  # Use symlinks for 10-100x speed improvement
-            dataset_name=dataset_name,  # Pass dataset name for proper temp directory naming
-        )
-    except Exception as e:
-        print(f"Error during evaluation of {dataset_name}: {e}")
-        import traceback
-        traceback.print_exc()
-        return 0.0, 0.0, 0.0, None
-    t_eval = time.time() - t1
-
-    print(f"Inference time (UCTTA): {t_infer:.2f}s")
-    print(f"Evaluation time: {t_eval:.2f}s")
-
-    return j_f_val, j_val, f_val, uctta_stats
 
 
 # Moved to shared_evaluation_utils.py to eliminate duplication
 from shared_evaluation_utils import build_predictor_with_overrides, create_append_shard_to_eval_callback
-
-

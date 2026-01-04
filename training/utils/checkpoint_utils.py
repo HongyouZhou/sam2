@@ -349,6 +349,42 @@ def load_state_dict_into_model(
     if checkpoint_kernels is not None:
         for f in checkpoint_kernels:
             state_dict = f(state_dict=state_dict)
+    
+    # Handle PEFT format checkpoints: convert base_model.model.* back to vanilla format
+    # This allows loading PEFT-format checkpoints into both PEFT and non-PEFT models
+    peft_prefixes = ['image_encoder', 'memory_attention', 'memory_encoder']
+    
+    # Check for PEFT format more robustly
+    has_peft_format = any(
+        ".base_model.model." in k
+        for k in state_dict.keys()
+    )
+    
+    if has_peft_format:
+        import logging
+        logging.info("Detected PEFT format in checkpoint, converting to vanilla format...")
+        new_state_dict = {}
+        
+        for k, v in state_dict.items():
+            new_key = k
+            # Remove base_model.model prefix for PEFT-wrapped components
+            if ".base_model.model." in k:
+                 new_key = k.replace(".base_model.model.", ".")
+            
+            # Skip LoRA-specific parameters (lora_A, lora_B) - merge_and_unload should have handled this
+            # but keep base_layer weights
+            if '.lora_A.' in new_key or '.lora_B.' in new_key:
+                logging.debug(f"Skipping LoRA parameter: {k}")
+                continue
+            
+            # Remove .base_layer suffix from base weights
+            new_key = new_key.replace('.base_layer.', '.')
+            
+            new_state_dict[new_key] = v
+        
+        state_dict = new_state_dict
+        logging.info(f"Converted {len(state_dict)} keys from PEFT format to vanilla format")
+    
     missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
 
     check_load_state_dict_errors(

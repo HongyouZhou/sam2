@@ -35,6 +35,10 @@ def extract_style_statistics(images: torch.Tensor) -> torch.Tensor:
     mean = images.mean(dim=[2, 3])  # [B, 3]
     std = images.std(dim=[2, 3])    # [B, 3]
     
+    # SAFETY: Clamp to reasonable ranges (normalized images should have mean ~0.45, std ~0.23)
+    mean = mean.clamp(min=-5.0, max=5.0)
+    std = std.clamp(min=0.01, max=5.0)
+    
     # Concatenate to form 6-dimensional style vector
     styles = torch.cat([mean, std], dim=1)  # [B, 6]
     return styles
@@ -78,6 +82,10 @@ def extract_gt_region_style(
             mode='nearest'
         )
     
+    # CRITICAL: Binarize masks to prevent numerical instability from soft masks
+    # Soft mask values (e.g., 0.001) can cause division instability in mean/std computation
+    gt_masks = (gt_masks > 0.5).float()
+    
     # Expand images to match mask: [B, 3, H, W] → [B, K, 3, H, W]
     images_expanded = images.unsqueeze(1).expand(-1, K, -1, -1, -1)
     
@@ -99,6 +107,13 @@ def extract_gt_region_style(
     
     # Concatenate: [B, K, 6]
     styles = torch.cat([mean, std], dim=2)
+    
+    # SAFETY: Clamp style statistics to reasonable ranges
+    # For normalized images (mean ~0.45, std ~0.23), style stats should be similar
+    # Extreme values indicate numerical instability (e.g., from empty masks)
+    styles_mean = styles[:, :, :3].clamp(min=-5.0, max=5.0)
+    styles_std = styles[:, :, 3:].clamp(min=0.01, max=5.0)
+    styles = torch.cat([styles_mean, styles_std], dim=2)
     
     # Fallback for too-small regions: use global statistics
     too_small = (pixel_count < min_pixels).any(dim=2)  # [B, K]

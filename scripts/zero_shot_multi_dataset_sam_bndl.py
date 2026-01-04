@@ -43,7 +43,18 @@ from zero_shot_utils import (
     load_first_frame_mask,
     threshold_mask_logits,
     select_top_objects_by_area,
+    select_top_objects_by_area,
     cleanup_gpu_memory,
+    save_single_mask_helper,
+)
+from bndl_eval_utils import (
+    calculate_pavpu_for_bndl,
+    create_bndl_visualization_refactored,
+    extract_evaluator_checkpoint_data,
+    finalize_bndl_evaluation,
+    log_bndl_statistics,
+    merge_evaluator_checkpoints,
+    setup_bndl_collection,
 )
 from checkpoint_manager import CheckpointManager, StatisticsCheckpointManager
 from evaluation_pipeline import run_benchmark_evaluation
@@ -85,652 +96,6 @@ POINT_COLORS = [
 ]
 
 
-def extract_pixel_bndl_model_simple(model):
-    """简化版本的BNDL模型提取"""
-    if hasattr(model, "module"):
-        model = model.module
-
-    # 直接检查常见路径
-    for attr in ["sam_mask_decoder", "mask_decoder"]:
-        if hasattr(model, attr):
-            mask_decoder = getattr(model, attr)
-            if hasattr(mask_decoder, "pixel_bndl"):
-                return mask_decoder.pixel_bndl
-
-    return None
-
-
-def extract_pixel_features(bndl_outputs):
-    """Extract pixel features needed for uncertainty sampling"""
-    try:
-        # We need the intermediate features that were used to generate pixel_logits_raw
-        # This should be available in the BNDL outputs
-        logger.info(f"Available BNDL outputs keys: {list(bndl_outputs.keys())}")
-
-        if "z_out" in bndl_outputs:
-            z_out = bndl_outputs["z_out"]
-            logger.info(f"Found z_out with shape: {z_out.shape}")
-            return z_out  # [B, H, W, C']
-        else:
-            logger.warning("z_out not found in BNDL outputs for uncertainty sampling")
-            # Try alternative feature sources
-            if "upscaled_embedding" in bndl_outputs:
-                logger.info("Using upscaled_embedding as alternative feature source")
-                return bndl_outputs["upscaled_embedding"]
-            return None
-    except Exception as e:
-        logger.warning(f"Failed to extract pixel features: {e}")
-        import traceback
-
-        logger.warning(f"Traceback: {traceback.format_exc()}")
-        return None
-
-
-def extract_bndl_outputs(outputs):
-    """Extract BNDL outputs from model outputs"""
-    for frame_idx, outs in enumerate(outputs):
-        if "multistep_bndl_outputs" in outs:
-            bndl_outputs_list = outs["multistep_bndl_outputs"]
-
-            # Use the last valid BNDL output (highest resolution)
-            for i in reversed(range(len(bndl_outputs_list))):
-                if bndl_outputs_list[i] is not None:
-                    return bndl_outputs_list[i], i, frame_idx
-    return None, None, None
-
-
-def extract_hyper_in_from_bndl_outputs(bndl_outputs, batch, mask_decoder):
-    """Extract hyper_in (external_pre_out_w) from BNDL outputs or regenerate it"""
-    try:
-        # First check if hyper_in is stored in BNDL outputs
-        if "hyper_in" in bndl_outputs and bndl_outputs["hyper_in"] is not None:
-            logger.info("Found hyper_in in BNDL outputs")
-            return bndl_outputs["hyper_in"]
-
-        # If not stored, we need to regenerate it by running the mask decoder's hypernetwork
-        # This requires reconstructing the transformer output tokens
-
-        # Extract the upscaled shape info
-        upscaled_shape = bndl_outputs.get("upscaled_shape")
-        if upscaled_shape is None:
-            logger.warning("No upscaled_shape found in BNDL outputs for hyper_in extraction")
-            return None
-
-        b, c, h, w = upscaled_shape
-        num_mask_tokens = mask_decoder.num_mask_tokens
-
-        # Try to regenerate hyper_in by running the hypernetwork MLPs
-        if hasattr(mask_decoder, "output_hypernetworks_mlps"):
-            try:
-                # Check if we have stored mask_tokens_out in BNDL outputs
-                mask_tokens_out = bndl_outputs.get("mask_tokens_out")
-
-                if mask_tokens_out is not None:
-                    logger.info("Using stored mask_tokens_out for hyper_in generation")
-                    # Use the actual mask tokens from the forward pass
-                else:
-                    logger.info("Using mask token embeddings as fallback for hyper_in generation")
-                    # Fallback: use the mask token embeddings
-                    mask_tokens_out = mask_decoder.mask_tokens.weight.unsqueeze(0).expand(b, -1, -1)  # [B, K, C]
-
-                # Generate hyper_in using the hypernetwork MLPs
-                hyper_in_list = []
-                for i in range(num_mask_tokens):
-                    hyper_out = mask_decoder.output_hypernetworks_mlps[i](mask_tokens_out[:, i, :])  # [B, C']
-                    hyper_in_list.append(hyper_out)
-
-                # Stack to get [B, K, C'] format
-                hyper_in = torch.stack(hyper_in_list, dim=1)
-
-                logger.info(f"Generated hyper_in with shape: {hyper_in.shape}")
-                return hyper_in
-
-            except Exception as e:
-                logger.warning(f"Failed to regenerate hyper_in: {e}")
-                return None
-        else:
-            logger.warning("No output_hypernetworks_mlps found in mask_decoder")
-            return None
-
-    except Exception as e:
-        logger.warning(f"Failed to extract hyper_in from BNDL outputs: {e}")
-        return None
-
-
-def prepare_targets_for_pavpu(targets, bndl_outputs):
-    """Prepare ground truth targets in the correct format for PAvPU calculation"""
-    try:
-        # targets should be in a format that can be converted to [B, H, W, K]
-        if targets is None:
-            return None
-
-        # Handle different target formats
-        if isinstance(targets, torch.Tensor):
-            # Direct tensor case
-            target_tensor = targets
-        elif isinstance(targets, list | tuple):
-            # List of tensors, take the first one
-            if len(targets) > 0:
-                target_tensor = targets[0]
-            else:
-                return None
-        elif hasattr(targets, "masks"):
-            # Nested structure
-            target_tensor = targets.masks
-        else:
-            logger.warning(f"Unknown target format: {type(targets)}")
-            return None
-
-        # Convert to correct shape [B, H, W, K] with bounds checking
-        logger.info(f"Original target shape: {target_tensor.shape}")
-
-        if len(target_tensor.shape) == 4:
-            # Check different possible 4D formats
-            if target_tensor.shape[0] < target_tensor.shape[1] and target_tensor.shape[2] == target_tensor.shape[3]:
-                # Format: [K, B, H, W] -> [B, H, W, K]
-                target_tensor = target_tensor.permute(1, 2, 3, 0)
-                logger.info(f"Transposed targets from [K, B, H, W] to [B, H, W, K]: {target_tensor.shape}")
-            elif target_tensor.shape[1] > target_tensor.shape[0] and target_tensor.shape[1] > target_tensor.shape[2]:
-                # Format: [B, K, H, W] -> [B, H, W, K]
-                target_tensor = target_tensor.permute(0, 2, 3, 1)
-                logger.info(f"Transposed targets from [B, K, H, W] to [B, H, W, K]: {target_tensor.shape}")
-            # else: already in [B, H, W, K] format or [B, H, W, C] format
-
-        elif len(target_tensor.shape) == 3:
-            # [B, H, W] format, add mask dimension
-            target_tensor = target_tensor.unsqueeze(-1)
-            logger.info(f"Added mask dimension to targets: {target_tensor.shape}")
-
-        elif len(target_tensor.shape) == 5:
-            # [B, T, K, H, W] format, take first frame and transpose
-            target_tensor = target_tensor[:, 0, :, :, :].permute(0, 2, 3, 1)
-            logger.info(f"Used first frame from 5D targets: {target_tensor.shape}")
-
-        else:
-            logger.warning(f"Unexpected target shape: {target_tensor.shape}")
-            return None
-
-        # Validate tensor values are in reasonable range
-        if torch.isnan(target_tensor).any():
-            logger.warning("NaN values detected in targets")
-            target_tensor = torch.nan_to_num(target_tensor, nan=0.0)
-
-        # Clamp to reasonable range
-        target_tensor = torch.clamp(target_tensor, 0.0, 1.0)
-
-        # Ensure it's on the correct device
-        if "pixel_logits_raw" in bndl_outputs and bndl_outputs["pixel_logits_raw"] is not None:
-            target_tensor = target_tensor.to(bndl_outputs["pixel_logits_raw"].device)
-        elif "wei_lambda" in bndl_outputs and bndl_outputs["wei_lambda"] is not None:
-            target_tensor = target_tensor.to(bndl_outputs["wei_lambda"].device)
-
-        # ===== IMPORTANT: Keep targets at original resolution =====
-        # Unlike training (where predictions are upsampled to a fixed resolution),
-        # for evaluation we want PAvPU calculated at the SAME resolution as the
-        # final mask evaluation (J&F metric), which is at original image resolution.
-        #
-        # Strategy: Keep targets at original resolution here, and upsample
-        # BNDL predictions to match in calculate_pavpu_for_bndl.
-        # This ensures consistency with how SAM2 evaluates final masks.
-        
-        logger.info(f"Keeping targets at original resolution: {target_tensor.shape}")
-        
-        # Note: We do NOT handle K (mask dimension) or spatial resolution here.
-        # The downstream calculate_pavpu_for_bndl will:
-        # 1. Upsample predictions to match target resolution (original image size)
-        # 2. Select the appropriate mask head (typically mask 0 for single-mask token)
-        # This design keeps PAvPU evaluation consistent with final mask evaluation.
-
-        return target_tensor
-
-    except Exception as e:
-        logger.warning(f"Failed to prepare targets for PAvPU: {e}")
-        return None
-
-
-def calculate_pavpu_for_bndl(bndl_outputs, batch, targets, phase, model):
-    """Store raw pixel-level uncertainty and accuracy for true PAvPU analysis (no thresholds)"""
-    try:
-        # Extract pixel BNDL model for uncertainty sampling
-        pixel_bndl_model = extract_pixel_bndl_model_simple(model)
-        if pixel_bndl_model is None:
-            logger.warning("Could not extract pixel_bndl model for PAvPU calculation")
-            return bndl_outputs
-
-        # Extract pixel features from BNDL outputs
-        pixel_feat = extract_pixel_features(bndl_outputs)
-        if pixel_feat is None:
-            logger.warning("Could not extract pixel features for PAvPU calculation")
-            return bndl_outputs
-
-        # Get external weights (hyper_in) if available
-        external_pre_out_w = None
-        if hasattr(model, "module"):
-            mask_decoder = getattr(model.module, "sam_mask_decoder", None) or getattr(model.module, "mask_decoder", None)
-        else:
-            mask_decoder = getattr(model, "sam_mask_decoder", None) or getattr(model, "mask_decoder", None)
-
-        if mask_decoder and hasattr(mask_decoder, "bndl_replace_global_with_hyper") and mask_decoder.bndl_replace_global_with_hyper:
-            # Extract hyper_in from BNDL outputs or regenerate it
-            external_pre_out_w = extract_hyper_in_from_bndl_outputs(bndl_outputs, batch, mask_decoder)
-
-        # Perform pixel-level uncertainty sampling
-        pixel_uncertainty_pval, mean_pixel_logits = pixel_uncertain_sampling(
-            pixel_bndl_model,
-            pixel_feat,
-            external_pre_out_w=external_pre_out_w,
-            sample_num=20,  # Reduced sample number for speed during evaluation
-        )
-        
-        # FIXED: p-value IS uncertainty (high p-value = no difference = high uncertainty)
-        # - High p-value (→1) = top-2 masks similar → HIGH uncertainty (model uncertain)
-        # - Low p-value (→0) = top-2 masks differ → LOW uncertainty (model confident)
-        # DO NOT invert: p-value directly represents uncertainty
-        pixel_uncertainty = pixel_uncertainty_pval  # No 1.0 - conversion!
-
-        # Additionally compute entropy-based uncertainty (continuous, smooth)
-        try:
-            entropy_map = pixel_entropy_uncertainty(
-                pixel_bndl_model,
-                pixel_feat,
-                external_pre_out_w=external_pre_out_w,
-                sample_num=20,
-            )  # [B, H, W]
-            # Optionally normalize to [0,1] by log(2) for Bernoulli upper bound
-            import math
-            entropy_norm = torch.clamp(entropy_map / math.log(2.0), 0.0, 1.0)
-            bndl_outputs["pixel_entropy"] = entropy_norm.detach()
-        except Exception as e:
-            logger.warning(f"Failed to compute pixel entropy uncertainty: {e}")
-
-        # Prepare ground truth masks for PAvPU calculation
-        pixel_targets = prepare_targets_for_pavpu(targets, bndl_outputs)
-
-        # Store raw data for true PAvPU analysis (scatter plot: uncertainty vs accuracy)
-        if pixel_targets is not None:
-            pixel_predictions = bndl_outputs.get("pixel_logits_raw", mean_pixel_logits)
-            if pixel_predictions is not None:
-                # Ensure correct format [B, H, W, K] and validate dimensions
-                if len(pixel_predictions.shape) == 4:
-                    if pixel_predictions.shape[1] == pixel_predictions.shape[2]:
-                        # Already in [B, H, W, K] format
-                        pass
-                    elif pixel_predictions.shape[-1] != pixel_predictions.shape[-2]:
-                        # Likely [B, K, H, W] format, transpose to [B, H, W, K]
-                        pixel_predictions = pixel_predictions.permute(0, 2, 3, 1)
-                else:
-                    logger.warning(f"Unexpected pixel_predictions shape: {pixel_predictions.shape}")
-                    return bndl_outputs
-
-                # Validate and align dimensions between predictions and targets
-                if pixel_predictions.shape != pixel_targets.shape:
-                    if len(pixel_targets.shape) == 4 and len(pixel_predictions.shape) == 4:
-                        B_pred, H_pred, W_pred, K_pred = pixel_predictions.shape
-                        B_targ, H_targ, W_targ, K_targ = pixel_targets.shape
-
-                        # Upsample predictions to match target resolution (original image size)
-                        # This ensures PAvPU is evaluated at the same resolution as final J&F metrics
-                        if H_pred != H_targ or W_pred != W_targ:
-                            logger.info(
-                                f"Upsampling predictions from {H_pred}x{W_pred} to {H_targ}x{W_targ} "
-                                f"to match original image resolution for PAvPU evaluation"
-                            )
-                            pixel_predictions = F.interpolate(
-                                pixel_predictions.permute(0, 3, 1, 2),  # [B, H, W, K] -> [B, K, H, W]
-                                size=(H_targ, W_targ),
-                                mode="bilinear",
-                                align_corners=False,
-                            ).permute(0, 2, 3, 1)  # [B, K, H, W] -> [B, H, W, K]
-                            
-                            # Also upsample pixel_uncertainty to match
-                            if pixel_uncertainty is not None and pixel_uncertainty.shape[-2:] != (H_targ, W_targ):
-                                if len(pixel_uncertainty.shape) == 3:  # [B, H, W]
-                                    pixel_uncertainty = F.interpolate(
-                                        pixel_uncertainty.unsqueeze(1),  # [B, H, W] -> [B, 1, H, W]
-                                        size=(H_targ, W_targ),
-                                        mode="bilinear",
-                                        align_corners=False,
-                                    ).squeeze(1)  # [B, 1, H, W] -> [B, H, W]
-                                    logger.info(f"Upsampled uncertainty to {pixel_uncertainty.shape}")
-                                elif len(pixel_uncertainty.shape) == 4:  # [B, H, W, C]
-                                    pixel_uncertainty = F.interpolate(
-                                        pixel_uncertainty.permute(0, 3, 1, 2),
-                                        size=(H_targ, W_targ),
-                                        mode="bilinear",
-                                        align_corners=False,
-                                    ).permute(0, 2, 3, 1)
-                                    logger.info(f"Upsampled uncertainty to {pixel_uncertainty.shape}")
-
-                        # Fix batch dimension mismatch (rare edge case)
-                        if B_pred != B_targ:
-                            min_batch = min(B_pred, B_targ)
-                            pixel_predictions = pixel_predictions[:min_batch]
-                            pixel_targets = pixel_targets[:min_batch]
-                            logger.info(f"Fixed batch dimension mismatch: using first {min_batch} samples")
-
-                        # Fix mask dimension mismatch (expected: K_pred=4, K_targ=1)
-                        if K_pred != K_targ:
-                            if K_pred > K_targ and K_targ == 1:
-                                # Multiple mask heads (K_pred > 1) but single ground truth
-                                # Use mask 0 (single-mask token) to match SAM-2 behavior
-                                pixel_predictions = pixel_predictions[..., 0:1]  # [B,H,W,K] -> [B,H,W,1]
-                                logger.info(f"Selected mask 0 from {K_pred} prediction heads to match single ground truth mask")
-                            elif K_targ > K_pred:
-                                # More ground truth masks than predictions (rare case)
-                                pixel_targets = pixel_targets[..., :K_pred]
-                                logger.info(f"Truncated targets from K={K_targ} to K={K_pred}")
-                            else:
-                                # Fallback: use first K masks
-                                min_k = min(K_pred, K_targ)
-                                pixel_predictions = pixel_predictions[..., :min_k]
-                                pixel_targets = pixel_targets[..., :min_k]
-                                logger.info(f"Truncated to K={min_k} masks (fallback)")
-
-                        # Final validation
-                        if pixel_predictions.shape != pixel_targets.shape:
-                            logger.error(f"Shape mismatch remains after alignment - predictions: {pixel_predictions.shape}, targets: {pixel_targets.shape}")
-                            return bndl_outputs
-                        else:
-                            logger.info(f"Successfully aligned shapes: {pixel_predictions.shape}")
-                    else:
-                        logger.error(f"Unexpected tensor dimensions - predictions: {pixel_predictions.shape}, targets: {pixel_targets.shape}")
-                        return bndl_outputs
-
-                # Store uncertainty and logits for evaluator
-                # Accuracy will be calculated by DistributedDatasetEvaluator for consistency
-                bndl_outputs["pixel_uncertainty"] = pixel_uncertainty.detach()
-                bndl_outputs["mean_pixel_logits"] = mean_pixel_logits.detach()
-                
-                logger.info("Stored pixel uncertainty and logits for dataset evaluator")
-            else:
-                logger.warning("No pixel predictions found for PAvPU calculation")
-        else:
-            logger.warning("No valid targets found for PAvPU calculation")
-
-    except Exception as e:
-        logger.warning(f"Failed to calculate PAvPU: {e}")
-        import traceback
-
-        logger.warning(f"PAvPU calculation traceback: {traceback.format_exc()}")
-
-    return bndl_outputs
-
-
-def log_bndl_statistics(bndl_outputs, step, phase, dataset_name, statistics_dict=None):
-    """Log BNDL statistics including pixel-level uncertainty and PAvPU"""
-    if bndl_outputs is None:
-        return statistics_dict or {}
-
-    if statistics_dict is None:
-        statistics_dict = {}
-
-    # Pixel-level parameters (lambda and k)
-    if "wei_lambda" in bndl_outputs and "inv_k" in bndl_outputs and bndl_outputs["wei_lambda"] is not None and bndl_outputs["inv_k"] is not None:
-        lambda_mean = bndl_outputs["wei_lambda"].mean().detach().cpu().item()
-        k_mean = (1.0 / (bndl_outputs["inv_k"] + 1e-6)).mean().detach().cpu().item()
-
-        key_prefix = f"{dataset_name}_{phase}"
-        statistics_dict[f"{key_prefix}_lambda_pixel"] = lambda_mean
-        statistics_dict[f"{key_prefix}_k_pixel"] = k_mean
-
-        logger.info(f"BNDL Stats - {key_prefix}: lambda_pixel={lambda_mean:.4f}, k_pixel={k_mean:.4f}")
-
-        # Log pixel uncertainty if available
-        if "pixel_uncertainty" in bndl_outputs and bndl_outputs["pixel_uncertainty"] is not None:
-            uncertainty_mean = bndl_outputs["pixel_uncertainty"].mean().detach().cpu().item()
-            statistics_dict[f"{key_prefix}_pixel_uncertainty"] = uncertainty_mean
-            logger.info(f"BNDL Stats - {key_prefix}: pixel_uncertainty={uncertainty_mean:.4f}")
-
-        # Log pixel entropy if available
-        if "pixel_entropy" in bndl_outputs and bndl_outputs["pixel_entropy"] is not None:
-            try:
-                entropy_mean = bndl_outputs["pixel_entropy"].mean().detach().cpu().item()
-                statistics_dict[f"{key_prefix}_pixel_entropy"] = entropy_mean
-                logger.info(f"BNDL Stats - {key_prefix}: pixel_entropy={entropy_mean:.4f}")
-            except Exception as e:
-                logger.warning(f"Failed to log pixel_entropy: {e}")
-
-        # Store raw PAvPU samples for true scatter plot (NO downsampling here - will downsample when saving checkpoint)
-        if "pavpu_uncertainty_samples" in bndl_outputs and "pavpu_accuracy_samples" in bndl_outputs:
-            uncertainty_samples = bndl_outputs["pavpu_uncertainty_samples"]
-            accuracy_samples = bndl_outputs["pavpu_accuracy_samples"]
-            
-            # Store raw samples WITHOUT downsampling (will be downsampled before saving checkpoint)
-            statistics_dict[f"{key_prefix}_pavpu_uncertainty_samples"] = uncertainty_samples.tolist() if hasattr(uncertainty_samples, "tolist") else list(uncertainty_samples)
-            statistics_dict[f"{key_prefix}_pavpu_accuracy_samples"] = accuracy_samples.tolist() if hasattr(accuracy_samples, "tolist") else list(accuracy_samples)
-            
-            logger.info(f"BNDL Stats - {key_prefix}: stored {len(uncertainty_samples)} PAvPU samples")
-
-    # Global w statistics (original BNDL)
-    if "wei_lambda_w" in bndl_outputs and "inv_k_w" in bndl_outputs and bndl_outputs["wei_lambda_w"] is not None and bndl_outputs["inv_k_w"] is not None:
-        lambda_w_mean = bndl_outputs["wei_lambda_w"].mean().detach().cpu().item()
-        k_w_mean = (1.0 / (bndl_outputs["inv_k_w"] + 1e-6)).mean().detach().cpu().item()
-
-        key_prefix = f"{dataset_name}_{phase}"
-        statistics_dict[f"{key_prefix}_lambda_w"] = lambda_w_mean
-        statistics_dict[f"{key_prefix}_k_w"] = k_w_mean
-
-        logger.info(f"BNDL Stats - {key_prefix}: lambda_w={lambda_w_mean:.4f}, k_w={k_w_mean:.4f}")
-
-    return statistics_dict
-
-
-
-
-def extract_pixel_params(bndl_outputs, batch_idx=0):
-    """Extract and process pixel-level parameters"""
-    b, c, h, w = bndl_outputs["upscaled_shape"]
-
-    lambda_vals = bndl_outputs["wei_lambda"].detach().cpu().numpy()  # [B, H, W, C]
-    inv_k_vals = bndl_outputs["inv_k"].detach().cpu().numpy()  # [B, H, W, C]
-    k_vals = 1.0 / (inv_k_vals + 1e-6)
-
-    # Extract specific batch - now working with [B, H, W, C] format
-    lambda_batch = lambda_vals[batch_idx]  # [H, W, C]
-    k_batch = k_vals[batch_idx]  # [H, W, C]
-
-    # Handle channel dimension - average across channels if multiple channels
-    if lambda_batch.shape[-1] > 1:
-        lambda_img = lambda_batch.mean(axis=-1)  # [H, W]
-        k_img = k_batch.mean(axis=-1)  # [H, W]
-    else:
-        lambda_img = lambda_batch.squeeze(-1)  # [H, W]
-        k_img = k_batch.squeeze(-1)  # [H, W]
-
-    return lambda_img, k_img
-
-
-def extract_original_image(batch, frame_idx=0, batch_idx=0):
-    """Extract and process original image, corresponding to the specified frame index"""
-    if not hasattr(batch, "img_batch"):
-        return None
-
-    try:
-        img_batch = batch.img_batch
-        if hasattr(img_batch, "cpu"):
-            img_batch = img_batch.cpu().numpy()
-
-        # Extract specific batch and frame
-        if len(img_batch.shape) == 5:  # [T, B, C, H, W]
-            T = img_batch.shape[0]
-            safe_t = max(0, min(int(frame_idx), T - 1))
-            orig_tensor = img_batch[safe_t, batch_idx]  # [C, H, W]
-        elif len(img_batch.shape) == 4:  # [B, C, H, W]
-            orig_tensor = img_batch[batch_idx]  # [C, H, W]
-        else:
-            logger.warning(f"Unexpected img_batch shape: {img_batch.shape}")
-            return None
-
-        # Convert [C, H, W] -> [H, W, C]
-        if len(orig_tensor.shape) == 3 and orig_tensor.shape[0] in [1, 3]:
-            original_img = orig_tensor.transpose(1, 2, 0)
-        else:
-            return None
-
-        # Denormalize if needed (ImageNet normalization)
-        if original_img.min() < -1 or original_img.max() > 2:
-            mean = np.array([0.485, 0.456, 0.406])
-            std = np.array([0.229, 0.224, 0.225])
-            if len(original_img.shape) == 3 and original_img.shape[-1] == 3:
-                original_img = original_img * std + mean
-
-        # Clip to valid range
-        original_img = np.clip(original_img, 0, 1)
-
-        # Ensure 3 channels
-        if len(original_img.shape) == 2:
-            original_img = np.stack([original_img] * 3, axis=-1)
-        elif len(original_img.shape) == 3 and original_img.shape[-1] == 1:
-            original_img = np.repeat(original_img, 3, axis=-1)
-
-        return original_img
-
-    except Exception as e:
-        logger.warning(f"Failed to process original image: {e}")
-        return None
-
-
-def upsample_params_to_image_size(lambda_img, k_img, target_shape):
-    """Upsample parameter maps to target image size"""
-    target_h, target_w = target_shape[:2]
-
-    if lambda_img.shape != (target_h, target_w):
-        lambda_img = cv2.resize(lambda_img, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
-        k_img = cv2.resize(k_img, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
-
-    return lambda_img, k_img
-
-
-def normalize_parameters_robust(lambda_img, k_img):
-    """Robust parameter normalization, handling outliers"""
-    try:
-        # Use percentiles for robust normalization, avoiding outlier effects
-        lambda_min = np.percentile(lambda_img, 1)
-        lambda_max = np.percentile(lambda_img, 99)
-        lambda_range = lambda_max - lambda_min
-        if lambda_range < 1e-6:
-            lambda_range = 1e-6
-
-        k_min = np.percentile(k_img, 1)
-        k_max = np.percentile(k_img, 99)
-        k_range = k_max - k_min
-        if k_range < 1e-6:
-            k_range = 1e-6
-
-        lambda_norm = (lambda_img - lambda_min) / lambda_range
-        k_norm = (k_img - k_min) / k_range
-
-        # Limit to [0, 1] range
-        lambda_norm = np.clip(lambda_norm, 0, 1)
-        k_norm = np.clip(k_norm, 0, 1)
-
-        return lambda_norm, k_norm
-
-    except Exception as e:
-        logger.warning(f"Parameter normalization failed: {e}")
-        # Return original values as fallback
-        return lambda_img, k_img
-
-
-def create_bndl_visualization_refactored(bndl_outputs, batch, outputs_for_vis, vis_dir, data_iter, step_index, frame_index, layout_type="full"):
-    """Create comprehensive BNDL visualization using refactored modules"""
-    try:
-        # Initialize refactored visualization modules via lazy import
-        try:
-            from visualization_utils import VisualizationUtils  # type: ignore
-            from bndl_visualizer import BNDLVisualizer  # type: ignore
-
-            viz_utils = VisualizationUtils()
-            bndl_viz = BNDLVisualizer()
-        except Exception:
-            return
-
-        # Extract parameters and image
-        lambda_img, k_img = extract_pixel_params(bndl_outputs)
-        original_img = extract_original_image(batch, frame_idx=frame_index)
-
-        if original_img is not None:
-            lambda_img, k_img = upsample_params_to_image_size(lambda_img, k_img, original_img.shape)
-
-        has_uncertainty = "pixel_uncertainty" in bndl_outputs and bndl_outputs["pixel_uncertainty"] is not None
-        has_ratio_data = (has_uncertainty and 
-                         "mean_pixel_logits" in bndl_outputs and 
-                         bndl_outputs["mean_pixel_logits"] is not None)
-        has_pavpu = ("pixel_pavpu" in bndl_outputs and bndl_outputs["pixel_pavpu"] is not None)
-
-        # Determine number of rows based on layout type and data availability
-        if layout_type == "full" and has_uncertainty:
-            if has_pavpu and has_ratio_data:
-                rows = 6  # add both PAvPU overlay and ratio row
-            elif has_pavpu or has_ratio_data:
-                rows = 5  # add one of them
-            else:
-                rows = 4
-        else:
-            rows = 3
-
-        # Use refactored tools to create figure layout
-        fig, axes = viz_utils.create_figure_layout(rows, 3, (18, 6 * rows))
-
-        # Plot common elements using refactored functions
-        plot_common_elements_refactored(axes, original_img, lambda_img, k_img, step_index, bndl_outputs, has_uncertainty, batch, outputs_for_vis, bndl_viz, viz_utils)
-        
-        # Add PAvPU thresholded overlay and U/A ratio continuous overlay (order: PAvPU first, then ratio)
-        current_row = 4
-        if has_pavpu and rows >= 5:
-            bndl_viz.plot_pavpu_overlay_visualization(axes[current_row, :], bndl_outputs, original_img, step_index)
-            current_row += 1
-        if has_ratio_data and rows >= current_row + 1:
-            bndl_viz.plot_uncertainty_accuracy_ratio_visualization(axes[current_row, :], bndl_outputs, original_img, step_index, ratio_type="U/A")
-
-        # Use refactored tools to save and close figure
-        save_path = os.path.join(vis_dir, f"iter_{data_iter}_step_{step_index}_bndl_{layout_type}.png")
-        viz_utils.save_and_close_figure(fig, save_path, dpi=150)
-
-        logger.info(f"BNDL visualization saved: {save_path}")
-
-    except Exception as e:
-        logger.warning(f"Failed to create BNDL visualization: {e}")
-        import traceback
-
-        logger.warning(f"Traceback: {traceback.format_exc()}")
-
-
-def plot_common_elements_refactored(
-    axes, original_img, lambda_img, k_img, step_index, bndl_outputs, has_uncertainty=False, batch=None, outputs_for_vis=None, bndl_viz: Any = None, viz_utils: Any = None
-):
-    """Plot common visualization elements using refactored modules"""
-    if viz_utils is None or bndl_viz is None:
-        return
-    # First row: original image and parameter heatmaps
-    viz_utils.plot_original_image(axes[0, 0], original_img)
-    viz_utils.plot_parameter_heatmap(axes[0, 1], lambda_img, f"Lambda (lambda) Step {step_index}", "viridis")
-    viz_utils.plot_parameter_heatmap(axes[0, 2], k_img, f"Shape (k) Step {step_index}", "plasma")
-
-    # Second row: parameter overlays or distributions, including uncertainty overlays
-    if original_img is not None and original_img.shape[:2] == lambda_img.shape:
-        if has_uncertainty:
-            bndl_viz.plot_parameter_and_uncertainty_overlays(
-                axes[1, :],
-                original_img,
-                lambda_img,
-                k_img,
-                bndl_outputs,
-                step_index,
-            )
-        else:
-            viz_utils.plot_parameter_overlays(axes[1, :], original_img, lambda_img, k_img, step_index)
-    else:
-        viz_utils.plot_parameter_distributions(axes[1, :], lambda_img, k_img, step_index)
-
-    # Third row: global parameters
-    bndl_viz.plot_global_parameters_in_layout(axes[2, :], bndl_outputs, step_index)
-
-    if has_uncertainty:
-        # Fourth row: uncertainty visualization
-        bndl_viz.plot_uncertainty_visualization(axes[3, :], bndl_outputs, step_index)
-
-
 @torch.inference_mode()
 @torch.autocast(device_type="cuda", dtype=torch.bfloat16)
 def inference_with_bndl(
@@ -740,13 +105,12 @@ def inference_with_bndl(
     out_dir: Path,
     score_thresh: float = 0.0,
     video_names: list[str] | None = None,
-    save_bndl_vis: bool = True,
+    save_bndl_vis: bool = False,  # Default False for faster evaluation
     vis_dir: Path | None = None,
     dataset_name: str = "unknown",
     collect_statistics: bool = True,
     eval_dir: Path | None = None,
     max_objects: int | None = None,
-    prompt_method: str = "gt_box",
     first_frame_only: bool = False,
     reuse_prompts_root: Path | None = None,
     # Protocol controls (no GT box fallback)
@@ -754,6 +118,12 @@ def inference_with_bndl(
     min_click_dist: float = 12.0,
     seed: int | None = 0,
     downsample_max_samples: int = 100000,
+    # Paper figure generation options
+    max_vis_per_video: int = 2,  # Max visualizations per video (2 for benchmarking, set higher for paper figures)
+    save_vis_pdf: bool = True,  # Save PDF versions for paper (300 DPI) - default True for professional use
+    # Optimization options
+    bndl_sample_num: int = 20,  # Number of samples for BNDL uncertainty
+    save_masks: bool = True,  # Save predicted masks to disk
 ):
     """
     3-click interactive inference with BNDL UQ analysis:
@@ -780,57 +150,83 @@ def inference_with_bndl(
     if save_bndl_vis and vis_dir is not None:
         vis_dir.mkdir(parents=True, exist_ok=True)
 
-    # Initialize statistics collection with incremental saving
-    dataset_statistics = {} if collect_statistics else None
+    # Initialize statistics collection infrastructure (extracted to helper function)
+    dataset_statistics, stats_checkpoint_mgr, eval_checkpoint_mgr, dataset_evaluator = setup_bndl_collection(collect_statistics, out_dir, dataset_name, eval_dir)
     total_frames_processed = 0
-    
-    # Checkpoint managers for statistics and evaluator data
-    stats_checkpoint_mgr = StatisticsCheckpointManager(
-        output_dir=out_dir.parent,
-        dataset_name=dataset_name,
-        interval=10,  # Increased from 2 to 10 for better performance
-    ) if collect_statistics else None
-    
-    eval_checkpoint_mgr = CheckpointManager(
-        output_dir=out_dir.parent,
-        dataset_name=dataset_name,
-        checkpoint_type="eval",
-        interval=10,  # Increased from 2 to 10 for better performance
-    ) if collect_statistics else None
 
-    # Initialize dataset evaluator for correlation analysis like in SAM trainer
-    # Use consistent path format: <output_root>/<dataset>_bndl_eval
-    dataset_evaluator = None
-    if collect_statistics:
-        try:
-            # Prioritize eval_dir if provided, otherwise use consistent naming pattern
-            if eval_dir is not None:
-                eval_save_dir = eval_dir
-            else:
-                # Use consistent format: out_dir.parent / f"{dataset_name}_bndl_eval"
-                eval_save_dir = out_dir.parent / f"{dataset_name.lower()}_bndl_eval" if dataset_name else (out_dir.parent / "bndl_eval")
-            
-            dataset_evaluator = DistributedDatasetEvaluator(
-                save_dir=str(eval_save_dir),
-                distributed=False,  # Single process for zero-shot evaluation
-                rank=0,
-                world_size=1,
-                # Align with training configuration for PAvPU calculation
-                foreground_dilation=4,
-                use_full_image=False,
-                per_pixel_statistics=True,
-            )
-            logger.info(f"Dataset evaluator initialized with save_dir: {dataset_evaluator.save_dir}")
-        except Exception as e:
-            logger.error(f"Failed to initialize dataset evaluator: {e}")
-            import traceback
-            logger.error(f"Traceback: {traceback.format_exc()}")
-            dataset_evaluator = None
+    # 🧪 EXPERIMENTAL: Try to detect and extract predictor config for potential reload
+    predictor_cfg_file = None
+    predictor_ckpt = None
+    try:
+        # Try to extract config from predictor for potential reload
+        if hasattr(predictor, "_cfg_file"):
+            predictor_cfg_file = predictor._cfg_file
+        if hasattr(predictor, "_ckpt_path"):
+            predictor_ckpt = predictor._ckpt_path
+    except Exception:
+        pass
 
     for v_idx, vid in enumerate(video_names, 1):
-        # Cleanup before each video
-        cleanup_gpu_memory(predictor)
-        
+        # 🧪 EXPERIMENTAL: Force reinitialize SAM model for each video (slow but thorough)
+        # This is a workaround for the issue where BNDL internal states accumulate across videos
+        # causing all-foreground predictions after the first video
+        print(f"\n🔄 [EXPERIMENT] Reinitializing SAM model for video {v_idx}...")
+
+        # Get device from current predictor
+        device = next(predictor.parameters()).device if hasattr(predictor, "parameters") else torch.device("cuda")
+
+        # Clear old predictor from GPU
+        del predictor
+        torch.cuda.empty_cache()
+        import gc
+
+        gc.collect()
+
+        # Rebuild predictor from saved checkpoint path
+        # NOTE: This requires that the predictor was built with the same checkpoint path
+        # The parent function (e.g., main()) should pass the predictor_config or rebuild here
+        from shared_evaluation_utils import build_predictor_with_overrides
+        import os
+
+        # Try to find checkpoint from multiple sources (in order of priority):
+        # 1. Environment variables set by train_and_zs.sh/parallel_compare.py
+        # 2. Variables extracted from the original predictor
+        # 3. Inferred from checkpoint path + experiment config directory
+
+        # Priority 1: BNDL_AUE specific env vars (set by train_and_zs.sh)
+        # These are passed via --bndl_aue_cfg and --bndl_aue_checkpoint
+        cfg_file = os.environ.get("BNDL_AUE_CFG") or os.environ.get("SAM2_CFG_FILE") or predictor_cfg_file
+        ckpt_path = os.environ.get("BNDL_AUE_CKPT") or os.environ.get("SAM2_CKPT_PATH") or predictor_ckpt
+
+        predictor = build_predictor_with_overrides(
+            cfg_file=cfg_file,
+            ckpt=ckpt_path,
+            device=str(device),
+            multimask=False,
+        )
+        print(f"✓ SAM model reinitialized successfully from {ckpt_path}")
+
+        if hasattr(predictor, "model"):
+            # Reset any internal state in the model
+            predictor.model.eval()  # Re-ensure eval mode
+
+            # Reset SAM2 base debug counter (_sam_heads_debug_counter in sam2_base.py)
+            if hasattr(predictor.model, "_sam_heads_debug_counter"):
+                predictor.model._sam_heads_debug_counter = 0
+
+            # Reset BNDL debug counters (these are just for logging but should be reset per video)
+            if hasattr(predictor.model, "sam_mask_decoder"):
+                mask_decoder = predictor.model.sam_mask_decoder
+                if hasattr(mask_decoder, "pixel_bndl_projector"):
+                    bndl = mask_decoder.pixel_bndl_projector
+                    if hasattr(bndl, "_eval_debug_counter"):
+                        bndl._eval_debug_counter = 0
+                    if hasattr(bndl, "_sparse_eval_debug_counter"):
+                        bndl._sparse_eval_debug_counter = 0
+
+        # NOTE: Removed per-video cleanup_gpu_memory() to reduce CUDA sync overhead
+        # Memory is managed at video completion instead
+
         print(f"\n{'=' * 60}")
         print(f"📹 Processing video [{v_idx:03}/{len(video_names)}]: {vid}")
         print(f"   Progress: {v_idx}/{len(video_names)} ({100.0 * v_idx / len(video_names):.1f}%)")
@@ -847,7 +243,7 @@ def inference_with_bndl(
         # Initialize predictor state
         max_frames_to_load = 1 if first_frame_only else None
         state = predictor.init_state(
-            str(video_dir), 
+            str(video_dir),
             max_frames=max_frames_to_load,
             offload_video_to_cpu=True,
             offload_state_to_cpu=True,
@@ -888,9 +284,8 @@ def inference_with_bndl(
             if not np.any(gt_bool):
                 continue
 
-            # Clear GPU memory before processing each object to prevent OOM
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            # NOTE: Removed per-object cuda.empty_cache() to reduce CUDA sync overhead
+            # Memory is managed at frame level for videos with many objects
 
             # Try reused prompts first, fall back to generation
             prompt_applied = False
@@ -899,11 +294,8 @@ def inference_with_bndl(
                 if prompt_applied:
                     # Extract points AND labels from prompt spec for saving
                     clicks = prompts_json[obj_id].get("clicks", [])
-                    obj_points[obj_id] = [
-                        (int(c["xy"][0]), int(c["xy"][1]), int(c.get("label", 1)))
-                        for c in clicks if "xy" in c
-                    ]
-            
+                    obj_points[obj_id] = [(int(c["xy"][0]), int(c["xy"][1]), int(c.get("label", 1))) for c in clicks if "xy" in c]
+
             if not prompt_applied:
                 # Generate new prompts using click protocol
                 used_pts, used_labels = generate_click_prompts(
@@ -941,7 +333,7 @@ def inference_with_bndl(
             seg = {}
             for i, oid in enumerate(out_obj_ids):
                 mask_logits = out_logits[i]
-                
+
                 # Handle multimask output (K>1): select mask 0 (singlemask output token)
                 # This matches SAM-2's default behavior when multimask_output=False
                 if mask_logits.ndim == 3:
@@ -951,20 +343,30 @@ def inference_with_bndl(
                     elif mask_logits.shape[0] > 1:
                         # Multiple masks: use mask 0 (singlemask token, SAM-2 default)
                         mask_logits = mask_logits[0]
-                
+
                 if tuple(mask_logits.shape[-2:]) != (H, W):
                     import torch.nn.functional as F
+
                     mask_logits = F.interpolate(
                         mask_logits.unsqueeze(0).unsqueeze(0),
                         size=(H, W),
                         mode="bilinear",
                         align_corners=False,
                     )[0, 0]
-                seg[oid] = threshold_mask_logits(mask_logits, score_thresh)
+                binary_mask = threshold_mask_logits(mask_logits, score_thresh)
+                seg[oid] = binary_mask
+
+                # DEBUG: Check for all-foreground anomaly in propagate output
+                fg_ratio = binary_mask.sum() / binary_mask.size
+                if fg_ratio > 0.9:
+                    logits_np = mask_logits.cpu().numpy() if hasattr(mask_logits, "cpu") else mask_logits
+                    print(f"⚠️ [PROPAGATE ANOMALY] vid={vid}, obj={oid}, fg_ratio={fg_ratio:.4f}")
+                    print(f"   logits: min={logits_np.min():.2f}, max={logits_np.max():.2f}, mean={logits_np.mean():.2f}")
+
             video_segments[f_idx] = seg
-            
-            # Clear GPU memory after processing each frame to prevent OOM with many objects
-            if torch.cuda.is_available() and len(out_obj_ids) > 10:
+
+            # Clear GPU memory only for videos with many objects (threshold raised to reduce sync overhead)
+            if torch.cuda.is_available() and len(out_obj_ids) > 20:
                 torch.cuda.empty_cache()
 
             # Collect BNDL statistics if enabled (with memory optimization)
@@ -974,7 +376,7 @@ def inference_with_bndl(
                 # Limit to 3 objects per frame for stats collection (memory already managed by checkpoints)
                 max_obj_stats = 3
                 logger.info(f"Processing {len(out_obj_ids[:max_obj_stats])} objects for stats collection")
-                
+
                 # Pre-load GT mask once per frame to avoid redundant I/O
                 gt_mask_full = None
                 current_mask_path = ann_dir / vid / f"{frame_names[f_idx]}.png"
@@ -990,10 +392,10 @@ def inference_with_bndl(
                     logger.info(f"Object ID {obj_id} -> internal index {obj_idx}")
                     bndl_outputs = predictor.get_bndl_outputs(state, f_idx, obj_idx)
                     logger.info(f"get_bndl_outputs(frame={f_idx}, obj_idx={obj_idx}): returned {'data' if bndl_outputs is not None else 'None'}")
-                    
+
                     if bndl_outputs is not None:
-                        # Calculate PAvPU if we have ground truth
-                        if gt_mask_full is not None:
+                        # Calculate PAvPU if we have ground truth AND statistics collection is enabled
+                        if collect_statistics and gt_mask_full is not None:
                             # Extract binary mask for current object
                             gt_mask = (gt_mask_full == obj_id).astype(np.float32)
                             # Convert to tensor format for PAvPU calculation
@@ -1003,24 +405,25 @@ def inference_with_bndl(
                                 gt_tensor = gt_tensor.to(bndl_outputs["pixel_logits_raw"].device)
                             elif "wei_lambda" in bndl_outputs:
                                 gt_tensor = gt_tensor.to(bndl_outputs["wei_lambda"].device)
-                            bndl_outputs = calculate_pavpu_for_bndl(bndl_outputs, None, gt_tensor, "eval", predictor)
+                            bndl_outputs = calculate_pavpu_for_bndl(bndl_outputs, None, gt_tensor, "eval", predictor, sample_num=bndl_sample_num)
                             del gt_tensor, gt_mask
 
-                        # Log statistics
-                        video_statistics = log_bndl_statistics(bndl_outputs, f_idx, "eval", f"{dataset_name}_{vid}_obj{obj_id}", video_statistics)
-                        total_frames_processed += 1
+                        # Log statistics if enabled
+                        if collect_statistics:
+                            video_statistics = log_bndl_statistics(bndl_outputs, f_idx, "eval", f"{dataset_name}_{vid}_obj{obj_id}", video_statistics)
+                            total_frames_processed += 1
 
                         # Add to dataset evaluator (memory managed by checkpoints)
                         if dataset_evaluator is not None:
                             _idx = id_to_idx.get(obj_id)
                             if _idx is not None and _idx < len(out_logits):
                                 pred_logits = out_logits[_idx]
-                                
+
                                 if gt_mask_full is not None and "pixel_uncertainty" in bndl_outputs:
                                     # Extract binary mask for current object only
                                     current_gt_mask = (gt_mask_full == obj_id).astype(np.float32)
                                     current_gt_tensor = torch.from_numpy(current_gt_mask).unsqueeze(0)
-                                    
+
                                     # Move to same device
                                     if "pixel_logits_raw" in bndl_outputs:
                                         current_gt_tensor = current_gt_tensor.to(bndl_outputs["pixel_logits_raw"].device)
@@ -1038,9 +441,8 @@ def inference_with_bndl(
                         # Clean up bndl_outputs after processing
                         del bndl_outputs
 
-
             # Generate BNDL visualizations for selected frames (reduced for memory)
-            if save_bndl_vis and vis_dir is not None and bndl_vis_count < 2:  # Limit to 2 visualizations per video
+            if save_bndl_vis and vis_dir is not None and bndl_vis_count < max_vis_per_video:  # Limit visualizations per video
                 try:
                     # Extract BNDL outputs from the predictor state
                     # This requires accessing the internal state or outputs
@@ -1064,11 +466,11 @@ def inference_with_bndl(
                                     gt_tensor = gt_tensor.to(bndl_outputs["pixel_logits_raw"].device)
                                 elif "wei_lambda" in bndl_outputs:
                                     gt_tensor = gt_tensor.to(bndl_outputs["wei_lambda"].device)
-                                bndl_outputs = calculate_pavpu_for_bndl(bndl_outputs, None, gt_tensor, "eval", predictor)
-                                
+                                bndl_outputs = calculate_pavpu_for_bndl(bndl_outputs, None, gt_tensor, "eval", predictor, sample_num=bndl_sample_num)
+
                                 # Clean up ground truth tensor immediately
                                 del gt_tensor, gt_mask
-                            
+
                             # Create visualization
                             vis_path = vis_dir / vid
                             vis_path.mkdir(parents=True, exist_ok=True)
@@ -1098,6 +500,20 @@ def inference_with_bndl(
                                 },
                             )()
 
+                            # Build prompt_info from obj_points for visualization
+                            # obj_points format: {obj_id: [(x, y, label), ...]}
+                            prompt_info = None
+                            if obj_points and first_obj_id in obj_points:
+                                pts = obj_points[first_obj_id]
+                                if pts:
+                                    # Convert to format expected by visualizer
+                                    point_coords = np.array([[p[0], p[1]] for p in pts])  # [N, 2]
+                                    point_labels = np.array([p[2] for p in pts])  # [N]
+                                    prompt_info = {
+                                        "point_coords": point_coords,
+                                        "point_labels": point_labels,
+                                    }
+
                             # Use refactored visualization function
                             create_bndl_visualization_refactored(
                                 bndl_outputs,
@@ -1108,6 +524,10 @@ def inference_with_bndl(
                                 0,  # step_index
                                 0,  # frame_index
                                 "full",
+                                save_individual=True,
+                                save_unified=False,
+                                prompt_info=prompt_info,
+                                save_pdf=save_vis_pdf,
                             )
                             bndl_vis_count += 1
                 except Exception as e:
@@ -1120,19 +540,23 @@ def inference_with_bndl(
 
             # Removed extra periodic GPU sync/GC to match original flow
 
-        # Save PNG masks
-        for f_idx in list(video_segments.keys()):
-            seg = video_segments[f_idx]
-            save_masks_to_dir(
-                output_mask_dir=str(out_dir),
-                video_name=vid,
-                frame_name=frame_names[f_idx],
-                per_obj_output_mask=seg,
-                height=H,
-                width=W,
-                per_obj_png_file=False,
-                output_palette=DAVIS_PALETTE,
-            )
+        # Save PNG masks in parallel using ThreadPoolExecutor for better I/O performance
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        # Determine if per-object PNG files are needed (e.g. for SA-V dataset)
+        per_obj_png_file = "sav" in (dataset_name or "").lower()
+
+        # Use up to 4 threads for I/O (more threads don't help with disk I/O)
+        max_io_workers = min(4, len(video_segments))
+        if save_masks and max_io_workers > 0:
+            with ThreadPoolExecutor(max_workers=max_io_workers) as io_executor:
+                futures = [io_executor.submit(save_single_mask_helper, f_idx, seg, vid, frame_names, out_dir, H, W, per_obj_png_file) for f_idx, seg in video_segments.items()]
+                # Wait for all saves to complete
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                    except Exception as e:
+                        logger.warning(f"Failed to save mask: {e}")
 
         # Clear any remaining frames
         video_segments.clear()
@@ -1144,42 +568,27 @@ def inference_with_bndl(
         if collect_statistics and video_statistics and dataset_statistics is not None:
             dataset_statistics.update(video_statistics)
             print(f"Collected BNDL statistics for video {vid}: {len(video_statistics)} metrics")
-            
+
             # Incremental save: periodically save statistics and clear memory to prevent OOM
             if stats_checkpoint_mgr and stats_checkpoint_mgr.should_checkpoint(v_idx):
                 # 🎯 保存checkpoint前降采样PAvPU样本
                 _, n_orig, n_down = downsample_statistics_pavpu(dataset_statistics, max_samples=downsample_max_samples)
                 if n_down < n_orig:
                     print(f"  💾 降采样: {n_orig:,} → {n_down:,} PAvPU样本 ({n_down / n_orig * 100:.1f}%)")
-                
+
                 checkpoint_file = stats_checkpoint_mgr.save_checkpoint(dataset_statistics, v_idx)
                 print(f"💾 Saved statistics checkpoint ({v_idx}/{len(video_names)} videos) to {checkpoint_file.name}")
-                
+
                 # Clear statistics from memory
                 dataset_statistics.clear()
                 CheckpointManager.force_memory_cleanup()
-                
+
                 # Also checkpoint dataset_evaluator to prevent OOM from pixel-level data accumulation
                 if eval_checkpoint_mgr and dataset_evaluator is not None and len(dataset_evaluator) > 0:
-                    if dataset_evaluator.per_pixel_statistics:
-                        eval_checkpoint_data = {
-                            'pixel_uncertainties': dataset_evaluator.pixel_data['uncertainties'].tolist(),
-                            'pixel_ious': dataset_evaluator.pixel_data['ious'].tolist(),
-                            'pixel_dices': dataset_evaluator.pixel_data['dices'].tolist(),
-                            'pixel_accuracies': dataset_evaluator.pixel_data['accuracies'].tolist(),
-                            'pixel_nlls': dataset_evaluator.pixel_data['nlls'].tolist(),
-                        }
-                    else:
-                        eval_checkpoint_data = {
-                            'pixel_uncertainties': [],
-                            'pixel_ious': [],
-                            'pixel_dices': [],
-                            'pixel_accuracies': [],
-                            'pixel_nlls': [],
-                        }
+                    eval_checkpoint_data = extract_evaluator_checkpoint_data(dataset_evaluator)
                     eval_checkpoint_file = eval_checkpoint_mgr.save_checkpoint(eval_checkpoint_data, v_idx)
                     print(f"💾 Saved evaluator checkpoint ({v_idx}/{len(video_names)} videos) to {eval_checkpoint_file.name}")
-                    
+
                     # Clear evaluator data using built-in reset method
                     dataset_evaluator.reset()
                     CheckpointManager.force_memory_cleanup()
@@ -1187,83 +596,25 @@ def inference_with_bndl(
         # Critical: Reset predictor state to free memory for this video
         cleanup_gpu_memory(predictor, state)
         print(f"✓ Video {vid} completed ({v_idx}/{len(video_names)})")
-    
+
     # Save any remaining statistics after the last video
     if stats_checkpoint_mgr and dataset_statistics and len(dataset_statistics) > 0:
         # 🎯 保存最终checkpoint前降采样PAvPU样本
         _, n_orig, n_down = downsample_statistics_pavpu(dataset_statistics, max_samples=downsample_max_samples)
         if n_down < n_orig:
             print(f"  💾 降采样: {n_orig:,} → {n_down:,} PAvPU样本 ({n_down / n_orig * 100:.1f}%)")
-        
+
         checkpoint_file = stats_checkpoint_mgr.save_checkpoint(dataset_statistics, len(video_names))
         print(f"💾 Saved final statistics checkpoint to {checkpoint_file.name}")
         dataset_statistics.clear()
         CheckpointManager.force_memory_cleanup()
-    
-    # Merge evaluator checkpoint files back into dataset_evaluator BEFORE generating evaluation
-    # CRITICAL: Must merge checkpoints first, otherwise len(dataset_evaluator) will be 0
-    if eval_checkpoint_mgr and dataset_evaluator is not None:
-        # Stream-merge to reduce memory peak and allow resumability
-        def _append_shard_to_evaluator(shard_data):
-            if not shard_data:
-                return
-            
-            # Collect all data
-            data_dict = {}
-            if shard_data.get('pixel_uncertainties'):
-                data_dict['uncertainties'] = shard_data['pixel_uncertainties']
-            if shard_data.get('pixel_accuracies'):
-                data_dict['accuracies'] = shard_data['pixel_accuracies']
-            if shard_data.get('pixel_ious'):
-                data_dict['ious'] = shard_data['pixel_ious']
-            if shard_data.get('pixel_dices'):
-                data_dict['dices'] = shard_data['pixel_dices']
-            if shard_data.get('pixel_nlls'):
-                data_dict['nlls'] = shard_data['pixel_nlls']
-            
-            if data_dict:
-                # Create new DataFrame
-                new_data = pd.DataFrame(data_dict)
-                
-                # Add to existing data
-                dataset_evaluator.pixel_data = pd.concat([dataset_evaluator.pixel_data, new_data], ignore_index=True)
-                
-                # If exceeding max samples, perform downsampling
-                if len(dataset_evaluator.pixel_data) > downsample_max_samples:
-                    dataset_evaluator.pixel_data = dataset_evaluator.pixel_data.sample(n=downsample_max_samples, random_state=42).reset_index(drop=True)
-                    print(f"  🔄 中间降采样: → {downsample_max_samples:,} 样本")
-            
-            CheckpointManager.force_memory_cleanup()
 
-        eval_checkpoint_mgr.merge_checkpoints_streaming(_append_shard_to_evaluator)
-    
-    # Generate dataset evaluation plots like in SAM trainer validation phase
-    if collect_statistics and dataset_evaluator and len(dataset_evaluator) > 0:
-        try:
-            print(f"\nGenerating dataset correlation analysis for {dataset_name}...")
+    # Merge evaluator checkpoint files back into dataset_evaluator
+    merge_evaluator_checkpoints(eval_checkpoint_mgr, dataset_evaluator, downsample_max_samples)
 
-            # Evaluate correlation like in SAM trainer
-            correlation_results = dataset_evaluator.evaluate_dataset_correlation()
-            logger.info(f"Correlation evaluation completed with {len(correlation_results)} metrics")
-
-            # Create visualization like in SAM trainer
-            dataset_evaluator.create_dataset_correlation_visualization(
-                title=f"{dataset_name} Zero-shot Analysis - Dataset Correlation", save_name=f"{dataset_name.lower()}_zeroshot_dataset_analysis.png"
-            )
-
-            # Save results like in SAM trainer
-            dataset_evaluator.save_correlation_results(save_name=f"{dataset_name.lower()}_zeroshot_results.json")
-
-            print(f"Dataset evaluation plots saved for {dataset_name}")
-            logger.info(f"Dataset evaluation completed for {dataset_name}")
-
-        except Exception as e:
-            logger.warning(f"Dataset evaluation failed for {dataset_name}: {e}")
-            import traceback
-
-            logger.warning(f"Traceback: {traceback.format_exc()}")
-    elif collect_statistics and dataset_evaluator:
-        logger.warning(f"No data collected for dataset evaluation in {dataset_name} (collected: {len(dataset_evaluator) if dataset_evaluator else 0})")
+    # Generate dataset evaluation plots
+    if collect_statistics:
+        finalize_bndl_evaluation(dataset_evaluator, dataset_name)
 
     # Merge checkpoint files back into final statistics
     if stats_checkpoint_mgr:
@@ -1271,12 +622,11 @@ def inference_with_bndl(
         if dataset_statistics is None:
             dataset_statistics = {}
         dataset_statistics.update(merged_stats)
-        
+
         # 🎯 关键优化: 合并后再次降采样（防止多个checkpoint累积太多样本）
         _, n_orig, n_down = downsample_statistics_pavpu(dataset_statistics, max_samples=downsample_max_samples)
         if n_down < n_orig:
-            print(f"  💾 合并后降采样: {n_orig:,} → {n_down:,} PAvPU样本 ({n_down/n_orig*100:.1f}%)")
-    
+            print(f"  💾 合并后降采样: {n_orig:,} → {n_down:,} PAvPU样本 ({n_down / n_orig * 100:.1f}%)")
 
     if collect_statistics and dataset_statistics:
         print(f"\nBNDL Statistics Summary for {dataset_name}:")
@@ -1312,8 +662,7 @@ def run_single_dataset_with_bndl(
     score_thresh: float = 0.0,
     num_workers: int | None = None,
     video_subset: list[str] | None = None,
-    save_bndl_vis: bool = True,
-    prompt_method: str = "gt_box",
+    save_bndl_vis: bool = False,  # Default False for faster evaluation
     first_frame_only: bool = False,
     max_objects: int | None = None,
     collect_statistics: bool = False,
@@ -1322,142 +671,65 @@ def run_single_dataset_with_bndl(
     min_click_dist: float = 12.0,
     seed: int = 0,
     downsample_max_samples: int = 100000,
+    # Paper figure generation options
+    max_vis_per_video: int = 2,  # Max visualizations per video (2 for benchmarking, set higher for paper figures)
+    save_vis_pdf: bool = True,  # Save PDF versions for paper (300 DPI) - default True for professional use
+    # Optimization options
+    bndl_sample_num: int = 20,
+    save_masks: bool = True,
 ) -> tuple[float, float, float, dict]:
-    """Run evaluation on a single dataset with BNDL UQ analysis and return metrics"""
+    """Run evaluation on a single dataset with BNDL UQ analysis and return metrics.
 
-    config = DATASET_CONFIGS[dataset_name]
-    if split is None:
-        split = config["default_split"]
-    
-    # Handle both single split and multiple splits
-    if isinstance(split, list):
-        # If multiple splits, use the first one for now (can be extended later)
-        split = split[0]
-    
-    assert isinstance(split, str)
+    This is a thin wrapper around zs_dataset_runner.run_single_dataset_generic
+    that passes BNDL-specific parameters.
+    """
+    from zs_dataset_runner import run_single_dataset_generic
 
-    root = Path(config["root"])
-    if config["has_split_subdir"]:
-        jpeg_dir = root / split / "JPEGImages"
-        ann_dir = root / split / "Annotations"
-    else:
-        jpeg_dir = root / "JPEGImages"
-        ann_dir = root / "Annotations"
-
-    if not jpeg_dir.is_dir() or not ann_dir.is_dir():
-        raise FileNotFoundError(f"JPEGImages or Annotations not found for {dataset_name}: {jpeg_dir}, {ann_dir}")
-
-    # Output directories
-    out_dir = output_path / f"{dataset_name.lower()}_pred"
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # BNDL visualization directory
+    # BNDL needs vis_dir and eval_dir computed
     bndl_vis_dir = output_path / f"{dataset_name.lower()}_bndl_vis" if save_bndl_vis else None
+    bndl_eval_dir = output_path / f"{dataset_name.lower()}_bndl_eval" if collect_statistics else None
 
-    print(f"\n{'=' * 60}")
-    print(f"Running {dataset_name} dataset evaluation with BNDL UQ analysis")
-    print(f"{'=' * 60}")
+    jf, j, f, stats = run_single_dataset_generic(
+        dataset_name=dataset_name,
+        predictor=predictor,
+        output_path=output_path,
+        inference_fn=inference_with_bndl,
+        method_name="BNDL",
+        split=split,
+        video_subset=video_subset,
+        num_workers=num_workers,
+        first_frame_only=first_frame_only,
+        score_thresh=score_thresh,
+        max_objects=max_objects,
+        reuse_prompts_root=reuse_prompts_root,
+        click_protocol=click_protocol,
+        min_click_dist=min_click_dist,
+        seed=seed,
+        collect_statistics=collect_statistics,
+        downsample_max_samples=downsample_max_samples,
+        # BNDL-specific kwargs
+        save_bndl_vis=save_bndl_vis,
+        vis_dir=bndl_vis_dir,
+        eval_dir=bndl_eval_dir,
+        # Paper figure generation options
+        max_vis_per_video=max_vis_per_video,
+        save_vis_pdf=save_vis_pdf,
+        # Optimization options
+        bndl_sample_num=bndl_sample_num,
+        save_masks=save_masks,
+    )
 
-    # Debug: Check data paths and availability
-    print(f"JPEG directory: {jpeg_dir}")
-    print(f"Annotation directory: {ann_dir}")
-    print(f"JPEG dir exists: {jpeg_dir.exists()}")
-    print(f"Ann dir exists: {ann_dir.exists()}")
-
-    # Handle file_list_txt if specified in config
-    if "file_list_txt" in config:
-        file_list_path = Path(config["file_list_txt"])
-        if file_list_path.exists():
-            with open(file_list_path, 'r') as f:
-                video_names_from_list = [line.strip() for line in f if line.strip()]
-            print(f"Using file list from {file_list_path}: {len(video_names_from_list)} videos")
-            # Filter video_subset if provided
-            if video_subset is not None:
-                video_subset = [v for v in video_subset if v in video_names_from_list]
-            else:
-                video_subset = video_names_from_list
-        else:
-            print(f"Warning: file_list_txt specified but file not found: {file_list_path}")
-
-    if jpeg_dir.exists():
-        video_dirs = [d for d in jpeg_dir.iterdir() if d.is_dir()]
-        print(f"Found {len(video_dirs)} video directories in JPEG dir")
-        if video_dirs:
-            print(f"First few videos: {[v.name for v in video_dirs[:3]]}")
-
-    if ann_dir.exists():
-        ann_dirs = [d for d in ann_dir.iterdir() if d.is_dir()]
-        print(f"Found {len(ann_dirs)} annotation directories")
-        if ann_dirs:
-            print(f"First few annotation videos: {[v.name for v in ann_dirs[:3]]}")
-
-    # Run inference with BNDL UQ analysis
-    start_time = time.time()
-    try:
-        dataset_statistics = inference_with_bndl(
-            predictor,
-            jpeg_dir,
-            ann_dir,
-            out_dir,
-            score_thresh=score_thresh,
-            video_names=video_subset,
-            save_bndl_vis=save_bndl_vis,
-            vis_dir=bndl_vis_dir,
-            dataset_name=dataset_name,
-            collect_statistics=collect_statistics,
-            eval_dir=(output_path / f"{dataset_name.lower()}_bndl_eval") if collect_statistics else None,
-            prompt_method=prompt_method,
-            first_frame_only=first_frame_only,
-            max_objects=max_objects,
-            reuse_prompts_root=reuse_prompts_root,
-            click_protocol=click_protocol,
-            min_click_dist=min_click_dist,
-            seed=seed,
-            downsample_max_samples=downsample_max_samples,
-        )
-    except Exception as e:
-        print(f"Error during inference for {dataset_name}: {e}")
-        raise
-    inference_time = time.time() - start_time
-
-    # Use unified evaluation pipeline (with symlinks for better performance)
-    eval_start_time = time.time()
-    try:
-        j_f_val, j_val, f_val = run_benchmark_evaluation(
-            gt_dir=ann_dir,
-            pred_dir=out_dir,
-            dataset_config=config,
-            video_subset=video_subset,
-            first_frame_only=first_frame_only,
-            num_workers=num_workers,
-            output_path=output_path,
-            use_symlinks=True,  # Use symlinks for 10-100x speed improvement
-            dataset_name=dataset_name,  # Pass dataset name for proper temp directory naming
-        )
-    except Exception as e:
-        print(f"Error during evaluation of {dataset_name}: {e}")
-        import traceback
-        traceback.print_exc()
-        return 0.0, 0.0, 0.0, {}
-
-    eval_time = time.time() - eval_start_time
-
-    print(f"Inference time: {inference_time:.2f}s")
-    print(f"Evaluation time: {eval_time:.2f}s")
+    # BNDL-specific: Save statistics to file
+    if stats:
+        stats_file = output_path / f"{dataset_name.lower()}_bndl_statistics.json"
+        with open(stats_file, "w") as f_out:
+            json.dump(stats, f_out, indent=2)
+        print(f"BNDL statistics saved to: {stats_file}")
 
     if save_bndl_vis and bndl_vis_dir is not None:
         print(f"BNDL UQ visualizations saved to: {bndl_vis_dir}")
 
-    # Save BNDL statistics to file
-    if dataset_statistics:
-        stats_file = output_path / f"{dataset_name.lower()}_bndl_statistics.json"
-        with open(stats_file, "w") as f:
-            json.dump(dataset_statistics, f, indent=2)
-        print(f"BNDL statistics saved to: {stats_file}")
-
-    # Note: Temporary directories are automatically cleaned up by run_benchmark_evaluation
-
-    return j_f_val, j_val, f_val, (dataset_statistics or {})
+    return jf, j, f, (stats or {})
 
 
 def create_comparison_plots_with_bndl(results: dict[str, tuple[float, float, float]], output_path: Path, all_statistics: dict | None = None):
@@ -1609,13 +881,6 @@ def parse_args():
     # Evaluation parameters
     p.add_argument("--device", default="cuda", help="Device to use")
     p.add_argument("--score_thresh", type=float, default=0.0, help="Mask logit threshold")
-    p.add_argument(
-        "--prompt_method",
-        type=str,
-        default="gt_box",
-        choices=["gt_box", "three_clicks"],
-        help="Prompting strategy: gt_box (default) or three_clicks",
-    )
     p.add_argument("--num_workers", type=int, default=None, help="Number of evaluation processes")
     p.add_argument("--output_path", default="./outputs/zs_04_09_sam_bndl", help="Root output directory")
     p.add_argument("--first_frame_only", action="store_true", help="Evaluate only the first frame per video by copying only the first PNG")
@@ -1627,7 +892,7 @@ def parse_args():
     p.add_argument("--multimask_for_tracking", action="store_true", default=False, help="Also enable multimask during tracking frames (not just the first click)")
 
     # BNDL UQ visualization options
-    p.add_argument("--save_bndl_vis", action="store_true", default=True, help="Generate BNDL UQ visualizations")
+    p.add_argument("--save_bndl_vis", action="store_true", default=False, help="Generate BNDL UQ visualizations (disabled by default for speed)")
     p.add_argument("--video_limit", type=int, default=None, help="Limit number of videos per dataset (for quick testing)")
     p.add_argument("--max_objects", type=int, default=20, help="Maximum number of objects to process per video (default: 20)")
     p.add_argument("--collect_statistics", action="store_true", default=False, help="Collect BNDL statistics (uses extra GPU memory)")
@@ -1637,6 +902,10 @@ def parse_args():
 
     # Downsampling parameters
     p.add_argument("--downsample_max_samples", type=int, default=100000, help="Maximum number of samples to keep after downsampling (default: 100000)")
+
+    # Optimization parameters
+    p.add_argument("--bndl_sample_num", type=int, default=20, help="Number of samples for BNDL uncertainty sampling (default: 20)")
+    p.add_argument("--no_save_masks", action="store_true", help="Disable saving predicted masks to disk for faster evaluation")
 
     return p.parse_args()
 
@@ -1651,7 +920,7 @@ def main():
     # Load SAM-2 predictor
     print("Loading SAM-2 checkpoint...")
     from shared_evaluation_utils import build_predictor_with_overrides
-    
+
     predictor = build_predictor_with_overrides(
         cfg_file=args.sam2_cfg,
         ckpt=args.sam2_checkpoint,
@@ -1676,7 +945,7 @@ def main():
                 config = DATASET_CONFIGS[dataset_name]
                 root = Path(config["root"])
                 split = config["default_split"]
-                
+
                 # Handle both single split and multiple splits
                 if isinstance(split, list):
                     split = split[0]
@@ -1700,12 +969,13 @@ def main():
                 num_workers=args.num_workers,
                 video_subset=video_subset,
                 save_bndl_vis=args.save_bndl_vis,
-                prompt_method=args.prompt_method,
                 first_frame_only=args.first_frame_only,
                 max_objects=args.max_objects,
                 collect_statistics=args.collect_statistics,
                 reuse_prompts_root=Path(args.reuse_prompts_root) if args.reuse_prompts_root else None,
                 downsample_max_samples=args.downsample_max_samples,
+                bndl_sample_num=args.bndl_sample_num,
+                save_masks=not args.no_save_masks,
             )
 
             results[dataset_name] = (j_f, j, f)

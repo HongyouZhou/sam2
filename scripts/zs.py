@@ -4,10 +4,38 @@
 
 from __future__ import annotations
 
-import argparse
-import json
+# CRITICAL: Must set sys.path BEFORE any sam2/BNDL imports
+# This allows using experiment-specific source code when PYTHONPATH is set
 import sys
 import os
+
+# If PYTHONPATH is set (by parallel_compare.py), prepend experiment source to sys.path
+# This ensures we use the experiment's source code snapshot, not the current workspace
+_pythonpath = os.environ.get("PYTHONPATH", "")
+if _pythonpath:
+    # Collect paths from PYTHONPATH that contain experiment source code
+    _experiment_paths = []
+    for _p in _pythonpath.split(os.pathsep):
+        if _p and "/src" in _p:  # This is likely an experiment source dir
+            _experiment_paths.append(_p)
+    
+    if _experiment_paths:
+        # Rebuild sys.path with experiment paths at the front
+        _new_sys_path = list(_experiment_paths)
+        for _existing in sys.path:
+            # Skip sam2 paths that would shadow experiment code (except scripts dir)
+            _skip = False
+            if "sam2" in _existing and _existing not in _experiment_paths:
+                if not _existing.endswith("/scripts"):
+                    _skip = True
+            if not _skip and _existing not in _new_sys_path:
+                _new_sys_path.append(_existing)
+        
+        sys.path[:] = _new_sys_path
+        print(f"[zs.py] Using experiment source code from: {_experiment_paths}")
+
+import argparse
+import json
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -36,6 +64,13 @@ from zero_shot_multi_dataset_ur_ern import (
     run_single_dataset_with_ur_ern as run_ur_ern_dataset,
 )
 
+# Method configuration registry (single source of truth)
+from zs_method_registry import (
+    METHOD_REGISTRY,
+    get_method_result_keys,
+    get_method_stats_keys,
+)
+
 matplotlib.use("Agg")  # Use non-interactive backend
 
 
@@ -51,6 +86,83 @@ def _load_eval_json(file_path: Path) -> dict | None:
         return None
 
 
+def _load_predictor(
+    model_name: str,
+    cfg: str | None,
+    checkpoint: str | None,
+    device: str,
+    required: bool = True,
+) -> Any | None:
+    """通用模型加载函数，减少代码重复。
+    
+    Args:
+        model_name: 模型名称（用于日志）
+        cfg: 配置文件路径
+        checkpoint: 检查点文件路径
+        device: 设备（cuda/cpu）
+        required: 如果为 True，缺少配置时抛出异常；否则返回 None
+    
+    Returns:
+        加载的 predictor，或 None（如果 required=False 且配置缺失）
+    """
+    if cfg is None or checkpoint is None:
+        if required:
+            raise ValueError(f"{model_name} requires both cfg and checkpoint to be specified")
+        return None
+    
+    print(f"\nLoading {model_name} checkpoint...")
+    
+    try:
+        # 统一的配置文件路径解析
+        import sam2
+        sam2_package_root = Path(sam2.__path__[0])
+        sam2_package_dir = sam2_package_root / "sam2"
+        config_paths_to_try = [
+            Path(cfg),
+            sam2_package_dir / cfg,
+            sam2_package_root / cfg,
+        ]
+        
+        # Add experiment config directory if set
+        experiment_config_dir = os.environ.get("EXPERIMENT_CONFIG_DIR")
+        if experiment_config_dir:
+            config_paths_to_try.insert(0, Path(experiment_config_dir) / cfg)
+        
+        config_found = any(p.exists() for p in config_paths_to_try)
+        if not config_found:
+            raise FileNotFoundError(
+                f"{model_name} config file not found: {cfg} "
+                f"(tried: {[str(p) for p in config_paths_to_try]})"
+            )
+        
+        if not Path(checkpoint).exists():
+            raise FileNotFoundError(f"{model_name} checkpoint file not found: {checkpoint}")
+        
+        from shared_evaluation_utils import build_predictor_with_overrides
+        predictor = build_predictor_with_overrides(
+            cfg_file=cfg,
+            ckpt=checkpoint,
+            device=device,
+        )
+        print(f"{model_name} loaded successfully!")
+        return predictor
+        
+    except FileNotFoundError as e:
+        print(f"❌ File not found error when loading {model_name}: {e}")
+        raise
+    except RuntimeError as e:
+        print(f"❌ Runtime error when loading {model_name} checkpoint: {e}")
+        print(f"   Config: {cfg}")
+        print(f"   Checkpoint: {checkpoint}")
+        raise
+    except Exception as e:
+        print(f"❌ Unexpected error when loading {model_name}: {type(e).__name__}: {e}")
+        print(f"   Config: {cfg}")
+        print(f"   Checkpoint: {checkpoint}")
+        import traceback
+        traceback.print_exc()
+        raise
+
 def run_comparison_evaluation(
     datasets: list[str],
     sam2_cfg: str,
@@ -65,11 +177,10 @@ def run_comparison_evaluation(
     device: str = "cuda",
     score_thresh: float = 0.0,
     thresh_grid: list[float] | None = None,
-    prompt_method: str = "gt_box",
     first_frame_only: bool = False,
     max_objects: int = 20,
     video_limit: int | None = None,
-    num_workers: int | None = None,
+    num_workers: int | None = 2,  # Default to 2 to prevent CPU oversubscription
     save_vis: bool = False,
     collect_bndl_stats: bool = False,
     uctta_steps: int = 2,
@@ -91,6 +202,10 @@ def run_comparison_evaluation(
     uctta_selection_p: float = 0.1,
     # Downsampling parameters
     downsample_max_samples: int = 100000,
+    # Paper figure generation options
+    max_vis_per_video: int = 2,
+    save_vis_pdf: bool = False,
+    no_save_masks: bool = False,
 ) -> tuple[
     dict[str, tuple[float, float, float]],  # sam2_results
     dict[str, tuple[float, float, float]],  # bndl_aue_results
@@ -126,206 +241,26 @@ def run_comparison_evaluation(
     if run_ur_ern:
         ur_ern_output.mkdir(parents=True, exist_ok=True)
 
-    # Build both predictors with identical Hydra overrides to ensure strict consistency
-    from shared_evaluation_utils import build_predictor_with_overrides
-
-    # Load SAM-2 predictor (original) with the same overrides (optional)
-    sam2_predictor = None
-    if run_sam or run_uctta:  # UCTTA needs SAM-2 predictor
-        print("\nLoading SAM-2 checkpoint...")
-        try:
-            # 检查文件是否存在
-            # 配置文件路径可能是相对于 Hydra 搜索路径的（如 configs/sam2.1/...）
-            # Hydra 的搜索路径是 pkg://sam2，指向 sam2/sam2/ 目录
-            # 需要尝试多个可能的路径
-            import sam2
-            sam2_package_root = Path(sam2.__path__[0])  # /path/to/sam2
-            sam2_package_dir = sam2_package_root / "sam2"  # /path/to/sam2/sam2
-            config_paths_to_try = [
-                Path(sam2_cfg),  # 相对路径（相对于当前工作目录）
-                sam2_package_dir / sam2_cfg,  # 相对于 sam2/sam2/ 目录（Hydra 搜索路径）
-                sam2_package_root / sam2_cfg,  # 相对于 sam2/ 目录
-            ]
-            
-            # Add experiment config directory if set
-            experiment_config_dir = os.environ.get("EXPERIMENT_CONFIG_DIR")
-            if experiment_config_dir:
-                config_paths_to_try.insert(0, Path(experiment_config_dir) / sam2_cfg)
-
-            config_found = False
-            for cfg_path in config_paths_to_try:
-                if cfg_path.exists():
-                    config_found = True
-                    break
-            if not config_found:
-                raise FileNotFoundError(f"SAM-2 config file not found: {sam2_cfg} (tried: {[str(p) for p in config_paths_to_try]})")
-            
-            if not Path(sam2_checkpoint).exists():
-                raise FileNotFoundError(f"SAM-2 checkpoint file not found: {sam2_checkpoint}")
-            
-            sam2_predictor = build_predictor_with_overrides(
-                cfg_file=sam2_cfg,
-                ckpt=sam2_checkpoint,
-                device=device,
-            )
-            print("SAM-2 loaded successfully!")
-        except FileNotFoundError as e:
-            print(f"❌ File not found error when loading SAM-2: {e}")
-            raise
-        except RuntimeError as e:
-            print(f"❌ Runtime error when loading SAM-2 checkpoint: {e}")
-            print(f"   Config: {sam2_cfg}")
-            print(f"   Checkpoint: {sam2_checkpoint}")
-            raise
-        except Exception as e:
-            print(f"❌ Unexpected error when loading SAM-2: {type(e).__name__}: {e}")
-            print(f"   Config: {sam2_cfg}")
-            print(f"   Checkpoint: {sam2_checkpoint}")
-            import traceback
-            traceback.print_exc()
-            raise
-
-    # Load BNDL predictor with the same overrides (optional)
-    bndl_predictor = None
-    if run_bndl:
-        if bndl_cfg is None or bndl_checkpoint is None:
-            raise ValueError("BNDL requires both bndl_cfg and bndl_checkpoint to be specified")
-        print("\nLoading BNDL checkpoint...")
-        try:
-            # 检查文件是否存在（使用与 SAM-2 相同的路径解析逻辑）
-            import sam2
-            sam2_package_root = Path(sam2.__path__[0])
-            sam2_package_dir = sam2_package_root / "sam2"
-            bndl_config_paths_to_try = [
-                Path(bndl_cfg),
-                sam2_package_dir / bndl_cfg,
-                sam2_package_root / bndl_cfg,
-            ]
-            bndl_config_found = False
-            for cfg_path in bndl_config_paths_to_try:
-                if cfg_path.exists():
-                    bndl_config_found = True
-                    break
-            if not bndl_config_found:
-                raise FileNotFoundError(f"BNDL config file not found: {bndl_cfg} (tried: {[str(p) for p in bndl_config_paths_to_try]})")
-            if not Path(bndl_checkpoint).exists():
-                raise FileNotFoundError(f"BNDL checkpoint file not found: {bndl_checkpoint}")
-            
-            bndl_predictor = build_predictor_with_overrides(
-                cfg_file=bndl_cfg,
-                ckpt=bndl_checkpoint,
-                device=device,
-            )
-            print("BNDL loaded successfully!")
-        except FileNotFoundError as e:
-            print(f"❌ File not found error when loading BNDL: {e}")
-            raise
-        except RuntimeError as e:
-            print(f"❌ Runtime error when loading BNDL checkpoint: {e}")
-            print(f"   Config: {bndl_cfg}")
-            print(f"   Checkpoint: {bndl_checkpoint}")
-            raise
-        except Exception as e:
-            print(f"❌ Unexpected error when loading BNDL: {type(e).__name__}: {e}")
-            print(f"   Config: {bndl_cfg}")
-            print(f"   Checkpoint: {bndl_checkpoint}")
-            import traceback
-            traceback.print_exc()
-            raise
-
-    # Load BNDL_AUE predictor with the same overrides (optional)
-    bndl_aue_predictor = None
-    if run_bndl_aue:
-        print("\nLoading BNDL_AUE checkpoint...")
-        try:
-            # 检查文件是否存在（使用与 SAM-2 相同的路径解析逻辑）
-            import sam2
-            sam2_package_root = Path(sam2.__path__[0])
-            sam2_package_dir = sam2_package_root / "sam2"
-            bndl_aue_config_paths_to_try = [
-                Path(bndl_aue_cfg),
-                sam2_package_dir / bndl_aue_cfg,
-                sam2_package_root / bndl_aue_cfg,
-            ]
-            bndl_aue_config_found = False
-            for cfg_path in bndl_aue_config_paths_to_try:
-                if cfg_path.exists():
-                    bndl_aue_config_found = True
-                    break
-            if not bndl_aue_config_found:
-                raise FileNotFoundError(f"BNDL_AUE config file not found: {bndl_aue_cfg} (tried: {[str(p) for p in bndl_aue_config_paths_to_try]})")
-            if not Path(bndl_aue_checkpoint).exists():
-                raise FileNotFoundError(f"BNDL_AUE checkpoint file not found: {bndl_aue_checkpoint}")
-            
-            bndl_aue_predictor = build_predictor_with_overrides(
-                cfg_file=bndl_aue_cfg,
-                ckpt=bndl_aue_checkpoint,
-                device=device,
-            )
-            print("BNDL_AUE loaded successfully!")
-        except FileNotFoundError as e:
-            print(f"❌ File not found error when loading BNDL_AUE: {e}")
-            raise
-        except RuntimeError as e:
-            print(f"❌ Runtime error when loading BNDL_AUE checkpoint: {e}")
-            print(f"   Config: {bndl_aue_cfg}")
-            print(f"   Checkpoint: {bndl_aue_checkpoint}")
-            raise
-        except Exception as e:
-            print(f"❌ Unexpected error when loading BNDL_AUE: {type(e).__name__}: {e}")
-            print(f"   Config: {bndl_aue_cfg}")
-            print(f"   Checkpoint: {bndl_aue_checkpoint}")
-            import traceback
-            traceback.print_exc()
-            raise
-
-    # Load SAM-2+UR-ERN predictor with the same overrides (if needed)
-    ur_ern_predictor = None
-    if run_ur_ern:
-        if ur_ern_cfg is None or ur_ern_checkpoint is None:
-            raise ValueError("UR-ERN requires both ur_ern_cfg and ur_ern_checkpoint to be specified")
-        print("\nLoading SAM-2+UR-ERN checkpoint...")
-        try:
-            # 检查文件是否存在（使用与 SAM-2 相同的路径解析逻辑）
-            import sam2
-            sam2_package_root = Path(sam2.__path__[0])
-            sam2_package_dir = sam2_package_root / "sam2"
-            ur_ern_config_paths_to_try = [
-                Path(ur_ern_cfg),
-                sam2_package_dir / ur_ern_cfg,
-                sam2_package_root / ur_ern_cfg,
-            ]
-            ur_ern_config_found = False
-            for cfg_path in ur_ern_config_paths_to_try:
-                if cfg_path.exists():
-                    ur_ern_config_found = True
-                    break
-            if not ur_ern_config_found:
-                raise FileNotFoundError(f"UR-ERN config file not found: {ur_ern_cfg} (tried: {[str(p) for p in ur_ern_config_paths_to_try]})")
-            if not Path(ur_ern_checkpoint).exists():
-                raise FileNotFoundError(f"UR-ERN checkpoint file not found: {ur_ern_checkpoint}")
-            
-            ur_ern_predictor = build_predictor_with_overrides(
-                cfg_file=ur_ern_cfg,
-                ckpt=ur_ern_checkpoint,
-                device=device,
-            )
-            print("SAM-2+UR-ERN loaded successfully!")
-        except FileNotFoundError as e:
-            print(f"❌ File not found error when loading UR-ERN: {e}")
-            raise
-        except RuntimeError as e:
-            print(f"❌ Runtime error when loading UR-ERN checkpoint: {e}")
-            print(f"   Config: {ur_ern_cfg}")
-            print(f"   Checkpoint: {ur_ern_checkpoint}")
-            raise
-        except Exception as e:
-            print(f"❌ Unexpected error when loading UR-ERN: {type(e).__name__}: {e}")
-            print(f"   Config: {ur_ern_cfg}")
-            print(f"   Checkpoint: {ur_ern_checkpoint}")
-            import traceback
-            traceback.print_exc()
-            raise
+    # Load predictors using unified helper function
+    # SAM-2 predictor (needed for SAM and UCTTA)
+    sam2_predictor = _load_predictor(
+        "SAM-2", sam2_cfg, sam2_checkpoint, device, required=False
+    ) if (run_sam or run_uctta) else None
+    
+    # BNDL predictor
+    bndl_predictor = _load_predictor(
+        "BNDL", bndl_cfg, bndl_checkpoint, device, required=run_bndl
+    ) if run_bndl else None
+    
+    # BNDL_AUE predictor
+    bndl_aue_predictor = _load_predictor(
+        "BNDL_AUE", bndl_aue_cfg, bndl_aue_checkpoint, device, required=run_bndl_aue
+    ) if run_bndl_aue else None
+    
+    # UR-ERN predictor
+    ur_ern_predictor = _load_predictor(
+        "SAM-2+UR-ERN", ur_ern_cfg, ur_ern_checkpoint, device, required=run_ur_ern
+    ) if run_ur_ern else None
 
     # Run evaluations
     sam2_results = {}
@@ -390,11 +325,11 @@ def run_comparison_evaluation(
                     save_vis=save_vis,
                     enhanced_vis=True,
                     max_objects=max_objects,
-                    prompt_method=prompt_method,
                     first_frame_only=first_frame_only,
                     click_protocol=click_protocol,
                     min_click_dist=float(min_click_dist),
                     seed=int(seed),
+                    save_masks=not no_save_masks,
                 )
                 sam2_time = time.time() - sam2_start
                 sam2_per_thresh.append((th, j_f_sam2, j_sam2, f_sam2))
@@ -411,7 +346,6 @@ def run_comparison_evaluation(
                     score_thresh=th,
                     num_workers=num_workers,
                     video_subset=video_subset,
-                    prompt_method=prompt_method,
                     first_frame_only=first_frame_only,
                     max_objects=max_objects,
                     uctta_steps=uctta_steps,
@@ -441,61 +375,47 @@ def run_comparison_evaluation(
                     uctta_results[dataset_name] = []  # type: ignore[assignment]
                 (uctta_results[dataset_name]).append((th, j_f_uctta, j_uctta, f_uctta))  # type: ignore[index]
 
-            # Run BNDL evaluation
-            if run_bndl:
-                print(f"--- Running BNDL evaluation for {dataset_name} @ thresh={th} ---")
-                bndl_start = time.time()
-                j_f_bndl, j_bndl, f_bndl, dataset_stats = run_bndl_dataset(
+            # Run BNDL / BNDL_AUE evaluation (unified loop)
+            bndl_models_to_eval = []
+            if run_bndl and bndl_predictor:
+                bndl_models_to_eval.append((
+                    "BNDL", bndl_predictor, bndl_output, 
+                    bndl_per_thresh, bndl_statistics
+                ))
+            if run_bndl_aue and bndl_aue_predictor:
+                bndl_models_to_eval.append((
+                    "BNDL_AUE", bndl_aue_predictor, bndl_aue_output,
+                    bndl_aue_per_thresh, bndl_aue_statistics
+                ))
+            
+            for model_name, predictor, output_dir, per_thresh_list, stats_dict in bndl_models_to_eval:
+                print(f"--- Running {model_name} evaluation for {dataset_name} @ thresh={th} ---")
+                eval_start = time.time()
+                j_f, j, f, dataset_stats = run_bndl_dataset(
                     dataset_name=dataset_name,
-                    predictor=bndl_predictor,
-                    output_path=bndl_output,
+                    predictor=predictor,
+                    output_path=output_dir,
                     score_thresh=th,
                     num_workers=num_workers,
                     video_subset=video_subset,
                     save_bndl_vis=save_vis,
-                    prompt_method=prompt_method,
                     first_frame_only=first_frame_only,
                     max_objects=max_objects,
-                    collect_statistics=collect_bndl_stats,  # Use parameter instead of forcing True
-                    reuse_prompts_root=sam2_output if run_sam else None,  # Only reuse prompts if SAM ran
+                    collect_statistics=collect_bndl_stats,
+                    reuse_prompts_root=sam2_output if run_sam else None,
                     click_protocol=click_protocol,
                     min_click_dist=min_click_dist,
                     seed=seed,
                     downsample_max_samples=downsample_max_samples,
+                    max_vis_per_video=max_vis_per_video,
+                    save_vis_pdf=save_vis_pdf,
+                    save_masks=not no_save_masks,
                 )
-                bndl_time = time.time() - bndl_start
-                bndl_per_thresh.append((th, j_f_bndl, j_bndl, f_bndl))
+                eval_time = time.time() - eval_start
+                per_thresh_list.append((th, j_f, j, f))
                 if dataset_stats:
-                    bndl_statistics[dataset_name] = dataset_stats
-                print(f"BNDL @ {th:.2f} - J&F: {j_f_bndl:.2f}, J: {j_bndl:.2f}, F: {f_bndl:.2f} (Time: {bndl_time:.2f}s)")
-
-            # Run BNDL_AUE evaluation
-            if run_bndl_aue:
-                print(f"--- Running BNDL_AUE evaluation for {dataset_name} @ thresh={th} ---")
-                bndl_aue_start = time.time()
-                j_f_bndl_aue, j_bndl_aue, f_bndl_aue, dataset_stats_aue = run_bndl_dataset(
-                    dataset_name=dataset_name,
-                    predictor=bndl_aue_predictor,
-                    output_path=bndl_aue_output,
-                    score_thresh=th,
-                    num_workers=num_workers,
-                    video_subset=video_subset,
-                    save_bndl_vis=save_vis,
-                    prompt_method=prompt_method,
-                    first_frame_only=first_frame_only,
-                    max_objects=max_objects,
-                    collect_statistics=collect_bndl_stats,  # Use parameter instead of forcing True
-                    reuse_prompts_root=sam2_output if run_sam else None,  # Only reuse prompts if SAM ran
-                    click_protocol=click_protocol,
-                    min_click_dist=min_click_dist,
-                    seed=seed,
-                    downsample_max_samples=downsample_max_samples,
-                )
-                bndl_aue_time = time.time() - bndl_aue_start
-                bndl_aue_per_thresh.append((th, j_f_bndl_aue, j_bndl_aue, f_bndl_aue))
-                if dataset_stats_aue:
-                    bndl_aue_statistics[dataset_name] = dataset_stats_aue
-                print(f"BNDL_AUE @ {th:.2f} - J&F: {j_f_bndl_aue:.2f}, J: {j_bndl_aue:.2f}, F: {f_bndl_aue:.2f} (Time: {bndl_aue_time:.2f}s)")
+                    stats_dict[dataset_name] = dataset_stats
+                print(f"{model_name} @ {th:.2f} - J&F: {j_f:.2f}, J: {j:.2f}, F: {f:.2f} (Time: {eval_time:.2f}s)")
 
             # Run SAM-2+UR-ERN evaluation
             if run_ur_ern and ur_ern_predictor is not None:
@@ -509,7 +429,6 @@ def run_comparison_evaluation(
                     num_workers=num_workers,
                     video_subset=video_subset,
                     save_ur_ern_vis=save_vis,
-                    prompt_method=prompt_method,
                     first_frame_only=first_frame_only,
                     max_objects=max_objects,
                     collect_statistics=True,  # Force collect statistics for comparison
@@ -2161,14 +2080,7 @@ def parse_args():
         default=None,
         help="Optional list of mask logit thresholds to sweep; best J&F per method will be reported",
     )
-    p.add_argument(
-        "--prompt_method",
-        type=str,
-        default="gt_box",
-        choices=["gt_box", "three_clicks"],
-        help="Prompting strategy: gt_box (default) or three_clicks",
-    )
-    p.add_argument("--num_workers", type=int, default=None, help="Number of evaluation processes")
+    p.add_argument("--num_workers", type=int, default=2, help="Number of evaluation processes (default: 2 to prevent CPU oversubscription)")
     p.add_argument("--output_path", default="./outputs/comparison_sam2_vs_bndl_011_01", help="Root output directory")
     p.add_argument("--process_full_video", action="store_true", help="Evaluate all frames in video (default: first frame only)")
 
@@ -2178,6 +2090,8 @@ def parse_args():
 
     # Visualization options
     p.add_argument("--save_vis", action="store_true", default=False, help="Save visualizations")
+    p.add_argument("--max_vis_per_video", type=int, default=2, 
+                   help="Max visualizations per video (default: 2 for benchmarking, set higher for paper figures)")
     p.add_argument("--collect_bndl_stats", action="store_true", default=True, help="Collect BNDL statistics")
     # Click protocol options
     p.add_argument("--click_protocol", type=str, default="3click", 
@@ -2213,6 +2127,9 @@ def parse_args():
     p.add_argument("--uctta_fisher_alpha", type=float, default=2000.0, help="Fisher regularization strength")
     p.add_argument("--uctta_entropy_th", type=float, default=0.4, help="Entropy threshold for sample selection")
     p.add_argument("--uctta_selection_p", type=float, default=0.1, help="Fraction of samples to select")
+    
+    # Optimization
+    p.add_argument("--no_save_masks", action="store_true", default=False, help="Disable mask saving to speed up evaluation")
 
     return p.parse_args()
 
@@ -2281,7 +2198,6 @@ def main():
                 device=args.device,
                 score_thresh=args.score_thresh,
                 thresh_grid=args.thresh_grid,
-                prompt_method=args.prompt_method,
                 first_frame_only=not args.process_full_video,
                 max_objects=args.max_objects,
                 video_limit=args.video_limit,
@@ -2305,6 +2221,10 @@ def main():
                 uctta_entropy_th=args.uctta_entropy_th,
                 uctta_selection_p=args.uctta_selection_p,
                 downsample_max_samples=args.downsample_max_samples,
+                # Paper figure generation options
+                max_vis_per_video=args.max_vis_per_video,
+                save_vis_pdf=True,  # Always save PDF for professional use
+                no_save_masks=args.no_save_masks,
             )
 
         # Save detailed results JSON (needed for parallel_compare.py) - skip if plot_only mode

@@ -3,25 +3,27 @@
 scratch:
   resolution: 1024
   train_batch_size: 1
-  num_train_workers: 16
-  num_frames: 4
+  num_train_workers: 8
+  num_frames: 1  # Changed from 1 to match SAM FT 017 config (testing loss_class issue)
+  val_num_frames: 1  # Validation uses single frame (many val datasets are image-based)
   max_num_objects: 3
+  val_max_videos: 8
   base_lr: 5.0e-6
   vision_lr: 3.0e-06
   phases_per_epoch: 1
-  num_epochs: 30
+  num_epochs: 10
 
 dataset:
   # PATHS to Dataset
   img_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/MOSE_release/train/JPEGImages # PATH to MOSE JPEGImages folder
   gt_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/MOSE_release/train/Annotations # PATH to MOSE Annotations folder
   file_list_txt: ${oc.env:PROJECT_HOME}/dev/ada_samp/sam2/training/assets/MOSE_sample_train_list.txt # Optional PATH to filelist containing a subset of videos to be used for training
-  multiplier: 4
+  multiplier: 4  # Reduced from 4 for faster sweep
   # PATHS to MOSE-val dataset
   val_img_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/MOSE_release/train/JPEGImages
   val_gt_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/MOSE_release/train/Annotations
   val_file_list_txt: ${oc.env:PROJECT_HOME}/dev/ada_samp/sam2/training/assets/MOSE_sample_val_list.txt
-  val_multiplier: 4
+  val_multiplier: 1
 
 
 # Video transforms
@@ -79,8 +81,8 @@ trainer:
   _target_: training.trainer.Trainer
   mode: train
   max_epochs: ${times:${scratch.num_epochs},${scratch.phases_per_epoch}}
-  actual_max_epochs: 30
-  val_epoch_freq: 5
+  actual_max_epochs: 10
+  val_epoch_freq: 1
   accelerator: cuda
   seed_value: 123
   cuda:
@@ -200,11 +202,8 @@ trainer:
     multimask_max_pt_num: 1
     use_mlp_for_obj_ptr_proj: true
     # === BNDL_CONFIG_START ===
-    # BNDL
+    # BNDL (always uses hyper_in only mode)
     use_bndl_for_pixels: true
-    bndl_fuse_type: none
-    bndl_replace_global_with_hyper: true
-    bndl_hyper_in_sparse: false
     # === BNDL_CONFIG_END ===
     # Compilation flag
     # Freeze image encoder to save memory
@@ -231,19 +230,16 @@ trainer:
 
     # === AUE_GCN_CONFIG_START ===
     # AUE (Adversarial Uncertainty Estimation) with Style-based augmentation
-    use_aue: true
+    use_aue: false
     # Constraint weight for adversarial samples (L1 distance to initial)
     aue_constraint_loss_weight: 0.0  # Weight for constraint regularization (0 = disabled)
     # Attack mode: "cooperative" (parallel prediction, joint application) or "sequential" (iterative)
     aue_attack_mode: "cooperative"
     # Style Adversarial options (alternative to AUE, for domain generalization)
-    use_style_adv: true
+    use_style_adv: false
     style_adv_mode: "image_level"  # "image_level" or "feature_level"
-    style_adv_epsilon: 2.0  # Perturbation budget for style
+    style_adv_epsilon: 1.1  # Perturbation budget for style
     style_adv_use_gt_region_style: true
-    
-    # Consistency Regularization: MMD(U_clean, U_adv)
-    aue_consistency_weight: 0.1  # Weight for consistency loss (0.3-0.7 recommended)
     
     # Multi-object style attack control
     adv_use_multi_object: true
@@ -256,6 +252,7 @@ trainer:
 
     # GCN-based multi-object style refinement
     style_adv_use_gcn: false  # Not needed for global-only style
+    style_adv_gcn_grl_alpha: 0.4  # GRL alpha for GCN path (lower = more stable)
     style_adv_gcn_hidden_dim: 64
     style_adv_gcn_num_layers: 2
     style_adv_gcn_edge_threshold: 0.0
@@ -263,35 +260,34 @@ trainer:
     style_adv_gcn_use_background_edges: true
     style_adv_gcn_distance_threshold: 1.0
     style_adv_gcn_use_boundary_distance: true
-    style_adv_gcn_use_visual_features: true  # Enable visual features in GCN for content-aware refinement
+    style_adv_gcn_use_visual_features: true
     style_adv_gcn_feature_dim: 256  # Feature dimension (matches backbone_fpn[-1] d_model)
     
     # Deformation Adversarial (feature-level, memory encoder based)
-    use_deform_adv: false # Disabled for style-only ablation
-    deform_adv_epsilon: 5.0  # Reduced from 10.0 to 5.0 for mild spatial perturbation
+    use_deform_adv: false
+    deform_adv_epsilon: 3.0  # Reduced from 10.0 to 5.0 for mild spatial perturbation
     deform_adv_use_soft_composite: true
     deform_adv_temperature: 1.0
     deform_adv_use_gcn: false
     deform_adv_gcn_num_layers: 2
     deform_adv_num_deform_groups: 4
     deform_adv_init_from_memory_encoder: true  # Initialize from pretrained memory encoder
-    deform_adv_freeze_mask_encoder: false  # Allow fine-tuning
+    deform_adv_freeze_encoder_components: true  # Freeze all encoder components (mask_encoder, img_feat_proj, fuser) to prevent GRL gradient instability
     deform_adv_zero_mean_offsets: true  # Remove global translation while keeping local warps
     deform_adv_local_offset_gain: 1.3  # Boost local deformation after centering
+    deform_adv_grl_alpha: 0.3  # GRL alpha for deformation offsets (lower = more stable)
     
     # Adversarial Pipeline Ordering
-    adversarial_attack_order: ["style"]
+    adversarial_attack_order: ["style", "deform"]
     
     # Distribution matching configuration for AUE calibration loss (nested config)
     aue_dist_matching_config:
-      # Current method: Baseline Hard-Aware MMD (error-based Top-K mining)
-      method: "mmd"  # Options: "mmd", "cka", "gram", "mmd_hard_aware", "domain_aware_soft_mmd"
-        
-      # To use NEW theory-driven method, change to:
-      # method: "domain_aware_soft_mmd"
-        
+      mse_weight: 0.08  # Reduced from 0.3
       use_patches: true  # Ignored for hard-aware methods (inherently patch-based)
       patch_size: 32  # Patch size for patch-based methods
+
+      # Current method: Baseline Hard-Aware MMD (error-based Top-K mining)
+      method: "mmd"  # Options: "mmd", "cka", "gram", "mmd_hard_aware", "domain_aware_soft_mmd"  
         
       # Method-specific parameters (only active when method is selected)
       mmd:
@@ -308,9 +304,9 @@ trainer:
       # NEW: Domain-Aware Soft MMD (theory-driven: OOD detection + MaxEnt)
       # Combines error (aleatoric) + feature diversity (epistemic) with soft weighting
       domain_aware_soft_mmd:
-        diversity_weight: 0.25       # Reduced from 0.4 to 0.25 (less emphasis on epistemic diversity)
+        diversity_weight: 0.30       # Reduced from 0.4 to 0.25 (less emphasis on epistemic diversity)
         temperature: 0.2             # Increased from 0.1 to 0.2 (smoother sample selection, less aggressive)
-        max_samples: 8192
+        max_samples: 4096
         diversity_method: "channel_std"  # "channel_std" (faster) | "spatial_var"
         enable_monitoring: false     # Disable monitoring to save memory and ignore low correlation for now
         
@@ -345,9 +341,7 @@ trainer:
     rand_init_cond_frames_for_train: True  # random 1~2
     num_correction_pt_per_frame: 7
     use_act_ckpt_iterative_pt_sampling: false
-    
-
-    
+     
     num_init_cond_frames_for_eval: 1  # only mask on the first frame
     forward_backbone_per_frame_for_eval: True
     
@@ -386,29 +380,366 @@ trainer:
         _partial_: true
         dict_key: all
 
-    # MOSE-val dataset
+    # =============================================================================
+    # ZS Validation: 23 OOD datasets for zero-shot evaluation during sweep
+    # Each dataset limited to max_videos: 8 for manageable validation time (~184 samples)
+    # Dice loss serves as proxy for J&F metric (monotonic relationship)
+    # =============================================================================
     val:
       _target_: training.dataset.sam2_datasets.TorchTrainMixedDataset
       phases_per_epoch: 1
       batch_sizes:
         - 1
+      datasets:
+        - _target_: training.dataset.utils.ConcatDataset
+          datasets:
+            # =========== Object-centric / Instance Datasets ===========
+            # 1. TrashCan
+            - _target_: training.dataset.vos_dataset.VOSDataset
+              transforms: ${vos.val_transforms}
+              training: false
+              video_dataset:
+                _target_: training.dataset.vos_raw_dataset.PNGRawDataset
+                img_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/TrashCan_SAM2/val/JPEGImages
+                gt_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/TrashCan_SAM2/val/Annotations
+                max_videos: ${scratch.val_max_videos}
+              sampler:
+                _target_: training.dataset.vos_sampler.RandomUniformSampler
+                num_frames: ${scratch.val_num_frames}
+                max_num_objects: ${scratch.max_num_objects}
+              multiplier: 1
 
-      datasets:                                        # single MOSE-val dataset
-        - _target_: training.dataset.vos_dataset.VOSDataset
-          transforms: ${vos.val_transforms}
-          training: false                              # <-- IMPORTANT
-          video_dataset:
-            _target_: training.dataset.vos_raw_dataset.PNGRawDataset
-            img_folder: ${dataset.val_img_folder}
-            gt_folder:  ${dataset.val_gt_folder}
-            file_list_txt: ${dataset.val_file_list_txt}
-          # sampler:
-          #   _target_: training.dataset.vos_sampler.EvalSampler  # sample all frames/objects
-          sampler:
-            _target_: training.dataset.vos_sampler.RandomUniformSampler
-            num_frames: ${scratch.num_frames}
-            max_num_objects: ${scratch.max_num_objects}
-          multiplier: ${dataset.val_multiplier}
+            # 2. iShape
+            - _target_: training.dataset.vos_dataset.VOSDataset
+              transforms: ${vos.val_transforms}
+              training: false
+              video_dataset:
+                _target_: training.dataset.vos_raw_dataset.PNGRawDataset
+                img_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/iShape_SAM2/val/JPEGImages
+                gt_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/iShape_SAM2/val/Annotations
+                max_videos: ${scratch.val_max_videos}
+              sampler:
+                _target_: training.dataset.vos_sampler.RandomUniformSampler
+                num_frames: ${scratch.val_num_frames}
+                max_num_objects: ${scratch.max_num_objects}
+              multiplier: 1
+
+            # 3. ZeroWaste-f
+            - _target_: training.dataset.vos_dataset.VOSDataset
+              transforms: ${vos.val_transforms}
+              training: false
+              video_dataset:
+                _target_: training.dataset.vos_raw_dataset.PNGRawDataset
+                img_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/ZeroWaste-f_SAM2/train/JPEGImages
+                gt_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/ZeroWaste-f_SAM2/train/Annotations
+                max_videos: ${scratch.val_max_videos}
+              sampler:
+                _target_: training.dataset.vos_sampler.RandomUniformSampler
+                num_frames: ${scratch.val_num_frames}
+                max_num_objects: ${scratch.max_num_objects}
+              multiplier: 1
+
+            # 4. LVIS
+            - _target_: training.dataset.vos_dataset.VOSDataset
+              transforms: ${vos.val_transforms}
+              training: false
+              video_dataset:
+                _target_: training.dataset.vos_raw_dataset.PNGRawDataset
+                img_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/LVIS_SAM2/val/JPEGImages
+                gt_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/LVIS_SAM2/val/Annotations
+                max_videos: ${scratch.val_max_videos}
+              sampler:
+                _target_: training.dataset.vos_sampler.RandomUniformSampler
+                num_frames: ${scratch.val_num_frames}
+                max_num_objects: ${scratch.max_num_objects}
+              multiplier: 1
+
+            # 5. DOORS
+            - _target_: training.dataset.vos_dataset.VOSDataset
+              transforms: ${vos.val_transforms}
+              training: false
+              video_dataset:
+                _target_: training.dataset.vos_raw_dataset.PNGRawDataset
+                img_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/DOORS_SAM2/val/JPEGImages
+                gt_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/DOORS_SAM2/val/Annotations
+                max_videos: ${scratch.val_max_videos}
+              sampler:
+                _target_: training.dataset.vos_sampler.RandomUniformSampler
+                num_frames: ${scratch.val_num_frames}
+                max_num_objects: ${scratch.max_num_objects}
+              multiplier: 1
+
+            # 6. BBBC038v1
+            - _target_: training.dataset.vos_dataset.VOSDataset
+              transforms: ${vos.val_transforms}
+              training: false
+              video_dataset:
+                _target_: training.dataset.vos_raw_dataset.PNGRawDataset
+                img_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/BBBC038v1_SAM2/train/JPEGImages
+                gt_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/BBBC038v1_SAM2/train/Annotations
+                max_videos: ${scratch.val_max_videos}
+              sampler:
+                _target_: training.dataset.vos_sampler.RandomUniformSampler
+                num_frames: ${scratch.val_num_frames}
+                max_num_objects: ${scratch.max_num_objects}
+              multiplier: 1
+
+            # 7. PPDLS
+            - _target_: training.dataset.vos_dataset.VOSDataset
+              transforms: ${vos.val_transforms}
+              training: false
+              video_dataset:
+                _target_: training.dataset.vos_raw_dataset.PNGRawDataset
+                img_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/PPDLS_SAM2/train/JPEGImages
+                gt_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/PPDLS_SAM2/train/Annotations
+                max_videos: ${scratch.val_max_videos}
+              sampler:
+                _target_: training.dataset.vos_sampler.RandomUniformSampler
+                num_frames: ${scratch.val_num_frames}
+                max_num_objects: ${scratch.max_num_objects}
+              multiplier: 1
+
+            # 8. IBD
+            - _target_: training.dataset.vos_dataset.VOSDataset
+              transforms: ${vos.val_transforms}
+              training: false
+              video_dataset:
+                _target_: training.dataset.vos_raw_dataset.PNGRawDataset
+                img_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/IBD_SAM2/val/JPEGImages
+                gt_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/IBD_SAM2/val/Annotations
+                max_videos: ${scratch.val_max_videos}
+              sampler:
+                _target_: training.dataset.vos_sampler.RandomUniformSampler
+                num_frames: ${scratch.val_num_frames}
+                max_num_objects: ${scratch.max_num_objects}
+              multiplier: 1
+
+            # 9. PIDRay
+            - _target_: training.dataset.vos_dataset.VOSDataset
+              transforms: ${vos.val_transforms}
+              training: false
+              video_dataset:
+                _target_: training.dataset.vos_raw_dataset.PNGRawDataset
+                img_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/PIDRay_SAM2/test/JPEGImages
+                gt_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/PIDRay_SAM2/test/Annotations
+                max_videos: ${scratch.val_max_videos}
+              sampler:
+                _target_: training.dataset.vos_sampler.RandomUniformSampler
+                num_frames: ${scratch.val_num_frames}
+                max_num_objects: ${scratch.max_num_objects}
+              multiplier: 1
+
+            # =========== Scene-centric / Stuff Datasets ===========
+            # 10. CITYSCAPES
+            - _target_: training.dataset.vos_dataset.VOSDataset
+              transforms: ${vos.val_transforms}
+              training: false
+              video_dataset:
+                _target_: training.dataset.vos_raw_dataset.PNGRawDataset
+                img_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/CITYSCAPES_SAM2/val/JPEGImages
+                gt_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/CITYSCAPES_SAM2/val/Annotations
+                max_videos: ${scratch.val_max_videos}
+              sampler:
+                _target_: training.dataset.vos_sampler.RandomUniformSampler
+                num_frames: ${scratch.val_num_frames}
+                max_num_objects: ${scratch.max_num_objects}
+              multiplier: 1
+
+            # 11. ADE20K
+            - _target_: training.dataset.vos_dataset.VOSDataset
+              transforms: ${vos.val_transforms}
+              training: false
+              video_dataset:
+                _target_: training.dataset.vos_raw_dataset.PNGRawDataset
+                img_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/ADE20K_SAM2/validation/JPEGImages
+                gt_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/ADE20K_SAM2/validation/Annotations
+                max_videos: ${scratch.val_max_videos}
+              sampler:
+                _target_: training.dataset.vos_sampler.RandomUniformSampler
+                num_frames: ${scratch.val_num_frames}
+                max_num_objects: ${scratch.max_num_objects}
+              multiplier: 1
+
+            # 12. Hypersim
+            - _target_: training.dataset.vos_dataset.VOSDataset
+              transforms: ${vos.val_transforms}
+              training: false
+              video_dataset:
+                _target_: training.dataset.vos_raw_dataset.PNGRawDataset
+                img_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/Hypersim_SAM2/train/JPEGImages
+                gt_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/Hypersim_SAM2/train/Annotations
+                max_videos: ${scratch.val_max_videos}
+              sampler:
+                _target_: training.dataset.vos_sampler.RandomUniformSampler
+                num_frames: ${scratch.val_num_frames}
+                max_num_objects: ${scratch.max_num_objects}
+              multiplier: 1
+
+            # 13. STREETS
+            - _target_: training.dataset.vos_dataset.VOSDataset
+              transforms: ${vos.val_transforms}
+              training: false
+              video_dataset:
+                _target_: training.dataset.vos_raw_dataset.PNGRawDataset
+                img_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/STREETS_SAM2/train/JPEGImages
+                gt_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/STREETS_SAM2/train/Annotations
+                max_videos: ${scratch.val_max_videos}
+              sampler:
+                _target_: training.dataset.vos_sampler.RandomUniformSampler
+                num_frames: ${scratch.val_num_frames}
+                max_num_objects: ${scratch.max_num_objects}
+              multiplier: 1
+
+            # 14. NDISPark
+            - _target_: training.dataset.vos_dataset.VOSDataset
+              transforms: ${vos.val_transforms}
+              training: false
+              video_dataset:
+                _target_: training.dataset.vos_raw_dataset.PNGRawDataset
+                img_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/NDISPark_SAM2/validation/JPEGImages
+                gt_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/NDISPark_SAM2/validation/Annotations
+                max_videos: ${scratch.val_max_videos}
+              sampler:
+                _target_: training.dataset.vos_sampler.RandomUniformSampler
+                num_frames: ${scratch.val_num_frames}
+                max_num_objects: ${scratch.max_num_objects}
+              multiplier: 1
+
+            # 15. plittersdorf
+            - _target_: training.dataset.vos_dataset.VOSDataset
+              transforms: ${vos.val_transforms}
+              training: false
+              video_dataset:
+                _target_: training.dataset.vos_raw_dataset.PNGRawDataset
+                img_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/plittersdorf_SAM2/train/JPEGImages
+                gt_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/plittersdorf_SAM2/train/Annotations
+                max_videos: ${scratch.val_max_videos}
+              sampler:
+                _target_: training.dataset.vos_sampler.RandomUniformSampler
+                num_frames: ${scratch.val_num_frames}
+                max_num_objects: ${scratch.max_num_objects}
+              multiplier: 1
+
+            # 16. NDD20
+            - _target_: training.dataset.vos_dataset.VOSDataset
+              transforms: ${vos.val_transforms}
+              training: false
+              video_dataset:
+                _target_: training.dataset.vos_raw_dataset.PNGRawDataset
+                img_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/NDD20_SAM2/train/JPEGImages
+                gt_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/NDD20_SAM2/train/Annotations
+                max_videos: ${scratch.val_max_videos}
+              sampler:
+                _target_: training.dataset.vos_sampler.RandomUniformSampler
+                num_frames: ${scratch.val_num_frames}
+                max_num_objects: ${scratch.max_num_objects}
+              multiplier: 1
+
+            # 17. TimberSeg
+            - _target_: training.dataset.vos_dataset.VOSDataset
+              transforms: ${vos.val_transforms}
+              training: false
+              video_dataset:
+                _target_: training.dataset.vos_raw_dataset.PNGRawDataset
+                img_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/TimberSeg_SAM2/train/JPEGImages
+                gt_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/TimberSeg_SAM2/train/Annotations
+                max_videos: ${scratch.val_max_videos}
+              sampler:
+                _target_: training.dataset.vos_sampler.RandomUniformSampler
+                num_frames: ${scratch.val_num_frames}
+                max_num_objects: ${scratch.max_num_objects}
+              multiplier: 1
+
+            # 18. WoodScape
+            - _target_: training.dataset.vos_dataset.VOSDataset
+              transforms: ${vos.val_transforms}
+              training: false
+              video_dataset:
+                _target_: training.dataset.vos_raw_dataset.PNGRawDataset
+                img_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/WoodScape_SAM2/train/JPEGImages
+                gt_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/WoodScape_SAM2/train/Annotations
+                max_videos: ${scratch.val_max_videos}
+              sampler:
+                _target_: training.dataset.vos_sampler.RandomUniformSampler
+                num_frames: ${scratch.val_num_frames}
+                max_num_objects: ${scratch.max_num_objects}
+              multiplier: 1
+
+            # =========== Egocentric / Video Datasets ===========
+            # 19. GTEA
+            - _target_: training.dataset.vos_dataset.VOSDataset
+              transforms: ${vos.val_transforms}
+              training: false
+              video_dataset:
+                _target_: training.dataset.vos_raw_dataset.PNGRawDataset
+                img_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/GTEA_SAM2/val/JPEGImages
+                gt_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/GTEA_SAM2/val/Annotations
+                max_videos: ${scratch.val_max_videos}
+              sampler:
+                _target_: training.dataset.vos_sampler.RandomUniformSampler
+                num_frames: ${scratch.val_num_frames}
+                max_num_objects: ${scratch.max_num_objects}
+              multiplier: 1
+
+            # 20. EgoHOS
+            - _target_: training.dataset.vos_dataset.VOSDataset
+              transforms: ${vos.val_transforms}
+              training: false
+              video_dataset:
+                _target_: training.dataset.vos_raw_dataset.PNGRawDataset
+                img_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/EgoHOS_SAM2/train/JPEGImages
+                gt_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/EgoHOS_SAM2/train/Annotations
+                max_videos: ${scratch.val_max_videos}
+              sampler:
+                _target_: training.dataset.vos_sampler.RandomUniformSampler
+                num_frames: ${scratch.val_num_frames}
+                max_num_objects: ${scratch.max_num_objects}
+              multiplier: 1
+
+            # 21. VISOR
+            - _target_: training.dataset.vos_dataset.VOSDataset
+              transforms: ${vos.val_transforms}
+              training: false
+              video_dataset:
+                _target_: training.dataset.vos_raw_dataset.PNGRawDataset
+                img_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/VISOR_SAM2/val/JPEGImages
+                gt_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/VISOR_SAM2/val/Annotations
+                max_videos: ${scratch.val_max_videos}
+              sampler:
+                _target_: training.dataset.vos_sampler.RandomUniformSampler
+                num_frames: ${scratch.val_num_frames}
+                max_num_objects: ${scratch.max_num_objects}
+              multiplier: 1
+
+            # 22. OVIS
+            - _target_: training.dataset.vos_dataset.VOSDataset
+              transforms: ${vos.val_transforms}
+              training: false
+              video_dataset:
+                _target_: training.dataset.vos_raw_dataset.PNGRawDataset
+                img_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/OVIS_SAM2/train/JPEGImages
+                gt_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/OVIS_SAM2/train/Annotations
+                max_videos: ${scratch.val_max_videos}
+              sampler:
+                _target_: training.dataset.vos_sampler.RandomUniformSampler
+                num_frames: ${scratch.val_num_frames}
+                max_num_objects: ${scratch.max_num_objects}
+              multiplier: 1
+
+            # 23. DRAM
+            - _target_: training.dataset.vos_dataset.VOSDataset
+              transforms: ${vos.val_transforms}
+              training: false
+              video_dataset:
+                _target_: training.dataset.vos_raw_dataset.PNGRawDataset
+                img_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/DRAM_SAM2/test/JPEGImages
+                gt_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/DRAM_SAM2/test/Annotations
+                max_videos: ${scratch.val_max_videos}
+              sampler:
+                _target_: training.dataset.vos_sampler.RandomUniformSampler
+                num_frames: ${scratch.val_num_frames}
+                max_num_objects: ${scratch.max_num_objects}
+              multiplier: 1
 
       shuffle: False
       num_workers: ${scratch.num_train_workers}
@@ -429,7 +760,7 @@ trainer:
 
     gradient_clip:
       _target_: training.optimizer.GradientClipper
-      max_norm: 0.1
+      max_norm: 2.0
       norm_type: 2
 
     param_group_modifiers:
@@ -469,30 +800,30 @@ trainer:
         # 默认组（未被下面命中者）
         - scheduler:
             _target_: fvcore.common.param_scheduler.CosineParamScheduler
-            start_value: 1.0e-6
-            end_value: 1.0e-7
+            start_value: ${scratch.base_lr}
+            end_value: ${divide:${scratch.base_lr},10}
 
-        # BNDL head: higher learning rate
         - scheduler:
             _target_: fvcore.common.param_scheduler.CosineParamScheduler
-            start_value: 1.0e-4
-            end_value: 1.0e-5
+            start_value: 5.0e-4
+            end_value: 5.0e-5
           param_names:
             - 'sam_mask_decoder.pixel_bndl.*'
 
+
         # Style Adversarial Network: moderate learning rate for effective adversarial training
-        - scheduler:
-            _target_: fvcore.common.param_scheduler.CosineParamScheduler
-            start_value: 1.0e-4
-            end_value: 1.0e-5
-          param_names:
-            - 'style_attacker.impl.style_net.*'
+        # - scheduler:
+        #     _target_: fvcore.common.param_scheduler.CosineParamScheduler
+        #     start_value: 1.0e-4
+        #     end_value: 1.0e-5
+        #   param_names:
+        #     - 'style_attacker.impl.style_net.*'
 
         # GCN: moderate learning rate for rapid alpha convergence
         # - scheduler:
         #     _target_: fvcore.common.param_scheduler.CosineParamScheduler
-        #     start_value: 1.0e-5
-        #     end_value: 1.0e-6
+        #     start_value: 1.0e-4
+        #     end_value: 1.0e-5
         #   param_names:
         #     - 'style_gcn.*'
 
@@ -514,18 +845,27 @@ trainer:
 
         - scheduler:
             _target_: fvcore.common.param_scheduler.CosineParamScheduler
-            start_value: 1.0e-07
-            end_value: 1.0e-07
+            start_value: ${scratch.vision_lr}
+            end_value: ${divide:${scratch.vision_lr},10}
           param_names:
             - image_encoder.*
-          # exclude_param_names:
-          #   - '*lora*'
+        #   exclude_param_names:
+        #     - '*lora*'
 
       weight_decay:
-        # 默认 weight decay
         - scheduler:
             _target_: fvcore.common.param_scheduler.ConstantParamScheduler
-            value: 0.01
+            value: 0.1
+        - scheduler:
+            _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+            value: 0.0
+          param_names:
+            - '*bias*'
+        - scheduler:
+            _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+            value: 0.0
+          module_cls_names: ['torch.nn.LayerNorm']
+          exclude_param_names: ['*bias*']
 
   loss:
     all:
@@ -544,29 +884,31 @@ trainer:
         focal_alpha_obj_score: -1.0
       bndl_loss:
         _target_: training.loss_bndl.BNDLLoss
-        kl_weight: 1.0
+        kl_weight: 0.1
       aue_loss:
         _target_: training.loss_aue.AUELoss
+        clean_weight: 1.0
+        adv_weight: 1.0
       # Initial weights (used as fallback if not specified in weight_schedule below)
       sam_weight: 1.0
       bndl_weight: 1.0
       aue_weight: 0.0
       weight_schedule:
-        - until_epoch: 10
+        # Phase 1 (epoch 0): Quick warm-up SAM+BNDL only
+        - until_epoch: 1
           sam_weight: 1.0
           bndl_weight: 1.0
           aue_weight: 0.0
-          uncertainty_weight: 0.0
-        - until_epoch: 15
+        # Phase 2 (epoch 1): Introduce AUE gradually
+        - until_epoch: 2
           sam_weight: 1.0
-          bndl_weight: 0.8
+          bndl_weight: 0.5
           aue_weight: 0.05
-          uncertainty_weight: 0.0
+        # Phase 3 (epoch 2-4): Full AUE weight for sweep comparison (3 epochs observation)
         - until_epoch: null
           sam_weight: 1.0
-          bndl_weight: 0.2
+          bndl_weight: 0.5
           aue_weight: 0.1
-          uncertainty_weight: 0.0
     val:
       _target_: training.loss_combined.CombinedSAMBNDLLoss
       sam_loss: ${trainer.loss.all.sam_loss}
@@ -600,11 +942,12 @@ trainer:
     log_freq: 10
     log_scalar_frequency: 10
     log_visual_frequency: 100
-    visualize_bndl: true
-    visualize_aue: true
+    visualize_bndl: false
+    visualize_aue: false
     style_aue_visual_frequency: 100
     uncertainty_metric: ["entropy", "nll"]
-    visualize_pavpu_overlay: true
+    visualize_pavpu_overlay: false
+    enable_pavpu_eval: false
     uncertainty_sample_num: 50
     # Pixel-level PAvPU statistics configuration
     correlation_foreground_dilation: 4
@@ -619,12 +962,8 @@ trainer:
       _partial_: True
       _target_: training.utils.checkpoint_utils.load_state_dict_into_model
       strict: False
-      ignore_missing_keys: [
-          # "sam_mask_decoder.pixel_bndl.*",
-      ]
-      ignore_unexpected_keys: [
-          # "sam_mask_decoder.pixel_bndl.*",
-      ]
+      ignore_missing_keys: []
+      ignore_unexpected_keys: []
       state_dict:
         _target_: training.utils.checkpoint_utils.load_checkpoint_and_apply_kernels
         checkpoint_path: ${oc.env:PROJECT_HOME}/dev/ada_samp/sam2/checkpoints/sam2.1_hiera_base_plus.pt # PATH to SAM 2.1 checkpoint

@@ -43,17 +43,16 @@ from prompt_utils import compute_tight_box_from_bool_mask, box_center_xy, sample
 # ---------- Unified click prompt generator ----------
 from prompt_generation import generate_click_prompts
 
-# Distinct colors for different objects
-OBJECT_COLORS = [
-    (255, 0, 0),  # Red
-    (0, 255, 0),  # Green
-    (0, 0, 255),  # Blue
-    (255, 255, 0),  # Yellow
-    (255, 0, 255),  # Magenta
-    (0, 255, 255),  # Cyan
-    (255, 128, 0),  # Orange
-    (128, 0, 255),  # Purple
-]
+# ---------- SAM Paper Visualizations (matching BNDL format) ----------
+from sam_vis_utils import get_object_colors
+
+try:
+    from sam_vis_utils import generate_sam_paper_visualizations
+except ImportError:
+    generate_sam_paper_visualizations = None
+
+# Get colors from colorcet/tab20 and convert to 0-255 range for PIL
+OBJECT_COLORS = [tuple(int(c * 255) for c in color) for color in get_object_colors(20)]
 
 # Point colors for positive/negative/error clicks
 POINT_COLORS = [
@@ -520,6 +519,7 @@ def inference_interactive(
     min_click_dist: float = 12.0,
     seed: int | None = 0,
     first_frame_only: bool = False,
+    save_masks: bool = True,
 ):
     if video_names is None:
         video_names = sorted([d.name for d in jpeg_dir.iterdir() if d.is_dir()])
@@ -547,7 +547,12 @@ def inference_interactive(
             continue
 
         max_frames_to_load = 1 if first_frame_only else None
-        state = predictor.init_state(str(video_dir), max_frames=max_frames_to_load)
+        state = predictor.init_state(
+            str(video_dir), 
+            max_frames=max_frames_to_load,
+            offload_video_to_cpu=True,  # Reduce GPU memory usage
+            offload_state_to_cpu=True,
+        )
         H, W = state["video_height"], state["video_width"]
 
         first_mask_path = ann_dir / vid / f"{frame_names[0]}.png"
@@ -573,8 +578,7 @@ def inference_interactive(
                 print(f"Warning: Empty GT mask for object {obj_id} in video {vid}")
                 continue
 
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+            # NOTE: Removed per-object cuda.empty_cache() to reduce CUDA sync overhead
 
             # Always use unified click generation (no fallback)
             used_pts, used_labels = generate_click_prompts(
@@ -614,17 +618,18 @@ def inference_interactive(
                 seg[oid] = (mask_logits > score_thresh).cpu().numpy()
             video_segments[f_idx] = seg
 
-        for f_idx, seg in video_segments.items():
-            save_masks_to_dir(
-                output_mask_dir=str(out_dir),
-                video_name=vid,
-                frame_name=frame_names[f_idx],
-                per_obj_output_mask=seg,
-                height=H,
-                width=W,
-                per_obj_png_file=False,
-                output_palette=DAVIS_PALETTE,
-            )
+        if save_masks:
+            for f_idx, seg in video_segments.items():
+                save_masks_to_dir(
+                    output_mask_dir=str(out_dir),
+                    video_name=vid,
+                    frame_name=frame_names[f_idx],
+                    per_obj_output_mask=seg,
+                    height=H,
+                    width=W,
+                    per_obj_png_file=False,
+                    output_palette=DAVIS_PALETTE,
+                )
 
         (out_dir / vid).mkdir(parents=True, exist_ok=True)
         with open(out_dir / vid / "query_points.json", "w") as f:
@@ -634,7 +639,6 @@ def inference_interactive(
 
         # Critical: Reset predictor state to free memory for this video
         predictor.reset_state(state)
-        torch.cuda.empty_cache()
 
 
 def run_single_dataset(
@@ -654,6 +658,7 @@ def run_single_dataset(
     click_protocol: str | None = None,
     min_click_dist: float | None = None,
     seed: int | None = None,
+    save_masks: bool = True,
 ) -> tuple[float, float, float]:
     """Run evaluation on a single dataset and return metrics"""
 
@@ -740,6 +745,7 @@ def run_single_dataset(
             min_click_dist=_min_click_dist,
             seed=_seed,
             first_frame_only=first_frame_only,
+            save_masks=save_masks,
         )
     except Exception as e:
         print(f"Error during inference for {dataset_name}: {e}")
@@ -841,6 +847,15 @@ def run_single_dataset(
             vis_dir = output_path / f"{dataset_name.lower()}_pred_vis"
             generate_visualizations(jpeg_dir, out_dir, ann_dir, vis_dir, video_subset)
             print(f"Standard visualizations saved to: {vis_dir}")
+        
+        # Also generate paper-quality individual visualizations (matching BNDL format)
+        if generate_sam_paper_visualizations is not None:
+            paper_vis_dir = output_path / f"{dataset_name.lower()}_sam_vis"
+            generate_sam_paper_visualizations(
+                jpeg_dir, out_dir, ann_dir, paper_vis_dir, 
+                video_names=video_subset, max_frames_per_video=2
+            )
+            print(f"Paper-quality visualizations saved to: {paper_vis_dir}")
 
     print(f"Inference time: {inference_time:.2f}s")
     print(f"Evaluation time: {eval_time:.2f}s")

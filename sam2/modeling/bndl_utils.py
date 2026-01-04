@@ -9,6 +9,9 @@ from dataclasses import dataclass
 
 import torch
 
+# Import precomputed constants from BNDL for consistency
+from BNDL.BNDL_upload.ViT_Sparse.utils.bndl import PI_OVER_8, LOG_2
+
 
 @dataclass
 class BNDLOutputs:
@@ -72,179 +75,146 @@ def pixel_weibull_to_entropy_uncertainty(
     """
     B, H, W, C = pixel_feat.shape
 
-    # Step 1: Forward through BNDL to get Weibull parameters
-    # force_sample=False ensures deterministic mode (uses expectation)
-    # Use no_grad to prevent gradients from flowing back to BNDL parameters.
-    
-    # SAFETY: Clamp external weights to prevent gradient explosion
-    if external_pre_out_w is not None:
-        external_pre_out_w = torch.clamp(external_pre_out_w, min=-5.0, max=5.0)
-
-    with torch.no_grad():
-        out, z_out, weibull_lambda, inv_k, pre_out_w, *_ = pixel_bndl_model(pixel_feat, force_sample=False, external_pre_out_w=external_pre_out_w)
+    # Step 1: Forward through BNDL to get Weibull parameters.
+    # force_sample=False ensures deterministic mode (uses expectation).
+    # Returns: out, z_out, weibull_lambda, kappa, pre_out_w, wei_lambda_w, kappa_w, lgamma_cache
+    # Note: BNDL now returns kappa directly (not inv_k) with scaled sigmoid constraint
+    out, z_out, weibull_lambda, kappa_x, pre_out_w, wei_lambda_w, kappa_w, lgamma_cache = pixel_bndl_model(
+        pixel_feat,
+        force_sample=False,
+        external_pre_out_w=external_pre_out_w,
+    )
     K = out.shape[-1]  # number of output classes/masks
 
-    # Early check: validate BNDL outputs
-    if not torch.isfinite(out).all():
-        raise RuntimeError("BNDL output contains NaN/Inf values")
-    if not torch.isfinite(weibull_lambda).all():
-        raise RuntimeError("BNDL weibull_lambda contains NaN/Inf values")
-    if not torch.isfinite(inv_k).all():
-        raise RuntimeError("BNDL inv_k contains NaN/Inf values")
+    # ============================================================
+    # Step 2a: Compute Weibull statistics for PIXEL features (E[Z_x], Var[Z_x])
+    # ============================================================
+    # kappa_x is already in [KAPPA_MIN, KAPPA_MAX] range via scaled sigmoid, no clamp needed
 
-    # Step 2: Compute Weibull statistics (E[Z] and Var[Z])
-    # Revert to 013 version: no eps_kappa correction
-    # In BNDL: inv_k = 1 / kappa (direct, no epsilon)
-    # Therefore: kappa = 1 / inv_k
-    # Clamp inv_k to prevent division by extremely small values
-    inv_k_clamped = torch.clamp(inv_k, min=1e-6, max=1.0)
-    kappa = 1.0 / inv_k_clamped
-    kappa = torch.clamp(kappa, min=0.5, max=8.0)  # Enforce KAPPA_MIN/MAX
-
-    # Early check: validate kappa
-    if not torch.isfinite(kappa).all():
-        raise RuntimeError("kappa computation produced NaN/Inf values")
-
-    # Clamp kappa for lgamma stability (prevent overflow)
-    kappa_safe = torch.clamp(kappa, min=0.5, max=8.0)
-    kappa_reciprocal = 1.0 / kappa_safe
-    kappa_reciprocal_2 = 2.0 / kappa_safe
-
-    # Clamp reciprocal values to prevent lgamma overflow
-    # lgamma(x) is stable for x < ~170, so we clamp to safe range
-    kappa_reciprocal = torch.clamp(kappa_reciprocal, max=50.0)
-    kappa_reciprocal_2 = torch.clamp(kappa_reciprocal_2, max=50.0)
+    # Reuse lgamma values from BNDL forward pass to avoid recomputation
+    lgamma_1_x = lgamma_cache["lgamma_1_k"]  # [B, H, W, 1]
+    lgamma_2_x = lgamma_cache["lgamma_2_k"]  # [B, H, W, 1]
 
     # Weibull expectation: E[Z] = λ * Γ(1 + 1/κ)
-    # (computed but not directly used in variance calculation)
-    lgamma_1_arg = 1.0 + kappa_reciprocal
-    lgamma_1 = torch.lgamma(lgamma_1_arg)
-
-    # Early check: validate lgamma_1
-    if not torch.isfinite(lgamma_1).all():
-        raise RuntimeError("lgamma(1 + 1/kappa) produced NaN/Inf values")
+    mean_z_x = weibull_lambda * torch.exp(lgamma_1_x)  # [B, H, W, C]
 
     # Weibull variance: Var[Z] = λ² * [Γ(1 + 2/κ) - Γ²(1 + 1/κ)]
-    lgamma_2_arg = 1.0 + kappa_reciprocal_2
-    lgamma_2 = torch.lgamma(lgamma_2_arg)
+    # Numerically stable: log(Γ(1+2/k) - Γ²(1+1/k))
+    a_x = lgamma_2_x
+    b_x = 2.0 * lgamma_1_x
+    t_x = torch.clamp(b_x - a_x, max=-1e-7)
+    log_gamma_diff_x = a_x + torch.log1p(-torch.exp(t_x))
+    var_z_x = weibull_lambda**2 * torch.exp(log_gamma_diff_x)  # [B, H, W, C]
 
-    # Early check: validate lgamma_2
-    if not torch.isfinite(lgamma_2).all():
-        raise RuntimeError("lgamma(1 + 2/kappa) produced NaN/Inf values")
+    # ============================================================
+    # Step 2b: Compute Weibull statistics for HYPER_IN weights (E[Z_w], Var[Z_w])
+    # ============================================================
+    if wei_lambda_w is not None and kappa_w is not None:
+        # kappa_w is already in [KAPPA_MIN, KAPPA_MAX] range via scaled sigmoid, no clamp needed
 
-    # Use log-space computation to avoid numerical instability
-    # Var[Z] = λ² * [exp(lgamma_2) - exp(2*lgamma_1)]
-    # Compute in log-space: log(Var[Z]) = 2*log(λ) + log(exp(lgamma_2) - exp(2*lgamma_1))
-    # Use log-sum-exp trick for stability: log(exp(a) - exp(b)) = a + log(1 - exp(b-a)) when a > b
-    lgamma_max = torch.maximum(lgamma_2, 2 * lgamma_1)
-    lgamma_2_shifted = lgamma_2 - lgamma_max
-    lgamma_1_shifted = 2 * lgamma_1 - lgamma_max
+        # Reuse lgamma values from BNDL forward pass to avoid recomputation
+        lgamma_1_w = lgamma_cache["lgamma_1_kw"]  # [B, K, C]
+        lgamma_2_w = lgamma_cache["lgamma_2_kw"]  # [B, K, C]
 
-    # Compute log(exp(lgamma_2) - exp(2*lgamma_1)) = lgamma_max + log(exp(shifted_2) - exp(shifted_1))
-    # Clamp the difference to prevent log(0) or log(negative)
-    exp_diff = torch.clamp(
-        torch.exp(lgamma_2_shifted) - torch.exp(lgamma_1_shifted),
-        min=1e-12,  # Small positive value to prevent log(0)
-    )
-    log_gamma_diff = lgamma_max + torch.log(exp_diff)
+        # Weibull expectation: E[W] = λ_w * Γ(1 + 1/κ_w)
+        mean_z_w = wei_lambda_w * torch.exp(lgamma_1_w)  # [B, K, C]
 
-    # Compute log(var_z) = 2*log(λ) + log_gamma_diff
-    log_lambda = torch.log(torch.clamp(weibull_lambda, min=1e-8))
-    log_var_z = 2 * log_lambda + log_gamma_diff
+        # Weibull variance: Var[W] = λ_w² * [Γ(1 + 2/κ_w) - Γ²(1 + 1/κ_w)]
+        a_w = lgamma_2_w
+        b_w = 2.0 * lgamma_1_w
+        t_w = torch.clamp(b_w - a_w, max=-1e-7)
+        log_gamma_diff_w = a_w + torch.log1p(-torch.exp(t_w))
+        var_z_w = wei_lambda_w**2 * torch.exp(log_gamma_diff_w)  # [B, K, C]
+    else:
+        # No external weights, use deterministic weights
+        mean_z_w = None
+        var_z_w = None
 
-    # Convert back and clamp to reasonable range
-    var_z = torch.exp(torch.clamp(log_var_z, max=15.0))  # exp(15) ≈ 3e6, more conservative
-    var_z = torch.clamp(var_z, min=1e-10, max=1e6)  # Final safety clamp
-
-    # Early check: validate var_z
-    if not torch.isfinite(var_z).all():
-        raise RuntimeError("var_z computation produced NaN/Inf values")
-
-    # Step 3: Propagate to logits statistics
-    # logits = linear_output(Z) = W @ Z + b
-    # In eval mode, out = E[logits] = W @ E[Z] + b
     mean_logits = out  # [B, H, W, K]
 
-    # Variance propagation: Var[logits_k] = Σ_i W_{ki}² * Var[Z_i]
-    # (assumes independent Z_i, which is true by BNDL's design)
-    if external_pre_out_w is not None:
-        # Case with external weights (hyper_in)
-        # external_pre_out_w: [B, K, C'] or [C', K]
-        
-        # Use _apply_external_weights from BNDL to handle shapes for variance
-        # We need W^2 @ Var[Z]
-        w_squared = external_pre_out_w ** 2
-        var_logits = pixel_bndl_model._apply_external_weights(var_z, w_squared)
-        
+    # ============================================================
+    # Step 3: Variance propagation for product of two random variables
+    # ============================================================
+    # For independent X, W: Var[X·W] = E[X]²·Var[W] + E[W]²·Var[X] + Var[X]·Var[W]
+    # The dot product: logits_k = Σ_c X_c · W_{k,c}
+    # Var[logits_k] = Σ_c Var[X_c · W_{k,c}]
+    #               = Σ_c [E[X_c]²·Var[W_{k,c}] + E[W_{k,c}]²·Var[X_c] + Var[X_c]·Var[W_{k,c}]]
+
+    if pre_out_w is not None and var_z_w is not None:
+        # Full variance propagation with both pixel and hyper_in variance
+        # mean_z_x: [B, H, W, C], mean_z_w: [B, K, C]
+        # var_z_x: [B, H, W, C], var_z_w: [B, K, C]
+
+        # Var[X·W] = E[X]²·Var[W] + E[W]²·Var[X] + Var[X]·Var[W]
+        # = E[X]²·Var[W] + Var[X]·(E[W]² + Var[W])
+        # This combines term2 and term3 into a single matrix multiplication
+
+        # Term 1: E[X]² · Var[W] → [B, H, W, C] @ [B, K, C] → [B, H, W, K]
+        mean_z_x_sq = mean_z_x**2  # [B, H, W, C]
+        term1 = pixel_bndl_model._apply_external_weights(mean_z_x_sq, var_z_w)  # [B, H, W, K]
+
+        # Term 2+3 combined: Var[X] · (E[W]² + Var[W]) → reduces one matmul
+        mean_z_w_sq_plus_var = mean_z_w**2 + var_z_w  # [B, K, C]
+        term2_3 = pixel_bndl_model._apply_external_weights(var_z_x, mean_z_w_sq_plus_var)  # [B, H, W, K]
+
+        # Total variance of the dot product (before logit scaling)
+        var_logits = term1 + term2_3  # [B, H, W, K]
+
+    elif pre_out_w is not None:
+        # Only pixel variance (original implementation)
+        w_squared = pre_out_w**2
+        var_logits = pixel_bndl_model._apply_external_weights(var_z_x, w_squared)
+
     elif hasattr(pixel_bndl_model, "linear"):
-        # Standard BNDL with internal linear layer
         output_weight = pixel_bndl_model.linear.weight  # [K, C]
-        # Einsum: sum over C dimension with squared weights
-        var_logits = torch.einsum("bhwc,kc->bhwk", var_z, output_weight**2)
-        
+        var_logits = torch.einsum("bhwc,kc->bhwk", var_z_x, output_weight**2)
+
     elif hasattr(pixel_bndl_model, "linear_output"):
         output_weight = pixel_bndl_model.linear_output.weight  # [K, C]
-        # Einsum: sum over C dimension with squared weights
-        var_logits = torch.einsum("bhwc,kc->bhwk", var_z, output_weight**2)
+        var_logits = torch.einsum("bhwc,kc->bhwk", var_z_x, output_weight**2)
     else:
-        # Fallback: use mean variance across channels
-        var_logits = var_z.mean(dim=-1, keepdim=True).expand(B, H, W, K)
+        var_logits = var_z_x.mean(dim=-1, keepdim=True).expand(B, H, W, K)
 
-    # Early check: validate var_logits
-    if not torch.isfinite(var_logits).all():
-        raise RuntimeError("var_logits computation produced NaN/Inf values")
-
-    # Clamp var_logits to prevent overflow in sqrt and kappa_sigmoid
-    var_logits = torch.clamp(var_logits, min=0.0, max=1e6)
+    # Scale by logit_scale² (since logits = logit_scale * dot + bias)
+    if hasattr(pixel_bndl_model, "logit_scale"):
+        var_logits = var_logits * (pixel_bndl_model.logit_scale**2)
 
     # Step 4: Compute E[sigmoid(logits)] via MacKay approximation
     # For X ~ N(μ, σ²): E[sigmoid(X)] ≈ sigmoid(κ * μ)
     # where κ = 1 / √(1 + π*σ²/8)
-    pi = 3.14159265359
-    # Clamp denominator to prevent division issues
-    denominator = 1.0 + pi * var_logits / 8.0
-    denominator = torch.clamp(denominator, min=1e-8)
+    # Since var_logits >= 0, denominator = 1 + π*var/8 >= 1, no clamp needed
+    denominator = 1.0 + PI_OVER_8 * var_logits
     kappa_sigmoid = 1.0 / torch.sqrt(denominator)
 
-    # Early check: validate kappa_sigmoid
-    if not torch.isfinite(kappa_sigmoid).all():
-        raise RuntimeError("kappa_sigmoid computation produced NaN/Inf values")
+    sigmoid_input = kappa_sigmoid * mean_logits
 
-    # Clamp kappa_sigmoid * mean_logits to prevent sigmoid overflow
-    sigmoid_input = kappa_sigmoid * torch.clamp(mean_logits, min=-50.0, max=50.0)
     mean_probs = torch.sigmoid(sigmoid_input)  # [B, H, W, K]
-
-    # Early check: validate mean_probs
-    if not torch.isfinite(mean_probs).all():
-        raise RuntimeError("mean_probs computation produced NaN/Inf values")
-
-    # Clamp mean_probs to valid probability range for numerical stability
-    mean_probs = torch.clamp(mean_probs, min=1e-8, max=1.0 - 1e-8)
 
     # Step 5: Compute Bernoulli entropy H(p) = -p*log(p) - (1-p)*log(1-p)
     # Use torch.special.entr for numerical stability (handles p=0 and p=1 gracefully)
     if hasattr(torch.special, "entr"):
         # PyTorch >= 1.9: use built-in entr function
         # entr(p) = -p * log(p), with entr(0) = 0 by convention
+        # CRITICAL FIX: Clamp probabilities to avoid Infinite gradients at p=0 or p=1
+        # d/dp(-p*ln(p)) = -ln(p) - 1, which diverges as p->0.
+        mean_probs = torch.clamp(mean_probs, min=1e-6, max=1.0 - 1e-6)
         entropy_per_mask = torch.special.entr(mean_probs) + torch.special.entr(1.0 - mean_probs)
     else:
         # Fallback: manual implementation with epsilon for stability
         eps = 1e-10
         entropy_per_mask = -(mean_probs * torch.log(mean_probs + eps) + (1.0 - mean_probs) * torch.log(1.0 - mean_probs + eps))
 
-    # Final clamp to ensure finite values
-    entropy_per_mask = torch.clamp(entropy_per_mask, min=0.0, max=1.0)
-
-    # Final check: guard against NaN/Inf
-    if not torch.isfinite(entropy_per_mask).all():
-        raise RuntimeError("Analytic uncertainty computation produced NaN/Inf values in final entropy")
+    # Step 6: Normalize entropy to [0, 1] by dividing by max Bernoulli entropy log(2)
+    # This makes uncertainty directly interpretable: 0 = certain, 1 = max uncertain
+    # Also ensures consistent scale with other inputs (e.g., base_iou ∈ [0, 1])
+    entropy_per_mask = entropy_per_mask / LOG_2
 
     # Return per-channel or aggregated
     if per_channel:
-        return entropy_per_mask  # [B, H, W, K]
+        return entropy_per_mask  # [B, H, W, K], range [0, 1]
     else:
         # Average across masks (backward compatible with sampling version)
-        return entropy_per_mask.mean(dim=-1)  # [B, H, W]
+        return entropy_per_mask.mean(dim=-1)  # [B, H, W], range [0, 1]
 
 
 def compute_analytic_sampling_correlation(

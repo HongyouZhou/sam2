@@ -73,9 +73,7 @@ class SAM2Train(SAM2Base):
         self.prob_to_use_pt_input_for_eval = prob_to_use_pt_input_for_eval
         self.prob_to_use_box_input_for_eval = prob_to_use_box_input_for_eval
         if prob_to_use_pt_input_for_train > 0 or prob_to_use_pt_input_for_eval > 0:
-            logging.info(
-                f"Training with points (sampled from masks) as inputs with p={prob_to_use_pt_input_for_train}"
-            )
+            logging.info(f"Training with points (sampled from masks) as inputs with p={prob_to_use_pt_input_for_train}")
             assert num_frames_to_correct_for_train >= num_init_cond_frames_for_train
             assert num_frames_to_correct_for_eval >= num_init_cond_frames_for_eval
 
@@ -96,28 +94,26 @@ class SAM2Train(SAM2Base):
         self.rng = np.random.default_rng(seed=42)
 
         if freeze_image_encoder:
-            if hasattr(self, 'use_lora') and self.use_lora:
+            if hasattr(self, "use_lora") and self.use_lora:
                 # 1. Strict Freezing Strategy (FS-SAM2 style)
                 # PEFT handles the internal freezing of the base modules (image/memory encoders/attention).
                 # We only need to ensure that everything ELSE (Mask Decoder, Prompt Encoder, etc.) is frozen.
                 logging.info("Strict Freezing Strategy Enabled (FS-SAM2): Freezing all non-LoRA components.")
-                
+
                 frozen_count = 0
                 total_count = 0
                 for name, param in self.named_parameters():
                     total_count += 1
                     # Skip the components managed by PEFT (they handle their own requires_grad)
-                    if name.startswith("image_encoder") or \
-                       name.startswith("memory_attention") or \
-                       name.startswith("memory_encoder"):
+                    if name.startswith("image_encoder") or name.startswith("memory_attention") or name.startswith("memory_encoder"):
                         continue
-                        
+
                     # Force freeze everything else (Mask Decoder, Prompt Encoder, Projections, etc.)
                     param.requires_grad = False
                     frozen_count += 1
-                
+
                 logging.info(f"Frozen {frozen_count}/{total_count} additional parameters (Decoder, PromptEnc, etc.).")
-                
+
                 # Optional: Logging trainable status
                 if hasattr(self.image_encoder, "print_trainable_parameters"):
                     print("Image Encoder params:")
@@ -134,7 +130,7 @@ class SAM2Train(SAM2Base):
                 # Freeze everything by default
                 for p in self.image_encoder.parameters():
                     p.requires_grad = False
-                
+
                 # Unfreeze specific components
                 if "neck" in unfreeze_image_encoder_components:
                     if hasattr(self.image_encoder, "neck"):
@@ -151,20 +147,20 @@ class SAM2Train(SAM2Base):
                             if len(self.image_encoder.trunk.stage_ends) >= 2:
                                 last_stage_start = self.image_encoder.trunk.stage_ends[-2] + 1
                             else:
-                                last_stage_start = 0 
-                            
+                                last_stage_start = 0
+
                             for i in range(last_stage_start, last_stage_end + 1):
                                 for p in self.image_encoder.trunk.blocks[i].parameters():
                                     p.requires_grad = True
                             logging.info(f"Unfrozen image encoder component: TRUNK_LAST_STAGE (blocks {last_stage_start}-{last_stage_end})")
                         else:
-                             logging.warning("Requested to unfreeze 'trunk_last_stage' but trunk has no 'stage_ends'.")
+                            logging.warning("Requested to unfreeze 'trunk_last_stage' but trunk has no 'stage_ends'.")
                     else:
                         logging.warning("Requested to unfreeze 'trunk_last_stage' but image_encoder structure is unknown.")
 
                 # Set global eval()
                 self.image_encoder.eval()
-                
+
                 # Define custom train function
                 def custom_train(mode=True):
                     if hasattr(self.image_encoder, "trunk"):
@@ -260,19 +256,11 @@ class SAM2Train(SAM2Base):
         use_pt_input = self.rng.random() < prob_to_use_pt_input
         if rand_init_cond_frames and num_init_cond_frames > 1:
             # randomly select 1 to `num_init_cond_frames` frames as initial conditioning frames
-            num_init_cond_frames = self.rng.integers(
-                1, num_init_cond_frames, endpoint=True
-            )
-        if (
-            use_pt_input
-            and rand_frames_to_correct
-            and num_frames_to_correct > num_init_cond_frames
-        ):
+            num_init_cond_frames = self.rng.integers(1, num_init_cond_frames, endpoint=True)
+        if use_pt_input and rand_frames_to_correct and num_frames_to_correct > num_init_cond_frames:
             # randomly select `num_init_cond_frames` to `num_frames_to_correct` frames to sample
             # correction clicks (only for the case of point input)
-            num_frames_to_correct = self.rng.integers(
-                num_init_cond_frames, num_frames_to_correct, endpoint=True
-            )
+            num_frames_to_correct = self.rng.integers(num_init_cond_frames, num_frames_to_correct, endpoint=True)
         backbone_out["use_pt_input"] = use_pt_input
 
         # Sample initial conditioning frames
@@ -286,20 +274,18 @@ class SAM2Train(SAM2Base):
                 replace=False,
             ).tolist()
         backbone_out["init_cond_frames"] = init_cond_frames
-        backbone_out["frames_not_in_init_cond"] = [
-            t for t in range(start_frame_idx, num_frames) if t not in init_cond_frames
-        ]
+        backbone_out["frames_not_in_init_cond"] = [t for t in range(start_frame_idx, num_frames) if t not in init_cond_frames]
         # Prepare mask or point inputs on initial conditioning frames
         backbone_out["mask_inputs_per_frame"] = {}  # {frame_idx: <input_masks>}
         backbone_out["point_inputs_per_frame"] = {}  # {frame_idx: <input_points>}
-        
+
         # Construct multi-object masks grouped by (frame, video) for AUE
         # ============================================================
         # CONTROL: Toggle background mask support (from config)
         # ============================================================
         # Set style_aug_enable_background = True to include background as extra object
         # Set style_aug_enable_background = False for objects-only
-        # 
+        #
         # When enabled:
         #   - K = max_num_objects + 1 (foreground objects + background)
         #   - Background = 1 - union(all objects)
@@ -307,35 +293,27 @@ class SAM2Train(SAM2Base):
         #   - Visualization shows green dashed bbox for background
         # ============================================================
         ENABLE_BACKGROUND_MASK = self.adv_enable_background
-        
+
         # Use max_num_objects from config (matches dataset sampler)
         # Add 1 slot for background if enabled
         max_num_objects = (self.max_num_objects + 1) if ENABLE_BACKGROUND_MASK else self.max_num_objects
         num_videos = input.num_videos
         H_mask, W_mask = input.masks.shape[-2:]
-        
+
         # Initialize: [T, B_videos, K, H, W]
         # Force float32 for AUE masks (input.masks might be bool)
-        mask_all_objs_for_aue = torch.zeros(
-            num_frames, num_videos, max_num_objects, H_mask, W_mask,
-            dtype=torch.float32, 
-            device=input.masks.device
-        )
-        num_objs_per_video_frame = torch.zeros(
-            num_frames, num_videos, 
-            dtype=torch.int32, 
-            device=input.masks.device
-        )
-        
+        mask_all_objs_for_aue = torch.zeros(num_frames, num_videos, max_num_objects, H_mask, W_mask, dtype=torch.float32, device=input.masks.device)
+        num_objs_per_video_frame = torch.zeros(num_frames, num_videos, dtype=torch.int32, device=input.masks.device)
+
         # Fill in masks for each (frame, video)
         for t in range(num_frames):
             frame_masks = input.masks[t]  # [O_t, H, W]
             frame_obj_to_img = input.obj_to_frame_idx[t]  # [O_t, 2]
-             
+
             for video_idx in range(num_videos):
-                obj_mask = (frame_obj_to_img[:, 1] == video_idx)
+                obj_mask = frame_obj_to_img[:, 1] == video_idx
                 obj_indices = obj_mask.nonzero(as_tuple=True)[0]
-                K_actual = len(obj_indices)                
+                K_actual = len(obj_indices)
 
                 if ENABLE_BACKGROUND_MASK:
                     # Reserve final slot for background, fill foreground up to max_num_objects - 1
@@ -348,9 +326,7 @@ class SAM2Train(SAM2Base):
                         mask_all_objs_for_aue[t, video_idx, :K_store] = video_frame_masks.float()
                         union_mask = video_frame_masks.float().sum(dim=0).clamp(0, 1)
                     else:
-                        union_mask = torch.zeros(
-                            H_mask, W_mask, dtype=mask_all_objs_for_aue.dtype, device=mask_all_objs_for_aue.device
-                        )
+                        union_mask = torch.zeros(H_mask, W_mask, dtype=mask_all_objs_for_aue.dtype, device=mask_all_objs_for_aue.device)
 
                     background_mask = (1.0 - union_mask).clamp(0, 1)
                     background_slot = max_num_objects - 1
@@ -370,10 +346,10 @@ class SAM2Train(SAM2Base):
 
                     # Total count = objects only
                     num_objs_per_video_frame[t, video_idx] = K_store
-        
+
         backbone_out["mask_all_objs_for_aue"] = mask_all_objs_for_aue
         backbone_out["num_objs_per_video_frame"] = num_objs_per_video_frame
-        
+
         for t in init_cond_frames:
             if not use_pt_input:
                 backbone_out["mask_inputs_per_frame"][t] = gt_masks_per_frame[t]
@@ -390,9 +366,7 @@ class SAM2Train(SAM2Base):
                     points, labels = get_next_point(
                         gt_masks=gt_masks_per_frame[t],
                         pred_masks=None,
-                        method=(
-                            "uniform" if self.training else self.pt_sampling_for_eval
-                        ),
+                        method=("uniform" if self.training else self.pt_sampling_for_eval),
                     )
 
                 point_inputs = {"point_coords": points, "point_labels": labels}
@@ -409,19 +383,12 @@ class SAM2Train(SAM2Base):
             assert num_frames_to_correct > num_init_cond_frames
             # initial cond frame + randomly selected remaining frames (without replacement)
             extra_num = num_frames_to_correct - num_init_cond_frames
-            frames_to_add_correction_pt = (
-                init_cond_frames
-                + self.rng.choice(
-                    backbone_out["frames_not_in_init_cond"], extra_num, replace=False
-                ).tolist()
-            )
+            frames_to_add_correction_pt = init_cond_frames + self.rng.choice(backbone_out["frames_not_in_init_cond"], extra_num, replace=False).tolist()
         backbone_out["frames_to_add_correction_pt"] = frames_to_add_correction_pt
 
         return backbone_out
 
-    def forward_tracking(
-        self, backbone_out, input: BatchedVideoDatapoint, return_dict=False
-    ):
+    def forward_tracking(self, backbone_out, input: BatchedVideoDatapoint, return_dict=False):
         """Forward video tracking on each frame (and sample correction clicks)."""
         img_feats_already_computed = backbone_out["backbone_fpn"] is not None
         if img_feats_already_computed:
@@ -449,7 +416,7 @@ class SAM2Train(SAM2Base):
             # Save current frame's object mapping information (for track_step)
             self._current_obj_to_frame_idx = input.obj_to_frame_idx[stage_id]  # [O_t, 2]
             self._current_backbone_out = backbone_out  # Save backbone_out reference
-            
+
             # Get the image features for the current frames
             # img_ids = input.find_inputs[stage_id].img_ids
             img_ids = input.flat_obj_to_img_idx[stage_id]
@@ -465,19 +432,17 @@ class SAM2Train(SAM2Base):
                     current_vision_feats,
                     current_vision_pos_embeds,
                     feat_sizes,
-                ) = self._prepare_backbone_features_per_frame(
-                    input.flat_img_batch, img_ids
-                )
+                ) = self._prepare_backbone_features_per_frame(input.flat_img_batch, img_ids)
 
             # Get output masks based on this frame's prompts and previous memory
             # Extract current frame's image for style-based AUE
             if img_feats_already_computed:
                 # If features already computed, we have all images in flat_img_batch
-                current_img_batch = input.flat_img_batch[img_ids] if hasattr(input, 'flat_img_batch') else None
+                current_img_batch = input.flat_img_batch[img_ids] if hasattr(input, "flat_img_batch") else None
             else:
                 # Images were computed on-the-fly in _prepare_backbone_features_per_frame
                 current_img_batch = None  # Would need to store from earlier, skip for now
-            
+
             current_out = self.track_step(
                 frame_idx=stage_id,
                 is_init_cond_frame=stage_id in init_cond_frames,
@@ -493,10 +458,7 @@ class SAM2Train(SAM2Base):
                 current_img_batch=current_img_batch,
             )
             # Append the output, depending on whether it's a conditioning frame
-            add_output_as_cond_frame = stage_id in init_cond_frames or (
-                self.add_all_frames_to_correct_as_cond
-                and stage_id in frames_to_add_correction_pt
-            )
+            add_output_as_cond_frame = stage_id in init_cond_frames or (self.add_all_frames_to_correct_as_cond and stage_id in frames_to_add_correction_pt)
             if add_output_as_cond_frame:
                 output_dict["cond_frame_outputs"][stage_id] = current_out
             else:
@@ -510,9 +472,7 @@ class SAM2Train(SAM2Base):
         all_frame_outputs.update(output_dict["non_cond_frame_outputs"])
         all_frame_outputs = [all_frame_outputs[t] for t in range(num_frames)]
         # Make DDP happy with activation checkpointing by removing unused keys
-        all_frame_outputs = [
-            {k: v for k, v in d.items() if k != "obj_ptr"} for d in all_frame_outputs
-        ]
+        all_frame_outputs = [{k: v for k, v in d.items() if k != "obj_ptr"} for d in all_frame_outputs]
 
         return all_frame_outputs
 
@@ -536,7 +496,7 @@ class SAM2Train(SAM2Base):
     ):
         if frames_to_add_correction_pt is None:
             frames_to_add_correction_pt = []
-        
+
         # Construct multi-object masks: [O_t, K, H, W]
         # IMPORTANT: gt_masks should ONLY be used for prompt sampling (points/boxes)
         # AUE should use OTHER objects' masks, not the current object's GT
@@ -547,48 +507,44 @@ class SAM2Train(SAM2Base):
         # Set style_aug_use_multi_object = False to disable AUE (no pixel_gt_for_aue)
         # ============================================================
         USE_MULTI_OBJECT_AUE = self.adv_use_multi_object
-        
+
         # DO NOT initialize pixel_gt_for_aue with gt_masks!
         # gt_masks is reserved for prompt sampling only
         pixel_gt_for_aue = None
         if self.use_aue:
-            if USE_MULTI_OBJECT_AUE and is_init_cond_frame and hasattr(self, '_current_backbone_out'):
+            if USE_MULTI_OBJECT_AUE and is_init_cond_frame and hasattr(self, "_current_backbone_out"):
                 backbone_out = self._current_backbone_out
                 if "mask_all_objs_for_aue" in backbone_out:
                     mask_all_objs = backbone_out["mask_all_objs_for_aue"][frame_idx]  # [B_videos, K, H, W]
-                    num_objs = backbone_out["num_objs_per_video_frame"][frame_idx]    # [B_videos]
+                    num_objs = backbone_out["num_objs_per_video_frame"][frame_idx]  # [B_videos]
                     obj_to_frame = self._current_obj_to_frame_idx  # [O_t, 2]
-                    
+
                     # For each object, construct all object masks from its video
                     O_t = len(obj_to_frame)
                     K = mask_all_objs.shape[1]
                     H, W = mask_all_objs.shape[2:]
-                    
+
                     # # DEBUG: Log mask construction
                     # print(f"DEBUG: AUE Track: Frame {frame_idx}, O_t={O_t}, K={K}")
-                    
-                    multi_obj_masks = torch.zeros(
-                        O_t, K, H, W,
-                        dtype=mask_all_objs.dtype,
-                        device=mask_all_objs.device
-                    )
-                    
+
+                    multi_obj_masks = torch.zeros(O_t, K, H, W, dtype=mask_all_objs.dtype, device=mask_all_objs.device)
+
                     for i in range(O_t):
                         video_idx = obj_to_frame[i, 1].item()
                         K_actual = num_objs[video_idx].item()
                         # Copy all non-empty masks from mask_all_objs (includes foreground + background if enabled)
                         # Background is at slot K-1 (e.g., index 10 when K=11), not necessarily in [:K_actual]
                         multi_obj_masks[i] = mask_all_objs[video_idx]
-                        
+
                         # if i == 0 and logging.getLogger().isEnabledFor(logging.DEBUG):
                         #      logging.debug(f"AUE Track: Obj 0 (Video {video_idx}), K_actual={K_actual}, Mask sum={multi_obj_masks[i].sum().item()}")
-                    
+
                     # Use multi-object masks
                     pixel_gt_for_aue = multi_obj_masks
             elif not USE_MULTI_OBJECT_AUE and gt_masks is not None:
                 # Single-object mode: always use current frame GT mask (all frames)
                 pixel_gt_for_aue = gt_masks
-                 
+
         # Cache memory context for adversarial branch (used inside compute_aue_loss)
         self._aue_memory_context = {
             "frame_idx": frame_idx,
@@ -635,25 +591,15 @@ class SAM2Train(SAM2Base):
         # Check: if use_bndl_for_pixels=True, aux_outputs must contain valid BNDL data
         if self.use_bndl_for_pixels:
             if aux_outputs is None:
-                raise RuntimeError(
-                    f"SAM2Train.track_step (frame_idx={frame_idx}): use_bndl_for_pixels=True but aux_outputs is None!"
-                )
+                raise RuntimeError(f"SAM2Train.track_step (frame_idx={frame_idx}): use_bndl_for_pixels=True but aux_outputs is None!")
             if not isinstance(aux_outputs, dict):
-                raise RuntimeError(
-                    f"SAM2Train.track_step (frame_idx={frame_idx}): use_bndl_for_pixels=True but aux_outputs is not a dict! "
-                    f"type: {type(aux_outputs)}"
-                )
+                raise RuntimeError(f"SAM2Train.track_step (frame_idx={frame_idx}): use_bndl_for_pixels=True but aux_outputs is not a dict! type: {type(aux_outputs)}")
             if "bndl" not in aux_outputs:
-                raise RuntimeError(
-                    f"SAM2Train.track_step (frame_idx={frame_idx}): use_bndl_for_pixels=True but aux_outputs does not contain 'bndl'! "
-                    f"aux_outputs keys: {list(aux_outputs.keys())}"
-                )
+                raise RuntimeError(f"SAM2Train.track_step (frame_idx={frame_idx}): use_bndl_for_pixels=True but aux_outputs does not contain 'bndl'! aux_outputs keys: {list(aux_outputs.keys())}")
             bndl_data = aux_outputs["bndl"]
             if not isinstance(bndl_data, dict):
-                raise RuntimeError(
-                    f"SAM2Train.track_step (frame_idx={frame_idx}): aux_outputs['bndl'] is not a dict! type: {type(bndl_data)}"
-                )
-        
+                raise RuntimeError(f"SAM2Train.track_step (frame_idx={frame_idx}): aux_outputs['bndl'] is not a dict! type: {type(bndl_data)}")
+
         if aux_outputs is not None:
             # 将 GT 添加到 BNDL 命名空间（如果存在）
             bndl_ns = aux_outputs.get("bndl", None)
@@ -689,16 +635,7 @@ class SAM2Train(SAM2Base):
                 img_batch_for_aue=current_img_batch,
                 pixel_gt_for_aue=pixel_gt_for_aue,
             )
-            (
-                _,
-                _,
-                _,
-                low_res_masks,
-                high_res_masks,
-                obj_ptr,
-                object_score_logits,
-                *_
-            ) = final_sam_outputs
+            (_, _, _, low_res_masks, high_res_masks, obj_ptr, object_score_logits, *_) = final_sam_outputs
 
         # Use the final prediction (after all correction steps for output and eval)
         current_out["pred_masks"] = low_res_masks
@@ -735,7 +672,6 @@ class SAM2Train(SAM2Base):
         img_batch_for_aue=None,
         pixel_gt_for_aue=None,
     ):
-
         assert gt_masks is not None
         all_pred_masks = [low_res_masks]
         all_pred_high_res_masks = [high_res_masks]
@@ -751,9 +687,7 @@ class SAM2Train(SAM2Base):
             # sample a new point from the error between prediction and ground-truth
             # (with a small probability, directly sample from GT masks instead of errors)
             if self.training and self.prob_to_sample_from_gt_for_train > 0:
-                sample_from_gt = (
-                    self.rng.random() < self.prob_to_sample_from_gt_for_train
-                )
+                sample_from_gt = self.rng.random() < self.prob_to_sample_from_gt_for_train
             else:
                 sample_from_gt = False
             # if `pred_for_new_pt` is None, only GT masks will be used for point sampling
@@ -803,14 +737,11 @@ class SAM2Train(SAM2Base):
                 object_score_logits,
                 aux_outputs,
             ) = sam_outputs
-            
+
             # Check: if use_bndl_for_pixels=True, aux_outputs must contain valid BNDL data
             if self.use_bndl_for_pixels:
                 if aux_outputs is None:
-                    raise RuntimeError(
-                        f"SAM2Train._iter_correct_pt_sampling (step {_}, frame_idx={current_out.get('frame_idx', 'unknown')}): "
-                        f"use_bndl_for_pixels=True but aux_outputs is None!"
-                    )
+                    raise RuntimeError(f"SAM2Train._iter_correct_pt_sampling (step {_}, frame_idx={current_out.get('frame_idx', 'unknown')}): use_bndl_for_pixels=True but aux_outputs is None!")
                 if not isinstance(aux_outputs, dict):
                     raise RuntimeError(
                         f"SAM2Train._iter_correct_pt_sampling (step {_}, frame_idx={current_out.get('frame_idx', 'unknown')}): "
@@ -825,10 +756,9 @@ class SAM2Train(SAM2Base):
                 bndl_data = aux_outputs["bndl"]
                 if not isinstance(bndl_data, dict):
                     raise RuntimeError(
-                        f"SAM2Train._iter_correct_pt_sampling (step {_}, frame_idx={current_out.get('frame_idx', 'unknown')}): "
-                        f"aux_outputs['bndl'] is not a dict! type: {type(bndl_data)}"
+                        f"SAM2Train._iter_correct_pt_sampling (step {_}, frame_idx={current_out.get('frame_idx', 'unknown')}): aux_outputs['bndl'] is not a dict! type: {type(bndl_data)}"
                     )
-            
+
             all_aux_outputs.append(aux_outputs)
             all_pred_masks.append(low_res_masks)
             all_pred_high_res_masks.append(high_res_masks)
@@ -841,15 +771,13 @@ class SAM2Train(SAM2Base):
         # Concatenate the masks along channel (to compute losses on all of them,
         # using `MultiStepIteractiveMasks`)
         current_out["multistep_pred_masks"] = torch.cat(all_pred_masks, dim=1)
-        current_out["multistep_pred_masks_high_res"] = torch.cat(
-            all_pred_high_res_masks, dim=1
-        )
+        current_out["multistep_pred_masks_high_res"] = torch.cat(all_pred_high_res_masks, dim=1)
         current_out["multistep_pred_multimasks"] = all_pred_multimasks
         current_out["multistep_pred_multimasks_high_res"] = all_pred_high_res_multimasks
         current_out["multistep_pred_ious"] = all_pred_ious
         current_out["multistep_point_inputs"] = all_point_inputs
         current_out["multistep_object_score_logits"] = all_object_score_logits
-        
+
         # 统一保存 aux_outputs（包含 BNDL/UR-ERN 等）
         current_out["multistep_aux_outputs"] = all_aux_outputs
 

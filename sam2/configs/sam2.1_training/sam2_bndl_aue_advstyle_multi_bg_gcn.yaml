@@ -1,0 +1,640 @@
+# @package _global_
+
+scratch:
+  resolution: 1024
+  train_batch_size: 1
+  num_train_workers: 16
+  num_frames: 4
+  max_num_objects: 3
+  base_lr: 5.0e-6
+  vision_lr: 3.0e-06
+  phases_per_epoch: 1
+  num_epochs: 30
+
+dataset:
+  # PATHS to Dataset
+  img_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/MOSE_release/train/JPEGImages # PATH to MOSE JPEGImages folder
+  gt_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/MOSE_release/train/Annotations # PATH to MOSE Annotations folder
+  file_list_txt: ${oc.env:PROJECT_HOME}/dev/ada_samp/sam2/training/assets/MOSE_sample_train_list.txt # Optional PATH to filelist containing a subset of videos to be used for training
+  multiplier: 4
+  # PATHS to MOSE-val dataset
+  val_img_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/MOSE_release/train/JPEGImages
+  val_gt_folder: ${oc.env:PROJECT_HOME}/dev/data/sam2_data/MOSE_release/train/Annotations
+  val_file_list_txt: ${oc.env:PROJECT_HOME}/dev/ada_samp/sam2/training/assets/MOSE_sample_val_list.txt
+  val_multiplier: 4
+
+
+# Video transforms
+vos:
+  train_transforms:
+    - _target_: training.dataset.transforms.ComposeAPI
+      transforms:
+        - _target_: training.dataset.transforms.RandomHorizontalFlip
+          consistent_transform: True
+        - _target_: training.dataset.transforms.RandomAffine
+          degrees: 25
+          shear: 20
+          # scale: [0.9, 1.1]
+          # translate: [0.05, 0.05]
+          image_interpolation: bilinear
+          consistent_transform: True
+          # num_tentatives: 3
+        - _target_: training.dataset.transforms.RandomResizeAPI
+          sizes: ${scratch.resolution}
+          square: true
+          consistent_transform: True
+        - _target_: training.dataset.transforms.ColorJitter
+          consistent_transform: True
+          brightness: 0.1
+          contrast: 0.03
+          saturation: 0.03
+          hue: null
+        - _target_: training.dataset.transforms.RandomGrayscale
+          p: 0.05
+          consistent_transform: True
+        - _target_: training.dataset.transforms.ColorJitter
+          consistent_transform: False
+          brightness: 0.1
+          contrast: 0.05
+          saturation: 0.05
+          hue: null
+        - _target_: training.dataset.transforms.ToTensorAPI
+        - _target_: training.dataset.transforms.NormalizeAPI
+          mean: [0.485, 0.456, 0.406]
+          std: [0.229, 0.224, 0.225]
+
+  val_transforms:
+    - _target_: training.dataset.transforms.ComposeAPI
+      transforms:
+        - _target_: training.dataset.transforms.RandomResizeAPI   # same resize as train
+          sizes: ${scratch.resolution}
+          square: true
+          consistent_transform: True          # single deterministic resize
+        - _target_: training.dataset.transforms.ToTensorAPI
+        - _target_: training.dataset.transforms.NormalizeAPI
+          mean: [0.485, 0.456, 0.406]
+          std:  [0.229, 0.224, 0.225] 
+
+trainer:
+  _target_: training.trainer.Trainer
+  mode: train
+  max_epochs: ${times:${scratch.num_epochs},${scratch.phases_per_epoch}}
+  actual_max_epochs: 30
+  val_epoch_freq: 5
+  accelerator: cuda
+  seed_value: 123
+  cuda:
+    allow_tf32: true
+    cudnn_benchmark: true
+
+  model:
+    _target_: training.model.sam2.SAM2Train
+    image_encoder:
+      _target_: sam2.modeling.backbones.image_encoder.ImageEncoder
+      scalp: 1
+      trunk:
+        _target_: sam2.modeling.backbones.hieradet.Hiera
+        embed_dim: 112
+        num_heads: 2
+        drop_path_rate: 0.1
+      neck:
+        _target_: sam2.modeling.backbones.image_encoder.FpnNeck
+        position_encoding:
+          _target_: sam2.modeling.position_encoding.PositionEmbeddingSine
+          num_pos_feats: 256
+          normalize: true
+          scale: null
+          temperature: 10000
+        d_model: 256
+        backbone_channel_list: [896, 448, 224, 112]
+        fpn_top_down_levels: [2, 3]  # output level 0 and 1 directly use the backbone features
+        fpn_interp_model: nearest
+
+    memory_attention:
+      _target_: sam2.modeling.memory_attention.MemoryAttention
+      d_model: 256
+      pos_enc_at_input: true
+      layer:
+        _target_: sam2.modeling.memory_attention.MemoryAttentionLayer
+        activation: relu
+        dim_feedforward: 2048
+        dropout: 0.1
+        pos_enc_at_attn: false
+        self_attention:
+          _target_: sam2.modeling.sam.transformer.RoPEAttention
+          rope_theta: 10000.0
+          feat_sizes: [64, 64]
+          embedding_dim: 256
+          num_heads: 1
+          downsample_rate: 1
+          dropout: 0.1
+        d_model: 256
+        pos_enc_at_cross_attn_keys: true
+        pos_enc_at_cross_attn_queries: false
+        cross_attention:
+          _target_: sam2.modeling.sam.transformer.RoPEAttention
+          rope_theta: 10000.0
+          feat_sizes: [64, 64]
+          rope_k_repeat: True
+          embedding_dim: 256
+          num_heads: 1
+          downsample_rate: 1
+          dropout: 0.1
+          kv_in_dim: 64
+      num_layers: 4
+
+    memory_encoder:
+        _target_: sam2.modeling.memory_encoder.MemoryEncoder
+        out_dim: 64
+        position_encoding:
+          _target_: sam2.modeling.position_encoding.PositionEmbeddingSine
+          num_pos_feats: 64
+          normalize: true
+          scale: null
+          temperature: 10000
+        mask_downsampler:
+          _target_: sam2.modeling.memory_encoder.MaskDownSampler
+          kernel_size: 3
+          stride: 2
+          padding: 1
+        fuser:
+          _target_: sam2.modeling.memory_encoder.Fuser
+          layer:
+            _target_: sam2.modeling.memory_encoder.CXBlock
+            dim: 256
+            kernel_size: 7
+            padding: 3
+            layer_scale_init_value: 1e-6
+            use_dwconv: True  # depth-wise convs
+          num_layers: 2
+
+    num_maskmem: 7
+    image_size: ${scratch.resolution}
+    # apply scaled sigmoid on mask logits for memory encoder, and directly feed input mask as output mask
+    sigmoid_scale_for_mem_enc: 20.0
+    sigmoid_bias_for_mem_enc: -10.0
+    use_mask_input_as_output_without_sam: false  # Must be false when use_bndl_for_pixels=True (incompatible)
+    # Memory
+    directly_add_no_mem_embed: true
+    no_obj_embed_spatial: true
+    # use high-resolution feature map in the SAM mask decoder
+    use_high_res_features_in_sam: true
+    # output 3 masks on the first click on initial conditioning frames
+    multimask_output_in_sam: true
+    # SAM heads
+    iou_prediction_use_sigmoid: True
+    # cross-attend to object pointers from other frames (based on SAM output tokens) in the encoder
+    use_obj_ptrs_in_encoder: true
+    add_tpos_enc_to_obj_ptrs: true
+    proj_tpos_enc_in_obj_ptrs: true
+    use_signed_tpos_enc_to_obj_ptrs: true
+    only_obj_ptrs_in_the_past_for_eval: true
+    # object occlusion prediction
+    pred_obj_scores: true
+    pred_obj_scores_mlp: true
+    fixed_no_obj_ptr: true
+    # multimask tracking settings
+    multimask_output_for_tracking: true
+    use_multimask_token_for_obj_ptr: true
+    multimask_min_pt_num: 0
+    multimask_max_pt_num: 1
+    use_mlp_for_obj_ptr_proj: true
+    # === BNDL_CONFIG_START ===
+    # BNDL
+    use_bndl_for_pixels: true
+    bndl_fuse_type: none
+    bndl_replace_global_with_hyper: true
+    bndl_hyper_in_sparse: false
+    # === BNDL_CONFIG_END ===
+    # Compilation flag
+    # Freeze image encoder to save memory
+    # === IMPORTANT: Conv-LoRA Configuration ===
+    freeze_image_encoder: false  # true = PEFT (only train LoRA, ~2-3% params), false = joint fine-tuning (train all, ~33% params)
+    # Unfreeze specific components for adaptation (e.g. "neck", "trunk_last_stage")
+    unfreeze_image_encoder_components: []
+
+    # === LORA_CONFIG_START ===
+    # LoRA: Parameter-efficient fine-tuning
+    use_lora: false
+    lora_rank: 4
+    lora_alpha: 16.0
+    lora_dropout: 0.1
+    lora_target_modules:  # Layers to inject LoRA (Match FS-SAM2: qkv, proj)
+      - "qkv" 
+      - "proj"
+    # === LORA_CONFIG_END ===
+    
+    # === MAX_OBJECTS_CONFIG_START ===
+    # Max number of objects (matches dataset sampler for memory efficiency)
+    max_num_objects: ${scratch.max_num_objects}
+    # === MAX_OBJECTS_CONFIG_END ===
+
+    # === AUE_GCN_CONFIG_START ===
+    # AUE (Adversarial Uncertainty Estimation) with Style-based augmentation
+    use_aue: true
+    # Constraint weight for adversarial samples (L1 distance to initial)
+    aue_constraint_loss_weight: 0.0  # Weight for constraint regularization (0 = disabled)
+    # Attack mode: "cooperative" (parallel prediction, joint application) or "sequential" (iterative)
+    aue_attack_mode: "cooperative"
+    # Style Adversarial options (alternative to AUE, for domain generalization)
+    use_style_adv: true
+    style_adv_mode: "image_level"  # "image_level" or "feature_level"
+    style_adv_epsilon: 2.0  # Perturbation budget for style
+    style_adv_use_gt_region_style: true
+    
+    # Multi-object style attack control
+    adv_use_multi_object: true
+    adv_enable_background: true
+    
+    # Global-Local Mixed Style Adversarial
+    style_adv_use_global_local_mix: false
+    style_adv_global_epsilon: 0.5
+    style_adv_global_weight: 0.5
+
+    # GCN-based multi-object style refinement
+    style_adv_use_gcn: true  # Not needed for global-only style
+    style_adv_gcn_grl_alpha: 0.1  # GRL alpha for GCN path (lower = more stable)
+    style_adv_gcn_hidden_dim: 64
+    style_adv_gcn_num_layers: 2
+    style_adv_gcn_edge_threshold: 0.0
+    style_adv_gcn_use_semantic_edges: true
+    style_adv_gcn_use_background_edges: true
+    style_adv_gcn_distance_threshold: 1.0
+    style_adv_gcn_use_boundary_distance: true
+    style_adv_gcn_use_visual_features: false
+    style_adv_gcn_feature_dim: 256  # Feature dimension (matches backbone_fpn[-1] d_model)
+    
+    # Deformation Adversarial (feature-level, memory encoder based)
+    use_deform_adv: false
+    deform_adv_epsilon: 5.0  # Reduced from 10.0 to 5.0 for mild spatial perturbation
+    deform_adv_use_soft_composite: true
+    deform_adv_temperature: 1.0
+    deform_adv_use_gcn: false
+    deform_adv_gcn_num_layers: 2
+    deform_adv_num_deform_groups: 4
+    deform_adv_init_from_memory_encoder: true  # Initialize from pretrained memory encoder
+    deform_adv_freeze_encoder_components: true  # Freeze all encoder components (mask_encoder, img_feat_proj, fuser) to prevent GRL gradient instability
+    deform_adv_zero_mean_offsets: true  # Remove global translation while keeping local warps
+    deform_adv_local_offset_gain: 1.3  # Boost local deformation after centering
+    
+    # Adversarial Pipeline Ordering
+    adversarial_attack_order: ["style"]
+    
+    # Distribution matching configuration for AUE calibration loss (nested config)
+    aue_dist_matching_config:
+      # Current method: Baseline Hard-Aware MMD (error-based Top-K mining)
+      method: "mmd"  # Options: "mmd", "cka", "gram", "mmd_hard_aware", "domain_aware_soft_mmd"
+        
+      # To use NEW theory-driven method, change to:
+      # method: "domain_aware_soft_mmd"
+        
+      use_patches: true  # Ignored for hard-aware methods (inherently patch-based)
+      patch_size: 32  # Patch size for patch-based methods
+        
+      # Method-specific parameters (only active when method is selected)
+      mmd:
+        kernel: "rbf"
+        bandwidth: 0.1
+        batch_size: 256
+        n_batches: 10
+        
+      # Baseline: Hard-Aware MMD (error-based Top-K mining)
+      mmd_hard_aware:
+        top_k_percent: 0.25     # Top 25% hardest patches (by error)
+        max_samples: 4096        # Memory optimization
+        
+      # NEW: Domain-Aware Soft MMD (theory-driven: OOD detection + MaxEnt)
+      # Combines error (aleatoric) + feature diversity (epistemic) with soft weighting
+      domain_aware_soft_mmd:
+        diversity_weight: 0.25       # Reduced from 0.4 to 0.25 (less emphasis on epistemic diversity)
+        temperature: 0.2             # Increased from 0.1 to 0.2 (smoother sample selection, less aggressive)
+        max_samples: 8192
+        diversity_method: "channel_std"  # "channel_std" (faster) | "spatial_var"
+        enable_monitoring: false     # Disable monitoring to save memory and ignore low correlation for now
+        
+      cka:
+        use_linear_kernel: true  # Linear kernel (faster) vs RBF kernel
+        use_minibatch: true  # Mini-batch computation for memory efficiency
+        minibatch_size: 512
+        
+      gram:
+        center: true
+        normalize: true
+    
+    # Analytic uncertainty computation (from Weibull parameters)
+    # true = use analytic uncertainty (with gradients to BNDL, bidirectional optimization)
+    # false = use sampling uncertainty (detached, gradients only to encoder)
+    aue_use_analytic_uncertainty: true
+    # === AUE_GCN_CONFIG_END ===
+
+    ####### Training specific params #######
+    # box/point input and corrections
+    prob_to_use_pt_input_for_train: 0.5
+    prob_to_use_pt_input_for_eval: 0.0
+    prob_to_use_box_input_for_train: 0.5  # 0.5*0.5 = 0.25 prob to use box instead of points
+    prob_to_use_box_input_for_eval: 0.0
+    prob_to_sample_from_gt_for_train: 0.1  # with a small prob, sampling correction points from GT mask instead of prediction errors
+    num_frames_to_correct_for_train: 2  # iteratively sample on random 1~2 frames (always include the first frame)
+    num_frames_to_correct_for_eval: 1  # only iteratively sample on first frame
+    rand_frames_to_correct_for_train: True  # random #init-cond-frame ~ 2
+    add_all_frames_to_correct_as_cond: True  # when a frame receives a correction click, it becomes a conditioning frame (even if it's not initially a conditioning frame)
+    # maximum 2 initial conditioning frames
+    num_init_cond_frames_for_train: 2
+    rand_init_cond_frames_for_train: True  # random 1~2
+    num_correction_pt_per_frame: 7
+    use_act_ckpt_iterative_pt_sampling: false
+    
+
+    
+    num_init_cond_frames_for_eval: 1  # only mask on the first frame
+    forward_backbone_per_frame_for_eval: True
+    
+
+  data:
+    train:
+      _target_: training.dataset.sam2_datasets.TorchTrainMixedDataset
+      phases_per_epoch: ${scratch.phases_per_epoch}
+      batch_sizes:
+        - ${scratch.train_batch_size}
+
+      datasets:
+        - _target_: training.dataset.utils.RepeatFactorWrapper
+          dataset:
+            _target_: training.dataset.utils.ConcatDataset
+            datasets:
+            - _target_: training.dataset.vos_dataset.VOSDataset
+              transforms: ${vos.train_transforms}
+              training: true
+              video_dataset:
+                _target_: training.dataset.vos_raw_dataset.PNGRawDataset
+                img_folder: ${dataset.img_folder}
+                gt_folder: ${dataset.gt_folder}
+                file_list_txt: ${dataset.file_list_txt}
+              sampler:
+                _target_: training.dataset.vos_sampler.RandomUniformSampler
+                num_frames: ${scratch.num_frames}
+                max_num_objects: ${scratch.max_num_objects}
+              multiplier: ${dataset.multiplier}
+      shuffle: True
+      num_workers: ${scratch.num_train_workers}
+      pin_memory: True
+      drop_last: True
+      collate_fn:
+        _target_: training.utils.data_utils.collate_fn
+        _partial_: true
+        dict_key: all
+
+    # MOSE-val dataset
+    val:
+      _target_: training.dataset.sam2_datasets.TorchTrainMixedDataset
+      phases_per_epoch: 1
+      batch_sizes:
+        - 1
+
+      datasets:                                        # single MOSE-val dataset
+        - _target_: training.dataset.vos_dataset.VOSDataset
+          transforms: ${vos.val_transforms}
+          training: false                              # <-- IMPORTANT
+          video_dataset:
+            _target_: training.dataset.vos_raw_dataset.PNGRawDataset
+            img_folder: ${dataset.val_img_folder}
+            gt_folder:  ${dataset.val_gt_folder}
+            file_list_txt: ${dataset.val_file_list_txt}
+          # sampler:
+          #   _target_: training.dataset.vos_sampler.EvalSampler  # sample all frames/objects
+          sampler:
+            _target_: training.dataset.vos_sampler.RandomUniformSampler
+            num_frames: ${scratch.num_frames}
+            max_num_objects: ${scratch.max_num_objects}
+          multiplier: ${dataset.val_multiplier}
+
+      shuffle: False
+      num_workers: ${scratch.num_train_workers}
+      pin_memory: True
+      drop_last: False
+      collate_fn:
+        _target_: training.utils.data_utils.collate_fn
+        _partial_: true
+        dict_key: val   
+
+  optim:
+    amp:
+      enabled: True
+      amp_dtype: bfloat16
+
+    optimizer:
+      _target_: torch.optim.AdamW
+
+    gradient_clip:
+      _target_: training.optimizer.GradientClipper
+      max_norm: 0.1
+      norm_type: 2
+
+    param_group_modifiers:
+      - _target_: training.optimizer.layer_decay_param_modifier
+        _partial_: True
+        layer_decay_value: 0.9
+        apply_to: 'image_encoder.trunk'
+        overrides:
+          - pattern: '*pos_embed*'
+            value: 1.0
+
+    # options:
+    #   lr:
+    #     - scheduler:
+    #         _target_: fvcore.common.param_scheduler.CosineParamScheduler
+    #         start_value: ${scratch.base_lr}
+    #         end_value: ${divide:${scratch.base_lr},10}
+    #     - scheduler:
+    #         _target_: fvcore.common.param_scheduler.CosineParamScheduler
+    #         start_value: ${scratch.vision_lr}
+    #         end_value: ${divide:${scratch.vision_lr},10}
+    #       param_names:
+    #         - 'image_encoder.*'
+    #   weight_decay:
+    #     - scheduler:
+    #         _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+    #         value: 0.1
+    #     - scheduler:
+    #         _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+    #         value: 0.0
+    #       param_names:
+    #         - '*bias*'
+    #       module_cls_names: ['torch.nn.LayerNorm']
+
+    options:
+      lr:
+        # 默认组（未被下面命中者）
+        - scheduler:
+            _target_: fvcore.common.param_scheduler.CosineParamScheduler
+            start_value: 1.0e-6
+            end_value: 1.0e-7
+
+        # BNDL head: higher learning rate
+        - scheduler:
+            _target_: fvcore.common.param_scheduler.CosineParamScheduler
+            start_value: 1.0e-4
+            end_value: 1.0e-5
+          param_names:
+            - 'sam_mask_decoder.pixel_bndl.*'
+
+        # Style Adversarial Network: moderate learning rate for effective adversarial training
+        - scheduler:
+            _target_: fvcore.common.param_scheduler.CosineParamScheduler
+            start_value: 1.0e-4
+            end_value: 1.0e-5
+          param_names:
+            - 'style_attacker.impl.style_net.*'
+
+        # GCN: moderate learning rate for rapid alpha convergence
+        - scheduler:
+            _target_: fvcore.common.param_scheduler.CosineParamScheduler
+            start_value: 1.0e-5
+            end_value: 1.0e-6
+          param_names:
+            - 'style_gcn.*'
+
+        # Deformation augmentation (DG-Font): moderate learning rate for effective training
+        # - scheduler:
+        #     _target_: fvcore.common.param_scheduler.CosineParamScheduler
+        #     start_value: 1.0e-4
+        #     end_value: 1.0e-5
+        #   param_names:
+        #     - 'deform_attacker.*'
+
+        # LoRA params: higher learning rate
+        # - scheduler:
+        #     _target_: fvcore.common.param_scheduler.CosineParamScheduler
+        #     start_value: 2.0e-4
+        #     end_value: 2.0e-5
+        #   param_names:
+        #     - '*lora*'
+
+        - scheduler:
+            _target_: fvcore.common.param_scheduler.CosineParamScheduler
+            start_value: 1.0e-07
+            end_value: 1.0e-07
+          param_names:
+            - image_encoder.*
+        #   exclude_param_names:
+        #     - '*lora*'
+
+      weight_decay:
+        # 默认 weight decay
+        - scheduler:
+            _target_: fvcore.common.param_scheduler.ConstantParamScheduler
+            value: 0.01
+
+  loss:
+    all:
+      _target_: training.loss_combined.CombinedSAMBNDLLoss
+      sam_loss:
+        _target_: training.loss_fns.MultiStepMultiMasksAndIous
+        weight_dict:
+          loss_mask: 20.0
+          loss_dice: 1.0
+          loss_iou: 1.0
+          loss_class: 1.0
+        supervise_all_iou: true
+        iou_use_l1_loss: true
+        pred_obj_scores: true
+        focal_gamma_obj_score: 0.0
+        focal_alpha_obj_score: -1.0
+      bndl_loss:
+        _target_: training.loss_bndl.BNDLLoss
+        kl_weight: 1.0
+      aue_loss:
+        _target_: training.loss_aue.AUELoss
+      # Initial weights (used as fallback if not specified in weight_schedule below)
+      sam_weight: 1.0
+      bndl_weight: 1.0
+      aue_weight: 0.0
+      weight_schedule:
+        - until_epoch: 10
+          sam_weight: 1.0
+          bndl_weight: 1.0
+          aue_weight: 0.0
+        - until_epoch: 15
+          sam_weight: 1.0
+          bndl_weight: 0.8
+          aue_weight: 0.05
+        - until_epoch: null
+          sam_weight: 1.0
+          bndl_weight: 0.2
+          aue_weight: 0.1
+    val:
+      _target_: training.loss_combined.CombinedSAMBNDLLoss
+      sam_loss: ${trainer.loss.all.sam_loss}
+      bndl_loss: ${trainer.loss.all.bndl_loss}
+      aue_loss: ${trainer.loss.all.aue_loss}
+      sam_weight: 1.0  # Keep full SAM weight
+      bndl_weight: 1.0  # Log BNDL loss, also add to core_loss
+      aue_weight: 1.0   # Log AUE loss, do not add to core_loss
+      prefix_keys: False # Keep original SAM loss keys (no sam_ prefix)
+    # val:
+    #   _target_: training.loss_fns.MultiStepMultiMasksAndIous
+    #   weight_dict: ${trainer.loss.all.sam_loss.weight_dict}
+    #   supervise_all_iou: ${trainer.loss.all.sam_loss.supervise_all_iou}
+    #   iou_use_l1_loss: ${trainer.loss.all.sam_loss.iou_use_l1_loss}
+    #   pred_obj_scores: ${trainer.loss.all.sam_loss.pred_obj_scores}
+    #   focal_gamma_obj_score: ${trainer.loss.all.sam_loss.focal_gamma_obj_score}
+    #   focal_alpha_obj_score: ${trainer.loss.all.sam_loss.focal_alpha_obj_score}
+
+  distributed:
+    backend: nccl
+    find_unused_parameters: True
+
+  logging:
+    # log_level_primary: "DEBUG"
+    tensorboard_writer:
+      _target_: training.utils.logger.make_tensorboard_logger
+      log_dir:  ${launcher.experiment_log_dir}/tensorboard
+      flush_secs: 120
+      should_log: True
+    log_dir: ${launcher.experiment_log_dir}/logs
+    log_freq: 10
+    log_scalar_frequency: 10
+    log_visual_frequency: 100
+    visualize_bndl: true
+    visualize_aue: true
+    style_aue_visual_frequency: 100
+    uncertainty_metric: ["entropy", "nll"]
+    visualize_pavpu_overlay: true
+    uncertainty_sample_num: 50
+    # Pixel-level PAvPU statistics configuration
+    correlation_foreground_dilation: 4
+    correlation_per_pixel: true
+    correlation_use_full_image: false
+
+  # initialize from a SAM 2 checkpoint
+  checkpoint:
+    save_dir: ${launcher.experiment_log_dir}/checkpoints
+    save_freq: 0 # 0 only last checkpoint is saved.
+    model_weight_initializer:
+      _partial_: True
+      _target_: training.utils.checkpoint_utils.load_state_dict_into_model
+      strict: False
+      ignore_missing_keys: []
+      ignore_unexpected_keys: []
+      state_dict:
+        _target_: training.utils.checkpoint_utils.load_checkpoint_and_apply_kernels
+        checkpoint_path: ${oc.env:PROJECT_HOME}/dev/ada_samp/sam2/checkpoints/sam2.1_hiera_base_plus.pt # PATH to SAM 2.1 checkpoint
+        ckpt_state_dict_keys: ['model']
+
+launcher:
+  num_nodes: 1
+  gpus_per_node: 8
+  # NOTE: experiment_log_dir is automatically set by train_and_zs.sh based on BNDL_AUE_VER
+  # To change version, edit BNDL_AUE_VER in scripts/train_and_zs.sh (no need to edit here)
+  experiment_log_dir: ${oc.env:PROJECT_HOME}/dev/ada_samp/logs/sam2/sam2_bndl_aue_017_bndl  # Default fallback, will be overridden
+
+# SLURM args if running on a cluster
+submitit:
+  partition: null
+  account: null
+  qos: null
+  cpus_per_task: 10
+  use_cluster: false
+  timeout_hour: 24
+  name: null
+  port_range: [10000, 65000]
