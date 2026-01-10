@@ -27,9 +27,7 @@ Scalar = Union[Tensor, ndarray, int, float]
 def make_tensorboard_logger(log_dir: str, **writer_kwargs: Any):
     makedir(log_dir)
     summary_writer_method = SummaryWriter
-    return TensorBoardLogger(
-        path=log_dir, summary_writer_method=summary_writer_method, **writer_kwargs
-    )
+    return TensorBoardLogger(path=log_dir, summary_writer_method=summary_writer_method, **writer_kwargs)
 
 
 class TensorBoardWriterWrapper:
@@ -148,6 +146,12 @@ class TensorBoardLogger(TensorBoardWriterWrapper):
             return
         self._writer.add_hparams(hparams, meters)
 
+    def add_histogram(self, name: str, values, step: int) -> None:
+        """Add histogram data to TensorBoard."""
+        if not self._writer:
+            return
+        self._writer.add_histogram(name, values, global_step=step)
+
 
 class Logger:
     """
@@ -173,6 +177,10 @@ class Logger:
     ) -> None:
         if self.tb_logger:
             self.tb_logger.log_hparams(hparams, meters)
+
+    def add_histogram(self, name: str, values, step: int) -> None:
+        if self.tb_logger:
+            self.tb_logger.add_histogram(name, values, step)
 
 
 # cache the opened file object, so that different calls to `setup_logger`

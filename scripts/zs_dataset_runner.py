@@ -7,7 +7,7 @@ that exist in each method-specific script.
 
 Usage:
     from zs_dataset_runner import run_single_dataset_generic
-    
+
     jf, j, f, stats = run_single_dataset_generic(
         dataset_name="GTEA",
         predictor=predictor,
@@ -58,12 +58,12 @@ def run_single_dataset_generic(
 ) -> tuple[float, float, float, dict[str, Any] | None]:
     """
     Generic single-dataset evaluation runner.
-    
+
     This consolidates the common logic in:
     - zero_shot_multi_dataset_sam_bndl.run_single_dataset_with_bndl
     - zero_shot_multi_dataset_uctta.run_single_dataset_with_uctta
     - zero_shot_multi_dataset_ur_ern.run_single_dataset_with_ur_ern
-    
+
     Args:
         dataset_name: Name of dataset (must be in DATASET_CONFIGS)
         predictor: SAM2 video predictor instance
@@ -83,7 +83,7 @@ def run_single_dataset_generic(
         collect_statistics: Whether to collect stats
         downsample_max_samples: Max samples for stats
         **inference_kwargs: Additional args for inference_fn
-    
+
     Returns:
         Tuple of (jf_score, j_score, f_score, statistics_dict)
     """
@@ -91,12 +91,12 @@ def run_single_dataset_generic(
     config = DATASET_CONFIGS[dataset_name]
     if split is None:
         split = config["default_split"]
-    
+
     if isinstance(split, list):
         split = split[0]
-    
+
     assert isinstance(split, str)
-    
+
     # Resolve paths
     root = Path(config["root"])
     if config["has_split_subdir"]:
@@ -105,20 +105,18 @@ def run_single_dataset_generic(
     else:
         jpeg_dir = root / "JPEGImages"
         ann_dir = root / "Annotations"
-    
+
     if not jpeg_dir.is_dir() or not ann_dir.is_dir():
-        raise FileNotFoundError(
-            f"JPEGImages or Annotations not found for {dataset_name}: {jpeg_dir}, {ann_dir}"
-        )
-    
+        raise FileNotFoundError(f"JPEGImages or Annotations not found for {dataset_name}: {jpeg_dir}, {ann_dir}")
+
     # Create output directory
     out_dir = output_path / f"{dataset_name.lower()}_pred"
     out_dir.mkdir(parents=True, exist_ok=True)
-    
+
     print(f"\n{'=' * 60}")
     print(f"Running {dataset_name} dataset evaluation (SAM-2 + {method_name})")
     print(f"{'=' * 60}")
-    
+
     # Handle file_list_txt if present
     if "file_list_txt" in config:
         file_list_path = Path(config["file_list_txt"])
@@ -126,8 +124,10 @@ def run_single_dataset_generic(
             with open(file_list_path, "r") as f:
                 names = [line.strip() for line in f if line.strip()]
             video_subset = [v for v in (video_subset or names) if v in names]
-    
+
     # Execute method-specific inference
+    # Note: first_frame_only and min_click_dist are not passed to inference_fn
+    # because inference_with_bndl was simplified to single-frame mode only
     t0 = time.time()
     statistics = inference_fn(
         predictor,
@@ -140,15 +140,13 @@ def run_single_dataset_generic(
         collect_statistics=collect_statistics,
         dataset_name=dataset_name,
         reuse_prompts_root=reuse_prompts_root,
-        first_frame_only=first_frame_only,
         click_protocol=click_protocol,
-        min_click_dist=min_click_dist,
         seed=seed,
         downsample_max_samples=downsample_max_samples,
         **inference_kwargs,
     )
     t_infer = time.time() - t0
-    
+
     # Run benchmark evaluation
     t1 = time.time()
     try:
@@ -166,14 +164,15 @@ def run_single_dataset_generic(
     except Exception as e:
         print(f"Error during evaluation of {dataset_name}: {e}")
         import traceback
+
         traceback.print_exc()
         return 0.0, 0.0, 0.0, None
-    
+
     t_eval = time.time() - t1
-    
+
     print(f"Inference time ({method_name}): {t_infer:.2f}s")
     print(f"Evaluation time: {t_eval:.2f}s")
-    
+
     return j_f_val, j_val, f_val, statistics
 
 
@@ -184,8 +183,8 @@ def run_single_dataset_generic(
 if __name__ == "__main__":
     print("Dataset Runner Module Tests")
     print("=" * 60)
-    
+
     print("\n1. Module imports:")
     print("  ✓ run_single_dataset_generic")
-    
+
     print("\n✓ All imports successful!")

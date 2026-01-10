@@ -9,8 +9,7 @@ from typing import List, Optional, Tuple, Type
 import torch
 from torch import nn
 
-from BNDL.BNDL_upload.ViT_Sparse.utils.bndl import BNDL
-from sam2.modeling.bndl_utils import pixel_weibull_to_entropy_uncertainty
+from BNDL.BNDL_upload.ViT_Sparse.utils.bndl import BNDL, entropy_uncertainty, uncertainty_sample_parallel
 from sam2.modeling.sam2_utils import MLP, LayerNorm2d
 
 
@@ -33,9 +32,13 @@ class MaskDecoder(nn.Module):
         pred_obj_scores_mlp: bool = False,
         # BNDL related
         use_bndl_for_pixels: bool = False,
+        bndl_factor_z: float = 0.0,
+        bndl_factor_w: float = 0.0,
         use_multimask_token_for_obj_ptr: bool = False,
         # UR-ERN related (mutually exclusive with BNDL)
         use_ur_ern_for_pixels: bool = False,
+        # BNDL eval mode control
+        bndl_force_single_sample: bool = False,  # If True, use single sampling in eval mode (match training behavior)
     ) -> None:
         """
         Predicts masks given an image and prompt embeddings, using a
@@ -82,13 +85,16 @@ class MaskDecoder(nn.Module):
 
         # BNDL related
         self.use_bndl_for_pixels = use_bndl_for_pixels
+        self.bndl_factor_z = float(bndl_factor_z)
+        self.bndl_factor_w = float(bndl_factor_w)
         if self.use_bndl_for_pixels:
-            pixel_feat_dim = transformer_dim // 8  # C' after up-scaling
+            pixel_feat_dim = transformer_dim // 8  # C' after up-scaling (32)
             self.pixel_bndl = BNDL(
-                pixel_feat_dim,
-                self.num_mask_tokens,
+                pixel_feat_dim,  # num_features: 32 (for pixel_feat)
+                2,  # num_classes: binary (fg/bg)
+                mask_token_dim=transformer_dim,  # 256 (for mask_tokens_out)
             )
-
+            self.bndl_force_single_sample = bndl_force_single_sample
         #########################################################
 
         # UR-ERN (NIG evidential regression) head - mutually exclusive with BNDL
@@ -260,46 +266,56 @@ class MaskDecoder(nn.Module):
         aux_outputs = None
         if self.use_bndl_for_pixels:
             pixel_feat = upscaled_embedding.permute(0, 2, 3, 1)  # [B, C, H, W] -> [B, H, W, C]
-
-            masks_bndl_raw, z_out, wei_lambda, kappa, out_w, wei_lambda_w, kappa_w, lgamma_cache = self.pixel_bndl(
+            # BNDL forward
+            # force_sample=True in eval mode when bndl_force_single_sample is set
+            # This ensures train-eval consistency (single sampling vs MC average)
+            force_sample = (not self.training) and getattr(self, "bndl_force_single_sample", False)
+            (
+                masks_bndl_sam,  # [B, H, W, K]
+                z_out,
+                wei_lambda,
+                inv_k,
+                wei_lambda_w,
+                inv_k_w,
+            ) = self.pixel_bndl(
                 pixel_feat,
-                external_pre_out_w=hyper_in,
-                factor_w=1.0,
+                mask_tokens_out,  # [B, K, 256] - use full Transformer output
+                factor_z=self.bndl_factor_z,
+                factor_w=self.bndl_factor_w,
+                force_sample=force_sample,
             )
 
-            masks_bndl = masks_bndl_raw.permute(0, 3, 1, 2)
+            masks_bndl = masks_bndl_sam.permute(0, 3, 1, 2)  # [B, K, H, W]
 
-            # Use per_channel=True to get per-mask uncertainty [B, H, W, K]
-            # This ensures each mask has its own pixel-level uncertainty
-            pixel_uncertainty = pixel_weibull_to_entropy_uncertainty(
+            # Uncertainty estimation (parallel sampling)
+            sampled_logits, mean_logits = uncertainty_sample_parallel(
                 self.pixel_bndl,
                 pixel_feat,
-                external_pre_out_w=hyper_in,
-                per_channel=True,  # Return [B, H, W, K] instead of [B, H, W]
+                mask_tokens_out,  # [B, K, 256] - use full Transformer output
+                sample_num=20,
+                factor_z=self.bndl_factor_z,
+                factor_w=self.bndl_factor_w,
             )
+
+            # [B, H, W, K] - per-mask entropy (uncertainty)
+            pixel_uncertainty = entropy_uncertainty(sampled_logits)
 
             aux_outputs = {
                 "bndl": {
                     "z_out": z_out,
                     "wei_lambda": wei_lambda,
-                    "kappa": kappa,  # Renamed from inv_k (now returns kappa directly)
+                    "inv_k": inv_k,
                     "wei_lambda_w": wei_lambda_w,
-                    "kappa_w": kappa_w,  # Renamed from inv_k_w
-                    "lgamma_cache": lgamma_cache,  # For reuse in bndl_utils to avoid recomputation
-                    "masks_bndl_raw": masks_bndl_raw.detach(),  # [B, H, W, K]
-                    "pixel_uncertainty": pixel_uncertainty,  # [B, H, W, K] - per-mask uncertainty
-                    "pixel_logits": masks_bndl_raw if self.training else masks_bndl_raw.detach(),
+                    "inv_k_w": inv_k_w,
+                    "masks_bndl_raw": masks_bndl_sam.detach(),  # [B, H, W, K]
+                    "pixel_uncertainty": pixel_uncertainty,  # [B, H, W, K]
+                    "pixel_logits": masks_bndl_sam if self.training else masks_bndl_sam.detach(),
                     "upscaled_shape": (b, c, h, w),
-                    # hyper_in: [B, K, 32D] - the projected tokens for AUE uncertainty calculation
-                    # Keep gradients during training for AUE adversarial branch backprop
-                    "hyper_in": hyper_in if self.training else hyper_in.detach(),
-                    "mask_tokens_out": mask_tokens_out.detach(),
+                    "mask_tokens_out": mask_tokens_out if self.training else mask_tokens_out.detach(),
                     "pixel_feat": pixel_feat.detach(),
-                    # Provide gradient-carrying pixel features for auxiliary losses during training
                     "pixel_feat_grad": pixel_feat if self.training else None,
                     "masks_bndl": masks_bndl.detach(),
                     "masks_hyper": masks_sam.detach() if masks_sam is not None else None,
-                    "out_w": out_w.detach() if out_w is not None else None,
                 }
             }
 
@@ -350,7 +366,7 @@ class MaskDecoder(nn.Module):
             bndl_data = aux_outputs["bndl"]
             if not isinstance(bndl_data, dict):
                 raise RuntimeError(f"MaskDecoder.predict_masks: aux_outputs['bndl'] is not a dict! type: {type(bndl_data)}")
-            required_keys = ["wei_lambda", "kappa", "masks_bndl_raw", "pixel_uncertainty"]
+            required_keys = ["masks_bndl_raw", "pixel_uncertainty", "wei_lambda", "inv_k", "wei_lambda_w", "inv_k_w"]
             missing_keys = [k for k in required_keys if k not in bndl_data]
             if missing_keys:
                 raise RuntimeError(f"MaskDecoder.predict_masks: aux_outputs['bndl'] missing required keys: {missing_keys}. Available keys: {list(bndl_data.keys())}")

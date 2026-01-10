@@ -1,45 +1,6 @@
 #!/usr/bin/env python
-"""
-智能GPU任务调度器 - 动态并行评估
-Dynamic GPU Task Scheduler for Zero-Shot Evaluation
-
-核心特性:
-1. 任务队列: 生成所有(数据集, 方法)组合
-2. 🚀 动态调度: GPU完成任务后立即从共享队列取下一个任务
-3. 🎯 智能负载均衡: 避免GPU空闲，最大化利用率（接近100%）
-4. 📊 实时进度监控: 显示任务完成状态
-
-总任务数 = len(datasets) × len(methods)
-例如: 3个数据集 × 5个方法 = 15个任务，8个GPU并行执行
-
-调度策略：
-- 旧版（静态分配）：任务预先分配到各GPU队列，导致尾部GPU空闲
-- 新版（动态队列）：共享任务队列，GPU完成后立即取新任务，GPU利用率接近100%
-
-用法:
-    # 使用8个GPU并行评估
-    python scripts/parallel_compare.py \
-        --datasets GTEA MOSE_val TrashCan \
-        --methods SAM UCTTA BNDL_AUE BNDL UR-ERN \
-        --gpu_ids 0 1 2 3 4 5 6 7
-    
-    # 只运行部分方法
-    python scripts/parallel_compare.py \
-        --datasets GTEA MOSE_val \
-        --methods UCTTA BNDL_AUE \
-        --gpu_ids 0 1
-    
-    # 🔥 智能续跑模式（中途中断后继续）
-    python scripts/parallel_compare.py \
-        --datasets GTEA MOSE_val TrashCan \
-        --methods SAM UCTTA BNDL_AUE BNDL UR-ERN \
-        --gpu_ids 0 1 2 3 4 5 6 7 \
-        --reuse_cached
-    # 自动检测已完成的任务，只运行未完成的部分
-"""
 
 import argparse
-import gc
 import json
 import os
 import re
@@ -267,34 +228,51 @@ def build_task_command(
         "cuda",
     ]
 
-    # 添加方法特定的flags
-    cmd.extend(METHOD_CONFIGS[method]["flags"])
+    # Get method config from registry
+    # This handles adding the correct method flag (e.g. --run_bndl_aue)
 
-    # SAM-2配置 (所有方法都需要)
-    # SAM_FT uses its own checkpoint, otherwise use standard SAM checkpoint
+    if method not in METHOD_REGISTRY:
+        raise ValueError(f"Unknown method: {method}")
+
+    method_cfg = METHOD_REGISTRY[method]
+    cmd.extend(method_cfg.flags)
+
+    # --- Config & Checkpoint Handling ---
+    # Determine which arguments to pick from 'args' and which flags to pass to 'zs.py'
+
+    # Generic logic: use the registry's cfg_arg/ckpt_arg keys to find values in 'args'
+    # Default target flags for zs.py
+    target_cfg_flag = method_cfg.cfg_arg
+    target_ckpt_flag = method_cfg.ckpt_arg
+
+    # Special case: SAM_FT reuses SAM's runner in zs.py, so it must pass --sam2_cfg/--sam2_checkpoint
     if method == "SAM_FT":
-        cmd.extend(["--sam2_cfg", args.sam_ft_cfg if hasattr(args, "sam_ft_cfg") and args.sam_ft_cfg else args.sam2_cfg])
-        cmd.extend(["--sam2_checkpoint", args.sam_ft_checkpoint])
-    else:
-        cmd.extend(["--sam2_cfg", args.sam2_cfg])
-        cmd.extend(["--sam2_checkpoint", args.sam2_checkpoint])
+        target_cfg_flag = "--sam2_cfg"
+        target_ckpt_flag = "--sam2_checkpoint"
 
-    # BNDL+AUE配置
-    if method == "BNDL_AUE":
-        cmd.extend(["--bndl_aue_cfg", args.bndl_aue_cfg])
-        cmd.extend(["--bndl_aue_checkpoint", args.bndl_aue_checkpoint])
+    # Add Config
+    if method_cfg.cfg_arg and target_cfg_flag:
+        # Get value from args (e.g. args.bndl_aue_cfg)
+        arg_name = method_cfg.cfg_arg.lstrip("-").replace("-", "_")
+        if hasattr(args, arg_name):
+            val = getattr(args, arg_name)
+            # For SAM_FT, fallback to sam2_cfg if sam_ft_cfg is not set
+            if method == "SAM_FT" and not val:
+                val = args.sam2_cfg
 
-    # BNDL (pure)配置
-    if method == "BNDL":
-        cmd.extend(["--bndl_cfg", args.bndl_cfg])
-        cmd.extend(["--bndl_checkpoint", args.bndl_checkpoint])
+            if val:
+                cmd.extend([target_cfg_flag, val])
 
-    # UR-ERN配置
-    if method == "UR-ERN":
-        cmd.extend(["--ur_ern_cfg", args.ur_ern_cfg])
-        cmd.extend(["--ur_ern_checkpoint", args.ur_ern_checkpoint])
+    # Add Checkpoint
+    if method_cfg.ckpt_arg and target_ckpt_flag:
+        arg_name = method_cfg.ckpt_arg.lstrip("-").replace("-", "_")
+        if hasattr(args, arg_name):
+            val = getattr(args, arg_name)
+            # For SAM_FT, do not fallback for validation? Original code implies it uses its own.
+            if val:
+                cmd.extend([target_ckpt_flag, val])
 
-    # 评估参数
+    # --- Common Evaluation Parameters ---
     cmd.extend(
         [
             "--score_thresh",
@@ -308,52 +286,44 @@ def build_task_command(
         ]
     )
 
-    # 可选参数
-    # zs.py uses --process_full_video (opposite logic of first_frame_only)
-    if not args.first_frame_only:
+    # Optional parameters
+    if args.full_video:
         cmd.append("--process_full_video")
-
     if args.video_limit:
         cmd.extend(["--video_limit", str(args.video_limit)])
-
     if args.num_workers:
         cmd.extend(["--num_workers", str(args.num_workers)])
+    if hasattr(args, "downsample_max_samples"):
+        cmd.extend(["--downsample_max_samples", str(args.downsample_max_samples)])
+    if hasattr(args, "no_save_masks") and args.no_save_masks:
+        cmd.append("--no_save_masks")
 
-    # UCTTA特定参数
+    # --- Method-Specific Parameters (using registry extras) ---
+    # Convert registry extra_args to CLI arguments if they exist in args object
+    # This simplifies UCTTA and other method-specific params
+
+    # UCTTA specific (some are not in registry extras but hardcoded in original)
     if method == "UCTTA":
-        cmd.extend(
-            [
-                "--uctta_steps",
-                str(args.uctta_steps),
-                "--uctta_lr",
-                str(args.uctta_lr),
-            ]
-        )
+        cmd.extend(["--uctta_steps", str(args.uctta_steps)])
+        cmd.extend(["--uctta_lr", str(args.uctta_lr)])
         if args.uctta_enable_bn:
             cmd.append("--uctta_enable_bn")
 
-    # AUE版本后缀（用于BNDL_AUE方法）
+    # AUE Version for BNDL_AUE
     if method == "BNDL_AUE" and hasattr(args, "bndl_aue_version"):
         cmd.extend(["--aue_version", args.bndl_aue_version])
 
-    # BNDL/BNDL_AUE/UR-ERN特定参数
-    if method in ["BNDL", "BNDL_AUE", "UR-ERN"] and args.collect_bndl_stats:
+    # Statistics & Visualization
+    # Applied to relevant methods
+    methods_supporting_stats = ["BNDL", "BNDL_AUE", "UR-ERN"]
+    if method in methods_supporting_stats and args.collect_bndl_stats:
         cmd.append("--collect_bndl_stats")
 
-    # 可视化输出（SAM 和 BNDL_AUE 均支持，用于论文对比）
-    if method in ["SAM", "SAM_FT", "BNDL_AUE"] and hasattr(args, "save_vis") and args.save_vis:
+    methods_supporting_vis = ["SAM", "SAM_FT", "BNDL_AUE"]
+    if method in methods_supporting_vis and hasattr(args, "save_vis") and args.save_vis:
         cmd.append("--save_vis")
-        # Paper figure generation options
         if hasattr(args, "max_vis_per_video"):
             cmd.extend(["--max_vis_per_video", str(args.max_vis_per_video)])
-
-    # 降采样参数（所有方法）
-    if hasattr(args, "downsample_max_samples"):
-        cmd.extend(["--downsample_max_samples", str(args.downsample_max_samples)])
-
-    # Optional mask saving optimization
-    if hasattr(args, "no_save_masks") and args.no_save_masks:
-        cmd.append("--no_save_masks")
 
     return cmd
 
@@ -1434,7 +1404,8 @@ def main():
     parser.add_argument("--click_protocol", default="3click", choices=["1click", "3click", "5click"])
     parser.add_argument("--max_objects", type=int, default=256)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--first_frame_only", action="store_true", help="只评估第一帧（快速模式）")
+    # 默认只评估第一帧（first_frame_only=True），传递 --full_video 则评估完整视频
+    parser.add_argument("--full_video", action="store_true", help="评估完整视频（默认只评估第一帧）")
     parser.add_argument("--video_limit", type=int, default=1000)
     parser.add_argument("--num_workers", type=int, default=2)
 
@@ -1509,7 +1480,7 @@ def main():
     print(f"\n总任务数: {len(args.datasets)} × {len(args.methods)} = {len(args.datasets) * len(args.methods)}")
     print(f"可用GPU: {len(args.gpu_ids)} ({args.gpu_ids})")
     print(f"输出目录: {args.output_path}")
-    print(f"模式: {'仅第一帧' if args.first_frame_only else '完整视频'}")
+    print(f"模式: {'完整视频' if args.full_video else '仅第一帧'}")
     print(f"智能续跑: {'启用 - 将跳过已完成任务' if args.reuse_cached else '禁用 - 将运行所有任务'}")
     print(f"可视化: {'跳过 - 仅生成CSV汇总' if args.skip_plots else '启用 - 将生成所有图表'}")
     print("=" * 80 + "\n")

@@ -116,6 +116,9 @@ model:
   # === BNDL_CONFIG_START ===
   # BNDL (always uses hyper_in only mode)
   use_bndl_for_pixels: true
+  sam_mask_decoder_extra_args:
+    bndl_factor_z: 0.0
+    bndl_factor_w: 0.0
   # === BNDL_CONFIG_END ===
   # Compilation flag
   # compile_image_encoder: False

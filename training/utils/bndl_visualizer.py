@@ -85,7 +85,14 @@ class BNDLVisualizer:
         k_eff_np = None
 
         wei_lambda = bndl_outputs.get("wei_lambda")
-        kappa = bndl_outputs.get("kappa")  # Now returns kappa directly, not inv_k
+        kappa = bndl_outputs.get("kappa")
+        if wei_lambda is None and bndl_outputs.get("wei_lambda_pos") is not None:
+            wei_lambda = bndl_outputs["wei_lambda_pos"]
+            if bndl_outputs.get("wei_lambda_neg") is not None:
+                wei_lambda = wei_lambda + bndl_outputs["wei_lambda_neg"]
+            kappa = bndl_outputs.get("kappa_pos")
+            if kappa is not None and bndl_outputs.get("kappa_neg") is not None:
+                kappa = 0.5 * (kappa + bndl_outputs["kappa_neg"])
         out_w = bndl_outputs.get("out_w")
         logits = bndl_outputs.get("masks_bndl_raw") if bndl_outputs.get("masks_bndl_raw") is not None else bndl_outputs.get("mean_pixel_logits")
 
@@ -296,9 +303,20 @@ class BNDLVisualizer:
     def plot_global_parameters_in_layout(self, axes, bndl_outputs: dict[str, Any], step_index: int) -> None:
         """在统一布局中绘制全局权重参数"""
         try:
-            lambda_w = bndl_outputs["wei_lambda_w"].detach().cpu().numpy()
-            # kappa_w is now returned directly (not inv_k_w)
-            k_w = bndl_outputs["kappa_w"].detach().cpu().numpy()
+            lambda_w = bndl_outputs.get("wei_lambda_w")
+            k_w = bndl_outputs.get("kappa_w")
+            if lambda_w is None and bndl_outputs.get("wei_lambda_w_pos") is not None:
+                lambda_w = bndl_outputs["wei_lambda_w_pos"]
+                if bndl_outputs.get("wei_lambda_w_neg") is not None:
+                    lambda_w = lambda_w + bndl_outputs["wei_lambda_w_neg"]
+                k_w = bndl_outputs.get("kappa_w_pos")
+                if k_w is not None and bndl_outputs.get("kappa_w_neg") is not None:
+                    k_w = 0.5 * (k_w + bndl_outputs["kappa_w_neg"])
+
+            if lambda_w is None or k_w is None:
+                return
+            lambda_w = lambda_w.detach().cpu().numpy()
+            k_w = k_w.detach().cpu().numpy()
             out_w = bndl_outputs.get("out_w")
             if out_w is not None and hasattr(out_w, "detach"):
                 out_w = out_w.detach().cpu().numpy()

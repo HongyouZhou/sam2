@@ -60,6 +60,7 @@ class SAM2Train(SAM2Base):
         # of all frames at once. This avoids backbone OOM errors on very long videos in evaluation, but could be slightly slower.
         forward_backbone_per_frame_for_eval=False,
         freeze_image_encoder=False,
+        freeze_image_encoder_epochs: int = 0,
         unfreeze_image_encoder_components=[],
         **kwargs,
     ):
@@ -93,7 +94,22 @@ class SAM2Train(SAM2Base):
         # A random number generator with a fixed initial seed across GPUs
         self.rng = np.random.default_rng(seed=42)
 
+        self.freeze_image_encoder_epochs = int(freeze_image_encoder_epochs or 0)
+        self._backbone_freeze_active = None
+        if self.freeze_image_encoder_epochs > 0 and getattr(self, "use_lora", False):
+            logging.warning(
+                "freeze_image_encoder_epochs is set but use_lora=True; "
+                "epoch-based freezing will be ignored to avoid freezing LoRA params."
+            )
+            self.freeze_image_encoder_epochs = 0
+
         if freeze_image_encoder:
+            if self.freeze_image_encoder_epochs > 0:
+                logging.warning(
+                    "freeze_image_encoder_epochs is set but freeze_image_encoder=True; "
+                    "epoch-based freezing will be ignored."
+                )
+                self.freeze_image_encoder_epochs = 0
             if hasattr(self, "use_lora") and self.use_lora:
                 # 1. Strict Freezing Strategy (FS-SAM2 style)
                 # PEFT handles the internal freezing of the base modules (image/memory encoders/attention).
@@ -170,6 +186,29 @@ class SAM2Train(SAM2Base):
                     return self.image_encoder
 
                 self.image_encoder.train = custom_train
+
+    def apply_backbone_freeze(self, epoch: int) -> None:
+        """Freeze image encoder for the first N epochs, then unfreeze."""
+        if self.freeze_image_encoder_epochs <= 0:
+            return
+
+        should_freeze = epoch < self.freeze_image_encoder_epochs
+        if self._backbone_freeze_active == should_freeze:
+            return
+
+        self._backbone_freeze_active = should_freeze
+        for param in self.image_encoder.parameters():
+            param.requires_grad = not should_freeze
+
+        if should_freeze:
+            self.image_encoder.eval()
+            logging.info(
+                f"Image encoder frozen for epoch {epoch} "
+                f"(unfreeze at epoch {self.freeze_image_encoder_epochs})."
+            )
+        else:
+            self.image_encoder.train()
+            logging.info(f"Image encoder unfrozen at epoch {epoch}.")
 
     def forward(self, input: BatchedVideoDatapoint):
         if self.training or not self.forward_backbone_per_frame_for_eval:

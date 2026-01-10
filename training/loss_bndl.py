@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from training.trainer import CORE_LOSS_KEY
 
@@ -24,12 +25,80 @@ def _connected_zero(*refs: torch.Tensor, device: torch.device | None = None) -> 
     return total * 0.0
 
 
+def _uncertainty_regularization(
+    inv_k: torch.Tensor,
+    pixel_logits: torch.Tensor,
+    pixel_gt: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """UR-style uncertainty regularization for BNDL.
+
+    Follows UR-ERN idea: ensure gradients exist in high uncertainty regions.
+
+    Args:
+        inv_k: [B, H, W, 1] - 1/kappa, larger = higher uncertainty
+        pixel_logits: [B, H, W, K] - mask predictions (K=4 for multimask)
+        pixel_gt: [B, 1, H_gt, W_gt] - ground truth mask in BCHW format
+        eps: numerical stability
+
+    Returns:
+        Scalar loss encouraging learning from high-uncertainty mistakes
+    """
+    # Compute prediction error
+    pred_prob = pixel_logits.sigmoid()  # [B, H, W, K]
+    B, H, W, K = pred_prob.shape
+
+    # Handle GT shape: convert from BCHW to BHW format first
+    if pixel_gt.ndim == 4:
+        # [B, C, H_gt, W_gt] -> [B, H_gt, W_gt]
+        pixel_gt = pixel_gt.squeeze(1)  # Remove channel dim
+
+    # Resize GT to match prediction resolution if needed
+    if pixel_gt.shape[-2:] != (H, W):
+        pixel_gt = F.interpolate(
+            pixel_gt.unsqueeze(1).float(),  # [B, 1, H_gt, W_gt]
+            size=(H, W),
+            mode="nearest",
+        ).squeeze(1)  # [B, H, W]
+
+    # Expand GT to match K masks: [B, H, W] -> [B, H, W, K]
+    pixel_gt = pixel_gt.unsqueeze(-1).expand(-1, -1, -1, K)  # [B, H, W, K]
+
+    pred_error = (pred_prob - pixel_gt.float()).abs()  # [B, H, W, K]
+
+    # inv_k is [B, H, W, 1], expand to match pred_error
+    uncertainty = inv_k.expand_as(pred_error)  # 1/kappa = high uncertainty
+
+    # UR loss: log(1 + uncertainty) * error
+    # When uncertainty is high AND error is high, loss is large
+    # This ensures gradients flow even in high-uncertainty regions
+    ur_loss = torch.log1p(uncertainty + eps) * pred_error
+
+    return ur_loss.mean()
+
+
 class BNDLLoss(nn.Module):
-    def __init__(self, kl_weight=1e-6, use_global_w_kl: bool = True, use_hyper_w_kl: bool = True):
+    def __init__(
+        self,
+        kl_weight=1e-6,
+        kl_weight_x: float | None = None,
+        kl_weight_w: float | None = None,
+        use_global_w_kl: bool = True,
+        use_hyper_w_kl: bool = True,
+        prior_gamma_shape: float = 1.0,
+        prior_gamma_scale: float = 1.0,
+        # UR-style regularization
+        ur_weight: float = 0.0,  # 0 = disabled by default
+    ):
         super().__init__()
         self.kl_weight = kl_weight
+        self.kl_weight_x = kl_weight_x
+        self.kl_weight_w = kl_weight_w
         self.use_global_w_kl = use_global_w_kl
         self.use_hyper_w_kl = use_hyper_w_kl
+        self.prior_gamma_shape = prior_gamma_shape
+        self.prior_gamma_scale = prior_gamma_scale
+        self.ur_weight = ur_weight
 
     def forward(self, outs_batch: list[dict], targets_batch: torch.Tensor):
         """
@@ -41,16 +110,9 @@ class BNDLLoss(nn.Module):
         # Get device and initialize all accumulators as tensors to preserve gradients
         device = targets_batch.device if targets_batch is not None else torch.device("cpu")
 
-        total_loss = torch.zeros((), device=device)
+        total_kl_loss = torch.zeros((), device=device)
+        total_ur_loss = torch.zeros((), device=device)
         valid_samples = 0
-
-        # Initialize accumulators for individual part losses (as tensors)
-        total_part1_x = torch.zeros((), device=device)
-        total_part2_x = torch.zeros((), device=device)
-        total_part3_x = torch.zeros((), device=device)
-        total_part1_w = torch.zeros((), device=device)
-        total_part2_w = torch.zeros((), device=device)
-        total_part3_w = torch.zeros((), device=device)
 
         zero_ref: torch.Tensor | None = None
 
@@ -66,83 +128,57 @@ class BNDLLoss(nn.Module):
                 continue
 
             # Initialize step accumulators as tensors
-            step_loss = torch.zeros((), device=device)
+            step_kl_loss = torch.zeros((), device=device)
+            step_ur_loss = torch.zeros((), device=device)
             valid_steps = 0
-
-            # Initialize step accumulators for individual part losses (as tensors)
-            step_part1_x = torch.zeros((), device=device)
-            step_part2_x = torch.zeros((), device=device)
-            step_part3_x = torch.zeros((), device=device)
-            step_part1_w = torch.zeros((), device=device)
-            step_part2_w = torch.zeros((), device=device)
-            step_part3_w = torch.zeros((), device=device)
 
             for step_idx, bndl_outputs in enumerate(bndl_outputs_list):
                 if bndl_outputs is not None:
                     if zero_ref is None and isinstance(bndl_outputs, dict):
-                        zero_ref = bndl_outputs.get("wei_lambda")
-                    kl_loss, part_losses = self._compute_kl_loss(bndl_outputs)
+                        if "wei_lambda_pos" in bndl_outputs:
+                            zero_ref = bndl_outputs.get("wei_lambda_pos")
+                        else:
+                            zero_ref = bndl_outputs.get("wei_lambda")
 
-                    loss = kl_loss
+                    # KL loss
+                    kl_loss = self._compute_kl_loss(bndl_outputs)
+                    step_kl_loss = step_kl_loss + kl_loss
 
-                    # Use tensor addition to preserve gradients
-                    step_loss = step_loss + loss
+                    # UR loss (if enabled and data available)
+                    if self.ur_weight > 0:
+                        inv_k = bndl_outputs.get("inv_k")
+                        pixel_logits = bndl_outputs.get("pixel_logits")
+                        pixel_gt = bndl_outputs.get("pixel_gt")
 
-                    # Accumulate individual part losses
-                    step_part1_x = step_part1_x + part_losses["part1_x"]
-                    step_part2_x = step_part2_x + part_losses["part2_x"]
-                    step_part3_x = step_part3_x + part_losses["part3_x"]
-                    step_part1_w = step_part1_w + part_losses["part1_w"]
-                    step_part2_w = step_part2_w + part_losses["part2_w"]
-                    step_part3_w = step_part3_w + part_losses["part3_w"]
+                        if inv_k is not None and pixel_logits is not None and pixel_gt is not None:
+                            ur_loss = _uncertainty_regularization(inv_k, pixel_logits, pixel_gt)
+                            step_ur_loss = step_ur_loss + ur_loss
 
                     valid_steps += 1
 
             if valid_steps > 0:
-                avg_step_loss = step_loss / valid_steps
+                avg_step_kl = step_kl_loss / valid_steps
+                avg_step_ur = step_ur_loss / valid_steps
 
-                # Use tensor addition to preserve gradients
-                total_loss = total_loss + avg_step_loss
-
-                # Accumulate averaged step part losses
-                total_part1_x = total_part1_x + (step_part1_x / valid_steps)
-                total_part2_x = total_part2_x + (step_part2_x / valid_steps)
-                total_part3_x = total_part3_x + (step_part3_x / valid_steps)
-                total_part1_w = total_part1_w + (step_part1_w / valid_steps)
-                total_part2_w = total_part2_w + (step_part2_w / valid_steps)
-                total_part3_w = total_part3_w + (step_part3_w / valid_steps)
+                total_kl_loss = total_kl_loss + avg_step_kl
+                total_ur_loss = total_ur_loss + avg_step_ur
 
                 valid_samples += 1
 
         if valid_samples > 0:
-            core_loss = total_loss / valid_samples
-
-            # Average the accumulated part losses
-            avg_part1_x = total_part1_x / valid_samples
-            avg_part2_x = total_part2_x / valid_samples
-            avg_part3_x = total_part3_x / valid_samples
-            avg_part1_w = total_part1_w / valid_samples
-            avg_part2_w = total_part2_w / valid_samples
-            avg_part3_w = total_part3_w / valid_samples
+            kl_loss = total_kl_loss / valid_samples
+            ur_loss = total_ur_loss / valid_samples
         else:
-            core_loss = _connected_zero(zero_ref, device=device)
-            avg_part1_x = core_loss
-            avg_part2_x = core_loss
-            avg_part3_x = core_loss
-            avg_part1_w = core_loss
-            avg_part2_w = core_loss
-            avg_part3_w = core_loss
+            kl_loss = _connected_zero(zero_ref, device=device)
+            ur_loss = torch.zeros((), device=device)
+
+        # Combine losses
+        core_loss = kl_loss + self.ur_weight * ur_loss
 
         return {
             CORE_LOSS_KEY: core_loss,
-            "kl_divergence": core_loss,
-            # Individual part losses (absolute values for logging)
-            "part1_x_abs": avg_part1_x.abs(),
-            "part2_x_abs": avg_part2_x.abs(),
-            "part3_x_abs": avg_part3_x.abs(),
-            "part1_w_abs": avg_part1_w.abs(),
-            "part2_w_abs": avg_part2_w.abs(),
-            "part3_w_abs": avg_part3_w.abs(),
+            "kl_divergence": kl_loss,
+            "ur_loss": ur_loss,
         }
 
     @staticmethod
@@ -161,87 +197,79 @@ class BNDLLoss(nn.Module):
         part2 = -Gam_scale * Wei_scale * torch.exp(torch.lgamma(1 + Wei_shape_res))
         part3 = eulergamma.to(Wei_scale.device) + 1 + Gam_shape * log_max(Gam_scale) - torch.lgamma(Gam_shape)
 
-        # TODO: 打印 part1, part2, part3 的值
         KL = part1 + part2 + part3
 
         # Simple NaN check - return 0 if computation failed
         if torch.any(torch.isnan(KL)) or torch.any(torch.isinf(KL)):
-            zero = _connected_zero(Wei_shape_res, Wei_scale, device=KL.device)
-            return (zero, zero, zero, zero)
+            return _connected_zero(Wei_shape_res, Wei_scale, device=KL.device)
 
-        # Handle different tensor shapes (global vs batch parameters)
-        try:
-            # Try to flatten and take mean
-            if KL.dim() > 0:
-                kl_mean = -torch.clamp(KL.view(-1).mean(), min=-1000, max=1000)
-                part1_mean = torch.clamp(part1.view(-1).mean(), min=-1000, max=1000)
-                part2_mean = torch.clamp(part2.view(-1).mean(), min=-1000, max=1000)
-                part3_mean = torch.clamp(part3.view(-1).mean(), min=-1000, max=1000)
-            else:
-                # Scalar tensor
-                kl_mean = -torch.clamp(KL, min=-1000, max=1000)
-                part1_mean = torch.clamp(part1, min=-1000, max=1000)
-                part2_mean = torch.clamp(part2, min=-1000, max=1000)
-                part3_mean = torch.clamp(part3, min=-1000, max=1000)
-        except Exception:
-            # Fallback: just take the mean without reshaping
-            kl_mean = -torch.clamp(KL.mean(), min=-1000, max=1000)
-            part1_mean = torch.clamp(part1.mean(), min=-1000, max=1000)
-            part2_mean = torch.clamp(part2.mean(), min=-1000, max=1000)
-            part3_mean = torch.clamp(part3.mean(), min=-1000, max=1000)
+        # Sum over the last dimension (feature dimension) and mean over batch/spatial
+        if KL.dim() > 0:
+            kl_mean = -torch.clamp(KL.sum(-1).mean(), min=-1000, max=1000)
+        else:
+            kl_mean = -torch.clamp(KL, min=-1000, max=1000)
 
-        return kl_mean, part1_mean, part2_mean, part3_mean
+        return kl_mean
 
     def _compute_kl_loss(self, bndl_outputs):
-        def kl_term(wei_lambda, inv_k, name=""):
+        # Use configurable prior parameters
+        gamma_shape_val = self.prior_gamma_shape
+        gamma_scale_val = self.prior_gamma_scale
+
+        def kl_term(wei_lambda, inv_k):
             # Simple input check
             if torch.any(torch.isnan(wei_lambda)) or torch.any(torch.isnan(inv_k)):
-                zero = _connected_zero(wei_lambda, inv_k, device=wei_lambda.device)
-                return (zero, zero, zero, zero)
+                return _connected_zero(wei_lambda, inv_k, device=wei_lambda.device)
 
             wei_lambda = wei_lambda.float()
             inv_k = inv_k.float()
 
-            gamma_shape = wei_lambda.new_tensor(1.0, dtype=torch.float32)
-            gamma_scale = wei_lambda.new_tensor(1.0, dtype=torch.float32)
+            gamma_shape = wei_lambda.new_tensor(gamma_shape_val, dtype=torch.float32)
+            gamma_scale = wei_lambda.new_tensor(gamma_scale_val, dtype=torch.float32)
 
-            kl_loss, part1_loss, part2_loss, part3_loss = BNDLLoss.KL_GamWei(gamma_shape, gamma_scale, inv_k, wei_lambda)
+            kl_loss = BNDLLoss.KL_GamWei(gamma_shape, gamma_scale, inv_k, wei_lambda)
 
             # Simple NaN check
             if torch.isnan(kl_loss) or torch.isinf(kl_loss):
-                zero = _connected_zero(wei_lambda, inv_k, device=kl_loss.device)
-                return (zero, zero, zero, zero)
+                return _connected_zero(wei_lambda, inv_k, device=kl_loss.device)
 
-            return kl_loss, part1_loss, part2_loss, part3_loss
+            return kl_loss
+
+        dev = None
+        for v in bndl_outputs.values():
+            if isinstance(v, torch.Tensor):
+                dev = v.device
+                break
+        if dev is None:
+            dev = torch.device("cpu")
 
         # 像素级KL散度 (Local sparsity)
-        # Note: BNDL now returns kappa directly, convert to inv_k for KL computation
-        KL_x, part1_x, part2_x, part3_x = kl_term(bndl_outputs["wei_lambda"], 1.0 / bndl_outputs["kappa"], "pixel")
+        if "wei_lambda" in bndl_outputs and "inv_k" in bndl_outputs:
+            KL_x = kl_term(bndl_outputs["wei_lambda"], bndl_outputs["inv_k"])
+        elif "wei_lambda" in bndl_outputs and "kappa" in bndl_outputs:  # Legacy fallback
+            KL_x = kl_term(bndl_outputs["wei_lambda"], 1.0 / bndl_outputs["kappa"])
+        else:
+            KL_x = torch.zeros((), device=dev)
 
         # Prompt-level KL散度 (Global sparsity via hyper_in)
-        # Initialize prompt-level terms as tensors on the right device
-        dev = bndl_outputs["wei_lambda"].device
         KL_w = torch.zeros((), device=dev)
-        part1_w = torch.zeros((), device=dev)
-        part2_w = torch.zeros((), device=dev)
-        part3_w = torch.zeros((), device=dev)
+        has_prompt_terms = False
 
-        has_prompt_terms = self.use_global_w_kl and bndl_outputs.get("wei_lambda_w") is not None and bndl_outputs.get("kappa_w") is not None
-        if has_prompt_terms:
-            # Note: BNDL now returns kappa_w directly, convert to inv_k_w for KL computation
-            KL_w, part1_w, part2_w, part3_w = kl_term(bndl_outputs["wei_lambda_w"], 1.0 / bndl_outputs["kappa_w"], "prompt_hyper_in")
+        if self.use_global_w_kl and self.use_hyper_w_kl:
+            if "wei_lambda_w" in bndl_outputs and "inv_k_w" in bndl_outputs:
+                has_prompt_terms = True
+                KL_w = kl_term(bndl_outputs["wei_lambda_w"], bndl_outputs["inv_k_w"])
+            elif "wei_lambda_w" in bndl_outputs and "kappa_w" in bndl_outputs:  # Legacy fallback
+                has_prompt_terms = True
+                KL_w = kl_term(bndl_outputs["wei_lambda_w"], 1.0 / bndl_outputs["kappa_w"])
 
         # 像素KL保持主导地位，prompt KL作为辅助正则化
-        pixel_kl_weight = self.kl_weight
-        # [Critical Fix for ZS] 提升权重以匹配主Loss量级(20.0)，强迫模型在ZS时不确定就闭嘴
-        prompt_kl_weight = self.kl_weight * 1.0 if has_prompt_terms else 0.0
-
-        # 添加自适应权重调整
+        pixel_kl_weight = self.kl_weight_x if self.kl_weight_x is not None else self.kl_weight
         if has_prompt_terms:
-            # 如果prompt KL过大，降低其权重
-            kl_ratio = (KL_w.abs() / (KL_x.abs() + 1e-8)).item()
+            prompt_kl_weight = self.kl_weight_w if self.kl_weight_w is not None else self.kl_weight
+        else:
+            prompt_kl_weight = 0.0
 
         total_loss = KL_x * pixel_kl_weight + KL_w * prompt_kl_weight
 
-        # Return both the total loss and individual part losses for logging
-        return total_loss, {"part1_x": part1_x, "part2_x": part2_x, "part3_x": part3_x, "part1_w": part1_w, "part2_w": part2_w, "part3_w": part3_w}
+        return total_loss

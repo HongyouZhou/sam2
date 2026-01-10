@@ -2,16 +2,18 @@
 
 scratch:
   resolution: 1024
-  train_batch_size: 1
+  train_batch_size: 4
   num_train_workers: 8
-  num_frames: 1  # Changed from 1 to match SAM FT 017 config (testing loss_class issue)
-  val_num_frames: 1  # Validation uses single frame (many val datasets are image-based)
+  num_frames: 1
+  val_num_frames: 1
   max_num_objects: 3
-  val_max_videos: 8
-  base_lr: 5.0e-6
-  vision_lr: 3.0e-06
+  val_max_videos: 16
+  # base_lr: 5.0e-6
+  # vision_lr: 3.0e-06
+  base_lr: 1.0e-6
+  vision_lr: 1.0e-07
   phases_per_epoch: 1
-  num_epochs: 10
+  num_epochs: 20
 
 dataset:
   # PATHS to Dataset
@@ -40,7 +42,7 @@ vos:
           # translate: [0.05, 0.05]
           image_interpolation: bilinear
           consistent_transform: True
-          # num_tentatives: 3
+          num_tentatives: 5
         - _target_: training.dataset.transforms.RandomResizeAPI
           sizes: ${scratch.resolution}
           square: true
@@ -81,7 +83,7 @@ trainer:
   _target_: training.trainer.Trainer
   mode: train
   max_epochs: ${times:${scratch.num_epochs},${scratch.phases_per_epoch}}
-  actual_max_epochs: 10
+  actual_max_epochs: 20
   val_epoch_freq: 1
   accelerator: cuda
   seed_value: 123
@@ -204,11 +206,15 @@ trainer:
     # === BNDL_CONFIG_START ===
     # BNDL (always uses hyper_in only mode)
     use_bndl_for_pixels: true
+    sam_mask_decoder_extra_args:
+      bndl_factor_z: 0.0
+      bndl_factor_w: 0.0
     # === BNDL_CONFIG_END ===
     # Compilation flag
     # Freeze image encoder to save memory
     # === IMPORTANT: Conv-LoRA Configuration ===
-    freeze_image_encoder: false  # true = PEFT (only train LoRA, ~2-3% params), false = joint fine-tuning (train all, ~33% params)
+    freeze_image_encoder: true  # true = PEFT (only train LoRA, ~2-3% params), false = joint fine-tuning (train all, ~33% params)
+    freeze_image_encoder_epochs: 20  # Freeze image encoder for first N epochs (0 = disabled)
     # Unfreeze specific components for adaptation (e.g. "neck", "trunk_last_stage")
     unfreeze_image_encoder_components: []
 
@@ -760,7 +766,7 @@ trainer:
 
     gradient_clip:
       _target_: training.optimizer.GradientClipper
-      max_norm: 2.0
+      max_norm: 0.1
       norm_type: 2
 
     param_group_modifiers:
@@ -805,8 +811,8 @@ trainer:
 
         - scheduler:
             _target_: fvcore.common.param_scheduler.CosineParamScheduler
-            start_value: 5.0e-4
-            end_value: 5.0e-5
+            start_value: 1.0e-4
+            end_value: 1.0e-5
           param_names:
             - 'sam_mask_decoder.pixel_bndl.*'
 
@@ -884,31 +890,27 @@ trainer:
         focal_alpha_obj_score: -1.0
       bndl_loss:
         _target_: training.loss_bndl.BNDLLoss
-        kl_weight: 0.1
+        kl_weight: 1e-11
+        kl_weight_x: 1e-11
+        kl_weight_w: 1e-11
+        prior_gamma_shape: 1.0
+        prior_gamma_scale: 3.0
+        ur_weight: 0.0
       aue_loss:
         _target_: training.loss_aue.AUELoss
         clean_weight: 1.0
         adv_weight: 1.0
-      # Initial weights (used as fallback if not specified in weight_schedule below)
       sam_weight: 1.0
-      bndl_weight: 1.0
+      bndl_weight: 0.1
       aue_weight: 0.0
+      # Warm-up: start without BNDL KL, then ramp up
       weight_schedule:
-        # Phase 1 (epoch 0): Quick warm-up SAM+BNDL only
-        - until_epoch: 1
-          sam_weight: 1.0
-          bndl_weight: 1.0
-          aue_weight: 0.0
-        # Phase 2 (epoch 1): Introduce AUE gradually
         - until_epoch: 2
-          sam_weight: 1.0
-          bndl_weight: 0.5
-          aue_weight: 0.05
-        # Phase 3 (epoch 2-4): Full AUE weight for sweep comparison (3 epochs observation)
+          bndl_weight: 0.0
+        - until_epoch: 4
+          bndl_weight: 0.05
         - until_epoch: null
-          sam_weight: 1.0
-          bndl_weight: 0.5
-          aue_weight: 0.1
+          bndl_weight: 0.1
     val:
       _target_: training.loss_combined.CombinedSAMBNDLLoss
       sam_loss: ${trainer.loss.all.sam_loss}
@@ -947,10 +949,10 @@ trainer:
     style_aue_visual_frequency: 100
     uncertainty_metric: ["entropy", "nll"]
     visualize_pavpu_overlay: false
-    enable_pavpu_eval: false
+    enable_pavpu_eval: true
     uncertainty_sample_num: 50
     # Pixel-level PAvPU statistics configuration
-    correlation_foreground_dilation: 4
+    correlation_foreground_dilation: 8
     correlation_per_pixel: true
     correlation_use_full_image: false
 
@@ -964,6 +966,10 @@ trainer:
       strict: False
       ignore_missing_keys: []
       ignore_unexpected_keys: []
+      checkpoint_kernels:
+        - _target_: training.utils.checkpoint_utils.CkptExcludeKernel
+          key_pattern:
+            - 'sam_mask_decoder.output_hypernetworks_mlps.*'
       state_dict:
         _target_: training.utils.checkpoint_utils.load_checkpoint_and_apply_kernels
         checkpoint_path: ${oc.env:PROJECT_HOME}/dev/ada_samp/sam2/checkpoints/sam2.1_hiera_base_plus.pt # PATH to SAM 2.1 checkpoint

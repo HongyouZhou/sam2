@@ -68,6 +68,60 @@ class BNDLOutputs:
     pixel_uncertainty: torch.Tensor | None = None  # [B, H, W]
 
 
+# Import nn for LoRA implementation
+import torch.nn as nn
+
+
+class _LoRA_qkv_hiera(nn.Module):
+    """LoRA wrapper for Hiera's MultiScaleAttention.qkv layer.
+
+    In Hiera's MultiScaleAttention:
+        self.qkv = nn.Linear(dim, dim_out * 3)
+        qkv = self.qkv(x).reshape(B, H * W, 3, self.num_heads, -1)
+        q, k, v = torch.unbind(qkv, 2)
+
+    We apply LoRA to Q and V only (not K), following SAMed's design.
+    """
+
+    def __init__(
+        self,
+        qkv: nn.Module,
+        linear_a_q: nn.Module,
+        linear_b_q: nn.Module,
+        linear_a_v: nn.Module,
+        linear_b_v: nn.Module,
+    ):
+        super().__init__()
+        self.qkv = qkv
+        self.linear_a_q = linear_a_q
+        self.linear_b_q = linear_b_q
+        self.linear_a_v = linear_a_v
+        self.linear_b_v = linear_b_v
+        self.dim_in = qkv.in_features
+        self.dim_out = qkv.out_features // 3  # dim_out for each of Q, K, V
+        # Store in_features and out_features for compatibility
+        self.in_features = qkv.in_features
+        self.out_features = qkv.out_features
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Original QKV output: [B, H, W, dim_out * 3]
+        qkv = self.qkv(x)
+
+        # LoRA additions for Q and V
+        # x shape: [B, H, W, dim_in]
+        new_q = self.linear_b_q(self.linear_a_q(x))  # [B, H, W, dim_out]
+        new_v = self.linear_b_v(self.linear_a_v(x))  # [B, H, W, dim_out]
+
+        # Add LoRA outputs to Q and V parts
+        # QKV layout: [Q, K, V] each of size dim_out
+        qkv = qkv.clone()  # Avoid in-place modification
+        qkv[..., : self.dim_out] = qkv[..., : self.dim_out] + new_q  # Q
+        qkv[..., -self.dim_out :] = qkv[..., -self.dim_out :] + new_v  # V
+        # K (middle part) remains unchanged
+
+        return qkv
+
+
 class SAM2Base(torch.nn.Module):
     def __init__(
         self,
@@ -223,54 +277,15 @@ class SAM2Base(torch.nn.Module):
         self.image_encoder = image_encoder
 
         # Apply LoRA if enabled (parameter-efficient fine-tuning)
+        # Uses SAMed-style manual LoRA: only Q and V, not K
         self.use_lora = use_lora
+        self.lora_rank = lora_rank
+        self.lora_layers: list[int] | None = None  # Will be set when LoRA is applied
+        self.lora_w_As: nn.ModuleList | None = None
+        self.lora_w_Bs: nn.ModuleList | None = None
+
         if use_lora:
-            try:
-                from peft import LoraConfig, get_peft_model
-            except ImportError:
-                raise ImportError("Please install peft: pip install peft")
-
-            # 1. Image Encoder LoRA
-            # FS-SAM2 style: r=4, targets=['qkv', 'proj'] (from config)
-            lora_config_encoder = LoraConfig(
-                r=lora_rank,
-                lora_alpha=lora_alpha,
-                lora_dropout=lora_dropout,
-                target_modules=lora_target_modules or ["qkv", "proj"],
-                bias="none",
-                inference_mode=False,
-            )
-            self.image_encoder = get_peft_model(self.image_encoder, lora_config_encoder)
-            logging.info(f"PEFT LoRA enabled for Image Encoder: rank={lora_rank}, targets={lora_target_modules}")
-            self.image_encoder.print_trainable_parameters()
-
-            # 2. Memory Attention LoRA (FS-SAM2: r=32, specific targets)
-            if memory_attention is not None:
-                lora_config_mem = LoraConfig(
-                    r=32,  # Hardcoded to match FS-SAM2
-                    lora_alpha=16,
-                    lora_dropout=0.1,
-                    target_modules=["q_proj", "v_proj", "k_proj", "out_proj"],
-                    bias="none",
-                    inference_mode=False,
-                )
-                memory_attention = get_peft_model(memory_attention, lora_config_mem)
-                logging.info(f"PEFT LoRA enabled for Memory Attention: rank=32")
-                memory_attention.print_trainable_parameters()
-
-            # 3. Memory Encoder LoRA (FS-SAM2: r=32, target='out_proj')
-            if memory_encoder is not None:
-                lora_config_mem_enc = LoraConfig(
-                    r=32,  # Hardcoded to match FS-SAM2
-                    lora_alpha=16,
-                    lora_dropout=0.1,
-                    target_modules=["out_proj"],
-                    bias="none",
-                    inference_mode=False,
-                )
-                memory_encoder = get_peft_model(memory_encoder, lora_config_mem_enc)
-                logging.info(f"PEFT LoRA enabled for Memory Encoder: rank=32")
-                memory_encoder.print_trainable_parameters()
+            self._apply_lora_to_image_encoder(lora_rank)
         # Use level 0, 1, 2 for high-res setting, or just level 2 for the default setting
         self.use_high_res_features_in_sam = use_high_res_features_in_sam
         self.num_feature_levels = 3 if use_high_res_features_in_sam else 1
@@ -461,72 +476,102 @@ class SAM2Base(torch.nn.Module):
                 dynamic=False,
             )
 
+    def _apply_lora_to_image_encoder(self, lora_rank: int) -> None:
+        """Apply SAMed-style LoRA to the Hiera image encoder.
+
+        Following SAMed's design:
+        - Only apply LoRA to Q and V projections, NOT K
+        - Freeze original weights
+        - Use kaiming_uniform_ for A, zeros_ for B
+
+        Args:
+            lora_rank: Rank of the low-rank adaptation matrices
+        """
+        import math
+
+        # Access Hiera trunk
+        trunk = self.image_encoder.trunk
+
+        # Freeze original image encoder parameters
+        for param in self.image_encoder.parameters():
+            param.requires_grad = False
+
+        # Storage for LoRA parameters
+        self.lora_w_As = nn.ModuleList()
+        self.lora_w_Bs = nn.ModuleList()
+        self.lora_layers = list(range(len(trunk.blocks)))
+
+        lora_count = 0
+        for i, blk in enumerate(trunk.blocks):
+            attn = blk.attn
+            w_qkv_linear = attn.qkv
+
+            dim_in = w_qkv_linear.in_features
+            dim_out = w_qkv_linear.out_features // 3
+
+            # Create LoRA matrices for Q
+            w_a_linear_q = nn.Linear(dim_in, lora_rank, bias=False)
+            w_b_linear_q = nn.Linear(lora_rank, dim_out, bias=False)
+
+            # Create LoRA matrices for V
+            w_a_linear_v = nn.Linear(dim_in, lora_rank, bias=False)
+            w_b_linear_v = nn.Linear(lora_rank, dim_out, bias=False)
+
+            # Initialize: A with kaiming, B with zeros
+            nn.init.kaiming_uniform_(w_a_linear_q.weight, a=math.sqrt(5))
+            nn.init.kaiming_uniform_(w_a_linear_v.weight, a=math.sqrt(5))
+            nn.init.zeros_(w_b_linear_q.weight)
+            nn.init.zeros_(w_b_linear_v.weight)
+
+            # Store in ModuleList
+            self.lora_w_As.append(w_a_linear_q)
+            self.lora_w_Bs.append(w_b_linear_q)
+            self.lora_w_As.append(w_a_linear_v)
+            self.lora_w_Bs.append(w_b_linear_v)
+
+            # Replace qkv with LoRA-wrapped version
+            attn.qkv = _LoRA_qkv_hiera(
+                w_qkv_linear,
+                w_a_linear_q,
+                w_b_linear_q,
+                w_a_linear_v,
+                w_b_linear_v,
+            )
+            lora_count += 1
+
+        # Calculate trainable parameters
+        lora_params = sum(p.numel() for p in self.lora_w_As.parameters()) + sum(p.numel() for p in self.lora_w_Bs.parameters())
+        total_params = sum(p.numel() for p in self.parameters())
+
+        logging.info(f"SAMed-style LoRA applied to {lora_count} attention layers, rank={lora_rank}")
+        logging.info(f"LoRA trainable params: {lora_params:,} | Total params: {total_params:,} | Trainable%: {100 * lora_params / total_params:.2f}%")
+
     def load_state_dict(self, state_dict: dict[str, Any], strict: bool = True):
         """
-        Override load_state_dict to handle parameter name mismatches when using LoRA.
-        When LoRA is enabled, the model structure changes (e.g., image_encoder -> image_encoder.base_model.model),
-        but the checkpoint usually contains vanilla parameter names.
+        Override load_state_dict to handle LoRA parameters.
+
+        With SAMed-style manual LoRA, no complex remapping is needed.
+        LoRA weights are stored separately with 'lora_' prefix.
         """
         if self.use_lora:
-            # Map of prefixes to check and their wrapped versions
-            # Key: prefix in state_dict (vanilla), Value: prefix in model (LoRA)
-            # We assume LoRA wraps the component such that 'component.X' becomes 'component.base_model.model.X'
+            # Load LoRA A and B matrices if present
+            lora_a_loaded = 0
+            lora_b_loaded = 0
 
-            # Identify which components are wrapped with LoRA
-            prefixes_to_map = []
+            for i, w_A in enumerate(self.lora_w_As or []):
+                key = f"lora_w_a_{i:03d}"
+                if key in state_dict:
+                    w_A.weight.data.copy_(state_dict.pop(key))
+                    lora_a_loaded += 1
 
-            # Image Encoder
-            if hasattr(self.image_encoder, "peft_config"):  # It's a PeftModel
-                prefixes_to_map.append("image_encoder")
+            for i, w_B in enumerate(self.lora_w_Bs or []):
+                key = f"lora_w_b_{i:03d}"
+                if key in state_dict:
+                    w_B.weight.data.copy_(state_dict.pop(key))
+                    lora_b_loaded += 1
 
-            # Memory Attention
-            if self.memory_attention is not None and hasattr(self.memory_attention, "peft_config"):
-                prefixes_to_map.append("memory_attention")
-
-            # Memory Encoder
-            if self.memory_encoder is not None and hasattr(self.memory_encoder, "peft_config"):
-                prefixes_to_map.append("memory_encoder")
-
-            if prefixes_to_map:
-                # Get current model keys to verify remapping
-                model_keys = set(self.state_dict().keys())
-                new_state_dict = {}
-
-                for k, v in state_dict.items():
-                    remapped = False
-                    for prefix in prefixes_to_map:
-                        if k.startswith(f"{prefix}.") and f"{prefix}.base_model.model." not in k:
-                            # Remap vanilla key to LoRA key
-                            base_key = k.replace(f"{prefix}.", f"{prefix}.base_model.model.")
-
-                            # Check if base_key exists directly
-                            if base_key in model_keys:
-                                new_state_dict[base_key] = v
-                                remapped = True
-                            else:
-                                # Try adding .base_layer before the last component (weight/bias)
-                                # e.g. ...linear.weight -> ...linear.base_layer.weight
-                                parts = base_key.rsplit(".", 1)
-                                if len(parts) == 2:
-                                    base_layer_key = f"{parts[0]}.base_layer.{parts[1]}"
-                                    if base_layer_key in model_keys:
-                                        new_state_dict[base_layer_key] = v
-                                        remapped = True
-                                    else:
-                                        # Fallback to base_key if neither found (will likely fail loading)
-                                        new_state_dict[base_key] = v
-                                        remapped = True
-                                else:
-                                    new_state_dict[base_key] = v
-                                    remapped = True
-                            break
-
-                    if not remapped:
-                        new_state_dict[k] = v
-
-                # Use the modified state dict
-                state_dict = new_state_dict
-                logging.info(f"LoRA enabled: Remapped {len(prefixes_to_map)} components in state_dict to match PeftModel structure.")
+            if lora_a_loaded > 0 or lora_b_loaded > 0:
+                logging.info(f"Loaded LoRA parameters: {lora_a_loaded} A matrices, {lora_b_loaded} B matrices")
 
         return super().load_state_dict(state_dict, strict)
 
@@ -1022,22 +1067,32 @@ class SAM2Base(torch.nn.Module):
         if pixel_feat is None:
             return None
 
-        # Extract external weights
-        external_w = None
-        if pixel_bndl_model is not None and not pixel_bndl_model.enable_global_sparse:
-            hyper_in = bndl.get("hyper_in")
-            if hyper_in is not None:
-                external_w = hyper_in
-            else:
-                B = pixel_feat.shape[0]
-                external_w = pixel_bndl_model.linear.weight.unsqueeze(0).expand(B, -1, -1)
+        # Extract mask_tokens_out for AUE's analytic uncertainty computation
+        # In training mode, this preserves gradients for bidirectional optimization
+        external_w = bndl.get("mask_tokens_out")  # [B, K, 256] - may have gradients
 
         # Compute logits if requested
         pixel_logits = None
         if compute_logits:
             pixel_logits = bndl.get("pixel_logits", bndl.get("masks_bndl_raw", None))
             if pixel_logits is None and pixel_bndl_model is not None:
-                pixel_logits, *_ = pixel_bndl_model(pixel_feat, force_sample=False, external_pre_out_w=external_w)
+                factor_z_pos = getattr(pixel_bndl_model, "default_factor_z_pos", getattr(pixel_bndl_model, "default_factor_z", 0.0))
+                factor_z_neg = getattr(pixel_bndl_model, "default_factor_z_neg", None)
+                if factor_z_neg is None:
+                    factor_z_neg = factor_z_pos
+                factor_w_pos = getattr(pixel_bndl_model, "default_factor_w_pos", getattr(pixel_bndl_model, "default_factor_w", 0.0))
+                factor_w_neg = getattr(pixel_bndl_model, "default_factor_w_neg", None)
+                if factor_w_neg is None:
+                    factor_w_neg = factor_w_pos
+                pixel_logits, *_ = pixel_bndl_model(
+                    pixel_feat,
+                    force_sample=False,
+                    external_pre_out_w=external_w,
+                    factor_z=factor_z_pos,
+                    factor_z_neg=factor_z_neg,
+                    factor_w=factor_w_pos,
+                    factor_w_neg=factor_w_neg,
+                )
 
         # Compute uncertainty if requested
         pixel_uncertainty = None
@@ -2337,13 +2392,13 @@ class SAM2Base(torch.nn.Module):
             aux_outputs = aux_outputs or {}
             bndl_outputs = aux_outputs.get("bndl", {})
             pixel_feat = bndl_outputs.get("pixel_feat_grad", bndl_outputs.get("pixel_feat", None))
-            # Also expose selected channel's hyper_in for single-channel UQ without revealing indices
-            if "hyper_in" in bndl_outputs and bndl_outputs["hyper_in"] is not None:
-                hyper_in_full = bndl_outputs["hyper_in"]  # [B, K, C'] (detached)
-                if isinstance(hyper_in_full, torch.Tensor) and hyper_in_full.ndim == 3:
-                    batch_inds = torch.arange(hyper_in_full.size(0), device=device)
-                    hyper_in_selected = hyper_in_full[batch_inds, selected_mask_index]  # [B, C']
-                    bndl_outputs["hyper_in_selected"] = hyper_in_selected.detach()
+            # Also expose selected channel's mask_tokens_out for single-channel UQ without revealing indices
+            if "mask_tokens_out" in bndl_outputs and bndl_outputs["mask_tokens_out"] is not None:
+                mask_tokens_out_full = bndl_outputs["mask_tokens_out"]  # [B, K, C'] (detached)
+                if isinstance(mask_tokens_out_full, torch.Tensor) and mask_tokens_out_full.ndim == 3:
+                    batch_inds = torch.arange(mask_tokens_out_full.size(0), device=device)
+                    mask_tokens_out_selected = mask_tokens_out_full[batch_inds, selected_mask_index]  # [B, C']
+                    bndl_outputs["mask_tokens_out_selected"] = mask_tokens_out_selected.detach()
             # Optional per-frame uncertainty for AUE
             pixel_uncertainty = bndl_outputs.get("pixel_uncertainty", None)
 

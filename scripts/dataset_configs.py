@@ -11,14 +11,14 @@ DATASET_CONFIGS = {
     "TrashCan": {
         "root": "/ssdArray/hongyou/dev/data/sam2_data/TrashCan_SAM2/",
         "splits": ["train", "val"],
-        "default_split": ["val"],
+        "default_split": ["train"],
         "has_split_subdir": True,
         "skip_first_and_last": False,
     },
     "GTEA": {
         "root": "/ssdArray/hongyou/dev/data/sam2_data/GTEA_SAM2/",
         "splits": ["train", "val"],
-        "default_split": ["val"],
+        "default_split": ["train"],
         "has_split_subdir": True,
         "skip_first_and_last": False,
     },
@@ -45,7 +45,7 @@ DATASET_CONFIGS = {
     },
     "DRAM": {
         "root": "/ssdArray/hongyou/dev/data/sam2_data/DRAM_SAM2/",
-        "splits": ["train", "test"],
+        "splits": ["train", "test", "val"],
         "default_split": ["test"],
         "has_split_subdir": True,
         "skip_first_and_last": False,
@@ -67,7 +67,7 @@ DATASET_CONFIGS = {
     "NDISPark": {
         "root": "/ssdArray/hongyou/dev/data/sam2_data/NDISPark_SAM2/",
         "splits": ["train", "validation"],
-        "default_split": ["validation"],
+        "default_split": ["train", "validation"],
         "has_split_subdir": True,
         "skip_first_and_last": False,
     },

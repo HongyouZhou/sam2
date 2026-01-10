@@ -56,13 +56,10 @@ def generate_click_prompts(
         neg_xy = None
 
     if click_protocol == "3click":
-        # 3-click: positive, negative (if available), error-based
-        if neg_xy is not None:
-            pts = np.array([[cx, cy], [int(neg_xy[0]), int(neg_xy[1])]], dtype=np.float32)
-            lbl = np.array([1, 0], dtype=np.int32)
-        else:
-            pts = np.array([[cx, cy]], dtype=np.float32)
-            lbl = np.array([1], dtype=np.int32)
+        # 3-click (SAM standard): positive, error-based, error-based
+        # First click: positive point in GT
+        pts = np.array([[cx, cy]], dtype=np.float32)
+        lbl = np.array([1], dtype=np.int32)
         _, obj_ids_after, masks = predictor.add_new_points_or_box(
             state,
             frame_idx=frame_idx,
@@ -70,7 +67,7 @@ def generate_click_prompts(
             points=pts,
             labels=lbl,
         )
-        
+
         # DEBUG: Check mask quality after first click
         cur_idx = obj_ids_after.index(obj_id)
         mask_logits_check = masks[cur_idx, 0] if masks.dim() == 4 else (masks[0] if masks.dim() == 3 else masks.squeeze())
@@ -78,37 +75,30 @@ def generate_click_prompts(
         if fg_ratio > 0.9:
             print(f"⚠️ [CLICK1 ANOMALY] obj={obj_id}, fg_ratio={fg_ratio:.4f}")
             print(f"   logits: min={mask_logits_check.min().item():.2f}, max={mask_logits_check.max().item():.2f}")
-        
-        used_pts.extend([(cx, cy)])
-        used_labels.extend([1])
-        if neg_xy is not None:
-            used_pts.append((int(neg_xy[0]), int(neg_xy[1])))
-            used_labels.append(0)
 
-        # Error-based third click
-        cur_idx = obj_ids_after.index(obj_id)
-        mask_logits_2d = masks[cur_idx, 0] if masks.dim() == 4 else (masks[0] if masks.dim() == 3 else masks.squeeze())
-        if tuple(mask_logits_2d.shape[-2:]) != gt_bool.shape:
-            h, w = gt_bool.shape
-            mask_logits_2d = F.interpolate(
-                mask_logits_2d.unsqueeze(0).unsqueeze(0),
-                size=(h, w),
-                mode="bilinear",
-                align_corners=False
-            )[0, 0]
-        pred_bool = (mask_logits_2d > score_thresh).detach().cpu().numpy().astype(bool)
-        nx, ny_label = sample_error_click(gt_bool, pred_bool)
-        nx_pt = (int(nx[0]), int(nx[1]))
-        used_pts.append(nx_pt)
-        used_labels.append(int(ny_label))
-        predictor.add_new_points_or_box(
-            state,
-            frame_idx=frame_idx,
-            obj_id=obj_id,
-            points=np.array([nx_pt], dtype=np.float32),
-            labels=np.array([int(ny_label)], dtype=np.int32),
-            clear_old_points=False,
-        )
+        used_pts.append((cx, cy))
+        used_labels.append(1)
+
+        # Second and third clicks: error-based (following SAM standard)
+        for _ in range(2):
+            cur_idx = obj_ids_after.index(obj_id)
+            mask_logits_2d = masks[cur_idx, 0] if masks.dim() == 4 else (masks[0] if masks.dim() == 3 else masks.squeeze())
+            if tuple(mask_logits_2d.shape[-2:]) != gt_bool.shape:
+                h, w = gt_bool.shape
+                mask_logits_2d = F.interpolate(mask_logits_2d.unsqueeze(0).unsqueeze(0), size=(h, w), mode="bilinear", align_corners=False)[0, 0]
+            pred_bool = (mask_logits_2d > score_thresh).detach().cpu().numpy().astype(bool)
+            nx, ny_label = sample_error_click(gt_bool, pred_bool)
+            nx_pt = (int(nx[0]), int(nx[1]))
+            used_pts.append(nx_pt)
+            used_labels.append(int(ny_label))
+            _, obj_ids_after, masks = predictor.add_new_points_or_box(
+                state,
+                frame_idx=frame_idx,
+                obj_id=obj_id,
+                points=np.array([nx_pt], dtype=np.float32),
+                labels=np.array([int(ny_label)], dtype=np.int32),
+                clear_old_points=False,
+            )
         return used_pts, used_labels
 
     # 1click / 5click: start with positive, then iterative error-based
@@ -127,21 +117,16 @@ def generate_click_prompts(
         mask_logits_2d = masks[cur_idx, 0] if masks.dim() == 4 else (masks[0] if masks.dim() == 3 else masks.squeeze())
         if tuple(mask_logits_2d.shape[-2:]) != gt_bool.shape:
             h, w = gt_bool.shape
-            mask_logits_2d = F.interpolate(
-                mask_logits_2d.unsqueeze(0).unsqueeze(0),
-                size=(h, w),
-                mode="bilinear",
-                align_corners=False
-            )[0, 0]
+            mask_logits_2d = F.interpolate(mask_logits_2d.unsqueeze(0).unsqueeze(0), size=(h, w), mode="bilinear", align_corners=False)[0, 0]
         pred_bool = (mask_logits_2d > score_thresh).detach().cpu().numpy().astype(bool)
         nx, ny_label = sample_error_click(gt_bool, pred_bool)
         nx_pt = (int(nx[0]), int(nx[1]))
-        
+
         # Enforce minimum distance constraint
         if min_click_dist > 0 and any(_euclidean_distance(nx_pt, p) < float(min_click_dist) for p in used_pts):
             ys, xs = np.where(gt_bool if ny_label == 1 else (~gt_bool & pred_bool))
             nx_pt = (int(xs.mean()) if xs.size else 0, int(ys.mean()) if ys.size else 0)
-        
+
         used_pts.append(nx_pt)
         used_labels.append(int(ny_label))
         _, obj_ids_after, masks = predictor.add_new_points_or_box(
@@ -154,4 +139,3 @@ def generate_click_prompts(
         )
 
     return used_pts, used_labels
-

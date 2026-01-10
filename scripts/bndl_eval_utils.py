@@ -22,9 +22,10 @@ from PIL import Image
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", "training", "utils"))
 
 # from BNDL.BNDL_upload.ViT_Sparse.utils.bndl import (
-#     pixel_uncertain_sampling,
-#     # pixel_entropy_uncertainty, # We will implement an optimized version
+#     uncertainty_sample_parallel,  # Renamed from pixel_uncertain_sampling
+#     entropy_uncertainty,  # Renamed from pixel_entropy_uncertainty
 # )
+# Note: We implement our own version below for compatibility
 from training.utils.dataset_evaluator import DistributedDatasetEvaluator
 from tools.vos_inference import DAVIS_PALETTE, save_masks_to_dir
 
@@ -81,12 +82,17 @@ def extract_pixel_features(bndl_outputs):
         return None
 
 
-def extract_hyper_in_from_bndl_outputs(bndl_outputs, batch, mask_decoder):
-    """Extract hyper_in (external_pre_out_w) from BNDL outputs or regenerate it."""
-    try:
-        if "hyper_in" in bndl_outputs and bndl_outputs["hyper_in"] is not None:
-            return bndl_outputs["hyper_in"]
+def extract_mask_tokens_from_bndl_outputs(bndl_outputs, batch, mask_decoder):
+    """Extract mask_tokens_out from BNDL outputs.
 
+    Since BNDL now directly uses mask_tokens_out (256-dim) via internal linear_add_w projection,
+    we simply return the stored mask_tokens_out from aux_outputs.
+    """
+    try:
+        if "mask_tokens_out" in bndl_outputs and bndl_outputs["mask_tokens_out"] is not None:
+            return bndl_outputs["mask_tokens_out"]
+
+        # Fallback: try to get from mask_decoder's learned embeddings
         upscaled_shape = bndl_outputs.get("upscaled_shape")
         if upscaled_shape is None:
             return None
@@ -94,45 +100,51 @@ def extract_hyper_in_from_bndl_outputs(bndl_outputs, batch, mask_decoder):
         b, c, h, w = upscaled_shape
         num_mask_tokens = mask_decoder.num_mask_tokens
 
-        if hasattr(mask_decoder, "output_hypernetworks_mlps"):
-            try:
-                mask_tokens_out = bndl_outputs.get("mask_tokens_out")
-                if mask_tokens_out is None:
-                    # Fallback
-                    mask_tokens_out = mask_decoder.mask_tokens.weight.unsqueeze(0).expand(b, -1, -1)
+        if hasattr(mask_decoder, "mask_tokens"):
+            # Use learned mask token embeddings as fallback
+            mask_tokens_out = mask_decoder.mask_tokens.weight.unsqueeze(0).expand(b, -1, -1)
+            return mask_tokens_out
 
-                hyper_in_list = []
-                for i in range(num_mask_tokens):
-                    hyper_out = mask_decoder.output_hypernetworks_mlps[i](mask_tokens_out[:, i, :])
-                    hyper_in_list.append(hyper_out)
-
-                hyper_in = torch.stack(hyper_in_list, dim=1)
-                return hyper_in
-
-            except Exception as e:
-                logger.warning(f"Failed to regenerate hyper_in: {e}")
-                return None
-        else:
-            return None
+        return None
 
     except Exception as e:
-        logger.warning(f"Failed to extract hyper_in from BNDL outputs: {e}")
+        logger.warning(f"Failed to extract mask_tokens_out from BNDL outputs: {e}")
         return None
 
 
 def pixel_uncertain_sampling(pixel_bndl_model, pixel_feat, external_pre_out_w=None, sample_num=20):
     """
     Optimized sampling that computes both uncertainty (p-value) and entropy in one pass.
-    Avoids redundant forward passes and loops.
+    Updated to work with refactored BNDL that uses mask_tokens_out instead of hyper_in.
 
-    Replaces the original BNDL implementation with a more efficient version.
+    Args:
+        pixel_bndl_model: BNDL model
+        pixel_feat: [B, H, W, C] pixel features
+        external_pre_out_w: [B, K, 256] mask_tokens_out (256-dim)
+        sample_num: number of samples
     """
     device = pixel_feat.device
     B, H, W, C = pixel_feat.shape
 
+    # Get factor parameters from model (simplified for refactored BNDL)
+    factor_z = getattr(pixel_bndl_model, "default_factor_z", 0.0)
+    factor_w = getattr(pixel_bndl_model, "default_factor_w", 0.0)
+
+    # Use mask_tokens_out directly
+    mask_tokens_out = external_pre_out_w
+
+    if mask_tokens_out is None:
+        raise ValueError("mask_tokens_out (external_pre_out_w) is required for BNDL sampling")
+
     # Pre-allocate tensor for samples
     with torch.no_grad():
-        sample_0, *_ = pixel_bndl_model(pixel_feat, force_sample=True, external_pre_out_w=external_pre_out_w)
+        sample_0, *_ = pixel_bndl_model(
+            pixel_feat,
+            mask_tokens_out,
+            force_sample=True,
+            factor_z=factor_z,
+            factor_w=factor_w,
+        )
         K = sample_0.shape[-1]
 
     sampled_logits = torch.zeros(B, H, W, K, sample_num, device=device, dtype=sample_0.dtype)
@@ -141,7 +153,13 @@ def pixel_uncertain_sampling(pixel_bndl_model, pixel_feat, external_pre_out_w=No
     # Run remaining samples
     with torch.no_grad():
         for i in range(1, sample_num):
-            s_out, *_ = pixel_bndl_model(pixel_feat, force_sample=True, external_pre_out_w=external_pre_out_w)
+            s_out, *_ = pixel_bndl_model(
+                pixel_feat,
+                mask_tokens_out,
+                force_sample=True,
+                factor_z=factor_z,
+                factor_w=factor_w,
+            )
             sampled_logits[..., i] = s_out
 
     # 1. Compute Mean Logits
@@ -226,6 +244,8 @@ def prepare_targets_for_pavpu(targets, bndl_outputs):
 
         if "pixel_logits_raw" in bndl_outputs and bndl_outputs["pixel_logits_raw"] is not None:
             target_tensor = target_tensor.to(bndl_outputs["pixel_logits_raw"].device)
+        elif "wei_lambda_pos" in bndl_outputs and bndl_outputs["wei_lambda_pos"] is not None:
+            target_tensor = target_tensor.to(bndl_outputs["wei_lambda_pos"].device)
         elif "wei_lambda" in bndl_outputs and bndl_outputs["wei_lambda"] is not None:
             target_tensor = target_tensor.to(bndl_outputs["wei_lambda"].device)
 
@@ -253,9 +273,9 @@ def calculate_pavpu_for_bndl(bndl_outputs, batch, targets, phase, model, sample_
         else:
             mask_decoder = getattr(model, "sam_mask_decoder", None) or getattr(model, "mask_decoder", None)
 
-        # Always extract hyper_in since we use hyper_in only mode
+        # Always extract mask_tokens_out since we use global sparse mode
         if mask_decoder:
-            external_pre_out_w = extract_hyper_in_from_bndl_outputs(bndl_outputs, batch, mask_decoder)
+            external_pre_out_w = extract_mask_tokens_from_bndl_outputs(bndl_outputs, batch, mask_decoder)
 
         pixel_uncertainty_pval, mean_pixel_logits, entropy_norm = pixel_uncertain_sampling(
             pixel_bndl_model,
@@ -354,49 +374,75 @@ def log_bndl_statistics(bndl_outputs, step, phase, dataset_name, statistics_dict
         statistics_dict = {}
 
     # Optimized: Keep as tensor, avoid .item() sync
-    if "wei_lambda" in bndl_outputs and "kappa" in bndl_outputs and bndl_outputs["wei_lambda"] is not None and bndl_outputs["kappa"] is not None:
+    key_prefix = f"{dataset_name}_{phase}"
+
+    if bndl_outputs.get("wei_lambda_pos") is not None and bndl_outputs.get("kappa_pos") is not None:
+        lambda_pos_mean = bndl_outputs["wei_lambda_pos"].mean().detach()
+        k_pos_mean = bndl_outputs["kappa_pos"].mean().detach()
+        statistics_dict[f"{key_prefix}_lambda_pixel_pos"] = lambda_pos_mean
+        statistics_dict[f"{key_prefix}_k_pixel_pos"] = k_pos_mean
+
+        lambda_sum = bndl_outputs["wei_lambda_pos"]
+        k_sum = bndl_outputs["kappa_pos"]
+
+        if bndl_outputs.get("wei_lambda_neg") is not None and bndl_outputs.get("kappa_neg") is not None:
+            lambda_neg_mean = bndl_outputs["wei_lambda_neg"].mean().detach()
+            k_neg_mean = bndl_outputs["kappa_neg"].mean().detach()
+            statistics_dict[f"{key_prefix}_lambda_pixel_neg"] = lambda_neg_mean
+            statistics_dict[f"{key_prefix}_k_pixel_neg"] = k_neg_mean
+            lambda_sum = lambda_sum + bndl_outputs["wei_lambda_neg"]
+            k_sum = 0.5 * (k_sum + bndl_outputs["kappa_neg"])
+
+        statistics_dict[f"{key_prefix}_lambda_pixel"] = lambda_sum.mean().detach()
+        statistics_dict[f"{key_prefix}_k_pixel"] = k_sum.mean().detach()
+
+    elif bndl_outputs.get("wei_lambda") is not None and bndl_outputs.get("kappa") is not None:
         lambda_mean = bndl_outputs["wei_lambda"].mean().detach()  # Keep on device
         k_mean = bndl_outputs["kappa"].mean().detach()  # kappa is already the shape parameter
 
-        key_prefix = f"{dataset_name}_{phase}"
-
-        # Use lists to accumulate tensors to batch sync later if needed,
-        # BUT current architecture expects scalars in the dict for now.
-        # To strictly follow "direct optimization", we should use .item() ONLY when printing/saving.
-        # However, for safety in existing pipeline which might expect float, we can compromise:
-        # We assume the user wants SPEED. Blocking here 10-20 times per video is fine,
-        # but per frame it is bad.
-
-        # For now, converting to item() is the bottleneck.
-        # Let's check if we can store tensors in statistics_dict.
-        # The downstream code in zero_shot_multi_dataset_sam_bndl.py does:
-        # avg_stats[key] = sum(values) / len(values)
-        # If values are 0-d tensors, sum() works fine!
-        # So we can remove .cpu().item() here!
+        # Use lists to accumulate tensors to batch sync later if needed.
 
         statistics_dict[f"{key_prefix}_lambda_pixel"] = lambda_mean
         statistics_dict[f"{key_prefix}_k_pixel"] = k_mean
 
-        if "pixel_uncertainty" in bndl_outputs and bndl_outputs["pixel_uncertainty"] is not None:
-            uncertainty_mean = bndl_outputs["pixel_uncertainty"].mean().detach()
-            statistics_dict[f"{key_prefix}_pixel_uncertainty"] = uncertainty_mean
+    if bndl_outputs.get("pixel_uncertainty") is not None:
+        uncertainty_mean = bndl_outputs["pixel_uncertainty"].mean().detach()
+        statistics_dict[f"{key_prefix}_pixel_uncertainty"] = uncertainty_mean
 
-        if "pixel_entropy" in bndl_outputs and bndl_outputs["pixel_entropy"] is not None:
-            entropy_mean = bndl_outputs["pixel_entropy"].mean().detach()
-            statistics_dict[f"{key_prefix}_pixel_entropy"] = entropy_mean
+    if bndl_outputs.get("pixel_entropy") is not None:
+        entropy_mean = bndl_outputs["pixel_entropy"].mean().detach()
+        statistics_dict[f"{key_prefix}_pixel_entropy"] = entropy_mean
 
-        if "pavpu_uncertainty_samples" in bndl_outputs and "pavpu_accuracy_samples" in bndl_outputs:
-            uncertainty_samples = bndl_outputs["pavpu_uncertainty_samples"]
-            accuracy_samples = bndl_outputs["pavpu_accuracy_samples"]
+    if "pavpu_uncertainty_samples" in bndl_outputs and "pavpu_accuracy_samples" in bndl_outputs:
+        uncertainty_samples = bndl_outputs["pavpu_uncertainty_samples"]
+        accuracy_samples = bndl_outputs["pavpu_accuracy_samples"]
 
-            statistics_dict[f"{key_prefix}_pavpu_uncertainty_samples"] = uncertainty_samples.tolist() if hasattr(uncertainty_samples, "tolist") else list(uncertainty_samples)
-            statistics_dict[f"{key_prefix}_pavpu_accuracy_samples"] = accuracy_samples.tolist() if hasattr(accuracy_samples, "tolist") else list(accuracy_samples)
+        statistics_dict[f"{key_prefix}_pavpu_uncertainty_samples"] = uncertainty_samples.tolist() if hasattr(uncertainty_samples, "tolist") else list(uncertainty_samples)
+        statistics_dict[f"{key_prefix}_pavpu_accuracy_samples"] = accuracy_samples.tolist() if hasattr(accuracy_samples, "tolist") else list(accuracy_samples)
 
-    if "wei_lambda_w" in bndl_outputs and "kappa_w" in bndl_outputs and bndl_outputs["wei_lambda_w"] is not None and bndl_outputs["kappa_w"] is not None:
+    if bndl_outputs.get("wei_lambda_w_pos") is not None and bndl_outputs.get("kappa_w_pos") is not None:
+        lambda_w_pos_mean = bndl_outputs["wei_lambda_w_pos"].mean().detach()
+        k_w_pos_mean = bndl_outputs["kappa_w_pos"].mean().detach()
+        statistics_dict[f"{key_prefix}_lambda_w_pos"] = lambda_w_pos_mean
+        statistics_dict[f"{key_prefix}_k_w_pos"] = k_w_pos_mean
+
+        lambda_w_sum = bndl_outputs["wei_lambda_w_pos"]
+        k_w_sum = bndl_outputs["kappa_w_pos"]
+
+        if bndl_outputs.get("wei_lambda_w_neg") is not None and bndl_outputs.get("kappa_w_neg") is not None:
+            lambda_w_neg_mean = bndl_outputs["wei_lambda_w_neg"].mean().detach()
+            k_w_neg_mean = bndl_outputs["kappa_w_neg"].mean().detach()
+            statistics_dict[f"{key_prefix}_lambda_w_neg"] = lambda_w_neg_mean
+            statistics_dict[f"{key_prefix}_k_w_neg"] = k_w_neg_mean
+            lambda_w_sum = lambda_w_sum + bndl_outputs["wei_lambda_w_neg"]
+            k_w_sum = 0.5 * (k_w_sum + bndl_outputs["kappa_w_neg"])
+
+        statistics_dict[f"{key_prefix}_lambda_w"] = lambda_w_sum.mean().detach()
+        statistics_dict[f"{key_prefix}_k_w"] = k_w_sum.mean().detach()
+
+    elif bndl_outputs.get("wei_lambda_w") is not None and bndl_outputs.get("kappa_w") is not None:
         lambda_w_mean = bndl_outputs["wei_lambda_w"].mean().detach()
-        k_w_mean = bndl_outputs["kappa_w"].mean().detach()  # kappa_w is already the shape parameter
-
-        key_prefix = f"{dataset_name}_{phase}"
+        k_w_mean = bndl_outputs["kappa_w"].mean().detach()
         statistics_dict[f"{key_prefix}_lambda_w"] = lambda_w_mean
         statistics_dict[f"{key_prefix}_k_w"] = k_w_mean
 
@@ -436,9 +482,7 @@ def setup_bndl_collection(
             distributed=False,
             rank=0,
             world_size=1,
-            foreground_dilation=4,
-            use_full_image=False,
-            per_pixel_statistics=True,
+            foreground_dilation=15,  # Match validation evaluator for consistency
         )
     except Exception as e:
         logger.error(f"Failed to initialize dataset evaluator: {e}")
@@ -447,22 +491,32 @@ def setup_bndl_collection(
 
 
 def extract_evaluator_checkpoint_data(dataset_evaluator: Any) -> dict:
-    """Extract checkpoint data from dataset evaluator."""
-    if dataset_evaluator.per_pixel_statistics:
+    """Extract checkpoint data from dataset evaluator.
+
+    Updated to use the simplified DistributedDatasetEvaluator API which uses:
+    - self.data: dict with image-level metrics (uncertainty, accuracy, correctness, nll)
+    - self.pixel_samples: dict with pixel-level samples (uncertainty, is_correct)
+    """
+    if dataset_evaluator is None:
         return {
-            "pixel_uncertainties": dataset_evaluator.pixel_data["uncertainties"].tolist(),
-            "pixel_ious": dataset_evaluator.pixel_data["ious"].tolist(),
-            "pixel_dices": dataset_evaluator.pixel_data["dices"].tolist(),
-            "pixel_accuracies": dataset_evaluator.pixel_data["accuracies"].tolist(),
-            "pixel_nlls": dataset_evaluator.pixel_data["nlls"].tolist(),
+            "pixel_uncertainties": [],
+            "pixel_accuracies": [],
+            "pixel_nlls": [],
         }
-    return {
-        "pixel_uncertainties": [],
-        "pixel_ious": [],
-        "pixel_dices": [],
-        "pixel_accuracies": [],
-        "pixel_nlls": [],
+
+    # Extract image-level data
+    result = {
+        "pixel_uncertainties": list(dataset_evaluator.data.get("uncertainty", [])),
+        "pixel_accuracies": list(dataset_evaluator.data.get("accuracy", [])),
+        "pixel_nlls": list(dataset_evaluator.data.get("nll", [])),
     }
+
+    # Also include pixel samples if available (for backwards compatibility)
+    if hasattr(dataset_evaluator, "pixel_samples") and dataset_evaluator.pixel_samples:
+        result["pixel_sample_uncertainties"] = list(dataset_evaluator.pixel_samples.get("uncertainty", []))
+        result["pixel_sample_is_correct"] = list(dataset_evaluator.pixel_samples.get("is_correct", []))
+
+    return result
 
 
 def merge_evaluator_checkpoints(
@@ -470,37 +524,73 @@ def merge_evaluator_checkpoints(
     dataset_evaluator: Any,
     downsample_max_samples: int,
 ) -> None:
-    """Merge checkpoint files back into dataset evaluator."""
+    """Merge checkpoint files back into dataset evaluator.
+
+    Updated to work with the simplified DistributedDatasetEvaluator API which uses:
+    - self.data: dict with image-level metrics (uncertainty, accuracy, correctness, nll)
+    - self.pixel_samples: dict with pixel-level samples (uncertainty, is_correct)
+    """
     if not eval_checkpoint_mgr or not dataset_evaluator:
         return
 
-    def _append_shard(shard_data):
+    # Simplified key mapping for the new evaluator API
+    key_map = {
+        "pixel_uncertainties": "uncertainty",
+        "pixel_accuracies": "accuracy",
+        "pixel_nlls": "nll",
+    }
+
+    total_samples = 0
+
+    def _collect_shard(shard_data):
+        nonlocal total_samples
         if not shard_data:
             return
 
-        data_dict = {}
-        key_map = {
-            "pixel_uncertainties": "uncertainties",
-            "pixel_accuracies": "accuracies",
-            "pixel_ious": "ious",
-            "pixel_dices": "dices",
-            "pixel_nlls": "nlls",
-        }
+        # Add data to evaluator's dict-based storage
         for src, dst in key_map.items():
             if shard_data.get(src):
-                data_dict[dst] = shard_data[src]
+                dataset_evaluator.data[dst].extend(shard_data[src])
+                total_samples += len(shard_data[src])
 
-        if data_dict:
-            new_data = pd.DataFrame(data_dict)
-            dataset_evaluator.pixel_data = pd.concat([dataset_evaluator.pixel_data, new_data], ignore_index=True)
+        # Handle pixel samples if present
+        if shard_data.get("pixel_sample_uncertainties"):
+            dataset_evaluator.pixel_samples["uncertainty"].extend(shard_data["pixel_sample_uncertainties"])
+        if shard_data.get("pixel_sample_is_correct"):
+            dataset_evaluator.pixel_samples["is_correct"].extend(shard_data["pixel_sample_is_correct"])
 
-            if len(dataset_evaluator.pixel_data) > downsample_max_samples:
-                dataset_evaluator.pixel_data = dataset_evaluator.pixel_data.sample(n=downsample_max_samples, random_state=42).reset_index(drop=True)
-                print(f"  🔄 中间降采样: → {downsample_max_samples:,} 样本")
+        # Downsample if too much data accumulated
+        if total_samples > downsample_max_samples * 2:
+            _downsample_data()
 
-        CheckpointManager.force_memory_cleanup()
+    def _downsample_data():
+        nonlocal total_samples
+        for key in dataset_evaluator.data:
+            if len(dataset_evaluator.data[key]) > downsample_max_samples:
+                import random
 
-    eval_checkpoint_mgr.merge_checkpoints_streaming(_append_shard)
+                random.seed(42)
+                indices = random.sample(range(len(dataset_evaluator.data[key])), downsample_max_samples)
+                dataset_evaluator.data[key] = [dataset_evaluator.data[key][i] for i in indices]
+                total_samples = downsample_max_samples
+                print(f"  🔄 降采样 {key}: → {downsample_max_samples:,} 样本")
+
+        # Also downsample pixel_samples
+        if len(dataset_evaluator.pixel_samples["uncertainty"]) > dataset_evaluator.max_pixel_samples:
+            import random
+
+            random.seed(42)
+            n = dataset_evaluator.max_pixel_samples
+            indices = random.sample(range(len(dataset_evaluator.pixel_samples["uncertainty"])), n)
+            dataset_evaluator.pixel_samples["uncertainty"] = [dataset_evaluator.pixel_samples["uncertainty"][i] for i in indices]
+            dataset_evaluator.pixel_samples["is_correct"] = [dataset_evaluator.pixel_samples["is_correct"][i] for i in indices]
+
+    # Stream through all checkpoints
+    if hasattr(eval_checkpoint_mgr, "merge_checkpoints_streaming"):
+        eval_checkpoint_mgr.merge_checkpoints_streaming(_collect_shard)
+    else:
+        # Fallback if streaming not available
+        logger.warning("merge_checkpoints_streaming not available, skipping checkpoint merge")
 
 
 def finalize_bndl_evaluation(
@@ -514,26 +604,36 @@ def finalize_bndl_evaluation(
         return
 
     try:
-        print(f"\nGenerating dataset correlation analysis for {dataset_name}...")
+        print(f"\nGenerating evaluation analysis for {dataset_name}...")
 
-        correlation_results = dataset_evaluator.evaluate_dataset_correlation()
-        logger.info(f"Correlation evaluation: {len(correlation_results)} metrics")
+        # Use the simplified evaluator API
+        results = dataset_evaluator.evaluate()
+        logger.info(f"Evaluation completed: {len(results)} metrics")
 
-        dataset_evaluator.create_dataset_correlation_visualization(
-            title=f"{dataset_name} Zero-shot Analysis - Dataset Correlation", save_name=f"{dataset_name.lower()}_zeroshot_dataset_analysis.png"
-        )
+        # Create visualization with the simplified API
+        dataset_evaluator.create_visualization(filename=f"{dataset_name.lower()}_zeroshot_correlation.png")
 
-        dataset_evaluator.save_correlation_results(save_name=f"{dataset_name.lower()}_zeroshot_results.json")
+        # Save results with the simplified API
+        dataset_evaluator.save_results(filename=f"{dataset_name.lower()}_zeroshot_results.json")
 
-        print(f"Dataset evaluation plots saved for {dataset_name}")
+        print(f"Dataset evaluation saved for {dataset_name}")
     except Exception as e:
         logger.warning(f"Dataset evaluation failed: {e}")
 
 
 def extract_pixel_params(bndl_outputs, batch_idx=0):
     """Extract and process pixel-level parameters"""
-    lambda_vals = bndl_outputs["wei_lambda"].detach().cpu().numpy()
-    k_vals = bndl_outputs["kappa"].detach().cpu().numpy()  # kappa is already the shape parameter
+    if bndl_outputs.get("wei_lambda_pos") is not None and bndl_outputs.get("kappa_pos") is not None:
+        lambda_sum = bndl_outputs["wei_lambda_pos"]
+        k_sum = bndl_outputs["kappa_pos"]
+        if bndl_outputs.get("wei_lambda_neg") is not None and bndl_outputs.get("kappa_neg") is not None:
+            lambda_sum = lambda_sum + bndl_outputs["wei_lambda_neg"]
+            k_sum = 0.5 * (k_sum + bndl_outputs["kappa_neg"])
+        lambda_vals = lambda_sum.detach().cpu().numpy()
+        k_vals = k_sum.detach().cpu().numpy()
+    else:
+        lambda_vals = bndl_outputs["wei_lambda"].detach().cpu().numpy()
+        k_vals = bndl_outputs["kappa"].detach().cpu().numpy()
 
     # Extract specific batch
     lambda_batch = lambda_vals[batch_idx]

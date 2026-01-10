@@ -1,884 +1,378 @@
-import os
+"""
+Simplified Uncertainty Evaluation for BNDL.
+
+Evaluates uncertainty quality using:
+- Image-level Pearson/Spearman correlations (statistically valid)
+- Pixel-level AUROC (error detection capability)
+- ECE (calibration quality)
+- PAvPU (uncertainty-accuracy alignment)
+"""
+
+import json
 import logging
+import os
+from typing import Any
+
+import matplotlib
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import matplotlib
-matplotlib.use('Agg')  # 使用非交互式后端
-from typing import Any
+from scipy.stats import spearmanr
+from sklearn.metrics import average_precision_score, roc_auc_score
 
-from .metric_calculator import MetricCalculator
-from .visualization_utils import VisualizationUtils
-from BNDL.BNDL_upload.ViT_Sparse.utils.bndl import calculate_nll_from_logits
+matplotlib.use("Agg")
 
 
-def _dilate_mask(mask: torch.Tensor, kernel_size: int = 10) -> torch.Tensor:
-    """
-    对二值mask进行形态学膨胀操作，用于扩展前景区域
-
-    Args:
-        mask: [H, W] 二值mask张量
-        kernel_size: 膨胀核大小（像素），推荐5-15
-
-    Returns:
-        dilated_mask: [H, W] 膨胀后的二值mask（与输入尺寸完全一致）
-    """
-    if kernel_size <= 0:
+def _dilate_mask(mask: torch.Tensor, kernel_size: int) -> torch.Tensor:
+    """Dilate a binary mask using max pooling."""
+    if kernel_size <= 1:
         return mask
-
-    # 保存原始尺寸
-    orig_h, orig_w = mask.shape
-
-    # 使用max_pool2d实现膨胀：将mask reshape为[1, 1, H, W]
-    mask_4d = mask.unsqueeze(0).unsqueeze(0).float()  # [1, 1, H, W]
-
-    # max_pool2d with padding实现膨胀效果
-    # padding = (kernel_size - 1) // 2 保证输出尺寸不变
+    mask_4d = mask.unsqueeze(0).unsqueeze(0).float()
     padding = (kernel_size - 1) // 2
     dilated = F.max_pool2d(mask_4d, kernel_size=kernel_size, stride=1, padding=padding)
-
-    # 转回[H, W]并转为bool
-    dilated_mask = dilated.squeeze(0).squeeze(0) > 0.5
-
-    # 确保输出尺寸与输入完全一致（修复由于padding/kernel_size组合导致的尺寸差异）
-    if dilated_mask.shape != (orig_h, orig_w):
-        # 如果尺寸不一致，使用插值调整回原始尺寸
-        dilated_mask = F.interpolate(
-            dilated_mask.unsqueeze(0).unsqueeze(0).float(),
-            size=(orig_h, orig_w),
-            mode='nearest'  # 使用nearest保持二值性质
-        ).squeeze(0).squeeze(0) > 0.5
-        logging.debug(f"Adjusted dilated mask size from {dilated.shape[2:]} to {(orig_h, orig_w)}")
-
-    return dilated_mask
+    return dilated.squeeze() > 0.5
 
 
 class DistributedDatasetEvaluator:
-    
-    def __init__(self, save_dir: str, distributed: bool = False, rank: int = 0, world_size: int = 1,
-                 foreground_dilation: int = 0, per_pixel_statistics: bool = True, 
-                 use_full_image: bool = True):
-        """
-        初始化分布式数据集评估器
+    """Simplified evaluator for uncertainty quality metrics."""
 
-        Args:
-            save_dir: 结果保存目录
-            distributed: 是否启用分布式训练
-            rank: 当前进程的rank
-            world_size: 总进程数
-            foreground_dilation: 前景区域膨胀半径（像素），0表示不膨胀（仅在use_full_image=False时使用）
-            per_pixel_statistics: 是否使用像素级统计（vs 图片级）
-            use_full_image: 是否统计全图像素（True=全图[默认], False=仅前景）
-        """
+    def __init__(
+        self,
+        save_dir: str,
+        distributed: bool = False,
+        rank: int = 0,
+        world_size: int = 1,
+        foreground_dilation: int = 15,  # Pixels to dilate GT region for boundary focus
+    ):
         self.save_dir = save_dir
-        self.distributed = distributed
+        self.distributed = distributed and dist.is_initialized()
         self.rank = rank
         self.world_size = world_size
-        self.is_main_process = rank == 0
+        self.is_main = rank == 0
         self.foreground_dilation = foreground_dilation
-        self.per_pixel_statistics = per_pixel_statistics
-        self.use_full_image = use_full_image
 
-        self.metric_calculator = MetricCalculator()
-        self.viz_utils = VisualizationUtils()
-
-        if per_pixel_statistics:
-            # 存储每个像素的指标值（每个数据点代表一个像素）
-            # 🎯 优化: 使用Pandas DataFrame替代Python list，大幅降低内存使用并支持高效降采样
-            self.pixel_data = pd.DataFrame({
-                'uncertainties': pd.Series(dtype='float32'),
-                'ious': pd.Series(dtype='float32'),
-                'dices': pd.Series(dtype='float32'),
-                'accuracies': pd.Series(dtype='float32'),
-                'nlls': pd.Series(dtype='float32')
-            })
-            self.max_samples = 100000  # 最大样本数
-        else:
-            # 向后兼容：存储每张图片的标量指标值
-            self.image_uncertainties = []  # 存储每张图片的平均uncertainty值
-            self.image_ious = []          # 存储每张图片的平均IoU值
-            self.image_dices = []         # 存储每张图片的平均DICE值
-            self.image_accuracies = []    # 存储每张图片的平均accuracy值
-            self.image_nlls = []          # 存储每张图片的平均NLL值（有监督不确定性）
-
-        # 存储最终结果
-        self.correlation_results = {}
-
-        # 分布式训练相关
-        if self.distributed:
-            self._setup_distributed()
-
-        # 只在主进程创建保存目录
-        if self.is_main_process:
-            os.makedirs(save_dir, exist_ok=True)
-            mode_str = "full_image" if use_full_image else f"foreground (dilation={foreground_dilation})"
-            logging.info(f"Dataset evaluator initialized: per_pixel={per_pixel_statistics}, mode={mode_str}")
-    
-    def _downsample_if_needed(self):
-        """当数据超过最大样本数时进行降采样"""
-        if len(self.pixel_data) > self.max_samples:
-            self.pixel_data = self.pixel_data.sample(n=self.max_samples, random_state=42).reset_index(drop=True)
-            print(f"  🔄 降采样: → {self.max_samples} 样本")
-    
-    def _setup_distributed(self):
-        """设置分布式训练相关配置"""
-        if not dist.is_initialized():
-            logging.warning("Distributed training not initialized, falling back to single GPU mode")
-            self.distributed = False
-            return
-        
-        logging.info(f"Initializing distributed evaluator: rank {self.rank}/{self.world_size}")
-    
-    def add_batch_data(self, 
-                       uncertainty: torch.Tensor,
-                       pred_logits: torch.Tensor,
-                       gt_masks: torch.Tensor) -> None:
-        """添加一个批次的数据用于后续评估，为每张图片计算标量指标"""
-        try:
-            # 数据验证
-            if uncertainty is None or pred_logits is None or gt_masks is None:
-                logging.warning("One or more inputs are None, skipping batch")
-                return
-            
-            # 检查张量形状
-            if uncertainty.numel() == 0 or pred_logits.numel() == 0 or gt_masks.numel() == 0:
-                logging.warning("One or more inputs have zero elements, skipping batch")
-                return
-            
-            # 标准化格式
-            uncertainty_norm = self.metric_calculator.normalize_tensor_format(uncertainty, "uncertainty")
-            pred_norm = self.metric_calculator.normalize_tensor_format(pred_logits, "pred_logits")
-            gt_norm = self.metric_calculator.normalize_tensor_format(gt_masks, "gt_masks")
-            
-            if uncertainty_norm is None or pred_norm is None or gt_norm is None:
-                logging.warning("Failed to normalize batch data, skipping")
-                return
-            
-            # 对齐空间维度
-            pred_aligned, gt_aligned, uncertainty_aligned = self.metric_calculator.align_spatial_dimensions(
-                pred_norm, gt_norm, uncertainty_norm
-            )
-            
-            if pred_aligned is None or gt_aligned is None or uncertainty_aligned is None:
-                logging.warning("Failed to align spatial dimensions, skipping")
-                return
-            
-            # 获取batch size
-            B = pred_aligned.shape[0]
-
-            if self.per_pixel_statistics:
-                # 像素级统计：收集前景扩展区域内的所有像素
-                total_pixels = 0
-                for i in range(B):
-                    # 提取单张图片的数据
-                    single_uncertainty = uncertainty_aligned[i]  # [H, W, K]
-                    single_pred = pred_aligned[i]                # [H, W, K]
-                    single_gt = gt_aligned[i]                    # [H, W, K]
-
-                    # 计算像素级指标
-                    pixel_unc, pixel_acc, pixel_iou, pixel_dice, pixel_nll = \
-                        self._calculate_pixel_wise_metrics(single_uncertainty, single_pred, single_gt)
-
-                    # 存储所有前景区域像素（使用Pandas DataFrame，支持高效降采样）
-                    if pixel_unc.numel() > 0:
-                        n_pixels = pixel_unc.numel()
-                        
-                        # 创建新的数据行（直接使用Pandas，避免numpy转换）
-                        new_data = pd.DataFrame({
-                            'uncertainties': pixel_unc.detach().cpu().numpy().flatten(),
-                            'accuracies': pixel_acc.detach().cpu().numpy().flatten(),
-                            'ious': pixel_iou.detach().cpu().numpy().flatten(),
-                            'dices': pixel_dice.detach().cpu().numpy().flatten(),
-                            'nlls': pixel_nll.detach().cpu().numpy().flatten()
-                        })
-                        
-                        # 添加到现有数据
-                        self.pixel_data = pd.concat([self.pixel_data, new_data], ignore_index=True)
-                        
-                        # 如果超过最大样本数，进行降采样
-                        if len(self.pixel_data) > self.max_samples:
-                            self.pixel_data = self.pixel_data.sample(n=self.max_samples, random_state=42).reset_index(drop=True)
-                            print(f"  🔄 自动降采样: {len(self.pixel_data) + self.max_samples} → {self.max_samples} 样本")
-                        
-                        total_pixels += n_pixels
-
-                if self.rank == 0:  # 只在主进程记录日志
-                    logging.info(f"Added {B} images ({total_pixels} foreground pixels) to evaluation data")
-            else:
-                # 图片级统计（向后兼容）：对每张图片计算标量指标
-                for i in range(B):
-                    # 提取单张图片的数据
-                    single_uncertainty = uncertainty_aligned[i]  # [H, W, K]
-                    single_pred = pred_aligned[i]                # [H, W, K]
-                    single_gt = gt_aligned[i]                    # [H, W, K]
-
-                    # 计算单张图片的标量指标
-                    iou_scalar = self._calculate_single_image_iou_scalar(single_pred, single_gt)
-                    dice_scalar = self._calculate_single_image_dice_scalar(single_pred, single_gt)
-                    accuracy_scalar = self._calculate_single_image_accuracy_scalar(single_pred, single_gt)
-                    uncertainty_scalar = self._calculate_single_image_uncertainty_scalar(single_uncertainty, single_pred, single_gt)
-
-                    # 计算NLL（复用BNDL模块的方法）
-                    nll_scalar = calculate_nll_from_logits(single_pred, single_gt, foreground_only=True)
-
-                    # 存储单张图片的标量指标（转换为CPU以节省GPU内存）
-                    self.image_uncertainties.append(uncertainty_scalar.detach().cpu())
-                    self.image_ious.append(iou_scalar.detach().cpu())
-                    self.image_dices.append(dice_scalar.detach().cpu())
-                    self.image_accuracies.append(accuracy_scalar.detach().cpu())
-                    self.image_nlls.append(nll_scalar.detach().cpu())
-
-                if self.rank == 0:  # 只在主进程记录日志
-                    logging.info(f"Added {B} images to evaluation data")
-            
-        except Exception as e:
-            logging.warning(f"Failed to add batch data: {e}")
-            import traceback
-            logging.warning(f"Traceback: {traceback.format_exc()}")
-    
-    def _calculate_single_image_iou_scalar(self, pred_logits: torch.Tensor, gt_masks: torch.Tensor) -> torch.Tensor:
-        """计算单张图片的平均IoU值（标量）"""
-        try:
-            # 确保输入形状匹配
-            if pred_logits.shape != gt_masks.shape:
-                logging.warning(f"Shape mismatch in single image IoU: pred {pred_logits.shape} vs gt {gt_masks.shape}")
-                return torch.tensor(0.0)
-            
-            # 对logits应用 > 0 阈值
-            pred_binary = pred_logits > 0
-            gt_binary = gt_masks > 0
-            
-            # 计算IoU：|A ∩ B| / |A ∪ B|
-            intersection = (pred_binary & gt_binary).float()
-            union = (pred_binary | gt_binary).float()
-            
-            # 对空间维度和通道维度求和，得到整张图片的IoU
-            intersection_sum = intersection.sum()  # 标量
-            union_sum = union.sum()  # 标量
-            
-            # 避免除零，计算整张图片的IoU
-            iou = intersection_sum / (union_sum + 1e-8)  # 标量
-            
-            # 确保值在[0, 1]范围内
-            iou = torch.clamp(iou, 0.0, 1.0)
-            
-            return iou
-            
-        except Exception as e:
-            logging.warning(f"Failed to calculate single image IoU scalar: {e}")
-            return torch.tensor(0.0)
-    
-    def _calculate_single_image_dice_scalar(self, pred_logits: torch.Tensor, gt_masks: torch.Tensor) -> torch.Tensor:
-        """计算单张图片的平均DICE值（标量）"""
-        try:
-            if pred_logits.shape != gt_masks.shape:
-                logging.warning(f"Shape mismatch in single image DICE: pred {pred_logits.shape} vs gt {gt_masks.shape}")
-                return torch.tensor(0.0)
-            
-            # 先应用sigmoid
-            pred_probs = torch.sigmoid(pred_logits)
-            
-            # 计算DICE：2 * |A ∩ B| / (|A| + |B|)
-            numerator = 2 * (pred_probs * gt_masks.float()).sum()  # 标量
-            denominator = pred_probs.sum() + gt_masks.float().sum()  # 标量
-            
-            # 避免除零，计算整张图片的DICE
-            dice = numerator / (denominator + 1e-8)  # 标量
-            
-            # 处理边界情况
-            gt_empty = (gt_masks.float().sum() < 1e-8)
-            pred_empty = (pred_probs.sum() < 1e-8)
-            
-            # 当两者都为空时，DICE = 1；当只有预测为空时，DICE = 0
-            if gt_empty and pred_empty:
-                dice = torch.tensor(1.0)
-            elif gt_empty and not pred_empty:
-                dice = torch.tensor(0.0)
-            
-            # 确保值在[0, 1]范围内
-            dice = torch.clamp(dice, 0.0, 1.0)
-            
-            return dice
-            
-        except Exception as e:
-            logging.warning(f"Failed to calculate single image DICE scalar: {e}")
-            return torch.tensor(0.0)
-    
-    def _calculate_single_image_accuracy_scalar(self, pred_logits: torch.Tensor, gt_masks: torch.Tensor) -> torch.Tensor:
-        """计算单张图片的平均准确率值（标量）；优先在前景区域上统计，避免背景主导"""
-        try:
-            if pred_logits.shape != gt_masks.shape:
-                logging.warning(f"Shape mismatch in single image accuracy: pred {pred_logits.shape} vs gt {gt_masks.shape}")
-                return torch.tensor(0.0)
-            
-            # 对logits应用 > 0 阈值，与 IoU 一致
-            pred_binary = pred_logits > 0
-            gt_binary = gt_masks > 0
-            
-            # 前景掩膜（任一通道为真）
-            fg_mask = gt_binary.any(dim=-1)  # [H, W]
-
-            # 计算准确率：(TP + TN) / (TP + TN + FP + FN)
-            correct_predictions = (pred_binary == gt_binary).float()  # [H, W, K]
-
-            if fg_mask.any():
-                # 仅在前景区域统计，避免背景像素占比过大
-                correct_sum = correct_predictions[fg_mask].sum()
-                total_pixels = correct_predictions[fg_mask].numel()
-            else:
-                # 无前景时退化为全图
-                correct_sum = correct_predictions.sum()
-                total_pixels = correct_predictions.numel()
-
-            # 计算准确率
-            pixel_acc = correct_sum / (total_pixels + 1e-8)  # 标量
-            
-            # 确保值在[0, 1]范围内
-            pixel_acc = torch.clamp(pixel_acc, 0.0, 1.0)
-            
-            return pixel_acc
-            
-        except Exception as e:
-            logging.warning(f"Failed to calculate single image accuracy scalar: {e}")
-            return torch.tensor(0.0)
-    
-    def _calculate_single_image_uncertainty_scalar(self, uncertainty: torch.Tensor, pred_logits: torch.Tensor, gt_masks: torch.Tensor) -> torch.Tensor:
-        """计算单张图片的不确定性标量，直接使用传入的不确定性并在前景区域取中位数。"""
-        # 统一到 [H, W]
-        if uncertainty.ndim == 3:
-            pixel_uncertainty = uncertainty.mean(dim=-1)
-        else:
-            pixel_uncertainty = uncertainty
-        pixel_uncertainty = pixel_uncertainty.float()
-
-        # 前景掩膜 [H, W]
-        fg_mask = (gt_masks > 0)
-        if fg_mask.ndim == 3:
-            fg_mask = fg_mask.any(dim=-1)
-
-        values = pixel_uncertainty[fg_mask] if fg_mask.any() else pixel_uncertainty.reshape(-1)
-        return values.median()
-
-    def _calculate_pixel_wise_metrics(self, uncertainty: torch.Tensor, pred_logits: torch.Tensor,
-                                      gt_masks: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        计算per-channel像素级指标，返回选定区域内每个像素每个通道的值
-        
-        每个像素产生K个独立样本（每个通道一个），避免跨通道聚合导致的相关性问题
-
-        Args:
-            uncertainty: [H, W, K] or [H, W] 不确定性
-            pred_logits: [H, W, K] 预测logits
-            gt_masks: [H, W, K] GT masks
-
-        Returns:
-            pixel_uncertainties: [N*K] 选定区域每个像素每个通道的uncertainty
-            pixel_accuracies: [N*K] 选定区域每个像素每个通道的accuracy（概率，范围0-1）
-            pixel_ious: [N*K] 选定区域每个像素每个通道的IoU（二值正确性，0或1）
-            pixel_dices: [N*K] 选定区域每个像素每个通道的DICE（概率版本，范围0-1）
-            pixel_nlls: [N*K] 选定区域每个像素每个通道的NLL值
-        """
-        try:
-            # 1. 构建统计区域mask
-            if self.use_full_image:
-                # 统计全图：创建全True的mask
-                H, W = gt_masks.shape[:2]
-                fg_mask_expanded = torch.ones(H, W, dtype=torch.bool, device=gt_masks.device)
-            else:
-                # 统计前景：构建前景mask并膨胀
-                fg_mask = (gt_masks > 0)
-                if fg_mask.ndim == 3:
-                    fg_mask = fg_mask.any(dim=-1)  # [H, W]
-
-                # 膨胀前景区域
-                if self.foreground_dilation > 0:
-                    fg_mask_expanded = _dilate_mask(fg_mask, kernel_size=self.foreground_dilation)
-                else:
-                    fg_mask_expanded = fg_mask
-
-            # 2. 确保uncertainty是[H, W, K]形状（per-channel统计）
-            if uncertainty.ndim == 2:
-                # 如果是[H, W]，扩展到[H, W, K]以匹配pred_logits
-                K = pred_logits.shape[-1]
-                pixel_uncertainty = uncertainty.unsqueeze(-1).expand(-1, -1, K)  # [H, W, K]
-            else:
-                pixel_uncertainty = uncertainty  # [H, W, K]
-            pixel_uncertainty = pixel_uncertainty.float()
-
-            # 3. 计算per-channel accuracy（使用概率，范围0-1）
-            gt_binary_bool = (gt_masks > 0)  # [H, W, K]
-            pred_binary_bool = (pred_logits > 0)  # [H, W, K]
-            gt_binary = gt_binary_bool.float()  # [H, W, K]
-            pred_probs = torch.sigmoid(pred_logits)  # [H, W, K]
-            
-            # Per-channel accuracy: 当gt=1时用prob，当gt=0时用1-prob
-            pixel_accuracy_per_channel = torch.where(
-                gt_binary > 0.5,
-                pred_probs,           # 真值=1：高概率 → 高准确率
-                1.0 - pred_probs      # 真值=0：低概率 → 高准确率
-            )  # [H, W, K], range [0, 1]
-
-            # 4. 计算per-channel IoU（binary correctness）
-            pixel_iou_per_channel = (pred_binary_bool == gt_binary_bool).float()  # [H, W, K]
-
-            # 5. 计算per-channel DICE（使用概率版本）
-            numerator = 2 * pred_probs * gt_binary  # [H, W, K]
-            denominator = pred_probs + gt_binary  # [H, W, K]
-            pixel_dice_per_channel = numerator / (denominator + 1e-8)
-            pixel_dice_per_channel = torch.clamp(pixel_dice_per_channel, 0.0, 1.0)
-
-            # 6. 计算per-channel NLL
-            pred_probs_safe = torch.clamp(pred_probs, 1e-7, 1 - 1e-7)
-            pixel_nll_per_channel = - (gt_binary * torch.log(pred_probs_safe) +
-                                       (1 - gt_binary) * torch.log(1 - pred_probs_safe))  # [H, W, K]
-
-            # 7. 提取选定区域的像素，并展平通道维度
-            # 每个像素产生K个样本
-            if fg_mask_expanded.any():
-                # 扩展mask到[H, W, K]
-                K = pixel_uncertainty.shape[-1]
-                fg_mask_expanded_K = fg_mask_expanded.unsqueeze(-1).expand(-1, -1, K)
-                
-                # 提取并展平：[H, W, K] -> [N*K]
-                extracted_uncertainty = pixel_uncertainty[fg_mask_expanded_K]
-                extracted_accuracy = pixel_accuracy_per_channel[fg_mask_expanded_K]
-                extracted_iou = pixel_iou_per_channel[fg_mask_expanded_K]
-                extracted_dice = pixel_dice_per_channel[fg_mask_expanded_K]
-                extracted_nll = pixel_nll_per_channel[fg_mask_expanded_K]
-            else:
-                # 如果mask为空，返回空张量
-                extracted_uncertainty = torch.tensor([], dtype=torch.float32)
-                extracted_accuracy = torch.tensor([], dtype=torch.float32)
-                extracted_iou = torch.tensor([], dtype=torch.float32)
-                extracted_dice = torch.tensor([], dtype=torch.float32)
-                extracted_nll = torch.tensor([], dtype=torch.float32)
-
-            return extracted_uncertainty, extracted_accuracy, extracted_iou, extracted_dice, extracted_nll
-
-        except Exception as e:
-            logging.warning(f"Failed to calculate pixel-wise metrics: {e}")
-            import traceback
-            logging.warning(f"Traceback: {traceback.format_exc()}")
-            # 返回空张量
-            empty = torch.tensor([], dtype=torch.float32)
-            return empty, empty, empty, empty, empty
-    
-    def _gather_distributed_data(self) -> tuple[list, list, list, list, list]:
-        """收集所有GPU进程的数据（使用NCCL-safe all_gather + padding）"""
-        if not self.distributed or not dist.is_initialized():
-            if self.per_pixel_statistics:
-                # 像素级统计：返回Pandas DataFrame的列
-                return (self.pixel_data['uncertainties'].tolist(),
-                        self.pixel_data['ious'].tolist(),
-                        self.pixel_data['dices'].tolist(),
-                        self.pixel_data['accuracies'].tolist(),
-                        self.pixel_data['nlls'].tolist())
-            else:
-                # 图片级统计：将张量转为标量列表
-                return (
-                    [t.item() if hasattr(t, 'item') else t for t in self.image_uncertainties],
-                    [t.item() if hasattr(t, 'item') else t for t in self.image_ious],
-                    [t.item() if hasattr(t, 'item') else t for t in self.image_dices],
-                    [t.item() if hasattr(t, 'item') else t for t in self.image_accuracies],
-                    [t.item() if hasattr(t, 'item') else t for t in self.image_nlls]
-                )
-
-        def gather_float_list(values: list) -> list:
-            """聚合float列表（支持像素级和图片级）"""
-            device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
-            local_vals = torch.tensor(values, device=device, dtype=torch.float32)
-            local_len = torch.tensor([local_vals.numel()], device=device, dtype=torch.int64)
-
-            # 收集各rank长度
-            len_list = [torch.zeros_like(local_len) for _ in range(self.world_size)]
-            dist.all_gather(len_list, local_len)
-            max_len = int(torch.stack(len_list).max().item())
-
-            # padding到相同长度
-            if local_vals.numel() < max_len:
-                pad = torch.full((max_len - local_vals.numel(),), float("nan"), device=device, dtype=torch.float32)
-                local_pad = torch.cat([local_vals, pad], dim=0)
-            else:
-                local_pad = local_vals
-
-            # all_gather实际数据
-            gathered = [torch.empty_like(local_pad) for _ in range(self.world_size)]
-            dist.all_gather(gathered, local_pad)
-
-            # 根据各rank真实长度去掉padding
-            out: list[float] = []
-            for r, tensor_r in enumerate(gathered):
-                n = int(len_list[r].item())
-                if n > 0:
-                    out.extend(tensor_r[:n].detach().cpu().tolist())
-            return out
-
-        if self.per_pixel_statistics:
-            # 像素级统计：从Pandas DataFrame获取数据
-            all_uncertainties = gather_float_list(self.pixel_data['uncertainties'].tolist())
-            all_ious = gather_float_list(self.pixel_data['ious'].tolist())
-            all_dices = gather_float_list(self.pixel_data['dices'].tolist())
-            all_accuracies = gather_float_list(self.pixel_data['accuracies'].tolist())
-            all_nlls = gather_float_list(self.pixel_data['nlls'].tolist())
-        else:
-            # 图片级统计：先转换再聚合
-            all_uncertainties = gather_float_list([t.item() if hasattr(t, 'item') else float(t) for t in self.image_uncertainties])
-            all_ious = gather_float_list([t.item() if hasattr(t, 'item') else float(t) for t in self.image_ious])
-            all_dices = gather_float_list([t.item() if hasattr(t, 'item') else float(t) for t in self.image_dices])
-            all_accuracies = gather_float_list([t.item() if hasattr(t, 'item') else float(t) for t in self.image_accuracies])
-            all_nlls = gather_float_list([t.item() if hasattr(t, 'item') else float(t) for t in self.image_nlls])
-
-        return all_uncertainties, all_ious, all_dices, all_accuracies, all_nlls
-
-    def _calculate_correlation_from_lists(self, uncertainties: list,
-                                          metrics: list,
-                                          metric_name: str) -> dict[str, float]:
-        """
-        从float列表计算相关性（支持像素级和图片级统计）
-
-        Args:
-            uncertainties: uncertainty值列表
-            metrics: metric值列表
-            metric_name: 指标名称
-
-        Returns:
-            相关性结果字典
-        """
-        if not uncertainties or not metrics:
-            logging.warning(f"Empty data for {metric_name} correlation")
-            return {}
-
-        if len(uncertainties) != len(metrics):
-            logging.warning(f"Length mismatch for {metric_name}: {len(uncertainties)} vs {len(metrics)}")
-            return {}
-
-        # 转换为numpy数组
-        uncertainty_np = np.array(uncertainties, dtype=np.float32)
-        metric_np = np.array(metrics, dtype=np.float32)
-
-        # 移除无效值（nan/inf）
-        valid_mask = np.isfinite(uncertainty_np) & np.isfinite(metric_np)
-        uncertainty_valid = uncertainty_np[valid_mask]
-        metric_valid = metric_np[valid_mask]
-
-        if len(uncertainty_valid) < 2:
-            logging.warning(f"Not enough valid data for {metric_name} correlation: {len(uncertainty_valid)}")
-            return {}
-
-        # 计算相关性
-        correlation = np.corrcoef(uncertainty_valid, metric_valid)[0, 1]
-
-        # 计算线性回归
-        slope, intercept = np.polyfit(uncertainty_valid, metric_valid, 1)
-
-        # 计算统计信息
-        results = {
-            'correlation': float(correlation),
-            'slope': float(slope),
-            'intercept': float(intercept),
-            'uncertainty_mean': float(np.mean(uncertainty_valid)),
-            'uncertainty_std': float(np.std(uncertainty_valid)),
-            'metric_mean': float(np.mean(metric_valid)),
-            'metric_std': float(np.std(metric_valid)),
-            'num_valid_points': int(np.sum(valid_mask)),
-            'total_points': len(uncertainty_np),
-            # 保存原始数据用于绘图（采样以节省内存，如果数据量很大）
-            'uncertainty_data': self._sample_data_for_plotting(uncertainty_valid),
-            'metric_data': self._sample_data_for_plotting(metric_valid)
+        # Simple image-level storage (sufficient for correlations)
+        self.data: dict[str, list[float]] = {
+            "uncertainty": [],
+            "accuracy": [],
+            "correctness": [],  # Binary: pred == gt
+            "nll": [],
         }
+
+        # Pixel-level samples for AUROC (subsampled to limit memory)
+        self.pixel_samples: dict[str, list[float]] = {
+            "uncertainty": [],
+            "is_correct": [],  # Binary: 0 or 1
+        }
+        self.max_pixel_samples = 100000  # Limit memory usage
+
+        # Results cache
+        self.results: dict[str, Any] = {}
+
+        if self.is_main:
+            os.makedirs(save_dir, exist_ok=True)
+            logging.info(f"Evaluator initialized: distributed={distributed}, dilation={foreground_dilation}")
+
+    def add_batch(
+        self,
+        uncertainty: torch.Tensor,
+        pred_logits: torch.Tensor,
+        gt_masks: torch.Tensor,
+    ) -> None:
+        """Add a batch of data. Computes image-level metrics from each sample."""
+        try:
+            # Ensure tensors are on same device and aligned
+            B = pred_logits.shape[0]
+
+            for i in range(B):
+                unc = uncertainty[i] if uncertainty.ndim > 2 else uncertainty
+                pred = pred_logits[i]
+                gt = gt_masks[i]
+
+                # Align spatial dims if needed
+                if pred.shape[:2] != gt.shape[:2]:
+                    gt = F.interpolate(
+                        gt.unsqueeze(0).unsqueeze(0).float(),
+                        size=pred.shape[:2],
+                        mode="nearest",
+                    ).squeeze()
+
+                # Compute image-level metrics
+                pred_binary = pred > 0
+                gt_binary = gt > 0.5
+
+                # Accuracy (soft): P(correct class)
+                pred_prob = torch.sigmoid(pred)
+                accuracy = torch.where(gt_binary, pred_prob, 1 - pred_prob).mean()
+
+                # Correctness (binary): fraction of correct pixels
+                correctness = (pred_binary == gt_binary).float().mean()
+
+                # NLL
+                pred_prob_safe = pred_prob.clamp(1e-7, 1 - 1e-7)
+                nll = -(gt_binary.float() * torch.log(pred_prob_safe) + (1 - gt_binary.float()) * torch.log(1 - pred_prob_safe)).mean()
+
+                # Uncertainty (mean over spatial dims)
+                if unc.ndim >= 2:
+                    unc_scalar = unc.float().mean()
+                else:
+                    unc_scalar = unc.float()
+
+                # Store image-level
+                self.data["uncertainty"].append(float(unc_scalar.cpu()))
+                self.data["accuracy"].append(float(accuracy.cpu()))
+                self.data["correctness"].append(float(correctness.cpu()))
+                self.data["nll"].append(float(nll.cpu()))
+
+                # Sample pixels for AUROC (from dilated GT region only)
+                if len(self.pixel_samples["uncertainty"]) < self.max_pixel_samples:
+                    # Create dilated GT mask (focus on boundary region)
+                    gt_mask = gt_binary.any(dim=-1) if gt_binary.ndim == 3 else gt_binary
+                    if self.foreground_dilation > 0:
+                        region_mask = _dilate_mask(gt_mask, self.foreground_dilation)
+                    else:
+                        region_mask = gt_mask
+
+                    # Get indices of pixels in the region
+                    region_indices = torch.where(region_mask.flatten())[0].cpu().numpy()
+
+                    if len(region_indices) > 0:
+                        # Get uncertainty and correctness for region pixels
+                        unc_flat = unc.float().flatten().cpu().numpy()
+                        correct_flat = (pred_binary == gt_binary).float()
+                        if correct_flat.ndim == 3:
+                            correct_flat = correct_flat.any(dim=-1)  # Any channel correct
+                        correct_flat = correct_flat.flatten().cpu().numpy()
+
+                        # Sample from region only
+                        n_sample = min(1000, len(region_indices), self.max_pixel_samples - len(self.pixel_samples["uncertainty"]))
+                        if n_sample > 0:
+                            sample_idx = np.random.choice(len(region_indices), n_sample, replace=False)
+                            pixel_idx = region_indices[sample_idx]
+                            self.pixel_samples["uncertainty"].extend(unc_flat[pixel_idx].tolist())
+                            self.pixel_samples["is_correct"].extend(correct_flat[pixel_idx].tolist())
+
+        except Exception as e:
+            logging.warning(f"add_batch failed: {e}")
+
+    def _gather_all(self) -> dict[str, np.ndarray]:
+        """Gather data from all processes."""
+        if not self.distributed:
+            return {k: np.array(v, dtype=np.float32) for k, v in self.data.items()}
+
+        gathered = {}
+        for key, values in self.data.items():
+            # Use all_gather_object for simplicity
+            all_values = [None] * self.world_size
+            dist.all_gather_object(all_values, values)
+            merged = []
+            for v in all_values:
+                if v:
+                    merged.extend(v)
+            gathered[key] = np.array(merged, dtype=np.float32)
+
+        return gathered
+
+    def _gather_pixel_samples(self) -> dict[str, np.ndarray]:
+        """Gather pixel samples from all processes for AUROC."""
+        if not self.distributed:
+            return {k: np.array(v, dtype=np.float32) for k, v in self.pixel_samples.items()}
+
+        gathered = {}
+        for key, values in self.pixel_samples.items():
+            all_values = [None] * self.world_size
+            dist.all_gather_object(all_values, values)
+            merged = []
+            for v in all_values:
+                if v:
+                    merged.extend(v)
+            gathered[key] = np.array(merged, dtype=np.float32)
+
+        return gathered
+
+    def evaluate(self) -> dict[str, Any]:
+        """Compute all uncertainty quality metrics."""
+        if len(self.data["uncertainty"]) == 0:
+            logging.warning("No data for evaluation")
+            return {}
+
+        # Gather from all processes
+        data = self._gather_all()
+        pixel_data = self._gather_pixel_samples()
+
+        if not self.is_main:
+            return {}
+
+        n_samples = len(data["uncertainty"])
+        logging.info(f"Evaluating {n_samples} images, {len(pixel_data['uncertainty'])} pixel samples")
+
+        results: dict[str, Any] = {"n_images": n_samples}
+
+        # Filter valid values
+        valid = np.isfinite(data["uncertainty"]) & np.isfinite(data["accuracy"])
+        unc = data["uncertainty"][valid]
+        acc = data["accuracy"][valid]
+        corr = data["correctness"][valid]
+
+        if len(unc) < 2:
+            logging.warning("Not enough valid samples")
+            return results
+
+        # === Correlations (image-level) ===
+        # Pearson
+        results["pearson_acc"] = float(np.corrcoef(unc, acc)[0, 1])
+        results["pearson_corr"] = float(np.corrcoef(unc, corr)[0, 1])
+
+        # Spearman
+        sp_acc, _ = spearmanr(unc, acc)
+        sp_corr, _ = spearmanr(unc, corr)
+        results["spearman_acc"] = float(sp_acc)
+        results["spearman_corr"] = float(sp_corr)
+
+        # === AUROC (pixel-level): Can uncertainty detect errors? ===
+        try:
+            pix_unc = pixel_data["uncertainty"]
+            pix_correct = pixel_data["is_correct"]
+            valid_pix = np.isfinite(pix_unc) & np.isfinite(pix_correct)
+            pix_unc = pix_unc[valid_pix]
+            pix_correct = pix_correct[valid_pix]
+
+            if len(pix_unc) > 100:
+                is_error = 1.0 - pix_correct  # 1 = error, 0 = correct
+                results["auroc"] = float(roc_auc_score(is_error, pix_unc))
+                results["aupr"] = float(average_precision_score(is_error, pix_unc))
+                results["n_pixels"] = len(pix_unc)
+                results["error_rate"] = float(is_error.mean())
+                logging.info(f"Pixel-level AUROC: {results['auroc']:.4f} ({len(pix_unc)} pixels, {results['error_rate'] * 100:.1f}% errors)")
+        except Exception as e:
+            logging.warning(f"AUROC failed: {e}")
+
+        # === ECE: Calibration (image-level) ===
+        results["ece"] = self._compute_ece(acc, unc)
+
+        # === PAvPU (image-level) ===
+        results.update(self._compute_pavpu(unc, corr))
+
+        # Log summary
+        logging.info(f"Results: Pearson(acc)={results.get('pearson_acc', 0):.3f}, AUROC={results.get('auroc', 0):.3f}, ECE={results.get('ece', 0):.3f}")
+
+        # Add histogram data for TensorBoard (subsample to limit size)
+        if len(pixel_data["uncertainty"]) > 0:
+            unc_samples = pixel_data["uncertainty"]
+            if len(unc_samples) > 10000:
+                unc_samples = np.random.choice(unc_samples, 10000, replace=False)
+            results["uncertainty_histogram"] = unc_samples
+
+        self.results = results
+        return results
+
+    def _compute_ece(self, accuracy: np.ndarray, uncertainty: np.ndarray, n_bins: int = 15) -> float:
+        """Expected Calibration Error."""
+        # Convert uncertainty to confidence (invert)
+        unc_range = uncertainty.max() - uncertainty.min()
+        if unc_range > 1e-8:
+            confidence = 1.0 - (uncertainty - uncertainty.min()) / unc_range
+        else:
+            return 0.0
+
+        ece = 0.0
+        for i in range(n_bins):
+            lo, hi = i / n_bins, (i + 1) / n_bins
+            mask = (confidence >= lo) & (confidence < hi)
+            if mask.sum() > 0:
+                avg_conf = confidence[mask].mean()
+                avg_acc = accuracy[mask].mean()
+                ece += np.abs(avg_conf - avg_acc) * mask.sum()
+
+        return float(ece / len(accuracy))
+
+    def _compute_pavpu(self, uncertainty: np.ndarray, correctness: np.ndarray) -> dict[str, float]:
+        """PAvPU at multiple thresholds."""
+        results = {}
+
+        # Normalize uncertainty
+        unc_range = uncertainty.max() - uncertainty.min()
+        if unc_range > 1e-8:
+            unc_norm = (uncertainty - uncertainty.min()) / unc_range
+        else:
+            return {"pavpu_0.05": 50.0}
+
+        for thresh in [0.01, 0.05, 0.10]:
+            # Top thresh% uncertainty = "uncertain"
+            thresh_val = np.percentile(unc_norm, (1 - thresh) * 100)
+            uncertain = unc_norm >= thresh_val
+            certain = ~uncertain
+            accurate = correctness > 0.5
+
+            ac = (accurate & certain).sum()  # Accurate & Certain
+            iu = (~accurate & uncertain).sum()  # Inaccurate & Uncertain
+            pavpu = (ac + iu) / len(correctness) * 100
+
+            results[f"pavpu_{thresh:.2f}"] = float(pavpu)
 
         return results
 
-    def _sample_data_for_plotting(self, data: np.ndarray, max_points: int = 10000) -> list[float]:
-        """对数据进行采样以用于绘图，避免存储过多数据点"""
-        if len(data) <= max_points:
-            return data.tolist()
-        else:
-            # 随机采样
-            indices = np.random.choice(len(data), max_points, replace=False)
-            return data[indices].tolist()
+    def save_results(self, filename: str = "evaluation_results.json") -> str:
+        """Save results to JSON."""
+        if not self.is_main or not self.results:
+            return ""
 
-    def evaluate_dataset_correlation(self) -> dict[str, dict[str, float]]:
-        """评估整个数据集的指标与不确定性相关性"""
+        path = os.path.join(self.save_dir, filename)
+        with open(path, "w") as f:
+            json.dump(self.results, f, indent=2)
+
+        logging.info(f"Results saved: {path}")
+        return path
+
+    def create_visualization(self, filename: str = "correlation_plot.png") -> str:
+        """Create simple scatter plot of uncertainty vs accuracy."""
+        if not self.is_main or len(self.data["uncertainty"]) == 0:
+            return ""
+
         try:
-            # 检查是否有数据
-            data_source = self.pixel_data['uncertainties'].tolist() if self.per_pixel_statistics else self.image_uncertainties
-            if not data_source:
-                logging.warning("No data available for evaluation")
-                return {}
+            fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
-            data_unit = "pixels" if self.per_pixel_statistics else "images"
-            if self.is_main_process:
-                logging.info(f"Evaluating correlation for {len(data_source)} {data_unit}")
+            unc = np.array(self.data["uncertainty"])
+            acc = np.array(self.data["accuracy"])
+            corr = np.array(self.data["correctness"])
 
-            # 收集分布式数据（返回float列表）
-            all_uncertainties, all_ious, all_dices, all_accuracies, all_nlls = self._gather_distributed_data()
+            # Uncertainty vs Accuracy
+            axes[0].scatter(unc, acc, alpha=0.3, s=10)
+            axes[0].set_xlabel("Uncertainty")
+            axes[0].set_ylabel("Accuracy")
+            axes[0].set_title(f"Unc vs Acc (r={self.results.get('pearson_acc', 0):.3f})")
 
-            # 只在主进程上进行评估
-            if not self.is_main_process:
-                return {}
+            # Uncertainty vs Correctness
+            axes[1].scatter(unc, corr, alpha=0.3, s=10)
+            axes[1].set_xlabel("Uncertainty")
+            axes[1].set_ylabel("Correctness")
+            axes[1].set_title(f"Unc vs Corr (r={self.results.get('pearson_corr', 0):.3f})")
 
-            # 记录各指标列表长度用于调试
-            logging.info(f"Gathered data lengths - Uncertainties: {len(all_uncertainties)}, "
-                        f"IoU: {len(all_ious)}, DICE: {len(all_dices)}, "
-                        f"Accuracy: {len(all_accuracies)}, NLL: {len(all_nlls)}")
-
-            # 分别计算每个指标的相关性（使用numpy数组进行计算）
-            correlation_results = {}
-
-            # IoU相关性
-            if all_ious:
-                logging.info(f"Calculating IoU correlation with {len(all_ious)} {data_unit}")
-                iou_corr = self._calculate_correlation_from_lists(
-                    all_uncertainties, all_ious, 'IoU'
-                )
-                if iou_corr:
-                    correlation_results['IoU'] = iou_corr
-                    logging.info(f"IoU correlation calculated: {iou_corr.get('correlation', 'N/A'):.4f}")
-
-            # DICE相关性
-            if all_dices:
-                logging.info(f"Calculating DICE correlation with {len(all_dices)} {data_unit}")
-                dice_corr = self._calculate_correlation_from_lists(
-                    all_uncertainties, all_dices, 'DICE'
-                )
-                if dice_corr:
-                    correlation_results['DICE'] = dice_corr
-                    logging.info(f"DICE correlation calculated: {dice_corr.get('correlation', 'N/A'):.4f}")
-
-            # Accuracy相关性
-            if all_accuracies:
-                logging.info(f"Calculating Accuracy correlation with {len(all_accuracies)} {data_unit}")
-                acc_corr = self._calculate_correlation_from_lists(
-                    all_uncertainties, all_accuracies, 'Accuracy'
-                )
-                if acc_corr:
-                    correlation_results['Accuracy'] = acc_corr
-                    logging.info(f"Accuracy correlation calculated: {acc_corr.get('correlation', 'N/A'):.4f}")
-
-            # NLL相关性（NLL本身就是不确定性度量，与uncertainty的相关性）
-            if all_nlls:
-                logging.info(f"Calculating NLL correlation with {len(all_nlls)} {data_unit}")
-                nll_corr = self._calculate_correlation_from_lists(
-                    all_uncertainties, all_nlls, 'NLL'
-                )
-                if nll_corr:
-                    correlation_results['NLL'] = nll_corr
-                    logging.info(f"NLL correlation calculated: {nll_corr.get('correlation', 'N/A'):.4f}")
-            
-            # 保存结果
-            self.correlation_results = correlation_results
-            
-            # 记录汇总信息
-            if correlation_results:
-                logging.info("Dataset correlation evaluation completed: " + 
-                           str(list(correlation_results.keys())))
-                for metric_name, results in correlation_results.items():
-                    correlation = results.get('correlation', 'N/A')
-                    valid_points = results.get('num_valid_points', 'N/A')
-                    logging.info(f"{metric_name}: correlation={correlation}, valid_points={valid_points}")
-            
-            return correlation_results
-            
-        except Exception as e:
-            logging.warning(f"Failed to evaluate dataset correlation: {e}")
-            import traceback
-            logging.warning(f"Correlation evaluation traceback: {traceback.format_exc()}")
-            return {}
-    
-    def create_dataset_correlation_visualization(self, 
-                                               title: str = "Dataset Metric-Uncertainty Correlation Analysis",
-                                               save_name: str = "dataset_correlation_analysis.png") -> str:
-        """
-        创建数据集相关性分析的可视化图表
-        
-        Args:
-            title: 图表标题
-            save_name: 保存文件名
-            
-        Returns:
-            保存的文件路径
-        """
-        try:
-            # 只在主进程上创建可视化
-            if not self.is_main_process:
-                return ""
-            
-            if not self.correlation_results:
-                logging.warning("No correlation results available for visualization")
-                return ""
-            
-            # 创建图形
-            fig = plt.figure(figsize=(18, 12))
-            
-            # 使用可视化工具创建数据集相关性图
-            self.viz_utils.plot_dataset_metric_uncertainty_correlation(
-                fig, self.correlation_results, title
-            )
-            
-            # 保存图表
-            save_path = os.path.join(self.save_dir, save_name)
             plt.tight_layout()
-            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            path = os.path.join(self.save_dir, filename)
+            plt.savefig(path, dpi=100)
             plt.close(fig)
-            
-            logging.info(f"Dataset correlation visualization saved: {save_path}")
-            return save_path
-            
+
+            logging.info(f"Visualization saved: {path}")
+            return path
+
         except Exception as e:
-            logging.warning(f"Failed to create dataset correlation visualization: {e}")
-            import traceback
-            logging.warning(f"Traceback: {traceback.format_exc()}")
+            logging.warning(f"Visualization failed: {e}")
             return ""
-    
-    def save_correlation_results(self, save_name: str = "correlation_results.json") -> str:
-        """
-        保存相关性分析结果到JSON文件
-        
-        Args:
-            save_name: 保存文件名
-            
-        Returns:
-            保存的文件路径
-        """
-        try:
-            # 只在主进程上保存结果
-            if not self.is_main_process:
-                return ""
-            
-            if not self.correlation_results:
-                logging.warning("No correlation results available for saving")
-                return ""
-            
-            import json
-            
-            # 处理numpy数据类型，确保可以序列化
-            serializable_results = {}
-            for metric_name, results in self.correlation_results.items():
-                serializable_results[metric_name] = {}
-                for key, value in results.items():
-                    if isinstance(value, (np.integer, np.floating)):
-                        serializable_results[metric_name][key] = float(value)
-                    elif isinstance(value, np.ndarray):
-                        # 将numpy数组转换为Python列表
-                        serializable_results[metric_name][key] = value.tolist()
-                    elif isinstance(value, list):
-                        serializable_results[metric_name][key] = [
-                            float(x) if isinstance(x, (np.integer, np.floating)) else x 
-                            for x in value
-                        ]
-                    else:
-                        serializable_results[metric_name][key] = value
-            
-            save_path = os.path.join(self.save_dir, save_name)
-            with open(save_path, 'w', encoding='utf-8') as f:
-                json.dump(serializable_results, f, indent=2, ensure_ascii=False)
-            
-            logging.info(f"Correlation results saved: {save_path}")
-            logging.info(f"Saved metrics: {list(serializable_results.keys())}")
-            return save_path
-            
-        except Exception as e:
-            logging.warning(f"Failed to save correlation results: {e}")
-            import traceback
-            logging.warning(f"Traceback: {traceback.format_exc()}")
-            return ""
-    
-    def get_summary_statistics(self) -> dict[str, Any]:
-        """
-        获取汇总统计信息
-        
-        Returns:
-            汇总统计字典
-        """
-        try:
-            if not self.correlation_results:
-                return {}
-            
-            # Use the correct data source based on mode
-            data_source = self.pixel_data['uncertainties'].tolist() if self.per_pixel_statistics else self.image_uncertainties
-            
-            summary = {
-                'total_batches': len(data_source),
-                'metrics_evaluated': list(self.correlation_results.keys()),
-                'correlation_summary': {},
-                'overall_statistics': {},
-                'distributed_info': {
-                    'distributed': self.distributed,
-                    'rank': self.rank,
-                    'world_size': self.world_size
-                }
-            }
-            
-            # 为每个指标计算汇总统计
-            for metric_name, results in self.correlation_results.items():
-                summary['correlation_summary'][metric_name] = {
-                    'correlation': results.get('correlation', np.nan),
-                    'slope': results.get('slope', np.nan),
-                    'valid_points': results.get('num_valid_points', 0),
-                    'total_points': results.get('total_points', 0)
-                }
-            
-            # 计算整体统计
-            correlations = [results.get('correlation', np.nan) for results in self.correlation_results.values()]
-            valid_correlations = [c for c in correlations if not np.isnan(c)]
-            
-            if valid_correlations:
-                summary['overall_statistics'] = {
-                    'mean_correlation': np.mean(valid_correlations),
-                    'std_correlation': np.std(valid_correlations),
-                    'min_correlation': np.min(valid_correlations),
-                    'max_correlation': np.max(valid_correlations)
-                }
-            
-            return summary
-            
-        except Exception as e:
-            logging.warning(f"Failed to get summary statistics: {e}")
-            return {}
-    
+
     def reset(self) -> None:
-        """重置评估器状态，清除所有数据"""
-        if self.per_pixel_statistics:
-            # 重置Pandas DataFrame
-            self.pixel_data = self.pixel_data.iloc[0:0]  # 清空但保持结构
-        else:
-            self.image_uncertainties.clear()
-            self.image_ious.clear()
-            self.image_dices.clear()
-            self.image_accuracies.clear()
-            self.image_nlls.clear()
-
-        self.correlation_results.clear()
-
-        if self.is_main_process:
-            data_unit = "pixel" if self.per_pixel_statistics else "image"
-            logging.info(f"Distributed dataset evaluator reset ({data_unit}-level statistics)")
+        """Clear all data."""
+        for key in self.data:
+            self.data[key].clear()
+        for key in self.pixel_samples:
+            self.pixel_samples[key].clear()
+        self.results.clear()
 
     def __len__(self) -> int:
-        """返回当前进程已添加的数据点数（图片数或像素数）"""
-        if self.per_pixel_statistics:
-            return len(self.pixel_data)  # 返回DataFrame的行数
-        else:
-            return len(self.image_uncertainties)
-
-    def get_total_images_across_all_processes(self) -> int:
-        """获取所有进程的总数据点数（all_reduce 求和）"""
-        if not self.distributed or not dist.is_initialized():
-            return len(self)
-
-        device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
-        local_count = torch.tensor([len(self)], device=device, dtype=torch.int64)
-        dist.all_reduce(local_count, op=dist.ReduceOp.SUM)
-        return int(local_count.item())
+        return len(self.data["uncertainty"])
 
 
-# 保持向后兼容性
-class DatasetEvaluator(DistributedDatasetEvaluator):
-    """向后兼容的DatasetEvaluator类"""
-    
-    def __init__(self, save_dir: str):
-        super().__init__(save_dir, distributed=False, rank=0, world_size=1)
+# Backward compatibility alias
+DatasetEvaluator = DistributedDatasetEvaluator
