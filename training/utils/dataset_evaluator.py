@@ -44,7 +44,9 @@ class DistributedDatasetEvaluator:
         distributed: bool = False,
         rank: int = 0,
         world_size: int = 1,
-        foreground_dilation: int = 15,  # Pixels to dilate GT region for boundary focus
+        foreground_dilation: int = 0,  # Set to 0 to use all pixels (no region filtering)
+        use_all_pixels: bool = True,  # If True, use all pixels instead of GT region
+        max_pixel_samples: int = 0,  # 0 = no limit (use all pixels)
     ):
         self.save_dir = save_dir
         self.distributed = distributed and dist.is_initialized()
@@ -52,6 +54,8 @@ class DistributedDatasetEvaluator:
         self.world_size = world_size
         self.is_main = rank == 0
         self.foreground_dilation = foreground_dilation
+        self.use_all_pixels = use_all_pixels
+        self.max_pixel_samples = max_pixel_samples  # 0 = no limit
 
         # Simple image-level storage (sufficient for correlations)
         self.data: dict[str, list[float]] = {
@@ -61,19 +65,18 @@ class DistributedDatasetEvaluator:
             "nll": [],
         }
 
-        # Pixel-level samples for AUROC (subsampled to limit memory)
+        # Pixel-level samples for AUROC and PAvPU (no downsampling by default)
         self.pixel_samples: dict[str, list[float]] = {
             "uncertainty": [],
             "is_correct": [],  # Binary: 0 or 1
         }
-        self.max_pixel_samples = 100000  # Limit memory usage
 
         # Results cache
         self.results: dict[str, Any] = {}
 
         if self.is_main:
             os.makedirs(save_dir, exist_ok=True)
-            logging.info(f"Evaluator initialized: distributed={distributed}, dilation={foreground_dilation}")
+            logging.info(f"Evaluator initialized: distributed={distributed}, use_all_pixels={use_all_pixels}, max_samples={max_pixel_samples}")
 
     def add_batch(
         self,
@@ -126,33 +129,49 @@ class DistributedDatasetEvaluator:
                 self.data["correctness"].append(float(correctness.cpu()))
                 self.data["nll"].append(float(nll.cpu()))
 
-                # Sample pixels for AUROC (from dilated GT region only)
-                if len(self.pixel_samples["uncertainty"]) < self.max_pixel_samples:
-                    # Create dilated GT mask (focus on boundary region)
-                    gt_mask = gt_binary.any(dim=-1) if gt_binary.ndim == 3 else gt_binary
-                    if self.foreground_dilation > 0:
-                        region_mask = _dilate_mask(gt_mask, self.foreground_dilation)
+                # Collect pixels for AUROC and PAvPU
+                # Check if we should continue collecting (0 = no limit)
+                should_collect = self.max_pixel_samples == 0 or len(self.pixel_samples["uncertainty"]) < self.max_pixel_samples
+
+                if should_collect:
+                    # Get uncertainty and correctness for all pixels
+                    unc_flat = unc.float().flatten().cpu().numpy()
+                    correct_flat = (pred_binary == gt_binary).float()
+                    if correct_flat.ndim == 3:
+                        correct_flat = correct_flat.any(dim=-1)  # Any channel correct
+                    correct_flat = correct_flat.flatten().cpu().numpy()
+
+                    if self.use_all_pixels:
+                        # Use ALL pixels (no region filtering, no sampling)
+                        self.pixel_samples["uncertainty"].extend(unc_flat.tolist())
+                        self.pixel_samples["is_correct"].extend(correct_flat.tolist())
                     else:
-                        region_mask = gt_mask
+                        # Legacy mode: sample from dilated GT region only
+                        gt_mask = gt_binary.any(dim=-1) if gt_binary.ndim == 3 else gt_binary
+                        if self.foreground_dilation > 0:
+                            region_mask = _dilate_mask(gt_mask, self.foreground_dilation)
+                        else:
+                            region_mask = gt_mask
 
-                    # Get indices of pixels in the region
-                    region_indices = torch.where(region_mask.flatten())[0].cpu().numpy()
+                        # Get indices of pixels in the region
+                        region_indices = torch.where(region_mask.flatten())[0].cpu().numpy()
 
-                    if len(region_indices) > 0:
-                        # Get uncertainty and correctness for region pixels
-                        unc_flat = unc.float().flatten().cpu().numpy()
-                        correct_flat = (pred_binary == gt_binary).float()
-                        if correct_flat.ndim == 3:
-                            correct_flat = correct_flat.any(dim=-1)  # Any channel correct
-                        correct_flat = correct_flat.flatten().cpu().numpy()
+                        if len(region_indices) > 0:
+                            # Sample from region only
+                            if self.max_pixel_samples > 0:
+                                remaining = self.max_pixel_samples - len(self.pixel_samples["uncertainty"])
+                                n_sample = min(1000, len(region_indices), remaining)
+                            else:
+                                n_sample = len(region_indices)
 
-                        # Sample from region only
-                        n_sample = min(1000, len(region_indices), self.max_pixel_samples - len(self.pixel_samples["uncertainty"]))
-                        if n_sample > 0:
-                            sample_idx = np.random.choice(len(region_indices), n_sample, replace=False)
-                            pixel_idx = region_indices[sample_idx]
-                            self.pixel_samples["uncertainty"].extend(unc_flat[pixel_idx].tolist())
-                            self.pixel_samples["is_correct"].extend(correct_flat[pixel_idx].tolist())
+                            if n_sample > 0:
+                                if n_sample < len(region_indices):
+                                    sample_idx = np.random.choice(len(region_indices), n_sample, replace=False)
+                                    pixel_idx = region_indices[sample_idx]
+                                else:
+                                    pixel_idx = region_indices
+                                self.pixel_samples["uncertainty"].extend(unc_flat[pixel_idx].tolist())
+                                self.pixel_samples["is_correct"].extend(correct_flat[pixel_idx].tolist())
 
         except Exception as e:
             logging.warning(f"add_batch failed: {e}")
@@ -249,11 +268,37 @@ class DistributedDatasetEvaluator:
         except Exception as e:
             logging.warning(f"AUROC failed: {e}")
 
+        # === NLL (Negative Log-Likelihood) - Proper Scoring Rule ===
+        # NLL is a proper scoring rule that measures the quality of probabilistic predictions
+        # Lower is better. NLL = -1/N * sum(y * log(p) + (1-y) * log(1-p))
+        if "nll" in data and len(data["nll"]) > 0:
+            valid_nll = data["nll"][np.isfinite(data["nll"])]
+            if len(valid_nll) > 0:
+                results["mean_nll"] = float(np.mean(valid_nll))
+                results["std_nll"] = float(np.std(valid_nll))
+                results["median_nll"] = float(np.median(valid_nll))
+                logging.info(f"NLL: mean={results['mean_nll']:.4f}, std={results['std_nll']:.4f}")
+
         # === ECE: Calibration (image-level) ===
         results["ece"] = self._compute_ece(acc, unc)
 
-        # === PAvPU (image-level) ===
-        results.update(self._compute_pavpu(unc, corr))
+        # === PAvPU (pixel-level) - using same pixel samples as AUROC ===
+        try:
+            pix_unc = pixel_data["uncertainty"]
+            pix_correct = pixel_data["is_correct"]
+            valid_pix = np.isfinite(pix_unc) & np.isfinite(pix_correct)
+            pix_unc = pix_unc[valid_pix]
+            pix_correct = pix_correct[valid_pix]
+
+            if len(pix_unc) > 100:
+                results.update(self._compute_pavpu(pix_unc, pix_correct))
+                # Log BNDL official thresholds (p > 0.01, 0.05, 0.1)
+                logging.info(
+                    f"PAvPU (BNDL): p>0.01:{results.get('pavpu_p001', 0):.1f}%, p>0.05:{results.get('pavpu_p005', 0):.1f}%, p>0.1:{results.get('pavpu_p01', 0):.1f}%, EFR:{results.get('error_flagging_rate', 0):.1f}%"
+                )
+        except Exception as e:
+            logging.warning(f"PAvPU failed: {e}")
+            results.update(self._compute_pavpu(unc, corr))  # Fallback to image-level
 
         # Log summary
         logging.info(f"Results: Pearson(acc)={results.get('pearson_acc', 0):.3f}, AUROC={results.get('auroc', 0):.3f}, ECE={results.get('ece', 0):.3f}")
@@ -263,7 +308,7 @@ class DistributedDatasetEvaluator:
             unc_samples = pixel_data["uncertainty"]
             if len(unc_samples) > 10000:
                 unc_samples = np.random.choice(unc_samples, 10000, replace=False)
-            results["uncertainty_histogram"] = unc_samples
+            results["uncertainty_histogram"] = unc_samples.tolist()
 
         self.results = results
         return results
@@ -289,28 +334,189 @@ class DistributedDatasetEvaluator:
         return float(ece / len(accuracy))
 
     def _compute_pavpu(self, uncertainty: np.ndarray, correctness: np.ndarray) -> dict[str, float]:
-        """PAvPU at multiple thresholds."""
+        """Compute PAvPU (Patch Accuracy vs Patch Uncertainty) metric.
+
+        Following the ICLR 2025 BNDL official repository (https://github.com/XYHu122/BNDL):
+        PAvPU = (n_ac + n_iu) / (n_ac + n_au + n_ic + n_iu)
+
+        Where:
+        - n_ac: accurate-certain (correct prediction with low uncertainty)
+        - n_au: accurate-uncertain (correct prediction with high uncertainty)
+        - n_ic: inaccurate-certain (wrong prediction with low uncertainty) - worst case!
+        - n_iu: inaccurate-uncertain (wrong prediction with high uncertainty)
+
+        CRITICAL: This implementation uses ABSOLUTE thresholds (e.g., u > 0.5) following
+        the official BNDL repository, NOT percentile-based thresholds. Percentile-based
+        thresholding can create artifacts when comparing models with different uncertainty
+        distributions (e.g., IoU-proxy models have concentrated distributions at 0).
+
+        The official BNDL `uncertain_cal` function uses absolute p-value thresholds
+        (p > 0.01, 0.05, 0.1) for statistical hypothesis testing.
+
+        Args:
+            uncertainty: Array of uncertainty values (higher = more uncertain), expected in [0, 1]
+            correctness: Array of binary correctness values (1 = correct, 0 = incorrect)
+
+        Returns:
+            dict with:
+            - pavpu_abs_XX: PAvPU at absolute uncertainty threshold of XX/100 (PRIMARY METRIC)
+            - pavpu_XX: PAvPU at percentile threshold (for backward compatibility)
+            - au_pavpu: Average PAvPU across absolute thresholds
+            - pavpu_components: Detailed breakdown at u > 0.5 threshold
+            - error_flagging_rate: n_iu / (n_ic + n_iu) - critical safety metric
+        """
         results = {}
 
-        # Normalize uncertainty
-        unc_range = uncertainty.max() - uncertainty.min()
-        if unc_range > 1e-8:
-            unc_norm = (uncertainty - uncertainty.min()) / unc_range
-        else:
-            return {"pavpu_0.05": 50.0}
+        if len(uncertainty) < 10:
+            return {"au_pavpu": 50.0, "pavpu_50": 50.0, "pavpu_abs_50": 50.0}
 
-        for thresh in [0.01, 0.05, 0.10]:
-            # Top thresh% uncertainty = "uncertain"
-            thresh_val = np.percentile(unc_norm, (1 - thresh) * 100)
-            uncertain = unc_norm >= thresh_val
-            certain = ~uncertain
-            accurate = correctness > 0.5
+        is_correct = correctness > 0.5
+        is_incorrect = ~is_correct
 
-            ac = (accurate & certain).sum()  # Accurate & Certain
-            iu = (~accurate & uncertain).sum()  # Inaccurate & Uncertain
-            pavpu = (ac + iu) / len(correctness) * 100
+        # ================================================================
+        # PRIMARY: BNDL Official Thresholds (p-value based)
+        # ================================================================
+        # BNDL official repository uses only 3 p-value thresholds: 0.01, 0.05, 0.1
+        # The uncertainty value is the p-value from a two-sample t-test
+        # uncertain = (p-value > threshold), i.e., cannot reject null hypothesis
+        bndl_thresholds = [0.01, 0.05, 0.1]
+        bndl_pavpu_values = []
 
-            results[f"pavpu_{thresh:.2f}"] = float(pavpu)
+        for thresh in bndl_thresholds:
+            # BNDL: uncertain = (testresult > thresh)
+            # where testresult is p-value from t-test
+            is_uncertain = uncertainty > thresh
+            is_certain = ~is_uncertain
+
+            # Four categories (matches BNDL official implementation)
+            # ac = accurate_pred * (1 - uncertain)  -> accurate & certain
+            # iu = (1 - accurate_pred) * uncertain  -> inaccurate & uncertain
+            n_ac = np.sum(is_correct & is_certain)
+            n_au = np.sum(is_correct & is_uncertain)
+            n_ic = np.sum(is_incorrect & is_certain)
+            n_iu = np.sum(is_incorrect & is_uncertain)
+
+            total = n_ac + n_au + n_ic + n_iu
+
+            if total > 0:
+                # BNDL: base_aic = (ac + iu) / total * 100
+                pavpu = (n_ac + n_iu) / total * 100
+            else:
+                pavpu = 50.0
+
+            # Use threshold value directly in key name to match BNDL style
+            thresh_key = f"pavpu_p{str(thresh).replace('.', '')}"  # e.g., pavpu_p001, pavpu_p005, pavpu_p01
+            results[thresh_key] = float(pavpu)
+            bndl_pavpu_values.append(pavpu)
+
+            # Store detailed breakdown at p > 0.05 threshold (middle threshold)
+            if thresh == 0.05:
+                # Error Flagging Rate (EFR): critical safety metric
+                efr = n_iu / (n_ic + n_iu) * 100 if (n_ic + n_iu) > 0 else 100.0
+
+                results["pavpu_components"] = {
+                    "n_ac": int(n_ac),
+                    "n_au": int(n_au),
+                    "n_ic": int(n_ic),
+                    "n_iu": int(n_iu),
+                    "threshold": float(thresh),
+                    "threshold_type": "pvalue",
+                }
+                results["error_flagging_rate"] = float(efr)
+
+        # Average PAvPU across BNDL thresholds (primary AU-PAvPU)
+        results["au_pavpu"] = float(np.mean(bndl_pavpu_values))
+
+        # Also provide individual results with clearer names
+        results["pavpu_abs_01"] = results.get("pavpu_p001", 50.0)  # p > 0.01
+        results["pavpu_abs_05"] = results.get("pavpu_p005", 50.0)  # p > 0.05
+        results["pavpu_abs_10"] = results.get("pavpu_p01", 50.0)  # p > 0.1
+
+        # ================================================================
+        # EXTENDED: Additional absolute thresholds for broader analysis
+        # ================================================================
+        # For models that output uncertainty in [0, 1] range (like entropy or normalized values)
+        ext_thresholds = [0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+        for thresh in ext_thresholds:
+            is_uncertain = uncertainty > thresh
+            is_certain = ~is_uncertain
+
+            n_ac = np.sum(is_correct & is_certain)
+            n_iu = np.sum(is_incorrect & is_uncertain)
+            total = len(correctness)
+
+            pavpu = (n_ac + n_iu) / total * 100 if total > 0 else 50.0
+            thresh_int = int(thresh * 100)
+            results[f"pavpu_abs_{thresh_int:02d}"] = float(pavpu)
+
+        # ================================================================
+        # SECONDARY: Percentile-based thresholds (backward compatibility)
+        # ================================================================
+        # Note: These can be misleading when comparing different model types
+        pct_thresholds = [1, 5, 10, 25, 50, 75, 90]
+        pct_pavpu_values = []
+
+        for thresh in pct_thresholds:
+            thresh_val = np.percentile(uncertainty, thresh)
+
+            is_uncertain = uncertainty > thresh_val
+            is_certain = ~is_uncertain
+
+            n_ac = np.sum(is_correct & is_certain)
+            n_au = np.sum(is_correct & is_uncertain)
+            n_ic = np.sum(is_incorrect & is_certain)
+            n_iu = np.sum(is_incorrect & is_uncertain)
+
+            total = n_ac + n_au + n_ic + n_iu
+
+            if total > 0:
+                pavpu = (n_ac + n_iu) / total * 100
+            else:
+                pavpu = 50.0
+
+            results[f"pavpu_{thresh:02d}"] = float(pavpu)
+            pct_pavpu_values.append(pavpu)
+
+            # Store percentile threshold info at 50%
+            if thresh == 50:
+                results["pavpu_pct_components"] = {
+                    "n_ac": int(n_ac),
+                    "n_au": int(n_au),
+                    "n_ic": int(n_ic),
+                    "n_iu": int(n_iu),
+                    "threshold": float(thresh_val),
+                    "threshold_type": "percentile",
+                }
+
+        results["au_pavpu_pct"] = float(np.mean(pct_pavpu_values))
+
+        # ================================================================
+        # PAvPU curve for visualization (using absolute thresholds)
+        # ================================================================
+        curve = []
+        for thresh in range(0, 101, 5):
+            thresh_val = thresh / 100.0
+
+            if thresh == 0:
+                # At threshold 0, all samples are "uncertain" (u > 0 is always true for positive u)
+                n_iu = np.sum(is_incorrect)
+                pavpu = n_iu / len(correctness) * 100 if len(correctness) > 0 else 50.0
+            elif thresh == 100:
+                # At threshold 1.0, all samples are "certain" (u > 1.0 is never true)
+                n_ac = np.sum(is_correct)
+                pavpu = n_ac / len(correctness) * 100 if len(correctness) > 0 else 50.0
+            else:
+                is_uncertain = uncertainty > thresh_val
+                is_certain = ~is_uncertain
+
+                n_ac = np.sum(is_correct & is_certain)
+                n_iu = np.sum(is_incorrect & is_uncertain)
+                total = len(correctness)
+                pavpu = (n_ac + n_iu) / total * 100 if total > 0 else 50.0
+
+            curve.append((thresh, float(pavpu)))
+
+        results["pavpu_curve"] = curve
 
         return results
 

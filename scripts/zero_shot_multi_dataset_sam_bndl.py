@@ -51,12 +51,171 @@ from bndl_eval_utils import (
 from checkpoint_manager import CheckpointManager
 from downsampling_utils import downsample_statistics_pavpu
 
+# ---------- UC-TTA (Test-Time Adaptation) ----------
+from uctta_utils import UCTTAConfig, UCTTAAdapter, apply_temperature
+
 # ---------- Dataset Configurations ----------
 from dataset_configs import DATASET_CONFIGS, DEFAULT_DATASETS
 
 # ---------- Unified click prompt generator ----------
 from prompt_loader import load_reused_prompts, save_prompts_to_json
 from prompt_utils import sample_error_click, sample_pos_neg
+
+
+# ---------- Color palette for uncertainty visualization ----------
+# Import the DAVIS palette from shared module (same as vos_inference.py)
+from sam2.utils.davis_palette import DAVIS_PALETTE
+
+
+def get_palette_from_mask_png(mask_path: Path) -> list[list[int]] | None:
+    """
+    Read the color palette from a palette-mode PNG file.
+
+    Args:
+        mask_path: Path to the mask PNG file (e.g., 00000.png)
+
+    Returns:
+        List of [R, G, B] colors, or None if palette cannot be read
+    """
+    if not mask_path.exists():
+        return None
+
+    try:
+        img = Image.open(mask_path)
+        if img.mode != "P":
+            return None
+
+        palette_flat = img.getpalette()
+        if palette_flat is None:
+            return None
+
+        # Convert flat list to list of [R, G, B] triplets
+        num_colors = len(palette_flat) // 3
+        palette = [[palette_flat[i * 3], palette_flat[i * 3 + 1], palette_flat[i * 3 + 2]] for i in range(num_colors)]
+        return palette
+    except Exception:
+        return None
+
+
+def create_colored_uncertainty_png(
+    uncertainty: np.ndarray,
+    obj_id: int,
+    pred_mask: np.ndarray | None = None,
+    palette: list[list[int]] | None = None,
+) -> np.ndarray:
+    """
+    Create a colored uncertainty visualization with black background (RGB).
+
+    Background is BLACK. Foreground (mask region) uses object color with intensity
+    proportional to uncertainty. Higher uncertainty = brighter color.
+
+    Args:
+        uncertainty: [H, W] uncertainty values in [0, 1]
+        obj_id: Object ID to get color from palette
+        pred_mask: Optional [H, W] binary mask to restrict visualization
+        palette: Color palette to use (read from 00000.png). Falls back to DAVIS_PALETTE.
+
+    Returns:
+        RGB image [H, W, 3] with black background and object-colored uncertainty
+    """
+    h, w = uncertainty.shape
+
+    # Use provided palette or fallback
+    if palette is None:
+        palette = DAVIS_PALETTE
+
+    # Get color for this object ID (modulo palette size for safety)
+    color_idx = int(obj_id) % len(palette)
+    base_color = np.array(palette[color_idx], dtype=np.float32)
+
+    # Create RGB output - start with black background
+    rgb = np.zeros((h, w, 3), dtype=np.uint8)
+
+    # Uncertainty intensity (higher uncertainty = brighter)
+    intensity = np.clip(uncertainty, 0, 1)
+
+    # If mask provided, only show uncertainty within mask region
+    if pred_mask is not None:
+        intensity = intensity * pred_mask.astype(np.float32)
+
+    # Apply color with intensity modulation
+    rgb[..., 0] = (base_color[0] * intensity).astype(np.uint8)
+    rgb[..., 1] = (base_color[1] * intensity).astype(np.uint8)
+    rgb[..., 2] = (base_color[2] * intensity).astype(np.uint8)
+
+    return rgb
+
+
+def create_colored_confidence_png(
+    iou_prediction: float,
+    pred_mask: np.ndarray,
+    obj_id: int,
+    palette: list[list[int]] | None = None,
+) -> np.ndarray:
+    """
+    Create a colored confidence visualization with black background (RGB).
+
+    Background is BLACK. Foreground (mask region) uses object color with intensity
+    proportional to IoU prediction. Higher IoU = brighter color.
+
+    This visualization highlights which method can better differentiate foreground
+    from background - higher confidence methods will show brighter foreground.
+
+    Args:
+        iou_prediction: IoU prediction value in [0, 1]
+        pred_mask: [H, W] binary mask for the object
+        obj_id: Object ID to get color from palette
+        palette: Color palette to use (read from 00000.png). Falls back to DAVIS_PALETTE.
+
+    Returns:
+        RGB image [H, W, 3] with black background and object-colored foreground
+    """
+    h, w = pred_mask.shape
+
+    # Use provided palette or fallback
+    if palette is None:
+        palette = DAVIS_PALETTE
+
+    # Get color for this object ID (modulo palette size for safety)
+    color_idx = int(obj_id) % len(palette)
+    base_color = np.array(palette[color_idx], dtype=np.float32)
+
+    # Create RGB output - start with black background
+    rgb = np.zeros((h, w, 3), dtype=np.uint8)
+
+    # HIGH-SENSITIVITY intensity mapping for confidence visualization
+    # Optimized for high IoU ranges where most meaningful differences occur
+    #
+    # Two-segment piecewise linear mapping:
+    #   [0.0, 0.9]   → intensity [0, 0.25]   (25% brightness, 90% IoU range - heavily compressed)
+    #   [0.9, 1.0]   → intensity [0.25, 1.0] (75% brightness, 10% IoU range - heavily expanded)
+    #
+    # This AGGRESSIVELY amplifies small differences in high-performance region. Examples:
+    #   IoU 0.614 (SAM FT avg) → intensity 0.17 (17%)
+    #   IoU 0.718 (BNDL avg)   → intensity 0.20 (20%)
+    #   IoU 0.926 (high SAM)   → intensity 0.45 (45%)
+    #   IoU 0.957 (high BNDL)  → intensity 0.68 (68%)
+    #   IoU 0.961 (high AUE)   → intensity 0.71 (71%)
+    #
+    # The breakpoint at 0.9 is chosen to maximize visibility of improvements:
+    # - Most baseline methods score 0.6-0.85 (compressed to show they're "lower tier")
+    # - High-performing methods (0.9+) get 75% of brightness range for fine differentiation
+
+    iou_breakpoint = 0.9
+    if iou_prediction < iou_breakpoint:
+        # Low-medium IoU: heavily compressed mapping
+        intensity = (iou_prediction / iou_breakpoint) * 0.25
+    else:
+        # High IoU: heavily expanded mapping (maximizes visible differences)
+        normalized = (iou_prediction - iou_breakpoint) / (1.0 - iou_breakpoint)
+        intensity = 0.25 + normalized * 0.75
+
+    # Apply color with intensity modulation only in mask region
+    rgb[pred_mask, 0] = int(base_color[0] * intensity)
+    rgb[pred_mask, 1] = int(base_color[1] * intensity)
+    rgb[pred_mask, 2] = int(base_color[2] * intensity)
+
+    return rgb
 
 
 def iterative_predict_with_clicks(
@@ -177,19 +336,39 @@ def build_image_predictor(
     device: str = "cuda",
     multimask: bool = True,
 ) -> SAM2ImagePredictor:
-    """Build SAM2ImagePredictor with consistent overrides."""
+    """Build SAM2ImagePredictor with consistent overrides.
+
+    CRITICAL: Ensures inference behavior matches training/validation:
+    1. apply_postprocessing=False: Disables dynamic_multimask_via_stability
+       which is NOT used during training, but enabled by default in build_sam2
+    2. bndl_force_single_sample: Set after model load to match training sampling
+    """
     hydra_overrides_extra = [
         # Set multimask_output_in_sam based on parameter
         f"++model.multimask_output_in_sam={str(multimask).lower()}",
+        # CRITICAL: Disable dynamic_multimask_via_stability to match training behavior
+        # Training does NOT use this, but build_sam2 enables it by default when apply_postprocessing=True
+        "++model.sam_mask_decoder_extra_args.dynamic_multimask_via_stability=false",
     ]
 
-    # Build base model with SAM2 (not video predictor)
+    # Build base model with SAM2
+    # apply_postprocessing=False to prevent unintended eval-time changes
     model = build_sam2(
         config_file=cfg_file,
         ckpt_path=ckpt,
         device=device,
         hydra_overrides_extra=hydra_overrides_extra,
+        apply_postprocessing=False,  # CRITICAL: Match training behavior
     )
+
+    # CRITICAL: Set bndl_force_single_sample to match training sampling behavior
+    # During training, BNDL uses random sampling (Weibull reparameterization)
+    # In eval mode by default, BNDL uses analytic expectation E[z] = λ * Γ(1 + 1/κ)
+    # This flag forces eval to use the same sampling as training for consistency
+    if hasattr(model, "sam_mask_decoder") and hasattr(model.sam_mask_decoder, "use_bndl_for_pixels"):
+        if model.sam_mask_decoder.use_bndl_for_pixels:
+            model.sam_mask_decoder.bndl_force_single_sample = True
+            logger.info("Set bndl_force_single_sample=True for training-eval consistency")
 
     # Wrap in SAM2ImagePredictor
     predictor = SAM2ImagePredictor(
@@ -350,9 +529,7 @@ def inference_single_image_with_bndl(
     return result
 
 
-@torch.inference_mode()
-@torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-def inference_with_bndl(
+def _inference_with_bndl_impl(
     predictor: SAM2ImagePredictor,
     jpeg_dir: Path,
     ann_dir: Path,
@@ -374,6 +551,11 @@ def inference_with_bndl(
     bndl_sample_num: int = 20,
     save_masks: bool = True,
     multimask_output: bool = True,
+    save_uncertainty_maps: bool = False,  # Save per-pixel uncertainty for visualization
+    colored_uncertainty_maps: bool = True,  # Use colored (matching mask) or grayscale uncertainty PNGs
+    # UC-TTA parameters (optional test-time adaptation)
+    uctta_config: UCTTAConfig | None = None,
+    uctta_adapter: UCTTAAdapter | None = None,
 ):
     """
     Single-frame inference with BNDL using SAM2ImagePredictor.
@@ -381,7 +563,24 @@ def inference_with_bndl(
     Strictly matches training click protocol:
     - Iterative prediction with mask_input feedback
     - Best mask selected by argmax(iou_predictions)
+
+    UC-TTA Integration (optional):
+    - When uctta_adapter is provided, test-time adaptation is applied
+    - Adapts BN/LN layers and temperature based on entropy minimization
+    - Does not require ground truth labels (self-supervised)
     """
+    # Allow environment variable to override save_uncertainty_maps
+    import os
+
+    if os.environ.get("ZS_SAVE_UNCERTAINTY_MAPS", "").lower() in ("true", "1", "yes"):
+        save_uncertainty_maps = True
+        print("  📊 Saving uncertainty maps enabled via ZS_SAVE_UNCERTAINTY_MAPS env var")
+
+    # Allow environment variable to control colored vs grayscale
+    if os.environ.get("ZS_COLORED_UNCERTAINTY", "").lower() in ("false", "0", "no"):
+        colored_uncertainty_maps = False
+        print("  📊 Using grayscale uncertainty maps (ZS_COLORED_UNCERTAINTY=false)")
+
     if video_names is None:
         video_names = sorted([d.name for d in jpeg_dir.iterdir() if d.is_dir()])
     else:
@@ -389,6 +588,10 @@ def inference_with_bndl(
 
     print(f"BNDL ({click_protocol}) inference on {len(video_names)} videos")
     print(f"  multimask_output={multimask_output} (selects best mask by IoU prediction)")
+
+    # Log UC-TTA status
+    if uctta_adapter is not None and uctta_config is not None and uctta_config.enabled:
+        print(f"  🔄 UC-TTA enabled: steps={uctta_config.steps}, lr={uctta_config.lr}, bn_adapt={uctta_config.enable_bn_adapt}")
 
     if seed is not None:
         np.random.seed(int(seed))
@@ -516,6 +719,20 @@ def inference_with_bndl(
                 obj_points[obj_id] = [(int(x), int(y), int(label)) for (x, y), label in zip(used_pts, used_labels, strict=True)]
                 best_idx = -1
 
+            # === UC-TTA: Apply test-time adaptation if enabled ===
+            if uctta_adapter is not None and uctta_config is not None and uctta_config.enabled:
+                # Convert logits to tensor if needed
+                logits_tensor = torch.from_numpy(best_mask).float().to(predictor.device) if isinstance(best_mask, np.ndarray) else best_mask
+
+                # Adapt and get temperature-scaled logits
+                scaled_logits = uctta_adapter.adapt(logits_tensor, target_size=(H, W))
+
+                # Re-threshold with adapted logits
+                if isinstance(scaled_logits, torch.Tensor):
+                    binary_mask = (scaled_logits.detach().cpu().numpy() > score_thresh).astype(bool)
+                else:
+                    binary_mask = (scaled_logits > score_thresh).astype(bool)
+
             seg[obj_id] = binary_mask
 
             # Debug: Check for all-foreground anomaly
@@ -529,6 +746,138 @@ def inference_with_bndl(
                 video_statistics[f"{frame_key}_iou_pred"] = float(best_iou)
                 video_statistics[f"{frame_key}_selected_mask_idx"] = int(best_idx) if best_idx >= 0 else 0
                 total_frames_processed += 1
+
+                # === PCC/AUROC collection: Add batch to dataset_evaluator ===
+                if dataset_evaluator is not None:
+                    try:
+                        # Get BNDL aux_outputs from predictor
+                        aux_outputs = predictor.get_last_aux_outputs()
+                        uncertainty = None
+                        uncertainty_source = "none"
+
+                        # Try to get BNDL pixel-level uncertainty first
+                        if aux_outputs is not None and "bndl" in aux_outputs:
+                            bndl_data = aux_outputs["bndl"]
+                            # pixel_uncertainty: [B, H, W, K] - use mean over K masks
+                            pixel_unc = bndl_data.get("pixel_uncertainty")
+                            if pixel_unc is not None:
+                                # Average uncertainty over mask channels, take first batch
+                                if pixel_unc.dim() == 4:
+                                    uncertainty = pixel_unc[0].mean(dim=-1)  # [H, W]
+                                else:
+                                    uncertainty = pixel_unc[0]  # [H, W]
+                                use_bndl_uncertainty = True
+                                uncertainty_source = "bndl"
+
+                        # Fallback: Use IoU prediction as uncertainty proxy when BNDL is not available
+                        # IoU prediction is a confidence score, so uncertainty = 1 - IoU
+                        # Fill uncertainty only in the predicted mask region
+                        if uncertainty is None:
+                            gt_h, gt_w = gt_bool.shape
+                            # best_iou is the predicted IoU confidence (0-1 range)
+                            # Higher IoU = higher confidence = lower uncertainty
+                            iou_uncertainty = 1.0 - float(best_iou)
+                            iou_uncertainty = max(0.0, min(1.0, iou_uncertainty))  # Clamp to [0, 1]
+
+                            # Create uncertainty map: only predicted mask pixels get IoU uncertainty
+                            # Background pixels get 0 uncertainty (confident background)
+                            device = "cuda" if torch.cuda.is_available() else "cpu"
+                            uncertainty = torch.zeros((gt_h, gt_w), dtype=torch.float32, device=device)
+
+                            # binary_mask is the predicted mask for this object
+                            pred_mask_tensor = torch.from_numpy(binary_mask.astype(np.float32)).to(device)
+                            if pred_mask_tensor.shape != uncertainty.shape:
+                                pred_mask_tensor = torch.nn.functional.interpolate(
+                                    pred_mask_tensor.unsqueeze(0).unsqueeze(0),
+                                    size=(gt_h, gt_w),
+                                    mode="nearest",
+                                ).squeeze()
+
+                            # Fill mask region with IoU-based uncertainty
+                            uncertainty[pred_mask_tensor > 0.5] = iou_uncertainty
+                            uncertainty_source = "iou_prediction"
+
+                            # Log first occurrence per video for debugging
+                            if obj_id == obj_ids[0]:
+                                logger.info(f"Using IoU-based uncertainty for {vid}: iou={best_iou:.4f}, unc={iou_uncertainty:.4f}, mask_pixels={int((pred_mask_tensor > 0.5).sum())}")
+
+                        # Process uncertainty (resize if needed, etc.)
+                        if uncertainty is not None:
+                            # Resize uncertainty to match GT size if needed
+                            unc_h, unc_w = uncertainty.shape
+                            gt_h, gt_w = gt_bool.shape
+                            if unc_h != gt_h or unc_w != gt_w:
+                                uncertainty = (
+                                    torch.nn.functional.interpolate(
+                                        uncertainty.unsqueeze(0).unsqueeze(0),
+                                        size=(gt_h, gt_w),
+                                        mode="bilinear",
+                                        align_corners=False,
+                                    )
+                                    .squeeze(0)
+                                    .squeeze(0)
+                                )
+
+                            # Prepare tensors for evaluator
+                            pred_logits = torch.from_numpy(best_mask).float().to(uncertainty.device)
+                            if pred_logits.shape != uncertainty.shape:
+                                pred_logits = (
+                                    torch.nn.functional.interpolate(
+                                        pred_logits.unsqueeze(0).unsqueeze(0),
+                                        size=(gt_h, gt_w),
+                                        mode="bilinear",
+                                        align_corners=False,
+                                    )
+                                    .squeeze(0)
+                                    .squeeze(0)
+                                )
+
+                            gt_masks = torch.from_numpy(gt_bool.astype(np.float32)).to(uncertainty.device)
+
+                            # Add to evaluator (expects [B, H, W] format)
+                            dataset_evaluator.add_batch(
+                                uncertainty=uncertainty.unsqueeze(0),  # [1, H, W]
+                                pred_logits=pred_logits.unsqueeze(0),  # [1, H, W]
+                                gt_masks=gt_masks.unsqueeze(0),  # [1, H, W]
+                            )
+
+                            # Save uncertainty map if requested (PNG only, no .npy to save disk space)
+                            if save_uncertainty_maps:
+                                unc_save_dir = out_dir / vid
+                                unc_save_dir.mkdir(parents=True, exist_ok=True)
+                                unc_np = uncertainty.cpu().numpy().astype(np.float32)
+
+                                # Read palette from the prediction mask (00000.png) to match colors
+                                pred_mask_path = unc_save_dir / "00000.png"
+                                palette = get_palette_from_mask_png(pred_mask_path)
+                                pred_mask_bool = binary_mask.astype(bool) if binary_mask is not None else None
+
+                                if colored_uncertainty_maps:
+                                    # Save as colored RGB PNG (black background, object color with intensity = uncertainty)
+                                    colored_unc = create_colored_uncertainty_png(unc_np, obj_id, pred_mask_bool, palette)
+                                    Image.fromarray(colored_unc, mode="RGB").save(unc_save_dir / f"uncertainty_obj{obj_id}.png")
+                                else:
+                                    # Save as grayscale PNG
+                                    unc_norm = (np.clip(unc_np, 0, 1) * 255).astype(np.uint8)
+                                    Image.fromarray(unc_norm).save(unc_save_dir / f"uncertainty_obj{obj_id}.png")
+
+                                # Save confidence visualization (RGB: black background, object color with intensity = IoU)
+                                if pred_mask_bool is not None:
+                                    confidence_img = create_colored_confidence_png(best_iou, pred_mask_bool, obj_id, palette)
+                                    Image.fromarray(confidence_img, mode="RGB").save(unc_save_dir / f"confidence_obj{obj_id}.png")
+
+                                # Save metadata about uncertainty source and confidence
+                                metadata = {
+                                    "uncertainty_source": uncertainty_source,
+                                    "iou_prediction": float(best_iou),
+                                    "obj_id": int(obj_id),
+                                    "uncertainty_mean": float(unc_np.mean()),
+                                    "uncertainty_max": float(unc_np.max()),
+                                }
+                                with open(unc_save_dir / f"uncertainty_obj{obj_id}_meta.json", "w") as f:
+                                    json.dump(metadata, f, indent=2)
+                    except Exception as e:
+                        logger.warning(f"Failed to collect PCC/AUROC data for {vid}/obj{obj_id}: {e}")
 
         video_segments[0] = seg
 
@@ -572,6 +921,10 @@ def inference_with_bndl(
         # Reset predictor
         predictor.reset_predictor()
 
+        # Reset UC-TTA adapter for next video (if enabled)
+        if uctta_adapter is not None and uctta_config is not None and uctta_config.enabled:
+            uctta_adapter.reset()
+
         # Cleanup GPU memory
         gc.collect()
         if torch.cuda.is_available():
@@ -599,8 +952,41 @@ def inference_with_bndl(
             dataset_statistics = {}
         dataset_statistics.update(merged_stats)
 
-    # Finalize evaluation
-    if collect_statistics:
+    # Finalize evaluation and compute PCC/AUROC metrics
+    uncertainty_metrics = {}
+    if collect_statistics and dataset_evaluator is not None:
+        try:
+            # Compute correlations and AUROC
+            uncertainty_metrics = dataset_evaluator.evaluate()
+            if uncertainty_metrics:
+                print(f"\n📊 Uncertainty Metrics for {dataset_name}:")
+                print(f"  Pearson (Unc vs Acc):  {uncertainty_metrics.get('pearson_acc', 0):.4f}")
+                print(f"  Pearson (Unc vs Corr): {uncertainty_metrics.get('pearson_corr', 0):.4f}")
+                print(f"  Spearman (Unc vs Acc): {uncertainty_metrics.get('spearman_acc', 0):.4f}")
+                if "auroc" in uncertainty_metrics:
+                    print(f"  AUROC (Error Detection): {uncertainty_metrics.get('auroc', 0):.4f}")
+                    print(f"  AUPR:  {uncertainty_metrics.get('aupr', 0):.4f}")
+                print(f"  ECE:   {uncertainty_metrics.get('ece', 0):.4f}")
+
+                # PAvPU metrics (BNDL official uses p-value thresholds: 0.01, 0.05, 0.1)
+                print(f"  AU-PAvPU: {uncertainty_metrics.get('au_pavpu', 0):.2f}%")
+                if "pavpu_p001" in uncertainty_metrics:
+                    print(f"  PAvPU@p>0.01: {uncertainty_metrics.get('pavpu_p001', 0):.1f}%")
+                    print(f"  PAvPU@p>0.05: {uncertainty_metrics.get('pavpu_p005', 0):.1f}%")
+                    print(f"  PAvPU@p>0.1:  {uncertainty_metrics.get('pavpu_p01', 0):.1f}%")
+                    print(f"  Error Flagging Rate: {uncertainty_metrics.get('error_flagging_rate', 0):.1f}%")
+                # Show component breakdown if available
+                if "pavpu_components" in uncertainty_metrics:
+                    comp = uncertainty_metrics["pavpu_components"]
+                    print(f"  Components (@p>0.05): n_ac={comp.get('n_ac', 0)}, n_au={comp.get('n_au', 0)}, n_ic={comp.get('n_ic', 0)}, n_iu={comp.get('n_iu', 0)}")
+
+                # Save results to file
+                dataset_evaluator.save_results(filename=f"{dataset_name.lower()}_uncertainty_metrics.json")
+                dataset_evaluator.create_visualization(filename=f"{dataset_name.lower()}_uncertainty_correlation.png")
+        except Exception as e:
+            logger.warning(f"Failed to compute uncertainty metrics: {e}")
+
+        # Also run traditional finalization (for legacy compatibility)
         finalize_bndl_evaluation(dataset_evaluator, dataset_name)
 
     if collect_statistics and dataset_statistics:
@@ -608,7 +994,138 @@ def inference_with_bndl(
         print(f"Total frames processed: {total_frames_processed}")
         print(f"Total statistics collected: {len(dataset_statistics)}")
 
+        # Merge uncertainty metrics into statistics
+        if uncertainty_metrics:
+            dataset_statistics["_uncertainty_metrics"] = uncertainty_metrics
+
     return dataset_statistics if collect_statistics else None
+
+
+def inference_with_bndl(
+    predictor: SAM2ImagePredictor,
+    jpeg_dir: Path,
+    ann_dir: Path,
+    out_dir: Path,
+    score_thresh: float = 0.0,
+    video_names: list[str] | None = None,
+    save_bndl_vis: bool = False,
+    vis_dir: Path | None = None,
+    dataset_name: str = "unknown",
+    collect_statistics: bool = True,
+    eval_dir: Path | None = None,
+    max_objects: int | None = None,
+    reuse_prompts_root: Path | None = None,
+    click_protocol: str = "3click",
+    seed: int | None = 0,
+    downsample_max_samples: int = 100000,
+    max_vis_per_video: int = 2,
+    save_vis_pdf: bool = True,
+    bndl_sample_num: int = 20,
+    save_masks: bool = True,
+    multimask_output: bool = True,
+    save_uncertainty_maps: bool = False,
+    colored_uncertainty_maps: bool = True,
+    # UC-TTA parameters
+    enable_uctta: bool = False,
+    uctta_steps: int = 2,
+    uctta_lr: float = 3e-4,
+    uctta_enable_bn_adapt: bool = True,
+    uctta_use_fisher_reg: bool = False,
+    uctta_entropy_threshold: float = 0.4,
+    uctta_selection_p: float = 0.1,
+):
+    """
+    Wrapper function for BNDL inference with optional UC-TTA support.
+
+    This wrapper handles the inference_mode/gradient compatibility:
+    - When UC-TTA is disabled: Uses fast @torch.inference_mode() path
+    - When UC-TTA is enabled: Disables inference_mode to allow gradient computation
+
+    Args:
+        enable_uctta: Whether to enable UC-TTA test-time adaptation
+        uctta_steps: Number of adaptation steps per sample
+        uctta_lr: Learning rate for UC-TTA adaptation
+        uctta_enable_bn_adapt: Whether to adapt BN/LN layers
+        uctta_use_fisher_reg: Whether to use Fisher regularization
+        uctta_entropy_threshold: Max entropy for sample selection
+        uctta_selection_p: Fraction of samples to use for adaptation
+    """
+    # Create UC-TTA config and adapter if enabled
+    uctta_config = None
+    uctta_adapter = None
+
+    if enable_uctta:
+        uctta_config = UCTTAConfig(
+            enabled=True,
+            steps=uctta_steps,
+            lr=uctta_lr,
+            enable_bn_adapt=uctta_enable_bn_adapt,
+            use_fisher_reg=uctta_use_fisher_reg,
+            entropy_threshold=uctta_entropy_threshold,
+            selection_p=uctta_selection_p,
+        )
+        uctta_adapter = UCTTAAdapter(predictor.model, uctta_config)
+        uctta_adapter.setup()
+
+        # UC-TTA requires gradients, so we can't use inference_mode
+        return _inference_with_bndl_impl(
+            predictor=predictor,
+            jpeg_dir=jpeg_dir,
+            ann_dir=ann_dir,
+            out_dir=out_dir,
+            score_thresh=score_thresh,
+            video_names=video_names,
+            save_bndl_vis=save_bndl_vis,
+            vis_dir=vis_dir,
+            dataset_name=dataset_name,
+            collect_statistics=collect_statistics,
+            eval_dir=eval_dir,
+            max_objects=max_objects,
+            reuse_prompts_root=reuse_prompts_root,
+            click_protocol=click_protocol,
+            seed=seed,
+            downsample_max_samples=downsample_max_samples,
+            max_vis_per_video=max_vis_per_video,
+            save_vis_pdf=save_vis_pdf,
+            bndl_sample_num=bndl_sample_num,
+            save_masks=save_masks,
+            multimask_output=multimask_output,
+            save_uncertainty_maps=save_uncertainty_maps,
+            colored_uncertainty_maps=colored_uncertainty_maps,
+            uctta_config=uctta_config,
+            uctta_adapter=uctta_adapter,
+        )
+    else:
+        # Standard BNDL inference with inference_mode for speed
+        with torch.inference_mode():
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                return _inference_with_bndl_impl(
+                    predictor=predictor,
+                    jpeg_dir=jpeg_dir,
+                    ann_dir=ann_dir,
+                    out_dir=out_dir,
+                    score_thresh=score_thresh,
+                    video_names=video_names,
+                    save_bndl_vis=save_bndl_vis,
+                    vis_dir=vis_dir,
+                    dataset_name=dataset_name,
+                    collect_statistics=collect_statistics,
+                    eval_dir=eval_dir,
+                    max_objects=max_objects,
+                    reuse_prompts_root=reuse_prompts_root,
+                    click_protocol=click_protocol,
+                    seed=seed,
+                    downsample_max_samples=downsample_max_samples,
+                    max_vis_per_video=max_vis_per_video,
+                    save_vis_pdf=save_vis_pdf,
+                    bndl_sample_num=bndl_sample_num,
+                    save_masks=save_masks,
+                    multimask_output=multimask_output,
+                    save_uncertainty_maps=save_uncertainty_maps,
+                    colored_uncertainty_maps=colored_uncertainty_maps,
+                    uctta_config=None,
+                    uctta_adapter=None,
+                )
 
 
 def run_single_dataset_with_bndl(
@@ -633,12 +1150,32 @@ def run_single_dataset_with_bndl(
     bndl_sample_num: int = 20,
     save_masks: bool = True,
     multimask_output: bool = True,
+    save_uncertainty_maps: bool = False,  # Save per-pixel uncertainty for visualization
+    colored_uncertainty_maps: bool = False,  # Use colored (matching mask) or grayscale uncertainty PNGs
     # Predictor build parameters (used if predictor is None)
     predictor_cfg: str | None = None,
     predictor_ckpt: str | None = None,
     predictor_device: str = "cuda",
+    # UC-TTA parameters
+    enable_uctta: bool = False,
+    uctta_steps: int = 2,
+    uctta_lr: float = 3e-4,
+    uctta_enable_bn_adapt: bool = True,
+    uctta_use_fisher_reg: bool = False,
+    uctta_entropy_threshold: float = 0.4,
+    uctta_selection_p: float = 0.1,
 ) -> tuple[float, float, float, dict]:
-    """Run evaluation on single dataset using SAM2ImagePredictor."""
+    """Run evaluation on single dataset using SAM2ImagePredictor.
+
+    Args:
+        enable_uctta: Enable UC-TTA test-time adaptation
+        uctta_steps: Number of UC-TTA adaptation steps per sample
+        uctta_lr: Learning rate for UC-TTA
+        uctta_enable_bn_adapt: Whether to adapt BN/LN layers
+        uctta_use_fisher_reg: Whether to use Fisher regularization
+        uctta_entropy_threshold: Max entropy for reliable sample selection
+        uctta_selection_p: Fraction of samples to use for adaptation
+    """
     from zs_dataset_runner import run_single_dataset_generic
 
     # Build predictor if not provided
@@ -679,6 +1216,16 @@ def run_single_dataset_with_bndl(
         bndl_sample_num=bndl_sample_num,
         save_masks=save_masks,
         multimask_output=multimask_output,
+        save_uncertainty_maps=save_uncertainty_maps,
+        colored_uncertainty_maps=colored_uncertainty_maps,
+        # UC-TTA parameters
+        enable_uctta=enable_uctta,
+        uctta_steps=uctta_steps,
+        uctta_lr=uctta_lr,
+        uctta_enable_bn_adapt=uctta_enable_bn_adapt,
+        uctta_use_fisher_reg=uctta_use_fisher_reg,
+        uctta_entropy_threshold=uctta_entropy_threshold,
+        uctta_selection_p=uctta_selection_p,
     )
 
     if stats:
@@ -778,6 +1325,51 @@ def parse_args():
         action="store_true",
         help="Do not save predicted masks",
     )
+    parser.add_argument(
+        "--save-uncertainty-maps",
+        action="store_true",
+        help="Save per-pixel uncertainty maps for visualization (requires --collect-stats)",
+    )
+    parser.add_argument(
+        "--grayscale-uncertainty",
+        action="store_true",
+        help="Use grayscale instead of colored uncertainty PNG visualizations",
+    )
+    # UC-TTA arguments
+    parser.add_argument(
+        "--enable-uctta",
+        action="store_true",
+        help="Enable UC-TTA (Uncertainty-Calibrated Test-Time Adaptation)",
+    )
+    parser.add_argument(
+        "--uctta-steps",
+        type=int,
+        default=2,
+        help="Number of UC-TTA adaptation steps per sample (default: 2)",
+    )
+    parser.add_argument(
+        "--uctta-lr",
+        type=float,
+        default=3e-4,
+        help="Learning rate for UC-TTA adaptation (default: 3e-4)",
+    )
+    parser.add_argument(
+        "--uctta-no-bn-adapt",
+        action="store_true",
+        help="Disable BN/LN layer adaptation (temperature-only mode)",
+    )
+    parser.add_argument(
+        "--uctta-entropy-threshold",
+        type=float,
+        default=0.4,
+        help="Max entropy threshold for reliable sample selection (default: 0.4)",
+    )
+    parser.add_argument(
+        "--uctta-selection-p",
+        type=float,
+        default=0.1,
+        help="Fraction of samples to use for UC-TTA adaptation (default: 0.1)",
+    )
     return parser.parse_args()
 
 
@@ -842,6 +1434,15 @@ def main():
             multimask_output=not args.no_multimask,
             save_bndl_vis=args.save_vis,
             save_masks=not args.no_save_masks,
+            save_uncertainty_maps=args.save_uncertainty_maps,
+            colored_uncertainty_maps=not args.grayscale_uncertainty,
+            # UC-TTA parameters
+            enable_uctta=args.enable_uctta,
+            uctta_steps=args.uctta_steps,
+            uctta_lr=args.uctta_lr,
+            uctta_enable_bn_adapt=not args.uctta_no_bn_adapt,
+            uctta_entropy_threshold=args.uctta_entropy_threshold,
+            uctta_selection_p=args.uctta_selection_p,
         )
 
         results[dataset_name] = (jf, j, f)

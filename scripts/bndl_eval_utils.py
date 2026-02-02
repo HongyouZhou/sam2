@@ -482,7 +482,9 @@ def setup_bndl_collection(
             distributed=False,
             rank=0,
             world_size=1,
-            foreground_dilation=15,  # Match validation evaluator for consistency
+            foreground_dilation=0,  # No region filtering
+            use_all_pixels=True,  # Use ALL pixels for true PAvPU
+            max_pixel_samples=5_000_000,  # Limit to 5M pixels to prevent OOM
         )
     except Exception as e:
         logger.error(f"Failed to initialize dataset evaluator: {e}")

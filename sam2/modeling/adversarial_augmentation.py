@@ -35,23 +35,29 @@ from sam2.modeling.style_gcn import build_object_graph
 
 
 class GradientReversalLayer(torch.autograd.Function):
+    """Pure gradient reversal without scaling.
+
+    Note: alpha scaling was removed as it's redundant with learning rate.
+    Control attack strength via LR scheduler and epsilon decay instead.
+    """
+
     @staticmethod
-    def forward(ctx, x, alpha):
-        ctx.alpha = alpha
+    def forward(ctx, x):
         return x
 
     @staticmethod
     def backward(ctx, grad_output):
-        return grad_output.neg() * ctx.alpha, None
+        return grad_output.neg()
 
 
 class GRL(nn.Module):
-    def __init__(self, alpha=1.0):
+    """Gradient Reversal Layer - pure negation, no scaling."""
+
+    def __init__(self):
         super().__init__()
-        self.alpha = alpha
 
     def forward(self, x):
-        return GradientReversalLayer.apply(x, self.alpha)
+        return GradientReversalLayer.apply(x)
 
 
 @dataclass
@@ -235,7 +241,6 @@ class ImageLevelStyleImpl(nn.Module):
         global_weight: float = 0.7,
         feature_dim: int = 256,
         num_objects: int = 11,
-        gcn_grl_alpha: float = 0.1,
         **kwargs,
     ):
         super().__init__()
@@ -247,7 +252,6 @@ class ImageLevelStyleImpl(nn.Module):
         self.use_global_local_mix = use_global_local_mix
         self.global_epsilon = global_epsilon
         self.global_weight = global_weight
-        self.gcn_grl_alpha = gcn_grl_alpha
 
         # Create adversarial style network with GRL
         # If GCN is used, we disable internal GRL and apply it after GCN refinement
@@ -260,9 +264,10 @@ class ImageLevelStyleImpl(nn.Module):
         )
 
         # GCN for multi-object coordination (if enabled)
-        if self.use_gcn:
-            logging.warning("Style GCN coordination with GRL not yet implemented")
-            self.style_gcn = None
+        # Note: The actual GCN module is created in SAM2Base._build_style_adv_components
+        # and accessed via model.style_gcn in predict_params(). This class only stores
+        # the flag; GCN refinement with GRL is implemented in predict_params().
+        self.style_gcn = None  # Unused: actual GCN is model.style_gcn
 
     def predict_params(self, clean_features: torch.Tensor, pixel_gt: torch.Tensor, model: "SAM2Base", img_batch: torch.Tensor | None = None, **kwargs) -> torch.Tensor:
         """
@@ -331,8 +336,7 @@ class ImageLevelStyleImpl(nn.Module):
                 # Apply GRL to the refined delta (since it was skipped in style_net)
                 # This ensures gradients flow: Loss -> GRL(neg) -> GCN -> delta -> style_net
                 # Both GCN and style_net update to maximize loss.
-                # Use smaller alpha (default 0.1) to prevent gradient explosion through GCN
-                grl = GRL(alpha=self.gcn_grl_alpha)
+                grl = GRL()
                 refined_delta = grl(refined_delta)
 
                 adv_styles = original_styles + refined_delta
@@ -400,7 +404,8 @@ class ImageLevelStyleImpl(nn.Module):
         styled_images = self.apply_transform(img_batch=img_batch, params=adv_styles, pixel_gt=pixel_gt, model=model)
 
         # 3. Forward through backbone
-        backbone_out = model.forward_image(styled_images, use_checkpoint=True)
+        # Detach to avoid expensive checkpointing - attacker gradients flow through GRL
+        backbone_out = model.forward_image(styled_images.detach(), use_checkpoint=False)
         styled_features = backbone_out["backbone_fpn"][-1]
 
         # 4. Extract high-res features
@@ -474,14 +479,12 @@ class ImageLevelStyleImpl(nn.Module):
         # CRITICAL: Detach to break gradient flow from deform_augmenter
         # Style PGD should only optimize style parameters, not deform offsets
         if model.style_adv_use_gt_region_style:
+            # extract_gt_region_style now always returns [B, K, 6]
             original_styles = extract_gt_region_style(img_batch.detach(), pixel_gt)
-            # Ensure [B, K, 6] format (extract_gt_region_style returns [B, 6] for K=1)
-            if original_styles.ndim == 2:
-                # [B, 6] -> [B, 1, 6] for single object
-                original_styles = original_styles.unsqueeze(1)
         else:
+            # Global style: extract_style_statistics now returns [B, 1, 6]
             global_style = extract_style_statistics(img_batch.detach())
-            original_styles = global_style.unsqueeze(1).expand(-1, K, -1)
+            original_styles = global_style.expand(-1, K, -1)  # [B, 1, 6] -> [B, K, 6]
 
         return pixel_gt, original_styles
 
@@ -492,80 +495,106 @@ class ImageLevelStyleImpl(nn.Module):
         gt_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
-        Apply style statistics to images using AdaIN (parallel multi-object composition).
+        Apply style statistics to images using Mask-Aware AdaIN.
 
-        CRITICAL: All objects' styles are applied independently based on the SAME original image,
-        then composed together. This eliminates order-dependence issues.
+        CRITICAL FIX (AUE 24/25): normalization is now tied to the specific object region.
+        - Previous implementation used Global Normalization, which caused mismatch when applying Local Style.
+        - New implementation computes Source Stats for the masked region, ensuring consistent Identity mapping.
 
         Args:
             img_batch: [B, 3, H, W] normalized images
             style_stats: [B, K, 6] or [B, 6] style statistics per object
-            gt_mask: [B, K, H, W] or [B, 1, H, W] GT masks (optional)
+            gt_mask: [B, K_mask, H, W] GT masks (optional)
 
         Returns:
-            styled_images: [B, 3, H, W] styled images (still normalized)
+            styled_images: [B, 3, H, W] styled images
         """
         # If no style stats provided, return original images
         if style_stats is None:
             return img_batch
 
-        # style_stats are expected to be finite because extraction utilities already
-        # (1) add eps in denominators and (2) clamp mean/std to safe ranges.
-
         B, C, H, W = img_batch.shape
 
-        # Detect single vs multi-object mode
+        # Handle backward compatibility for [B, 6] input
         if style_stats.ndim == 2:
-            # [B, 6] single object (backward compatible)
             style_stats = style_stats.unsqueeze(1)  # [B, 1, 6]
-            if gt_mask is not None and gt_mask.ndim == 4 and gt_mask.shape[1] == 1:
-                # gt_mask already [B, 1, H, W], keep as is
-                pass
 
         K = style_stats.shape[1]
 
-        # CRITICAL FIX: Compute normalization based on ORIGINAL image ONCE
-        # All objects will use this consistent baseline
-        base_means = img_batch.mean(dim=[2, 3], keepdim=True)  # [B, 3, 1, 1]
-        base_stds = img_batch.std(dim=[2, 3], keepdim=True) + 1e-6  # [B, 3, 1, 1]
-        normalized = (img_batch - base_means) / base_stds
+        # 1. Mask Alignment & Source Statistics Extraction
+        source_stats = None
 
-        # Collect styled regions for all objects
+        if gt_mask is not None:
+            # Ensure mask acts as a float binary mask
+            if gt_mask.shape[2:] != (H, W):
+                gt_mask = F.interpolate(gt_mask.float(), size=(H, W), mode="nearest")
+            gt_mask = (gt_mask > 0.5).float()
+
+            # Align mask channels with style stats (handle drop/merge from predict pipeline)
+            if gt_mask.shape[1] != K:
+                if K == 1:
+                    # Single-object style applied to Multi-object mask -> Merge all objects
+                    gt_mask = gt_mask.max(dim=1, keepdim=True)[0]
+                elif K == gt_mask.shape[1] - 1:
+                    # Background drop detected (style has 1 less channel) -> Drop last channel
+                    gt_mask = gt_mask[:, :-1]
+                else:
+                    # Fallback for unexpected mismatch: wrap or slice safely
+                    logging.warning(f"Style/Mask channel mismatch: Style={K}, Mask={gt_mask.shape[1]}. Slicing mask.")
+                    gt_mask = gt_mask[:, :K]
+
+            # Compute Source Stats using the aligned mask
+            # CRITICAL: Compute on img_batch (with gradient) to support full differentiability
+            # extract_gt_region_style handles broadcasting and safe division
+            # We use min_pixels=100 to MATCH the default used in 'predict_params' (_prepare_style_adversary_inputs)
+            # This ensures that fallback-to-global decisions are identical between prediction and application,
+            # preventing Global-vs-Local mismatch for small objects.
+            source_stats = extract_gt_region_style(img_batch, gt_mask, min_pixels=100)  # [B, K, 6]
+
+        else:
+            # Global Application (no mask provided)
+            source_stats = extract_style_statistics(img_batch)  # [B, 1, 6]
+            if K > 1:
+                source_stats = source_stats.expand(-1, K, -1)
+            # Create dummy full-image masks for composition loop
+            gt_mask = torch.ones(B, K, H, W, device=img_batch.device)
+
+        # 2. Iterate and Apply Style per Object
         styled_regions = []
         masks_list = []
 
-        # Apply style for each object independently (all based on original image)
         for k in range(K):
-            object_style = style_stats[:, k]  # [B, 6]
-            object_mask = gt_mask[:, k : k + 1] if gt_mask is not None else None  # [B, 1, H, W]
+            target_style = style_stats[:, k]  # [B, 6]
+            source_style = source_stats[:, k]  # [B, 6]
+            mask_k = gt_mask[:, k : k + 1]  # [B, 1, H, W]
 
-            # Extract target means and stds
-            target_means = object_style[:, :3].view(B, 3, 1, 1)  # [B, 3, 1, 1]
-            target_stds = object_style[:, 3:].view(B, 3, 1, 1)  # [B, 3, 1, 1]
+            # Extract Means and Stds
+            src_mean = source_style[:, :3].view(B, 3, 1, 1)
+            src_std = source_style[:, 3:].view(B, 3, 1, 1)
+            tgt_mean = target_style[:, :3].view(B, 3, 1, 1)
+            tgt_std = target_style[:, 3:].view(B, 3, 1, 1)
 
-            # Apply AdaIN with target style (based on original normalized image)
-            object_styled = normalized * target_stds + target_means
+            # Mask-Aware AdaIN: (x - mu_src) / sigma_src * sigma_tgt + mu_tgt
+            # Using specific source stats ensures that if Tgt ~= Src, result ~= Input (Identity)
+            # We add 1e-6 to std for numerical stability
+            normalized = (img_batch - src_mean) / (src_std + 1e-6)
+            object_styled = normalized * tgt_std + tgt_mean
 
-            if object_mask is not None:
-                # Adjust mask to image size
-                if object_mask.shape[2:] != (H, W):
-                    object_mask = F.interpolate(object_mask.float(), size=(H, W), mode="nearest")
-                object_mask = object_mask.float()
+            # Clamp output to safe image range
+            object_styled = object_styled.clamp(min=-3.0, max=3.0)
 
-                # Store styled region and mask
-                styled_regions.append(object_styled)
-                masks_list.append(object_mask)
-            else:
-                # No mask: apply to full image (single-object mode)
-                styled_regions.append(object_styled)
-                masks_list.append(torch.ones(B, 1, H, W, device=img_batch.device))
+            styled_regions.append(object_styled)
+            masks_list.append(mask_k)
 
-        # Compose all styled regions with masks
-        # Strategy: Later objects overwrite earlier ones in overlap regions
+        # 3. Composition
+        # Compose objects onto the original image
+        # Using simple overwriting (Painter's Algorithm) based on the channel order
         styled_images = img_batch.clone()
 
         for k in range(K):
-            styled_images = masks_list[k] * styled_regions[k] + (1 - masks_list[k]) * styled_images
+            m = masks_list[k]
+            # Hard composition masked by region
+            styled_images = m * styled_regions[k] + (1 - m) * styled_images
 
         return styled_images
 
@@ -772,7 +801,6 @@ class FeatureLevelDeformationImpl(nn.Module):
         image_size: int = 1024,
         zero_mean_offsets: bool = False,
         local_offset_gain: float = 1.0,
-        grl_alpha: float = 0.1,
         **kwargs,
     ):
         super().__init__()
@@ -812,7 +840,6 @@ class FeatureLevelDeformationImpl(nn.Module):
             zero_mean_offsets=zero_mean_offsets,
             local_offset_gain=local_offset_gain,
             use_grl=not use_gcn,  # Disable internal GRL if GCN is used (to apply it after GCN)
-            grl_alpha=grl_alpha,
         )
 
         # 5. Soft compositor for multi-object overlaps
@@ -942,7 +969,7 @@ class FeatureLevelDeformationImpl(nn.Module):
 
             # Apply manual GRL if internal GRL was disabled (e.g. for GCN coordination)
             if self.use_gcn:
-                grl = GRL(alpha=self.deform_module.grl_alpha)
+                grl = GRL()
                 feat_off = grl(feat_off)
                 img_off = grl(img_off)
 
@@ -1111,7 +1138,6 @@ class FeatureBasedDeformModule(nn.Module):
         zero_mean_offsets: bool = False,
         local_offset_gain: float = 1.0,
         use_grl: bool = True,
-        grl_alpha: float = 0.1,
     ):
         super().__init__()
         self.feature_dim = feature_dim
@@ -1120,24 +1146,34 @@ class FeatureBasedDeformModule(nn.Module):
         self.zero_mean_offsets = zero_mean_offsets
         self.local_offset_gain = local_offset_gain
         self.use_grl = use_grl
-        self.grl_alpha = float(grl_alpha)
 
         # Offset predictor: fused_features -> dense offsets (2 channels)
         self.offset_net = nn.Sequential(
+            nn.InstanceNorm2d(feature_dim),  # Normalize input (critical for stability)
             nn.Conv2d(feature_dim, 128, kernel_size=3, padding=1),
+            nn.InstanceNorm2d(128),
             nn.ReLU(inplace=True),
             nn.Conv2d(128, 64, kernel_size=3, padding=1),
+            nn.InstanceNorm2d(64),
             nn.ReLU(inplace=True),
             nn.Conv2d(64, 2, kernel_size=3, padding=1),  # 2 channels for (dx, dy)
         )
 
-        # Initialize: small values for last layer
-        nn.init.normal_(self.offset_net[-1].weight, mean=0.0, std=0.1)
-        nn.init.zeros_(self.offset_net[-1].bias)
+        # Initialize ALL layers with small weights for near-zero initial output
+        # This prevents overly strong attacks at the start of training
+        for m in self.offset_net.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.normal_(m.weight, mean=0.0, std=0.01)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        logging.info(f"FeatureBasedDeformModule: Initialized all conv layers with std=0.01 for near-zero initial output")
 
-        # Gradient Reversal Layer
-        # Placed at OUTPUT to invert gradients for the offset network parameters
-        self.grl = GRL(alpha=self.grl_alpha)
+        # Gradient Reversal Layer - pure negation, no scaling
+        # Note: Attack strength is controlled via LR and epsilon, not GRL alpha
+        self.grl = GRL()
+
+        # Track if we've logged initial output (for debugging)
+        self._logged_initial_output = False
 
     def forward(self, fused_features: torch.Tensor, object_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
@@ -1156,16 +1192,25 @@ class FeatureBasedDeformModule(nn.Module):
         # Range: (-1, 1) after tanh
         raw_offsets = self.offset_net(fused_features)  # [B, 2, H_feat, W_feat]
 
+        # Log initial output magnitude once (verify near-zero initialization)
+        if not self._logged_initial_output:
+            logging.info(
+                f"DeformModule initial output: mean={raw_offsets.mean().item():.6f}, std={raw_offsets.std().item():.6f}, min={raw_offsets.min().item():.6f}, max={raw_offsets.max().item():.6f}"
+            )
+            self._logged_initial_output = True
+
         # 3. Apply GRL to the offsets (OUTPUT side)
         # This ensures OffsetNet receives inverted gradients (Maximize Loss)
         if self.use_grl:
-            # Scale alpha by spectral norm or similar if needed, but for now fixed
             raw_offsets_adv = self.grl(raw_offsets)
         else:
             raw_offsets_adv = raw_offsets
 
-        # Safe Tanh: clamp input to prevent NaN in grad if input is huge
-        raw_offsets_adv = torch.tanh(raw_offsets_adv)
+        # === RELATIVE ENCODING (Jan 16 Evening) ===
+        # Instead of tanh + clamp, use sigmoid for naturally bounded output.
+        # Sigmoid outputs [0, 1], we shift to [-0.5, 0.5] for symmetric offsets.
+        # This is smoother than tanh near the boundaries and avoids saturation.
+        offset_ratio = torch.sigmoid(raw_offsets_adv) - 0.5  # [-0.5, 0.5]
 
         # Remove global shift while keeping local deformation energy
         if self.zero_mean_offsets:
@@ -1173,15 +1218,13 @@ class FeatureBasedDeformModule(nn.Module):
                 # SAFETY: Ensure mask is binary to prevent numerical instability
                 object_mask_binary = (object_mask > 0.5).float()
                 mask_sum = object_mask_binary.sum(dim=(2, 3), keepdim=True).clamp(min=1.0)
-                mean_offset = (raw_offsets_adv * object_mask_binary).sum(dim=(2, 3), keepdim=True) / mask_sum
+                mean_offset = (offset_ratio * object_mask_binary).sum(dim=(2, 3), keepdim=True) / mask_sum
             else:
-                mean_offset = raw_offsets_adv.mean(dim=(2, 3), keepdim=True)
-            raw_offsets_adv = raw_offsets_adv - mean_offset
+                mean_offset = offset_ratio.mean(dim=(2, 3), keepdim=True)
+            offset_ratio = offset_ratio - mean_offset
 
-        # Optionally boost local variation after centering while keeping bounds
-        if self.local_offset_gain != 1.0:
-            raw_offsets_adv = raw_offsets_adv * self.local_offset_gain
-            raw_offsets_adv = raw_offsets_adv.clamp(min=-1.0, max=1.0)
+        # After zero-mean, the range is still bounded (approx [-0.5, 0.5] in practice)
+        # No need for local_offset_gain or additional clamp with this design
 
         # Use actual target resolution instead of a fixed scale factor
         if isinstance(self.image_size, (tuple, list)):
@@ -1193,29 +1236,25 @@ class FeatureBasedDeformModule(nn.Module):
         scale_x = target_w / float(fused_features.shape[3])
 
         # 1. Compute Image-level Offsets (Target Resolution)
-        # Upsample to image space, then scale offsets from feature pixels -> image pixels.
+        # offset_ratio is in [-0.5, 0.5], multiply by 2*epsilon to get [-epsilon, +epsilon]
         # Use float32 here for stability under AMP.
-        raw_offsets_adv_f32 = raw_offsets_adv.to(dtype=torch.float32)
+        offset_ratio_f32 = offset_ratio.to(dtype=torch.float32)
         image_raw_offsets = F.interpolate(
-            raw_offsets_adv_f32,
+            offset_ratio_f32,
             size=(target_h, target_w),
             mode="bilinear",
             align_corners=False,
         )
+        # Scale: offset_ratio * 2 * epsilon * scale_factor
+        # This gives max pixel shift of ±epsilon * scale_factor
         scale_tensor = torch.tensor([scale_x, scale_y], device=fused_features.device, dtype=torch.float32).view(1, 2, 1, 1)
-        image_offsets_f32 = image_raw_offsets * (float(self.epsilon) * scale_tensor)
-
-        # Safety bound: tanh already bounds raw_offsets_adv in [-1,1], but keep an explicit clamp
-        # in pixel space to avoid rare numeric outliers destabilizing the backbone update.
-        max_abs_px = float(self.epsilon) * max(float(scale_x), float(scale_y))
-        # tanh bounds raw_offsets_adv in [-1, 1], so interpolation/scaling should already
-        # keep offsets within +/- max_abs_px.
+        image_offsets_f32 = image_raw_offsets * (2.0 * float(self.epsilon) * scale_tensor)
 
         image_offsets = image_offsets_f32.to(dtype=fused_features.dtype)
 
         # 2. Feature-level Offsets (Source Resolution)
         # Keep offsets in feature pixel units for direct warping on the feature map
-        feature_offsets = (raw_offsets_adv_f32 * float(self.epsilon)).to(dtype=fused_features.dtype)
+        feature_offsets = (offset_ratio_f32 * 2.0 * float(self.epsilon)).to(dtype=fused_features.dtype)
 
         return feature_offsets, image_offsets
 
@@ -1287,17 +1326,29 @@ class StyleAdversarialNetwork(nn.Module):
         self.use_grl = use_grl
 
         # Shared MLP: [B, K, C] -> [B, K, 6]
+        # LayerNorm normalizes across feature dimension (C), ensuring consistent
+        # style residual magnitudes regardless of object size or feature statistics
         self.object_mlp = nn.Sequential(
             nn.Linear(feature_dim, 128),
+            nn.LayerNorm(128),
             nn.ReLU(inplace=True),
             nn.Linear(128, 6),
         )
 
-        # Initialize small residuals
-        nn.init.normal_(self.object_mlp[-1].weight, mean=0.0, std=0.1)
-        nn.init.zeros_(self.object_mlp[-1].bias)
+        # Initialize ALL layers with small weights for near-zero initial output
+        # This prevents overly strong attacks at the start of training
+        # Previously only the last layer was initialized, causing strong initial attacks
+        for m in self.object_mlp.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, mean=0.0, std=0.01)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        logging.info(f"StyleAdversarialNetwork: Initialized all linear layers with std=0.01 for near-zero initial output")
 
-        self.grl = GRL(alpha=0.1)
+        self.grl = GRL()
+
+        # Track if we've logged initial output (for debugging)
+        self._logged_initial_output = False
 
     def forward(
         self,
@@ -1333,16 +1384,20 @@ class StyleAdversarialNetwork(nn.Module):
 
         style_residuals = self.object_mlp(object_features)
 
-        # Apply GRL and constrain if enabled
-        # If disabled (e.g. for GCN use), we output raw residuals (scaled by tanh)
-        # and let the caller handle GRL.
+        # Log initial output magnitude once (verify near-zero initialization)
+        if not self._logged_initial_output:
+            logging.info(
+                f"StyleNetwork initial output: mean={style_residuals.mean().item():.6f}, "
+                f"std={style_residuals.std().item():.6f}, "
+                f"min={style_residuals.min().item():.6f}, max={style_residuals.max().item():.6f}"
+            )
+            self._logged_initial_output = True
+
+        # Apply GRL if enabled
         if self.use_grl:
             style_residuals_adv = self.grl(style_residuals)
         else:
             style_residuals_adv = style_residuals
-
-        # Safe Tanh: clamp input to prevent NaN in grad if input is huge
-        style_residuals_adv = torch.tanh(torch.clamp(style_residuals_adv, -10.0, 10.0)) * self.epsilon
 
         # Handle shape mismatch if pixel_gt K != original_styles K
         if style_residuals_adv.shape[1] != K_actual:
@@ -1352,13 +1407,42 @@ class StyleAdversarialNetwork(nn.Module):
                 pad_k = K_actual - style_residuals_adv.shape[1]
                 style_residuals_adv = F.pad(style_residuals_adv, (0, 0, 0, pad_k))
 
-        # CRITICAL: Clamp final output to prevent extreme values that cause transformer NaN
-        # Style stats (mean, std): reasonable ranges are [-5, 5] for means, [0.01, 5] for stds
-        adv_styles_out = original_styles + style_residuals_adv
+        # === RELATIVE ENCODING (Jan 16 Evening, Fixed Jan 18) ===
+        # All transformations are now controlled by epsilon for proper regularization.
+        # epsilon=0.0001 → minimal perturbation; epsilon=0.1 → stronger perturbation
+        #
+        # Split the 6-dim output into scale (first 3) and shift (last 3)
+        raw_scale = style_residuals_adv[:, :, :3]  # For multiplicative factor
+        raw_shift = style_residuals_adv[:, :, 3:]  # For additive factor
 
-        # Separate clamping for means and stds
-        adv_means = adv_styles_out[:, :, :3].clamp(min=-5.0, max=5.0)
-        adv_stds = adv_styles_out[:, :, 3:].clamp(min=0.05, max=5.0)  # Prevent near-zero or huge stds
+        # === FIX: Scale factor now controlled by epsilon ===
+        # epsilon=0.0001 → scale_range=0.02 → [0.98, 1.02] (±2% brightness)
+        # epsilon=0.01   → scale_range=0.20 → [0.80, 1.20] (±20% brightness)
+        # epsilon=0.1    → scale_range=0.20 → [0.80, 1.20] (capped at ±20%)
+        scale_range = min(0.2, self.epsilon * 200)
+        scale_factor = 1.0 - scale_range + 2 * scale_range * torch.sigmoid(raw_scale)
+
+        # Shift factor: tanh outputs [-1, 1], scale by epsilon for small shifts
+        # Max shift is ±epsilon (e.g., ±0.5 for epsilon=0.5)
+        shift_factor = self.epsilon * torch.tanh(raw_shift)  # [-epsilon, +epsilon]
+
+        # Apply relative transformation to original styles
+        original_means = original_styles[:, :, :3]  # [B, K, 3]
+        original_stds = original_styles[:, :, 3:]  # [B, K, 3]
+
+        # Means: scale + shift (both now bounded by epsilon)
+        adv_means = original_means * scale_factor + shift_factor
+
+        # === FIX: Std scale now controlled by epsilon ===
+        # epsilon=0.0001 → std_range=0.05 → [0.95, 1.05] (±5% contrast)
+        # epsilon=0.01   → std_range=0.50 → [0.50, 1.50] (±50% contrast)
+        # epsilon=0.1    → std_range=0.50 → [0.50, 1.50] (capped at ±50%)
+        std_range = min(0.5, self.epsilon * 500)
+        std_scale = 1.0 - std_range + 2 * std_range * torch.sigmoid(raw_scale)
+        adv_stds = original_stds * std_scale
+        # Safety: ensure stds stay positive
+        adv_stds = adv_stds.clamp(min=0.1)
+
         adv_styles_out = torch.cat([adv_means, adv_stds], dim=2)
 
         return adv_styles_out

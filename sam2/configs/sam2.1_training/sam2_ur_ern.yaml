@@ -395,8 +395,10 @@ trainer:
         kl_weight: 0.0  # BNDL 关闭，权重设为 0
       ur_ern_loss:
         _target_: training.loss_ur_ern.URERNLoss
-        lambda_ur: 0.005  # UR 正则权重，起步值
-        label_smoothing: 0.02  # 二值标签平滑
+        # UR-ERN paper (arXiv:2401.01484) Eq. 11: L^UR-ERN = L^NLL + λ·L^R + λ₁·L^U
+        lambda_r: 0.01    # λ for L^R: evidence regularizer |y-γ|·(2v+α) (Eq. 5)
+        lambda_u: 0.001   # λ₁ for L^U: uncertainty regularizer |y-γ|²/ln(α) (Eq. 10) - core innovation
+        label_smoothing: 0.02  # Binary label smoothing
       sam_weight: 1.0
       bndl_weight: 0.0  # BNDL 关闭
       ur_ern_weight: 1.0  # UR-ERN 主要监督信号

@@ -61,9 +61,14 @@ class TensorBoardWriterWrapper:
         _, self._rank = get_machine_local_and_dist_rank()
         self._path: str = path
         if self._rank == 0:
-            logging.info(
-                f"TensorBoard SummaryWriter instantiated. Files will be stored in: {path}"
-            )
+            logging.info(f"TensorBoard SummaryWriter instantiated. Files will be stored in: {path}")
+            # CRITICAL: Use aggressive flush settings to prevent image loss
+            # Default max_queue=10 and flush_secs=120 can cause data loss when:
+            # - Training is interrupted before buffer is flushed
+            # - Multiple rapid add_image calls overflow the queue
+            # Use setdefault to allow config override while providing safe defaults
+            kwargs.setdefault("max_queue", 1)  # Minimal buffering to prevent image loss
+            kwargs.setdefault("flush_secs", 5)  # Frequent flush to disk (vs default 120s)
             self._writer = summary_writer_method(
                 log_dir=path,
                 *args,
@@ -71,9 +76,7 @@ class TensorBoardWriterWrapper:
                 **kwargs,
             )
         else:
-            logging.debug(
-                f"Not logging meters on this host because env RANK: {self._rank} != 0"
-            )
+            logging.debug(f"Not logging meters on this host because env RANK: {self._rank} != 0")
         atexit.register(self.close)
 
     @property
@@ -150,6 +153,11 @@ class TensorBoardLogger(TensorBoardWriterWrapper):
         """Add histogram data to TensorBoard."""
         if not self._writer:
             return
+        # Convert list to numpy array if needed (TensorBoard requires array/tensor)
+        import numpy as np
+
+        if isinstance(values, list):
+            values = np.array(values)
         self._writer.add_histogram(name, values, global_step=step)
 
 

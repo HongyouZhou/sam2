@@ -287,7 +287,8 @@ class MaskDecoder(nn.Module):
 
             masks_bndl = masks_bndl_sam.permute(0, 3, 1, 2)  # [B, K, H, W]
 
-            # Uncertainty estimation (parallel sampling)
+            # === Uncertainty estimation ===
+            # 1. Sampling-based uncertainty (no gradients, for visualization/logging)
             sampled_logits, mean_logits = uncertainty_sample_parallel(
                 self.pixel_bndl,
                 pixel_feat,
@@ -296,9 +297,22 @@ class MaskDecoder(nn.Module):
                 factor_z=self.bndl_factor_z,
                 factor_w=self.bndl_factor_w,
             )
+            # [B, H, W, K] - per-mask entropy (no gradients due to torch.no_grad in sampling)
+            pixel_uncertainty_sampling = entropy_uncertainty(sampled_logits)
 
-            # [B, H, W, K] - per-mask entropy (uncertainty)
-            pixel_uncertainty = entropy_uncertainty(sampled_logits)
+            # 2. Analytic uncertainty (with gradients, for training BNDL calibration)
+            # Computed from Weibull parameters: H = -p*log(p) - (1-p)*log(1-p) with MacKay approx
+            # Only compute during training to save memory
+            pixel_uncertainty_analytic = None
+            if self.training:
+                from sam2.modeling.bndl_utils import pixel_weibull_to_entropy_uncertainty
+
+                pixel_uncertainty_analytic = pixel_weibull_to_entropy_uncertainty(
+                    pixel_bndl_model=self.pixel_bndl,
+                    pixel_feat=pixel_feat,
+                    external_pre_out_w=mask_tokens_out,
+                    per_channel=True,  # [B, H, W, K] to match sampling shape
+                )
 
             aux_outputs = {
                 "bndl": {
@@ -308,7 +322,13 @@ class MaskDecoder(nn.Module):
                     "wei_lambda_w": wei_lambda_w,
                     "inv_k_w": inv_k_w,
                     "masks_bndl_raw": masks_bndl_sam.detach(),  # [B, H, W, K]
-                    "pixel_uncertainty": pixel_uncertainty,  # [B, H, W, K]
+                    # Two types of uncertainty with clear semantics:
+                    # - sampling: no gradients, use for visualization, logging, attacker loss
+                    # - analytic: with gradients, use for BNDL calibration (MMD loss)
+                    "pixel_uncertainty_sampling": pixel_uncertainty_sampling,  # [B, H, W, K], no grad
+                    "pixel_uncertainty_analytic": pixel_uncertainty_analytic,  # [B, H, W, K], with grad (or None in eval)
+                    # Legacy alias for backward compatibility (points to sampling)
+                    "pixel_uncertainty": pixel_uncertainty_sampling,  # [B, H, W, K]
                     "pixel_logits": masks_bndl_sam if self.training else masks_bndl_sam.detach(),
                     "upscaled_shape": (b, c, h, w),
                     "mask_tokens_out": mask_tokens_out if self.training else mask_tokens_out.detach(),

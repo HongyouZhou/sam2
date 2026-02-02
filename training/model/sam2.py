@@ -16,6 +16,152 @@ from sam2.utils.misc import concat_points
 from training.utils.data_utils import BatchedVideoDatapoint
 
 
+def _log_branch_consistency(
+    clean_gt: torch.Tensor,
+    adv_gt: torch.Tensor,
+    clean_features: torch.Tensor | None,
+    adv_features: torch.Tensor | None,
+    clean_prompts: dict | None,
+    adv_prompts: dict | None,
+    tag: str = "",
+) -> None:
+    """Log numerical consistency metrics between clean and adversarial branches.
+
+    Call this periodically during training to verify that both branches
+    are operating on equivalent data. Differences indicate potential bugs.
+    """
+    import logging
+
+    logger = logging.getLogger()  # Use root logger to match setup_logging configuration
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+
+    lines = [f"=== Branch Consistency Check {tag} ==="]
+
+    # GT Mask comparison
+    if clean_gt is not None and adv_gt is not None:
+        clean_shape = tuple(clean_gt.shape)
+        adv_shape = tuple(adv_gt.shape)
+        shape_match = clean_shape == adv_shape
+
+        clean_sum = clean_gt.float().sum().item()
+        adv_sum = adv_gt.float().sum().item()
+        sum_diff = abs(clean_sum - adv_sum)
+
+        clean_range = (clean_gt.min().item(), clean_gt.max().item())
+        adv_range = (adv_gt.min().item(), adv_gt.max().item())
+
+        lines.append(f"GT Shape: clean={clean_shape}, adv={adv_shape}, match={shape_match}")
+        lines.append(f"GT Sum: clean={clean_sum:.2f}, adv={adv_sum:.2f}, diff={sum_diff:.2f}")
+        lines.append(f"GT Range: clean={clean_range}, adv={adv_range}")
+
+        if shape_match:
+            # Check pixel-wise difference
+            diff = (clean_gt.float() - adv_gt.float()).abs()
+            diff_mean = diff.mean().item()
+            diff_max = diff.max().item()
+            lines.append(f"GT Diff: mean={diff_mean:.6f}, max={diff_max:.6f}")
+
+    # Feature comparison
+    if clean_features is not None and adv_features is not None:
+        clean_f_range = (clean_features.min().item(), clean_features.max().item())
+        adv_f_range = (adv_features.min().item(), adv_features.max().item())
+        clean_f_mean = clean_features.mean().item()
+        adv_f_mean = adv_features.mean().item()
+        clean_f_std = clean_features.std().item()
+        adv_f_std = adv_features.std().item()
+
+        lines.append(f"Features Range: clean={clean_f_range}, adv={adv_f_range}")
+        lines.append(f"Features Stats: clean(mean={clean_f_mean:.4f}, std={clean_f_std:.4f}), adv(mean={adv_f_mean:.4f}, std={adv_f_std:.4f})")
+
+    # Prompt comparison
+    if clean_prompts is not None and adv_prompts is not None:
+        clean_pts = clean_prompts.get("point_coords")
+        adv_pts = adv_prompts.get("point_coords")
+        if clean_pts is not None and adv_pts is not None:
+            pts_shape_match = clean_pts.shape == adv_pts.shape
+            lines.append(f"Prompts: clean_shape={tuple(clean_pts.shape)}, adv_shape={tuple(adv_pts.shape)}, match={pts_shape_match}")
+
+    logger.debug("\n".join(lines))
+
+
+def _warp_point_coords(
+    point_coords: torch.Tensor,
+    deform_offsets: torch.Tensor | None,
+    image_size: tuple[int, int] = (1024, 1024),
+) -> torch.Tensor:
+    """Warp point coordinates using deformation offsets.
+
+    When deformation attack is applied, the GT mask is warped. To maintain
+    consistency with clean branch prompts, we need to warp the point coordinates
+    by the same offsets.
+
+    Args:
+        point_coords: [B, N, 2] point coordinates in (x, y) format
+        deform_offsets: [B, K, 2, H, W] or [B, 2, H, W] deformation offsets (None if no deformation)
+        image_size: (H, W) image dimensions
+
+    Returns:
+        Warped point coordinates [B, N, 2]
+    """
+    if deform_offsets is None:
+        return point_coords.clone()
+
+    B, N, _ = point_coords.shape
+    H_img, W_img = image_size
+
+    # Handle both 4D [B, 2, H, W] and 5D [B, K, 2, H, W] tensors
+    if deform_offsets.dim() == 5:
+        # Average offsets across objects [B, K, 2, H, W] -> [B, 2, H, W]
+        offsets_4d = deform_offsets.mean(dim=1)
+    else:
+        offsets_4d = deform_offsets
+
+    _, _, H_off, W_off = offsets_4d.shape
+
+    # point_coords are in pixel coordinates
+    # We need to sample the offset at each point location
+
+    # Normalize coordinates to [-1, 1] for grid_sample
+    coords_normalized = point_coords.clone().float()
+    coords_normalized[..., 0] = coords_normalized[..., 0] / W_img * 2 - 1  # x -> normalized
+    coords_normalized[..., 1] = coords_normalized[..., 1] / H_img * 2 - 1  # y -> normalized
+
+    # grid_sample expects [B, H_out, W_out, 2], we have [B, N, 2]
+    # Reshape to [B, 1, N, 2] for sampling
+    grid = coords_normalized.unsqueeze(1)  # [B, 1, N, 2]
+
+    # Sample offsets at each point location
+    # offsets_4d: [B, 2, H, W] -> need to interpolate
+    sampled_offsets = torch.nn.functional.grid_sample(
+        offsets_4d,  # [B, 2, H, W]
+        grid,  # [B, 1, N, 2]
+        mode="bilinear",
+        padding_mode="border",
+        align_corners=False,
+    )  # [B, 2, 1, N]
+
+    # Reshape to [B, N, 2]
+    sampled_offsets = sampled_offsets.squeeze(2).permute(0, 2, 1)  # [B, N, 2]
+
+    # Apply offsets (offsets are in pixel space at offset resolution, scale to image resolution)
+    scale_x = W_img / W_off
+    scale_y = H_img / H_off
+
+    # Use out-of-place operations to avoid gradient issues
+    coords_x = point_coords[..., 0].float() + sampled_offsets[..., 0] * scale_x
+    coords_y = point_coords[..., 1].float() + sampled_offsets[..., 1] * scale_y
+
+    # Clamp to valid range (out-of-place)
+    coords_x = coords_x.clamp(0, W_img - 1)
+    coords_y = coords_y.clamp(0, H_img - 1)
+
+    # Stack to form final coordinates [B, N, 2]
+    warped_coords = torch.stack([coords_x, coords_y], dim=-1)
+
+    return warped_coords
+
+
 class SAM2Train(SAM2Base):
     def __init__(
         self,
@@ -62,6 +208,10 @@ class SAM2Train(SAM2Base):
         freeze_image_encoder=False,
         freeze_image_encoder_epochs: int = 0,
         unfreeze_image_encoder_components=[],
+        # Epsilon decay for adversarial training stability
+        epsilon_decay_start_epoch: int = 0,  # Epoch to start decay (0 = disabled)
+        epsilon_decay_end_epoch: int = 0,  # Epoch to reach min epsilon (0 = use max_epochs)
+        epsilon_min_ratio: float = 0.3,  # Min epsilon as ratio of initial
         **kwargs,
     ):
         super().__init__(image_encoder, memory_attention, memory_encoder, **kwargs)
@@ -96,50 +246,34 @@ class SAM2Train(SAM2Base):
 
         self.freeze_image_encoder_epochs = int(freeze_image_encoder_epochs or 0)
         self._backbone_freeze_active = None
+
+        # Epsilon decay initialization
+        self.epsilon_decay_start_epoch = int(epsilon_decay_start_epoch or 0)
+        self.epsilon_decay_end_epoch = int(epsilon_decay_end_epoch or 0)
+        self.epsilon_min_ratio = float(epsilon_min_ratio if epsilon_min_ratio else 0.3)
+        self._epsilon_decay_logged_epoch = -1
+        # Initial epsilons captured from parent's AUE config (set after super().__init__)
+        self._initial_style_epsilon = getattr(self, "style_adv_epsilon", 0.1)
+        self._initial_deform_epsilon = getattr(self, "deform_adv_epsilon", 0.2)
         if self.freeze_image_encoder_epochs > 0 and getattr(self, "use_lora", False):
-            logging.warning(
-                "freeze_image_encoder_epochs is set but use_lora=True; "
-                "epoch-based freezing will be ignored to avoid freezing LoRA params."
-            )
+            logging.warning("freeze_image_encoder_epochs is set but use_lora=True; epoch-based freezing will be ignored to avoid freezing LoRA params.")
             self.freeze_image_encoder_epochs = 0
 
         if freeze_image_encoder:
             if self.freeze_image_encoder_epochs > 0:
-                logging.warning(
-                    "freeze_image_encoder_epochs is set but freeze_image_encoder=True; "
-                    "epoch-based freezing will be ignored."
-                )
+                logging.warning("freeze_image_encoder_epochs is set but freeze_image_encoder=True; epoch-based freezing will be ignored.")
                 self.freeze_image_encoder_epochs = 0
             if hasattr(self, "use_lora") and self.use_lora:
-                # 1. Strict Freezing Strategy (FS-SAM2 style)
-                # PEFT handles the internal freezing of the base modules (image/memory encoders/attention).
-                # We only need to ensure that everything ELSE (Mask Decoder, Prompt Encoder, etc.) is frozen.
-                logging.info("Strict Freezing Strategy Enabled (FS-SAM2): Freezing all non-LoRA components.")
+                # LoRA mode: PEFT/LoRA handles image_encoder freezing internally
+                # (base weights frozen, only LoRA adapters trainable)
+                # Other components (Mask Decoder, Prompt Encoder, BNDL, etc.) remain trainable
+                logging.info("LoRA mode: image_encoder managed by PEFT (base frozen, LoRA trainable)")
+                logging.info("Other components (Mask Decoder, Prompt Encoder, BNDL) remain trainable")
 
-                frozen_count = 0
-                total_count = 0
-                for name, param in self.named_parameters():
-                    total_count += 1
-                    # Skip the components managed by PEFT (they handle their own requires_grad)
-                    if name.startswith("image_encoder") or name.startswith("memory_attention") or name.startswith("memory_encoder"):
-                        continue
-
-                    # Force freeze everything else (Mask Decoder, Prompt Encoder, Projections, etc.)
-                    param.requires_grad = False
-                    frozen_count += 1
-
-                logging.info(f"Frozen {frozen_count}/{total_count} additional parameters (Decoder, PromptEnc, etc.).")
-
-                # Optional: Logging trainable status
-                if hasattr(self.image_encoder, "print_trainable_parameters"):
-                    print("Image Encoder params:")
-                    self.image_encoder.print_trainable_parameters()
-                if self.memory_attention is not None and hasattr(self.memory_attention, "print_trainable_parameters"):
-                    print("Memory Attention params:")
-                    self.memory_attention.print_trainable_parameters()
-                if self.memory_encoder is not None and hasattr(self.memory_encoder, "print_trainable_parameters"):
-                    print("Memory Encoder params:")
-                    self.memory_encoder.print_trainable_parameters()
+                # Count trainable params for logging
+                lora_params = sum(p.numel() for n, p in self.named_parameters() if p.requires_grad and ("linear_a" in n or "linear_b" in n))
+                other_trainable = sum(p.numel() for n, p in self.named_parameters() if p.requires_grad and not ("linear_a" in n or "linear_b" in n))
+                logging.info(f"LoRA params: {lora_params:,} | Other trainable: {other_trainable:,}")
 
             else:
                 # 2. Original Logic for standard Fine-Tuning (non-LoRA) or manual freezing
@@ -202,13 +336,55 @@ class SAM2Train(SAM2Base):
 
         if should_freeze:
             self.image_encoder.eval()
-            logging.info(
-                f"Image encoder frozen for epoch {epoch} "
-                f"(unfreeze at epoch {self.freeze_image_encoder_epochs})."
-            )
+            logging.info(f"Image encoder frozen for epoch {epoch} (unfreeze at epoch {self.freeze_image_encoder_epochs}).")
         else:
             self.image_encoder.train()
             logging.info(f"Image encoder unfrozen at epoch {epoch}.")
+
+    def apply_epsilon_decay(self, epoch: int) -> None:
+        """Decay adversarial epsilon based on epoch for training stability.
+
+        Applies linear decay from initial epsilon to epsilon * min_ratio
+        between start_epoch and end_epoch. Both style and deform attackers
+        are decayed by the same factor to maintain relative strength.
+        """
+        if self.epsilon_decay_start_epoch <= 0:
+            return  # Disabled
+
+        # Calculate decay factor
+        if epoch < self.epsilon_decay_start_epoch:
+            decay_factor = 1.0  # Not started yet
+        elif self.epsilon_decay_end_epoch <= self.epsilon_decay_start_epoch:
+            decay_factor = self.epsilon_min_ratio  # Invalid range, use min
+        elif epoch >= self.epsilon_decay_end_epoch:
+            decay_factor = self.epsilon_min_ratio  # Reached minimum
+        else:
+            # Linear interpolation
+            progress = (epoch - self.epsilon_decay_start_epoch) / (self.epsilon_decay_end_epoch - self.epsilon_decay_start_epoch)
+            decay_factor = 1.0 - progress * (1.0 - self.epsilon_min_ratio)
+
+        # Update Style Attacker epsilon
+        if getattr(self, "use_style_adv", False) and hasattr(self, "style_attacker"):
+            new_eps = self._initial_style_epsilon * decay_factor
+            self.style_adv_epsilon = new_eps
+            self.style_attacker.impl.epsilon = new_eps
+            if hasattr(self.style_attacker.impl, "style_net"):
+                self.style_attacker.impl.style_net.epsilon = new_eps
+
+        # Update Deform Attacker epsilon
+        if getattr(self, "use_deform_adv", False) and hasattr(self, "deform_attacker"):
+            new_eps = self._initial_deform_epsilon * decay_factor
+            self.deform_adv_epsilon = new_eps
+            self.deform_attacker.impl.epsilon = new_eps
+            if hasattr(self.deform_attacker.impl, "deform_module"):
+                self.deform_attacker.impl.deform_module.epsilon = new_eps
+
+        # Log only on epoch change
+        if epoch != self._epsilon_decay_logged_epoch:
+            self._epsilon_decay_logged_epoch = epoch
+            style_eps = getattr(self, "style_adv_epsilon", 0)
+            deform_eps = getattr(self, "deform_adv_epsilon", 0)
+            logging.info(f"Epsilon decay: epoch={epoch}, factor={decay_factor:.3f}, style_eps={style_eps:.4f}, deform_eps={deform_eps:.4f}")
 
     def forward(self, input: BatchedVideoDatapoint):
         if self.training or not self.forward_backbone_per_frame_for_eval:
@@ -584,7 +760,7 @@ class SAM2Train(SAM2Base):
                 # Single-object mode: always use current frame GT mask (all frames)
                 pixel_gt_for_aue = gt_masks
 
-        # Cache memory context for adversarial branch (used inside compute_aue_loss)
+        # Cache memory context for adversarial branch (used in AUE module)
         self._aue_memory_context = {
             "frame_idx": frame_idx,
             "is_init_cond_frame": is_init_cond_frame,
@@ -608,8 +784,6 @@ class SAM2Train(SAM2Base):
                 num_frames,
                 track_in_reverse,
                 prev_sam_mask_logits,
-                pixel_gt_for_aue=pixel_gt_for_aue,
-                current_img_batch=current_img_batch,
             )
         finally:
             # Clear to avoid stale context on other code paths
@@ -653,7 +827,16 @@ class SAM2Train(SAM2Base):
         current_out["multistep_pred_multimasks"] = [low_res_multimasks]
         current_out["multistep_pred_multimasks_high_res"] = [high_res_multimasks]
         current_out["multistep_pred_ious"] = [ious]
-        current_out["multistep_point_inputs"] = [point_inputs]
+        # Store a DEEP COPY of initial point_inputs before iterative refinement modifies it
+        # This is critical for AUE branch to get clean initial prompts
+        if point_inputs is not None:
+            initial_point_inputs_copy = {
+                "point_coords": point_inputs["point_coords"].clone().detach(),
+                "point_labels": point_inputs["point_labels"].clone().detach(),
+            }
+        else:
+            initial_point_inputs_copy = None
+        current_out["multistep_point_inputs"] = [initial_point_inputs_copy]
         current_out["multistep_object_score_logits"] = [object_score_logits]
 
         # Optionally, sample correction points iteratively to correct the mask
@@ -671,10 +854,242 @@ class SAM2Train(SAM2Base):
                 high_res_masks,
                 object_score_logits,
                 current_out,
-                img_batch_for_aue=current_img_batch,
-                pixel_gt_for_aue=pixel_gt_for_aue,
             )
             (_, _, _, low_res_masks, high_res_masks, obj_ptr, object_score_logits, *_) = final_sam_outputs
+
+        skip_aue = getattr(self, "_skip_aue_forward", False)
+
+        if self.training and self.use_aue and is_init_cond_frame and pixel_gt_for_aue is not None and current_img_batch is not None and not skip_aue:
+            # Get auxiliary outputs from the final refinement step
+            final_aux_outputs = current_out.get("multistep_aux_outputs", [None])[-1]
+            if final_aux_outputs is not None and "bndl" in final_aux_outputs:
+                bndl_ns = final_aux_outputs["bndl"]
+                pixel_feat = bndl_ns.get("pixel_feat_grad", bndl_ns.get("pixel_feat", None))
+                pixel_logits_for_aue = bndl_ns.get(
+                    "pixel_logits",
+                    bndl_ns.get("masks_bndl_raw", bndl_ns.get("mean_pixel_logits", None)),
+                )
+                external_w_for_aue = bndl_ns.get("mask_tokens_out", None)
+                pixel_uncertainty = bndl_ns.get("pixel_uncertainty", None)
+
+                if pixel_feat is not None and pixel_logits_for_aue is not None and self._aue_module is not None:
+                    # Initialize empty metrics (MMD computation moved to loss_mmd.py)
+                    # Raw BNDL data is already in bndl_ns for loss function to use
+                    aue_metrics = {}
+
+                    # === Step 1: Generate adversarial samples ===
+                    if self._aue_module._pipeline is not None:
+                        enable_vis = getattr(self, "_enable_style_visualization", False)
+
+                        adv_samples = self._aue_module.generate_adversarial_samples(
+                            img_batch=current_img_batch,
+                            backbone_features=pix_feat,
+                            high_res_features=high_res_features,
+                            pixel_gt=pixel_gt_for_aue,
+                            single_obj_gt=gt_masks,  # Pass single object GT (same as clean branch)
+                            enable_vis=enable_vis,
+                        )
+
+                        # === Step 2: Run forward + refinement on adversarial samples ===
+                        # Reuse existing _track_step() and _iter_correct_pt_sampling() logic
+                        adv_pixel_gt = adv_samples["adv_pixel_gt"]
+                        adv_features = adv_samples["adv_features"]
+                        adv_high_res = adv_samples["adv_high_res"]
+
+                        # === CRITICAL: Use single object GT for SAM task (prompts + loss) ===
+                        # adv_single_obj_gt is the warped version of gt_masks (if deformation was applied)
+                        # This ensures adversarial branch learns the SAME task as clean branch
+                        adv_single_obj_gt = adv_samples.get("adv_single_obj_gt")
+                        if adv_single_obj_gt is not None:
+                            adv_gt_for_task = adv_single_obj_gt.float()
+                        elif gt_masks is not None:
+                            # Fallback: use original gt_masks if no deformation
+                            adv_gt_for_task = gt_masks.float()
+                            if adv_gt_for_task.dim() == 3:
+                                adv_gt_for_task = adv_gt_for_task.unsqueeze(1)
+                        else:
+                            # Legacy fallback: sum all objects (should not happen)
+                            if adv_pixel_gt.shape[1] > 1:
+                                adv_gt_for_task = adv_pixel_gt.sum(dim=1, keepdim=True).clamp(0, 1)
+                            else:
+                                adv_gt_for_task = adv_pixel_gt
+
+                        # Add no_mem_embed to match clean branch behavior for init_cond_frames
+                        # Clean branch: pix_feat_with_mem = current_vision_feats[-1] + self.no_mem_embed
+                        # See SAM2Base._prepare_memory_conditioned_features (L1470-1474)
+                        if self.directly_add_no_mem_embed and hasattr(self, "no_mem_embed"):
+                            # adv_features is [B, C, H, W], need to add no_mem_embed [1, 1, C]
+                            # Reshape no_mem_embed for broadcasting
+                            B, C, H, W = adv_features.shape
+                            no_mem = self.no_mem_embed.view(1, C, 1, 1).expand(B, C, 1, 1)
+                            adv_features = adv_features + no_mem
+
+                        # Boolean GT for prompt sampling (only needed for iterative refinement fallback)
+                        adv_gt_bool = adv_gt_for_task > 0.5
+
+                        # === Use clean branch's INITIAL prompts with coordinate warping ===
+                        # Get the initial prompts BEFORE iterative refinement (saved in multistep_point_inputs[0])
+                        # Then warp coordinates and execute the same iterative refinement
+                        deform_offsets = adv_samples.get("deform_offsets")  # [B, 2, H, W] or None
+
+                        # Get initial prompts (before any correction points were added)
+                        initial_point_inputs = current_out.get("multistep_point_inputs", [None])[0]
+
+                        if initial_point_inputs is not None and initial_point_inputs.get("point_coords") is not None:
+                            # Get image size from GT mask
+                            H_img, W_img = adv_gt_for_task.shape[-2:]
+
+                            # Clone initial coordinates to avoid inplace modification issues
+                            # (clean branch's _iter_correct_pt_sampling modifies point_inputs inplace)
+                            initial_coords = initial_point_inputs["point_coords"].clone().detach()
+                            initial_labels = initial_point_inputs["point_labels"].clone().detach()
+
+                            # Warp clean branch's initial coordinates using deformation offsets
+                            warped_coords = _warp_point_coords(
+                                initial_coords,
+                                deform_offsets,
+                                image_size=(H_img, W_img),
+                            )
+                            adv_point_inputs = {
+                                "point_coords": warped_coords,
+                                "point_labels": initial_labels,
+                            }
+                        else:
+                            # Fallback: sample new prompts if clean branch didn't use points
+                            from sam2.modeling.sam2_utils import get_next_point, sample_box_points
+
+                            use_box = hasattr(self, "prob_to_use_box_input_for_train") and self.rng.random() < self.prob_to_use_box_input_for_train
+                            if use_box:
+                                adv_points, adv_labels = sample_box_points(adv_gt_bool)
+                            else:
+                                adv_points, adv_labels = get_next_point(
+                                    gt_masks=adv_gt_bool,
+                                    pred_masks=None,
+                                    method="uniform",
+                                )
+                            adv_point_inputs = {"point_coords": adv_points, "point_labels": adv_labels}
+
+                        # === Numerical Consistency Check (DEBUG level) ===
+                        _log_branch_consistency(
+                            clean_gt=gt_masks,
+                            adv_gt=adv_gt_for_task,
+                            clean_features=pix_feat,
+                            adv_features=adv_features,
+                            clean_prompts=initial_point_inputs,  # Compare with initial prompts
+                            adv_prompts=adv_point_inputs,
+                            tag=f"frame={frame_idx}",
+                        )
+
+                        # Forward through SAM heads with INITIAL prompts (same as clean branch step 1)
+                        # Use gradient checkpointing for memory efficiency (AUE decoder recomputes during backward)
+                        use_aue_decoder_checkpoint = getattr(self, "use_aue_decoder_checkpoint", True)
+                        (
+                            adv_low_res_multimasks,
+                            adv_high_res_multimasks,
+                            adv_ious,
+                            adv_low_res_masks,
+                            adv_high_res_masks,
+                            _,
+                            adv_object_score_logits,
+                            adv_aux_outputs,
+                        ) = self._forward_sam_heads(
+                            backbone_features=adv_features,
+                            point_inputs=adv_point_inputs,
+                            mask_inputs=None,
+                            high_res_features=adv_high_res,
+                            multimask_output=self._use_multimask(is_init_cond_frame=True, point_inputs=adv_point_inputs),
+                            use_checkpoint=use_aue_decoder_checkpoint,
+                        )
+
+                        # === Run iterative refinement (same as clean branch) ===
+                        adv_multistep_multimasks = [adv_high_res_multimasks]
+                        adv_multistep_ious = [adv_ious]
+                        adv_multistep_object_score_logits = [adv_object_score_logits]
+
+                        if frame_idx in frames_to_add_correction_pt and self.num_correction_pt_per_frame > 0:
+                            # Prepare current_out for _iter_correct_pt_sampling
+                            adv_current_out = {
+                                "multistep_aux_outputs": [adv_aux_outputs],
+                                "multistep_pred_multimasks_high_res": [adv_high_res_multimasks],
+                                "multistep_pred_ious": [adv_ious],
+                                "multistep_object_score_logits": [adv_object_score_logits],
+                                "multistep_point_inputs": [adv_point_inputs],
+                            }
+
+                            # Reuse the same iterative refinement as clean branch
+                            adv_point_inputs, final_adv_sam_outputs = self._iter_correct_pt_sampling(
+                                is_init_cond_frame=True,
+                                point_inputs=adv_point_inputs,
+                                gt_masks=adv_gt_bool,
+                                high_res_features=adv_high_res,
+                                pix_feat_with_mem=adv_features,
+                                low_res_multimasks=adv_low_res_multimasks,
+                                high_res_multimasks=adv_high_res_multimasks,
+                                ious=adv_ious,
+                                low_res_masks=adv_low_res_masks,
+                                high_res_masks=adv_high_res_masks,
+                                object_score_logits=adv_object_score_logits,
+                                current_out=adv_current_out,
+                            )
+
+                            # Extract multi-step outputs from the result
+                            adv_multistep_multimasks = adv_current_out["multistep_pred_multimasks_high_res"]
+                            adv_multistep_ious = adv_current_out["multistep_pred_ious"]
+                            adv_multistep_object_score_logits = adv_current_out["multistep_object_score_logits"]
+                            # Get the final aux_outputs from multistep
+                            adv_aux_outputs = adv_current_out["multistep_aux_outputs"][-1]
+
+                        # === Step 3: Store adversarial outputs for task/BNDL/MMD loss ===
+                        # Store in SAME FORMAT as clean branch for consistent loss computation
+                        bndl_ns["adv_outputs"] = {
+                            # Multi-step outputs (for SAM loss via _forward)
+                            "multistep_pred_multimasks_high_res": adv_multistep_multimasks,
+                            "multistep_pred_ious": adv_multistep_ious,
+                            "multistep_object_score_logits": adv_multistep_object_score_logits,
+                            # Single-step outputs (for backward compatibility)
+                            "pred_masks": adv_high_res_multimasks,  # [B, M, H, W] multimasks
+                            "ious": adv_ious,  # [B, M]
+                            "object_score_logits": adv_object_score_logits,  # [B, 1]
+                            "gt": adv_gt_for_task,  # [B, 1, H, W] SINGLE object GT (same as clean branch)
+                            "aux_outputs": adv_aux_outputs,  # For BNDL/MMD loss
+                        }
+
+                        # === Step 4: Store styled_images for attacker loss (SEPARATION DESIGN) ===
+                        # This provides a gradient path from attacker loss back to Style/Deform networks
+                        adv_images_for_attacker = adv_samples.get("adv_images_for_attacker")
+                        if adv_images_for_attacker is not None:
+                            bndl_ns["adv_images_for_attacker"] = adv_images_for_attacker
+                            bndl_ns["attacker_pixel_gt"] = adv_pixel_gt  # For recomputing forward if needed
+
+                        # === Prepare visualization data ===
+                        vis_refs = adv_samples.get("vis_refs", {})
+                        if enable_vis and vis_refs:
+                            from sam2.modeling.aue.visualization import AUEVisualizer
+
+                            visualizer = AUEVisualizer()
+                            adv_img_for_vis = visualizer.select_adv_image_for_vis(vis_refs)
+                            aue_metrics["aue_visualization"] = visualizer.prepare_visualization_data(
+                                img_batch=vis_refs.get("img_batch", current_img_batch.detach().cpu()),
+                                adv_images=adv_img_for_vis,
+                                pixel_gt=vis_refs.get("pixel_gt", pixel_gt_for_aue.detach().cpu()),
+                                original_styles=vis_refs.get("original_styles"),
+                                adv_styles=vis_refs.get("adversarial_styles"),
+                                deform_offsets=vis_refs.get("deform_offsets"),
+                                warped_images=vis_refs.get("warped_images"),
+                                warped_masks=vis_refs.get("warped_pixel_gt"),
+                                attack_order=vis_refs.get("attack_order"),
+                            )
+
+                        bndl_ns["aue_metrics"] = aue_metrics
+                    else:
+                        # No adversarial pipeline available
+                        bndl_ns["aue_loss_adv"] = torch.tensor(0.0, device=pixel_feat.device)
+
+                    # Check for GCN stats
+                    gcn_stats = getattr(self, "_latest_gcn_stats", None)
+                    if gcn_stats and isinstance(bndl_ns, dict):
+                        bndl_ns["gcn_stats"] = gcn_stats
+                        self._latest_gcn_stats = None
 
         # Use the final prediction (after all correction steps for output and eval)
         current_out["pred_masks"] = low_res_masks
@@ -708,8 +1123,6 @@ class SAM2Train(SAM2Base):
         high_res_masks,
         object_score_logits,
         current_out,
-        img_batch_for_aue=None,
-        pixel_gt_for_aue=None,
     ):
         assert gt_masks is not None
         all_pred_masks = [low_res_masks]
@@ -750,8 +1163,6 @@ class SAM2Train(SAM2Base):
                     mask_inputs=mask_inputs,
                     high_res_features=high_res_features,
                     multimask_output=multimask_output,
-                    pixel_gt_for_aue=None,
-                    img_batch_for_style_aue=None,
                     use_reentrant=False,
                 )
             else:
@@ -761,8 +1172,6 @@ class SAM2Train(SAM2Base):
                     mask_inputs=mask_inputs,
                     high_res_features=high_res_features,
                     multimask_output=multimask_output,
-                    pixel_gt_for_aue=None,
-                    img_batch_for_style_aue=None,
                 )
 
             # Unpack sam_outputs (always 8 elements now)

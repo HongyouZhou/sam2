@@ -11,14 +11,14 @@ DATASET_CONFIGS = {
     "TrashCan": {
         "root": "/ssdArray/hongyou/dev/data/sam2_data/TrashCan_SAM2/",
         "splits": ["train", "val"],
-        "default_split": ["train"],
+        "default_split": ["train", "val"],
         "has_split_subdir": True,
         "skip_first_and_last": False,
     },
     "GTEA": {
         "root": "/ssdArray/hongyou/dev/data/sam2_data/GTEA_SAM2/",
         "splits": ["train", "val"],
-        "default_split": ["train"],
+        "default_split": ["train", "val"],
         "has_split_subdir": True,
         "skip_first_and_last": False,
     },
@@ -194,8 +194,8 @@ DATASET_CONFIGS = {
 
 # Default dataset list for evaluation
 DEFAULT_DATASETS = [
-    # "MOSE_train",  # Source domain (fine-tune domain for BNDL/UR-ERN, 1246 videos)
-    # "MOSE_val",    # Within-domain baseline (200 videos)
+    "MOSE_train",  # Source domain (fine-tune domain for BNDL/UR-ERN, 1246 videos)
+    "MOSE_val",  # Within-domain baseline (200 videos)
     "TrashCan",
     "GTEA",
     "PIDRay",
@@ -243,7 +243,6 @@ DATASET_TO_TYPE: dict[str, str] = {
     "BBBC038v1": "OBJECT",
     "PPDLS": "OBJECT",
     "IBD": "OBJECT",
-
     # Scene-centric / Stuff
     "CITYSCAPES": "SCENE",
     "ADE20K": "SCENE",
@@ -254,13 +253,12 @@ DATASET_TO_TYPE: dict[str, str] = {
     "plittersdorf": "SCENE",
     "NDD20": "SCENE",
     "TimberSeg": "SCENE",
-
     # Egocentric / Video
     "GTEA": "EGO_VIDEO",
     "EgoHOS": "EGO_VIDEO",
     "VISOR": "EGO_VIDEO",
     "OVIS": "EGO_VIDEO",
     "MOSE_train": "EGO_VIDEO",  # MOSE train split (1246 videos) - fine-tune domain
-    "MOSE_val": "EGO_VIDEO",    # MOSE val split (200 videos) - within-domain test
+    "MOSE_val": "EGO_VIDEO",  # MOSE val split (200 videos) - within-domain test
     "DRAM": "EGO_VIDEO",
 }

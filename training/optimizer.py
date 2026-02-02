@@ -227,6 +227,7 @@ def unix_module_cls_pattern_to_parameter_names(
 def unix_param_pattern_to_parameter_names(
     filter_param_names: Optional[List[str]],
     parameter_names: Dict[str, torch.Tensor],
+    allow_empty_match: bool = False,
 ) -> Union[None, Set[str]]:
     """Returns param names which pass the filters specified in filter_param_names.
 
@@ -235,6 +236,7 @@ def unix_param_pattern_to_parameter_names(
             wildcards, like ["block.2.*", "block.2.linear.weight"]
         module_cls_to_param_names: Mapping from module classes to the parameter names
             they contain. See `get_module_cls_to_param_names`.
+        allow_empty_match: If True, skip patterns with no matches instead of error.
     """
 
     if filter_param_names is None:
@@ -242,11 +244,18 @@ def unix_param_pattern_to_parameter_names(
     allowed_parameter_names = []
     for param_name in filter_param_names:
         matching_parameters = set(fnmatch.filter(parameter_names, param_name))
-        assert (
-            len(matching_parameters) >= 1
-        ), f"param_name {param_name} does not match any parameters in the model"
+        if len(matching_parameters) == 0:
+            if allow_empty_match:
+                logging.debug(f"Skipping param_name [{param_name}]: no matches (optional)")
+                continue
+            else:
+                raise AssertionError(
+                    f"param_name {param_name} does not match any parameters in the model"
+                )
         logging.info(f"Matches for param_name [{param_name}]: {matching_parameters}")
         allowed_parameter_names.append(matching_parameters)
+    if len(allowed_parameter_names) == 0:
+        return set()
     return set.union(*allowed_parameter_names)
 
 
@@ -264,8 +273,11 @@ def _unix_pattern_to_parameter_names(
     if "param_names" not in scheduler_cfg and "module_cls_names" not in scheduler_cfg:
         return None
     
+    # Check if this is an optional param group (e.g., LoRA params may not exist)
+    allow_empty = scheduler_cfg.get("optional", False)
+    
     included_params = unix_param_pattern_to_parameter_names(
-        scheduler_cfg.get("param_names"), parameter_names
+        scheduler_cfg.get("param_names"), parameter_names, allow_empty_match=allow_empty
     ).union(
         unix_module_cls_pattern_to_parameter_names(
             scheduler_cfg.get("module_cls_names"), module_cls_to_param_names

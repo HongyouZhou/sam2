@@ -215,6 +215,10 @@ def run_comparison_evaluation(
     max_vis_per_video: int = 2,
     save_vis_pdf: bool = False,
     no_save_masks: bool = False,
+    # Enable UCTTA within BNDL_AUE (combined baseline)
+    bndl_aue_enable_uctta: bool = False,
+    bndl_aue_uctta_steps: int = 2,
+    bndl_aue_uctta_lr: float = 3e-4,
 ) -> tuple[
     dict[str, tuple[float, float, float]],  # sam2_results
     dict[str, tuple[float, float, float]],  # bndl_aue_results
@@ -377,6 +381,24 @@ def run_comparison_evaluation(
                 bndl_configs.append(("BNDL_AUE", bndl_aue_output, bndl_aue_per_thresh, bndl_aue_statistics, bndl_aue_cfg, bndl_aue_checkpoint))
 
             for m_name, m_out, m_list, m_stats, m_cfg, m_ckpt in bndl_configs:
+                bndl_kwargs = {
+                    "predictor_cfg": m_cfg,
+                    "predictor_ckpt": m_ckpt,
+                    "predictor_device": device,
+                    "collect_statistics": collect_bndl_stats,
+                    "reuse_prompts_root": sam2_output if run_sam else None,
+                    "downsample_max_samples": downsample_max_samples,
+                    "multimask_output": True,
+                    "save_uncertainty_maps": save_vis,  # Save per-pixel uncertainty maps
+                    "max_vis_per_video": max_vis_per_video,
+                    "save_vis_pdf": save_vis_pdf,
+                    "save_masks": not no_save_masks,
+                }
+                # Add UCTTA support for BNDL_AUE if enabled
+                if m_name == "BNDL_AUE" and bndl_aue_enable_uctta:
+                    bndl_kwargs["enable_uctta"] = True
+                    bndl_kwargs["uctta_steps"] = bndl_aue_uctta_steps
+                    bndl_kwargs["uctta_lr"] = bndl_aue_uctta_lr
                 tasks.append(
                     {
                         "name": m_name,
@@ -385,19 +407,7 @@ def run_comparison_evaluation(
                         "output": m_out,
                         "results_list": m_list,
                         "stats": m_stats,
-                        "kwargs": {
-                            "predictor_cfg": m_cfg,
-                            "predictor_ckpt": m_ckpt,
-                            "predictor_device": device,
-                            "collect_statistics": collect_bndl_stats,
-                            "reuse_prompts_root": sam2_output if run_sam else None,
-                            "downsample_max_samples": downsample_max_samples,
-                            "multimask_output": True,
-                            "save_bndl_vis": save_vis,
-                            "max_vis_per_video": max_vis_per_video,
-                            "save_vis_pdf": save_vis_pdf,
-                            "save_masks": not no_save_masks,
-                        },
+                        "kwargs": bndl_kwargs,
                     }
                 )
 
@@ -894,6 +904,11 @@ def parse_args():
     # Optimization
     p.add_argument("--no_save_masks", action="store_true", default=False, help="Disable mask saving to speed up evaluation")
 
+    # BNDL_AUE + UCTTA combined baseline
+    p.add_argument("--bndl_aue_enable_uctta", action="store_true", default=False, help="Enable UCTTA test-time adaptation within BNDL_AUE")
+    p.add_argument("--bndl_aue_uctta_steps", type=int, default=2, help="UCTTA steps for BNDL_AUE (default: 2)")
+    p.add_argument("--bndl_aue_uctta_lr", type=float, default=3e-4, help="UCTTA learning rate for BNDL_AUE (default: 3e-4)")
+
     return p.parse_args()
 
 
@@ -987,6 +1002,10 @@ def main():
                     max_vis_per_video=args.max_vis_per_video,
                     save_vis_pdf=True,  # Always save PDF for professional use
                     no_save_masks=args.no_save_masks,
+                    # BNDL_AUE + UCTTA combined baseline
+                    bndl_aue_enable_uctta=args.bndl_aue_enable_uctta,
+                    bndl_aue_uctta_steps=args.bndl_aue_uctta_steps,
+                    bndl_aue_uctta_lr=args.bndl_aue_uctta_lr,
                 )
             )
 

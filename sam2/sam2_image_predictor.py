@@ -54,6 +54,8 @@ class SAM2ImagePredictor:
         self._orig_hw = None
         # Whether the predictor is set for single image or a batch of images
         self._is_batch = False
+        # Last aux_outputs from mask decoder (contains BNDL/UR-ERN uncertainty)
+        self._last_aux_outputs = None
 
         # Predictor config
         self.mask_threshold = mask_threshold
@@ -371,7 +373,7 @@ class SAM2ImagePredictor:
         # Predict masks
         batched_mode = concat_points is not None and concat_points[0].shape[0] > 1  # multi object prediction
         high_res_features = [feat_level[img_idx].unsqueeze(0) for feat_level in self._features["high_res_feats"]]
-        low_res_masks, iou_predictions, _, _, _ = self.model.sam_mask_decoder(
+        low_res_masks, iou_predictions, _, _, aux_outputs = self.model.sam_mask_decoder(
             image_embeddings=self._features["image_embed"][img_idx].unsqueeze(0),
             image_pe=self.model.sam_prompt_encoder.get_dense_pe(),
             sparse_prompt_embeddings=sparse_embeddings,
@@ -380,6 +382,9 @@ class SAM2ImagePredictor:
             repeat_image=batched_mode,
             high_res_features=high_res_features,
         )
+
+        # Store aux_outputs (contains BNDL/UR-ERN uncertainty) for downstream access
+        self._last_aux_outputs = aux_outputs
 
         # Upscale the masks to the original image resolution
         masks = self._transforms.postprocess_masks(low_res_masks, self._orig_hw[img_idx])
@@ -412,3 +417,14 @@ class SAM2ImagePredictor:
         self._features = None
         self._orig_hw = None
         self._is_batch = False
+        self._last_aux_outputs = None
+
+    def get_last_aux_outputs(self) -> dict | None:
+        """
+        Returns the aux_outputs from the last prediction.
+        Contains BNDL or UR-ERN uncertainty outputs if enabled.
+
+        Returns:
+            dict or None: aux_outputs with keys like 'bndl' or 'ur_ern'
+        """
+        return self._last_aux_outputs

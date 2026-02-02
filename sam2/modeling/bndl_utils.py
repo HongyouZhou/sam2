@@ -8,18 +8,31 @@ including analytic uncertainty computation from Weibull parameters.
 from dataclasses import dataclass
 
 import torch
-import torch.nn.functional as F
 
 # Import precomputed constants from BNDL for consistency
-from BNDL.BNDL_upload.ViT_Sparse.utils.bndl import PI_OVER_8, LOG_2
+from BNDL.BNDL_upload.ViT_Sparse.utils.bndl import LOG_2, PI_OVER_8
 
 
 @dataclass
 class BNDLOutputs:
+    """Container for BNDL outputs with optional cached Weibull parameters.
+
+    The cached parameters (wei_lambda, inv_k, etc.) can be populated from BNDL's
+    forward pass to avoid redundant computation in analytic uncertainty estimation.
+    """
+
     pixel_feat: torch.Tensor
     pixel_logits: torch.Tensor
     external_w: torch.Tensor | None
     pixel_uncertainty: torch.Tensor | None
+    # Cached Weibull parameters to avoid redundant BNDL forward passes
+    wei_lambda: torch.Tensor | None = None  # [B, H, W, C]
+    inv_k: torch.Tensor | None = None  # [B, H, W, 1]
+    wei_lambda_w: torch.Tensor | None = None  # [B, K, num_classes, C]
+    inv_k_w: torch.Tensor | None = None  # [B, K, 1, C]
+    pre_out: torch.Tensor | None = None  # [B, H, W, C] - reparameterized pixel features
+    pre_out_w: torch.Tensor | None = None  # [B, K, num_classes, C] - reparameterized weights
+    mean_logits: torch.Tensor | None = None  # [B, H, W, K] - same as pixel_logits for convenience
 
 
 def pixel_weibull_to_entropy_uncertainty(
@@ -27,6 +40,7 @@ def pixel_weibull_to_entropy_uncertainty(
     pixel_feat: torch.Tensor,
     external_pre_out_w: torch.Tensor | None = None,
     per_channel: bool = False,
+    cached_outputs: BNDLOutputs | None = None,
 ) -> torch.Tensor:
     """
     Compute Bernoulli entropy uncertainty analytically from Weibull parameters (with gradients).
@@ -40,6 +54,7 @@ def pixel_weibull_to_entropy_uncertainty(
         external_pre_out_w: [B, K, C'] mask_tokens_out (256-dim) - BNDL internally projects this via linear_add_w
         per_channel: If True, return per-channel entropy [B, H, W, K]
                      If False, return aggregated entropy [B, H, W]
+        cached_outputs: Optional BNDLOutputs with cached Weibull parameters to avoid redundant forward pass
 
     Returns:
         uncertainty_map: [B, H, W, K] if per_channel=True, else [B, H, W]
@@ -51,27 +66,46 @@ def pixel_weibull_to_entropy_uncertainty(
     """
     B, H, W, C = pixel_feat.shape
 
-    # Get factor parameters from model attributes or use defaults
-    factor_z = getattr(pixel_bndl_model, "default_factor_z", 0.0)
-    factor_w = getattr(pixel_bndl_model, "default_factor_w", 0.02)
-
-    # external_pre_out_w (mask_tokens_out) is required for the current BNDL API
-    if external_pre_out_w is None:
-        raise ValueError("external_pre_out_w (mask_tokens_out) is required for pixel_weibull_to_entropy_uncertainty. Please pass the mask_tokens_out tensor from mask_decoder.")
-
-    # Step 1: Forward through BNDL to get Weibull parameters
-    # Current BNDL API: forward(pixel_feat, mask_token, factor_z, factor_w, force_sample)
-    # Returns: out_sam, z_out, wei_lambda, inv_k, wei_lambda_w, inv_k_w
-    outputs = pixel_bndl_model(
-        pixel_feat,
-        external_pre_out_w,  # mask_tokens_out [B, K, 256]
-        factor_z=factor_z,
-        factor_w=factor_w,
-        force_sample=False,  # Use deterministic mode (Weibull mean)
+    # Check if we can use cached parameters
+    use_cache = (
+        cached_outputs is not None
+        and cached_outputs.wei_lambda is not None
+        and cached_outputs.inv_k is not None
+        and cached_outputs.wei_lambda_w is not None
+        and cached_outputs.inv_k_w is not None
+        and cached_outputs.pixel_logits is not None
     )
 
-    # Unpack the 6-tuple return value
-    out_sam, z_out, wei_lambda, inv_k, wei_lambda_w, inv_k_w = outputs
+    if use_cache:
+        # Use cached Weibull parameters (avoids redundant forward pass)
+        wei_lambda = cached_outputs.wei_lambda
+        inv_k = cached_outputs.inv_k
+        wei_lambda_w = cached_outputs.wei_lambda_w
+        inv_k_w = cached_outputs.inv_k_w
+        out_sam = cached_outputs.pixel_logits
+    else:
+        # Fall back to computing via BNDL forward pass
+        # Get factor parameters from model attributes or use defaults
+        factor_z = getattr(pixel_bndl_model, "default_factor_z", 0.0)
+        factor_w = getattr(pixel_bndl_model, "default_factor_w", 0.02)
+
+        # external_pre_out_w (mask_tokens_out) is required for the current BNDL API
+        if external_pre_out_w is None:
+            raise ValueError("external_pre_out_w (mask_tokens_out) is required for pixel_weibull_to_entropy_uncertainty. Please pass the mask_tokens_out tensor from mask_decoder.")
+
+        # Forward through BNDL to get Weibull parameters
+        # Current BNDL API: forward(pixel_feat, mask_token, factor_z, factor_w, force_sample)
+        # Returns: out_sam, z_out, wei_lambda, inv_k, wei_lambda_w, inv_k_w, pre_out, pre_out_w
+        outputs = pixel_bndl_model(
+            pixel_feat,
+            external_pre_out_w,  # mask_tokens_out [B, K, 256]
+            factor_z=factor_z,
+            factor_w=factor_w,
+            force_sample=False,  # Use deterministic mode (Weibull mean)
+        )
+
+        # Unpack the 6-tuple return value (019 API)
+        out_sam, _z_out, wei_lambda, inv_k, wei_lambda_w, inv_k_w = outputs
 
     # out_sam is already the final logits [B, H, W, K]
     # We need to estimate uncertainty from the Weibull parameters
@@ -101,7 +135,7 @@ def pixel_weibull_to_entropy_uncertainty(
     # var_z: [B, H, W, C] = [B, H, W, 32]
 
     mean_logits = out_sam  # [B, H, W, K]
-    K = mean_logits.shape[-1]
+    _ = mean_logits.shape[-1]  # K (number of masks) - not used but kept for reference
 
     # Compute variance of weight contributions from Weibull parameters
     # Var[W] = λ² * [Γ(1 + 2/κ) - Γ²(1 + 1/κ)]
@@ -130,15 +164,15 @@ def pixel_weibull_to_entropy_uncertainty(
     mean_probs = torch.sigmoid(sigmoid_input)  # [B, H, W, K]
 
     # Step 5: Compute Bernoulli entropy H(p) = -p*log(p) - (1-p)*log(1-p)
-    # Clamp probabilities to avoid infinite gradients at p=0 or p=1
-    mean_probs = torch.clamp(mean_probs, min=1e-6, max=1.0 - 1e-6)
+    # Use 1e-4 to avoid numerical issues in bfloat16 (consistent with entropy_uncertainty)
+    mean_probs = torch.clamp(mean_probs, min=1e-4, max=1.0 - 1e-4)
 
     if hasattr(torch.special, "entr"):
         # PyTorch >= 1.9: use built-in entr function
         entropy_per_mask = torch.special.entr(mean_probs) + torch.special.entr(1.0 - mean_probs)
     else:
-        # Fallback: manual implementation
-        eps = 1e-10
+        # Fallback: manual implementation (use larger eps for bfloat16 safety)
+        eps = 1e-8
         entropy_per_mask = -(mean_probs * torch.log(mean_probs + eps) + (1.0 - mean_probs) * torch.log(1.0 - mean_probs + eps))
 
     # Step 6: Normalize entropy to [0, 1] by dividing by max Bernoulli entropy log(2)

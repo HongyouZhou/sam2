@@ -49,9 +49,7 @@ class MixedDataLoader:
             raise TypeError(f"{type(self).__name__} object is not an iterator")
 
         while self._iter_mixing_prob.any():  # at least one D-Loader with non-zero prob.
-            dataset_idx = self._iter_mixing_prob.multinomial(
-                1, generator=self.random_generator
-            ).item()
+            dataset_idx = self._iter_mixing_prob.multinomial(1, generator=self.random_generator).item()
             try:
                 item = next(self._iter_dls[dataset_idx])
                 return item
@@ -80,6 +78,8 @@ class TorchTrainMixedDataset:
         worker_init_fn: Optional[Callable] = None,
         phases_per_epoch: int = 1,
         dataset_prob: Optional[List[float]] = None,
+        persistent_workers: bool = False,
+        prefetch_factor: Optional[int] = None,
     ) -> None:
         """
         Args:
@@ -93,6 +93,8 @@ class TorchTrainMixedDataset:
             worker_init_fn (Callable): Function to init each dataloader worker.
             phases_per_epoch (int): Number of phases per epoch.
             dataset_prob (List[float]): Probability of choosing the dataloader to sample from. Should sum to 1.0
+            persistent_workers (bool): Keep workers alive between epochs (faster epoch transitions).
+            prefetch_factor (int): Number of batches to prefetch per worker.
         """
 
         self.datasets = datasets
@@ -103,6 +105,8 @@ class TorchTrainMixedDataset:
         self.drop_last = drop_last
         self.collate_fn = collate_fn
         self.worker_init_fn = worker_init_fn
+        self.persistent_workers = persistent_workers
+        self.prefetch_factor = prefetch_factor
         assert len(self.datasets) > 0
         for dataset in self.datasets:
             assert not isinstance(dataset, IterableDataset), "Not supported"
@@ -112,10 +116,7 @@ class TorchTrainMixedDataset:
         self.chunks = [None] * len(datasets)
         if dataset_prob is None:
             # If not provided, assign each dataset a probability proportional to its length.
-            dataset_lens = [
-                (math.floor(len(d) / bs) if drop_last else math.ceil(len(d) / bs))
-                for d, bs in zip(datasets, batch_sizes)
-            ]
+            dataset_lens = [(math.floor(len(d) / bs) if drop_last else math.ceil(len(d) / bs)) for d, bs in zip(datasets, batch_sizes)]
             total_len = sum(dataset_lens)
             dataset_prob = torch.tensor([d_len / total_len for d_len in dataset_lens])
         else:
@@ -134,9 +135,7 @@ class TorchTrainMixedDataset:
 
     def get_loader(self, epoch) -> Iterable:
         dataloaders = []
-        for d_idx, (dataset, batch_size) in enumerate(
-            zip(self.datasets, self.batch_sizes)
-        ):
+        for d_idx, (dataset, batch_size) in enumerate(zip(self.datasets, self.batch_sizes)):
             if self.phases_per_epoch > 1:
                 # Major epoch that looops over entire dataset
                 # len(main_epoch) == phases_per_epoch * len(epoch)
@@ -167,14 +166,22 @@ class TorchTrainMixedDataset:
             sampler.set_epoch(epoch)
 
             batch_sampler = BatchSampler(sampler, batch_size, drop_last=self.drop_last)
-            dataloaders.append(
-                DataLoader(
-                    dataset,
-                    num_workers=self.num_workers,
-                    pin_memory=self.pin_memory,
-                    batch_sampler=batch_sampler,
-                    collate_fn=self.collate_fn,
-                    worker_init_fn=self.worker_init_fn,
-                )
+
+            # Build DataLoader kwargs, conditionally adding persistent_workers and prefetch_factor
+            loader_kwargs = dict(
+                dataset=dataset,
+                num_workers=self.num_workers,
+                pin_memory=self.pin_memory,
+                batch_sampler=batch_sampler,
+                collate_fn=self.collate_fn,
+                worker_init_fn=self.worker_init_fn,
             )
+            # persistent_workers requires num_workers > 0
+            if self.num_workers > 0 and self.persistent_workers:
+                loader_kwargs["persistent_workers"] = True
+                # prefetch_factor is only valid with persistent_workers or multiprocessing
+                if self.prefetch_factor is not None:
+                    loader_kwargs["prefetch_factor"] = self.prefetch_factor
+
+            dataloaders.append(DataLoader(**loader_kwargs))
         return MixedDataLoader(dataloaders, self.dataset_prob)

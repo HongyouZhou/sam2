@@ -313,6 +313,14 @@ def build_task_command(
     if method == "BNDL_AUE" and hasattr(args, "bndl_aue_version"):
         cmd.extend(["--aue_version", args.bndl_aue_version])
 
+    # BNDL_AUE + UCTTA combined mode
+    if method == "BNDL_AUE" and hasattr(args, "bndl_aue_enable_uctta") and args.bndl_aue_enable_uctta:
+        cmd.append("--bndl_aue_enable_uctta")
+        if hasattr(args, "bndl_aue_uctta_steps"):
+            cmd.extend(["--bndl_aue_uctta_steps", str(args.bndl_aue_uctta_steps)])
+        if hasattr(args, "bndl_aue_uctta_lr"):
+            cmd.extend(["--bndl_aue_uctta_lr", str(args.bndl_aue_uctta_lr)])
+
     # Statistics & Visualization
     # Applied to relevant methods
     methods_supporting_stats = ["BNDL", "BNDL_AUE", "UR-ERN"]
@@ -1415,8 +1423,9 @@ def main():
     parser.add_argument("--uctta_enable_bn", action="store_true", default=True)
     parser.add_argument("--uctta_fisher_reg", action="store_true", default=True)
 
-    # BNDL参数 - 默认禁用统计收集以加速评估，需要时手动启用
-    parser.add_argument("--collect_bndl_stats", action="store_true", default=False, help="启用BNDL统计收集（PAvPU等）。默认禁用以加速评估。")
+    # BNDL参数 - 默认启用统计收集以获取PCC/AUROC等不确定性指标
+    parser.add_argument("--collect_bndl_stats", action="store_true", default=True, help="启用BNDL统计收集（PCC/AUROC/PAvPU等）。默认启用。")
+    parser.add_argument("--no_collect_bndl_stats", dest="collect_bndl_stats", action="store_false", help="禁用BNDL统计收集以加速评估。")
 
     # 可视化输出（SAM 和 BNDL_AUE 均支持）
     parser.add_argument(
@@ -1438,6 +1447,11 @@ def main():
     parser.add_argument("--bndl_aue_version", type=str, default="017_bndl_lora")
     parser.add_argument("--bndl_version", type=str, default="013_01")
     parser.add_argument("--ur_ern_version", type=str, default="001_01")
+
+    # BNDL_AUE + UCTTA combined mode
+    parser.add_argument("--bndl_aue_enable_uctta", action="store_true", default=False, help="Enable UCTTA within BNDL_AUE evaluation")
+    parser.add_argument("--bndl_aue_uctta_steps", type=int, default=2, help="UCTTA steps for BNDL_AUE")
+    parser.add_argument("--bndl_aue_uctta_lr", type=float, default=3e-4, help="UCTTA learning rate for BNDL_AUE")
 
     # 智能续跑功能
     parser.add_argument("--reuse_cached", action="store_true", default=False, help="智能续跑模式：自动检测并跳过已完成的(方法,数据集)组合，中途中断后可续跑")

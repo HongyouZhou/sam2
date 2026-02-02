@@ -2,8 +2,8 @@
 
 scratch:
   resolution: 1024
-  train_batch_size: 4
-  num_train_workers: 8
+  train_batch_size: 2
+  num_train_workers: 4
   num_frames: 1
   val_num_frames: 1
   max_num_objects: 3
@@ -14,6 +14,13 @@ scratch:
   vision_lr: 1.0e-07
   phases_per_epoch: 1
   num_epochs: 20
+  
+  mmd_config:
+    method: spatial_mmd
+    patch_size: 16
+    temperature: 0.5
+    kernel_bandwidth: 0.3
+    use_checkpoint: false
 
 dataset:
   # PATHS to Dataset
@@ -42,7 +49,7 @@ vos:
           # translate: [0.05, 0.05]
           image_interpolation: bilinear
           consistent_transform: True
-          num_tentatives: 5
+          num_tentatives: 8
         - _target_: training.dataset.transforms.RandomResizeAPI
           sizes: ${scratch.resolution}
           square: true
@@ -87,6 +94,12 @@ trainer:
   val_epoch_freq: 1
   accelerator: cuda
   seed_value: 123
+  gradient_accumulation_steps: 2
+  # Gradient conflict monitoring (for debugging AUE training)
+  gradient_conflict_monitor:
+    enabled: false  # Enable for debugging, disable for production (adds overhead)
+    sample_rate: 0.05  # Only compute every 1/0.05 = 20 steps
+    target_params: ["bndl", "iou"]  # Parameter name patterns to monitor
   cuda:
     allow_tf32: true
     cudnn_benchmark: true
@@ -206,6 +219,7 @@ trainer:
     # === BNDL_CONFIG_START ===
     # BNDL (always uses hyper_in only mode)
     use_bndl_for_pixels: true
+    use_ur_ern_for_pixels: false
     sam_mask_decoder_extra_args:
       bndl_factor_z: 0.0
       bndl_factor_w: 0.0
@@ -217,6 +231,10 @@ trainer:
     freeze_image_encoder_epochs: 20  # Freeze image encoder for first N epochs (0 = disabled)
     # Unfreeze specific components for adaptation (e.g. "neck", "trunk_last_stage")
     unfreeze_image_encoder_components: []
+    
+    epsilon_decay_start_epoch: 0   # Epoch to start decay (0 = disabled)
+    epsilon_decay_end_epoch: 0     # Epoch to reach minimum (0 = use actual_max_epochs)
+    epsilon_min_ratio: 0.1         # Final epsilon = initial * min_ratio
 
     # === LORA_CONFIG_START ===
     # LoRA: Parameter-efficient fine-tuning
@@ -236,15 +254,11 @@ trainer:
 
     # === AUE_GCN_CONFIG_START ===
     # AUE (Adversarial Uncertainty Estimation) with Style-based augmentation
-    use_aue: false
-    # Constraint weight for adversarial samples (L1 distance to initial)
-    aue_constraint_loss_weight: 0.0  # Weight for constraint regularization (0 = disabled)
-    # Attack mode: "cooperative" (parallel prediction, joint application) or "sequential" (iterative)
-    aue_attack_mode: "cooperative"
+    use_aue: true
     # Style Adversarial options (alternative to AUE, for domain generalization)
-    use_style_adv: false
+    use_style_adv: true
     style_adv_mode: "image_level"  # "image_level" or "feature_level"
-    style_adv_epsilon: 1.1  # Perturbation budget for style
+    style_adv_epsilon: 0.3
     style_adv_use_gt_region_style: true
     
     # Multi-object style attack control
@@ -257,8 +271,7 @@ trainer:
     style_adv_global_weight: 0.5
 
     # GCN-based multi-object style refinement
-    style_adv_use_gcn: false  # Not needed for global-only style
-    style_adv_gcn_grl_alpha: 0.4  # GRL alpha for GCN path (lower = more stable)
+    style_adv_use_gcn: true  # Not needed for global-only style
     style_adv_gcn_hidden_dim: 64
     style_adv_gcn_num_layers: 2
     style_adv_gcn_edge_threshold: 0.0
@@ -270,8 +283,8 @@ trainer:
     style_adv_gcn_feature_dim: 256  # Feature dimension (matches backbone_fpn[-1] d_model)
     
     # Deformation Adversarial (feature-level, memory encoder based)
-    use_deform_adv: false
-    deform_adv_epsilon: 3.0  # Reduced from 10.0 to 5.0 for mild spatial perturbation
+    use_deform_adv: true
+    deform_adv_epsilon: 0.15
     deform_adv_use_soft_composite: true
     deform_adv_temperature: 1.0
     deform_adv_use_gcn: false
@@ -280,55 +293,15 @@ trainer:
     deform_adv_init_from_memory_encoder: true  # Initialize from pretrained memory encoder
     deform_adv_freeze_encoder_components: true  # Freeze all encoder components (mask_encoder, img_feat_proj, fuser) to prevent GRL gradient instability
     deform_adv_zero_mean_offsets: true  # Remove global translation while keeping local warps
-    deform_adv_local_offset_gain: 1.3  # Boost local deformation after centering
-    deform_adv_grl_alpha: 0.3  # GRL alpha for deformation offsets (lower = more stable)
+    deform_adv_local_offset_gain: 1.0
     
     # Adversarial Pipeline Ordering
     adversarial_attack_order: ["style", "deform"]
     
-    # Distribution matching configuration for AUE calibration loss (nested config)
-    aue_dist_matching_config:
-      mse_weight: 0.08  # Reduced from 0.3
-      use_patches: true  # Ignored for hard-aware methods (inherently patch-based)
-      patch_size: 32  # Patch size for patch-based methods
-
-      # Current method: Baseline Hard-Aware MMD (error-based Top-K mining)
-      method: "mmd"  # Options: "mmd", "cka", "gram", "mmd_hard_aware", "domain_aware_soft_mmd"  
-        
-      # Method-specific parameters (only active when method is selected)
-      mmd:
-        kernel: "rbf"
-        bandwidth: 0.1
-        batch_size: 256
-        n_batches: 10
-        
-      # Baseline: Hard-Aware MMD (error-based Top-K mining)
-      mmd_hard_aware:
-        top_k_percent: 0.25     # Top 25% hardest patches (by error)
-        max_samples: 4096        # Memory optimization
-        
-      # NEW: Domain-Aware Soft MMD (theory-driven: OOD detection + MaxEnt)
-      # Combines error (aleatoric) + feature diversity (epistemic) with soft weighting
-      domain_aware_soft_mmd:
-        diversity_weight: 0.30       # Reduced from 0.4 to 0.25 (less emphasis on epistemic diversity)
-        temperature: 0.2             # Increased from 0.1 to 0.2 (smoother sample selection, less aggressive)
-        max_samples: 4096
-        diversity_method: "channel_std"  # "channel_std" (faster) | "spatial_var"
-        enable_monitoring: false     # Disable monitoring to save memory and ignore low correlation for now
-        
-      cka:
-        use_linear_kernel: true  # Linear kernel (faster) vs RBF kernel
-        use_minibatch: true  # Mini-batch computation for memory efficiency
-        minibatch_size: 512
-        
-      gram:
-        center: true
-        normalize: true
-    
     # Analytic uncertainty computation (from Weibull parameters)
     # true = use analytic uncertainty (with gradients to BNDL, bidirectional optimization)
     # false = use sampling uncertainty (detached, gradients only to encoder)
-    aue_use_analytic_uncertainty: true
+    aue_use_analytic_uncertainty: true  
     # === AUE_GCN_CONFIG_END ===
 
     ####### Training specific params #######
@@ -347,6 +320,7 @@ trainer:
     rand_init_cond_frames_for_train: True  # random 1~2
     num_correction_pt_per_frame: 7
     use_act_ckpt_iterative_pt_sampling: false
+    use_aue_decoder_checkpoint: false
      
     num_init_cond_frames_for_eval: 1  # only mask on the first frame
     forward_backbone_per_frame_for_eval: True
@@ -381,6 +355,8 @@ trainer:
       num_workers: ${scratch.num_train_workers}
       pin_memory: True
       drop_last: True
+      persistent_workers: True  # Keep workers alive between epochs
+      prefetch_factor: 2  # Batches to prefetch per worker
       collate_fn:
         _target_: training.utils.data_utils.collate_fn
         _partial_: true
@@ -751,6 +727,8 @@ trainer:
       num_workers: ${scratch.num_train_workers}
       pin_memory: True
       drop_last: False
+      persistent_workers: True  # Keep workers alive between epochs
+      prefetch_factor: 2  # Batches to prefetch per worker
       collate_fn:
         _target_: training.utils.data_utils.collate_fn
         _partial_: true
@@ -768,6 +746,14 @@ trainer:
       _target_: training.optimizer.GradientClipper
       max_norm: 0.1
       norm_type: 2
+
+    # === Attacker Optimizer Configuration ===
+    # Separate optimizer for Style/Deform attacker networks
+    # Uses cosine annealing LR schedule (1e-3 → 1e-4)
+    attacker_optim:
+      lr_start: 1.0e-3
+      lr_end: 1.0e-4
+      weight_decay: 0.0
 
     param_group_modifiers:
       - _target_: training.optimizer.layer_decay_param_modifier
@@ -815,39 +801,27 @@ trainer:
             end_value: 1.0e-5
           param_names:
             - 'sam_mask_decoder.pixel_bndl.*'
+          optional: true  # Skip if BNDL is disabled (use_bndl_for_pixels=false)
 
+        # UR-ERN head: higher learning rate (optional - skipped when use_ur_ern_for_pixels=false)
+        - scheduler:
+            _target_: fvcore.common.param_scheduler.CosineParamScheduler
+            start_value: 1.0e-3
+            end_value: 2.0e-4
+          param_names:
+            - 'sam_mask_decoder.ur_ern_head.*'
+          optional: true  # Skip if no UR-ERN params exist
 
-        # Style Adversarial Network: moderate learning rate for effective adversarial training
-        # - scheduler:
-        #     _target_: fvcore.common.param_scheduler.CosineParamScheduler
-        #     start_value: 1.0e-4
-        #     end_value: 1.0e-5
-        #   param_names:
-        #     - 'style_attacker.impl.style_net.*'
-
-        # GCN: moderate learning rate for rapid alpha convergence
-        # - scheduler:
-        #     _target_: fvcore.common.param_scheduler.CosineParamScheduler
-        #     start_value: 1.0e-4
-        #     end_value: 1.0e-5
-        #   param_names:
-        #     - 'style_gcn.*'
-
-        # Deformation augmentation (DG-Font): moderate learning rate for effective training
-        # - scheduler:
-        #     _target_: fvcore.common.param_scheduler.CosineParamScheduler
-        #     start_value: 1.0e-4
-        #     end_value: 1.0e-5
-        #   param_names:
-        #     - 'deform_attacker.*'
-
-        # LoRA params: higher learning rate
-        # - scheduler:
-        #     _target_: fvcore.common.param_scheduler.CosineParamScheduler
-        #     start_value: 2.0e-4
-        #     end_value: 2.0e-5
-        #   param_names:
-        #     - '*lora*'
+        # LoRA params: higher learning rate (optional - skipped when use_lora=false)
+        # PEFT uses 'lora_A' and 'lora_B' naming convention
+        - scheduler:
+            _target_: fvcore.common.param_scheduler.CosineParamScheduler
+            start_value: 1.0e-4
+            end_value: 1.0e-5
+          param_names:
+            - '*lora_A*'
+            - '*lora_B*'
+          optional: true  # Skip if no LoRA params exist
 
         - scheduler:
             _target_: fvcore.common.param_scheduler.CosineParamScheduler
@@ -855,18 +829,22 @@ trainer:
             end_value: ${divide:${scratch.vision_lr},10}
           param_names:
             - image_encoder.*
-        #   exclude_param_names:
-        #     - '*lora*'
+          exclude_param_names:
+            - '*lora_A*'
+            - '*lora_B*'
 
       weight_decay:
+        # Default weight decay
         - scheduler:
             _target_: fvcore.common.param_scheduler.ConstantParamScheduler
             value: 0.1
+        # Bias: no weight decay
         - scheduler:
             _target_: fvcore.common.param_scheduler.ConstantParamScheduler
             value: 0.0
           param_names:
             - '*bias*'
+        # LayerNorm: no weight decay
         - scheduler:
             _target_: fvcore.common.param_scheduler.ConstantParamScheduler
             value: 0.0
@@ -896,30 +874,57 @@ trainer:
         prior_gamma_shape: 1.0
         prior_gamma_scale: 3.0
         ur_weight: 0.0
+      mmd_loss:
+        _target_: training.loss_mmd.MMDCalibrationLoss
+        config: ${scratch.mmd_config}
       aue_loss:
         _target_: training.loss_aue.AUELoss
-        clean_weight: 1.0
-        adv_weight: 1.0
+        task_weight: 1.0       # Task loss updates SAM + attacker (via GRL) - set 0 for isolation
+        bndl_weight: 0.0
+        mmd_weight: 0.0
+        attacker_uncertainty_weight: 0.0  # Attacker maximizes uncertainty (NO BNDL update)
+        attacker_mmd_weight: 0.3  # Attacker maximizes miscalibration (NO SAM/BNDL update)
+        attacker_task_weight: 0.0  # NEW: Task loss only updates attacker (NO SAM update) - complete isolation
+        mmd_config: ${scratch.mmd_config}
+      # === UR-ERN Loss Configuration ===
+      # UR-ERN paper (arXiv:2401.01484) Eq. 11: L^UR-ERN = L^NLL + λ·L^R + λ₁·L^U
+      # NOTE: UR-ERN is mutually exclusive with BNDL (use_ur_ern_for_pixels vs use_bndl_for_pixels)
+      # Set ur_ern_weight > 0 and use_ur_ern_for_pixels=true in model config to enable
+      # Override via Hydra: ++trainer.loss.all.ur_ern_loss._target_=training.loss_ur_ern.URERNLoss
+      ur_ern_loss: null  # Placeholder for val interpolation; override with ++ prefix when enabling UR-ERN
       sam_weight: 1.0
-      bndl_weight: 0.1
+      bndl_weight: 0.0
+      mmd_weight: 0.6
       aue_weight: 0.0
-      # Warm-up: start without BNDL KL, then ramp up
+      ur_ern_weight: 0.0  # Disabled by default (this config uses BNDL), set > 0 for UR-ERN baseline
       weight_schedule:
-        - until_epoch: 2
-          bndl_weight: 0.0
         - until_epoch: 4
+          bndl_weight: 0.0
+          mmd_weight: 0.0
+          aue_weight: 0.0
+        - until_epoch: 6
+          sam_weight: 1.0
           bndl_weight: 0.05
+          mmd_weight: 0.0
+          aue_weight: 0.0
         - until_epoch: null
-          bndl_weight: 0.1
+          sam_weight: 0.8
+          bndl_weight: 0.05
+          mmd_weight: 0.0
+          aue_weight: 0.2
     val:
       _target_: training.loss_combined.CombinedSAMBNDLLoss
       sam_loss: ${trainer.loss.all.sam_loss}
       bndl_loss: ${trainer.loss.all.bndl_loss}
+      mmd_loss: ${trainer.loss.all.mmd_loss}
       aue_loss: ${trainer.loss.all.aue_loss}
-      sam_weight: 1.0  # Keep full SAM weight
-      bndl_weight: 1.0  # Log BNDL loss, also add to core_loss
-      aue_weight: 1.0   # Log AUE loss, do not add to core_loss
-      prefix_keys: False # Keep original SAM loss keys (no sam_ prefix)
+      ur_ern_loss: ${trainer.loss.all.ur_ern_loss}
+      sam_weight: 1.0
+      bndl_weight: 1.0
+      mmd_weight: 0.0       # Log MMD loss
+      aue_weight: 0.0       # Do not add to core_loss during validation
+      ur_ern_weight: 0.0    # Disabled by default
+      prefix_keys: False
     # val:
     #   _target_: training.loss_fns.MultiStepMultiMasksAndIous
     #   weight_dict: ${trainer.loss.all.sam_loss.weight_dict}
@@ -934,25 +939,25 @@ trainer:
     find_unused_parameters: True
 
   logging:
-    # log_level_primary: "DEBUG"
+    # log_level_primary: "INFO"
     tensorboard_writer:
       _target_: training.utils.logger.make_tensorboard_logger
       log_dir:  ${launcher.experiment_log_dir}/tensorboard
-      flush_secs: 120
+      flush_secs: 5  # Aggressive flush to prevent image loss (was 120)
       should_log: True
     log_dir: ${launcher.experiment_log_dir}/logs
     log_freq: 10
     log_scalar_frequency: 10
-    log_visual_frequency: 100
+    log_visual_frequency: 5
     visualize_bndl: false
-    visualize_aue: false
-    style_aue_visual_frequency: 100
+    visualize_aue: true
+    style_aue_visual_frequency: 5
     uncertainty_metric: ["entropy", "nll"]
     visualize_pavpu_overlay: false
     enable_pavpu_eval: true
     uncertainty_sample_num: 50
     # Pixel-level PAvPU statistics configuration
-    correlation_foreground_dilation: 8
+    correlation_foreground_dilation: 12
     correlation_per_pixel: true
     correlation_use_full_image: false
 

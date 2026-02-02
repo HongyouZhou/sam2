@@ -90,6 +90,7 @@ class OptimConf:
     amp: Optional[Dict[str, Any]] = None
     gradient_clip: Any = None
     gradient_logger: Any = None
+    attacker_optim: Optional[Dict[str, Any]] = None  # Config for separate attacker optimizer
 
     def __post_init__(self):
         # amp
@@ -152,7 +153,7 @@ class LoggingConf:
     visualize_bndl: bool = False
     bndl_vis_sample_rate: float = 0.05  # Probability of saving BNDL visualization for each validation batch (0.05 = 5%)
     visualize_aue: bool = False  # Enable AUE visualization (style and/or deformation: original vs adversarial images)
-    style_aue_visual_frequency: int = 100  # Log Style AUE visualization every N steps
+    style_aue_visual_frequency: int = 5  # Log Style AUE visualization every N steps
     uncertainty_metric: set = field(default_factory=lambda: {"entropy"})  # Options: {"entropy"}, {"nll"}, {"sampling"}, {"entropy", "nll"}, {"entropy", "nll", "sampling"}, etc.
     visualize_pavpu_overlay: bool = True  # Enable PAvPU overlay visualization on original images
     enable_pavpu_eval: bool = True  # Enable PAvPU evaluator computation during validation
@@ -189,9 +190,14 @@ class Trainer:
         meters: Optional[Dict[str, Any]] = None,
         loss: Optional[Dict[str, Any]] = None,
         actual_max_epochs: Optional[int] = None,  # New: actual epochs to train (if different from max_epochs for lr scheduling)
+        gradient_accumulation_steps: int = 1,  # Accumulate gradients over N steps before optimizer.step()
+        gradient_conflict_monitor: Optional[Dict[str, Any]] = None,  # Gradient conflict monitoring config
     ):
         self._setup_env_variables(env_variables)
         self._setup_timers()
+
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+        self._gradient_conflict_monitor_conf = gradient_conflict_monitor or {}
 
         self.data_conf = data
         self.model_conf = model
@@ -458,9 +464,21 @@ class Trainer:
     ):
         # Enable style visualization periodically BEFORE forward pass
         _model = unwrap_ddp_if_wrapped(self.model)
-        style_aue_freq = getattr(self.logging_conf, "style_aue_visual_frequency", 100)
-        enable_vis = phase == "train" and self.steps[phase] % style_aue_freq == 0
+        style_aue_freq = 3  # Hardcoded: visualize every 5 steps
+
+        # Track if we've already logged visualization for this step (to avoid duplicates with gradient accumulation)
+        current_step = self.steps[phase]
+        last_vis_step = getattr(self, "_last_vis_step", {}).get(phase, -1)
+        already_logged_this_step = current_step == last_vis_step
+
+        enable_vis = phase == "train" and current_step % style_aue_freq == 0 and not already_logged_this_step
         _model._enable_style_visualization = enable_vis
+
+        # Mark this step as logged (will be used to prevent duplicate logging during gradient accumulation)
+        if enable_vis:
+            if not hasattr(self, "_last_vis_step"):
+                self._last_vis_step = {}
+            self._last_vis_step[phase] = current_step
 
         outputs = model(batch)
         targets = batch.masks
@@ -474,6 +492,9 @@ class Trainer:
 
         # loss contains multiple sub-components we wish to log
         step_losses = {}
+
+        # Initialize bndl_outputs to None to avoid NameError when use_bndl_for_pixels is False
+        bndl_outputs = None
 
         # Log BNDL statistics from model outputs if available (only if BNDL is enabled)
         if getattr(_model, "use_bndl_for_pixels", False):
@@ -495,45 +516,44 @@ class Trainer:
                 # Log BNDL statistics for both train and val
                 self._log_bndl_statistics(bndl_outputs, self.steps[phase], phase)
 
-                # Capture AUE/BNDL loss terms for epoch aggregation
-                if isinstance(bndl_outputs, dict):
-                    aue_metrics = bndl_outputs.get("aue_metrics", {})
-                    for metric in (
-                        "total_loss",
-                        "calibration_loss_clean",
-                        "calibration_loss_adversarial",
-                    ):
-                        val = aue_metrics.get(metric)
-                        if isinstance(val, torch.Tensor):
-                            step_losses[f"BNDL/AUE_Losses/{phase}_{key}_{metric}"] = val
+                # Also check for aue_metrics in the FIRST aux_output (where it's set during _forward_sam_heads)
+                # Since AUE is only computed on the first forward pass, we need to look there specifically
+                self._log_aue_metrics_from_outputs(outputs, self.steps[phase], phase)
 
+                # NOTE: AUE loss terms are now logged via loss_combined.py return dict
+                # (Losses/train_all_aue_task_loss, etc.) - no manual extraction needed.
+
+                if isinstance(bndl_outputs, dict):
                     pixel_nll = bndl_outputs.get("pixel_nll")
                     if isinstance(pixel_nll, torch.Tensor):
                         step_losses[f"BNDL/NLL/{phase}_{key}_pixel_nll"] = pixel_nll
 
-        # Log Style AUE visualization if available and enabled (only on rank 0) - DISABLED
-        # Temporarily disabled
-        # if (
-        #     phase == "train"
-        #     and self.distributed_rank == 0
-        #     and getattr(self.logging_conf, "visualize_aue", False)
-        #     and hasattr(_model, "use_style_adv")
-        #     and _model.use_style_adv
-        #     and _model._enable_style_visualization
-        # ):
-        #     self._log_style_aue_visualization(outputs, self.steps[phase])
+        # Log Style AUE visualization if available and enabled (only on rank 0)
+        if (
+            phase == "train"
+            and self.distributed_rank == 0
+            and getattr(self.logging_conf, "visualize_aue", False)
+            and hasattr(_model, "use_style_adv")
+            and _model.use_style_adv
+            and _model._enable_style_visualization
+        ):
+            self._log_style_aue_visualization(outputs, self.steps[phase])
 
-        # Log Deformation AUE visualization if available and enabled (only on rank 0) - DISABLED
-        # Temporarily disabled
-        # if (
-        #     phase == "train"
-        #     and self.distributed_rank == 0
-        #     and getattr(self.logging_conf, "visualize_aue", False)
-        #     and hasattr(_model, "use_deform_adv")
-        #     and _model.use_deform_adv
-        #     and _model._enable_style_visualization
-        # ):
-        #     self._log_deform_aue_visualization(outputs, self.steps[phase])
+        # Log Deformation AUE visualization if available and enabled (only on rank 0)
+        if (
+            phase == "train"
+            and self.distributed_rank == 0
+            and getattr(self.logging_conf, "visualize_aue", False)
+            and hasattr(_model, "use_deform_adv")
+            and _model.use_deform_adv
+            and _model._enable_style_visualization
+        ):
+            self._log_deform_aue_visualization(outputs, self.steps[phase])
+
+        # Log Clean vs Adversarial comparison (input, segmentation, uncertainty from both branches)
+        # Replaces the old separate uncertainty visualization
+        if phase == "train" and self.distributed_rank == 0 and getattr(self.logging_conf, "visualize_aue", False) and _model._enable_style_visualization and bndl_outputs is not None:
+            self._log_clean_vs_adv_comparison(bndl_outputs, batch, outputs, self.steps[phase], frame_index=frame_index)
 
         if isinstance(loss, dict):
             if CORE_LOSS_KEY not in loss:
@@ -542,6 +562,14 @@ class Trainer:
             # Separate normal losses and refinement metrics
             for k, v in loss.items():
                 if k == CORE_LOSS_KEY:
+                    continue
+
+                # Preserve _attacker_only_loss for separate optimizer (keep tensor with gradients)
+                # Also log with proper prefix for TensorBoard categorization
+                if k == "_attacker_only_loss":
+                    step_losses[k] = v  # Keep as-is for optimizer (tensor with gradients)
+                    # Also add a prefixed version for TensorBoard logging
+                    step_losses[f"Losses/{phase}_{key}{k}"] = v.detach() if torch.is_tensor(v) else v
                     continue
 
                 ref_idx = k.find("_refinement_")
@@ -553,6 +581,27 @@ class Trainer:
                     # Normal losses go to Losses/ prefix
                     step_losses[f"Losses/{phase}_{key}_{k}"] = v
 
+            # Compute gradient conflicts if monitor is enabled (training phase only)
+            if phase == "train" and hasattr(self, "gradient_conflict_monitor") and self.gradient_conflict_monitor is not None:
+                try:
+                    # Log first invocation
+                    if not hasattr(self, "_gc_logged_first_call"):
+                        self._gc_logged_first_call = True
+                        logging.info(f"GradConflict: First invocation at step {self.steps[phase]}, loss keys: {list(loss.keys())}")
+                    # Get TensorBoard writer from Logger.tb_logger.writer
+                    tb_writer = getattr(getattr(self.logger, "tb_logger", None), "writer", None)
+
+                    self.gradient_conflict_monitor.compute_conflict_from_loss_dict(
+                        loss_dict=loss,
+                        writer=tb_writer,
+                        step=self.steps[phase],
+                    )
+                except Exception as e:
+                    # Log errors as warning to make them visible
+                    if not hasattr(self, "_gc_error_logged"):
+                        self._gc_error_logged = True
+                        logging.warning(f"Gradient conflict monitor error: {e}", exc_info=True)
+
             loss = self._log_loss_detailed_and_return_core_loss(loss, loss_log_str, self.steps[phase], phase)
 
         if self.steps[phase] % self.logging_conf.log_scalar_frequency == 0:
@@ -561,8 +610,6 @@ class Trainer:
                 loss,
                 self.steps[phase],
             )
-
-        self.steps[phase] += 1
 
         ret_tuple = {loss_str: loss}, batch_size, step_losses
 
@@ -643,6 +690,10 @@ class Trainer:
                     f.write(json.dumps(self.best_meter_values) + "\n")
 
             self.epoch += 1
+
+            # Step attacker LR scheduler (if exists)
+            if hasattr(self, "attacker_scheduler") and self.attacker_scheduler is not None:
+                self.attacker_scheduler.step()
         # epoch was incremented in the loop but the val step runs out of the loop
         self.epoch -= 1
 
@@ -765,6 +816,9 @@ class Trainer:
                     loss_mts[loss_key].update(loss.item(), batch_size)
 
                     for k, v in extra_losses.items():
+                        # Skip internal keys (start with _) - these are for optimizer use only
+                        if k.startswith("_"):
+                            continue
                         if k not in extra_loss_mts:
                             extra_loss_mts[k] = AverageMeter(k, self.device, ":.2e")
                         if torch.is_tensor(v):
@@ -793,6 +847,9 @@ class Trainer:
                         progress_meter.val,
                         self.steps[Phase.VAL],
                     )
+
+            # Increment val step counter (no gradient accumulation in validation)
+            self.steps[Phase.VAL] += 1
 
             # Randomly visualize BNDL parameters during validation - DISABLED
             # CRITICAL FIX: Run forward pass on ALL ranks to avoid SyncBatchNorm deadlock
@@ -928,6 +985,15 @@ class Trainer:
         model_unwrapped = unwrap_ddp_if_wrapped(self.model)
         if hasattr(model_unwrapped, "apply_backbone_freeze"):
             model_unwrapped.apply_backbone_freeze(self.epoch)
+        if hasattr(model_unwrapped, "apply_epsilon_decay"):
+            model_unwrapped.apply_epsilon_decay(self.epoch)
+
+        if "all" in self.loss and hasattr(self.loss["all"], "aue_weight"):
+            skip_aue = self.loss["all"].aue_weight == 0
+            setattr(model_unwrapped, "_skip_aue_forward", skip_aue)
+            if skip_aue and self.epoch == 0:
+                logging.info(f"AUE forward pass skipped (aue_weight=0) - AUE networks will not train until weight > 0")
+
         end = time.time()
 
         for data_iter, batch in enumerate(train_loader):
@@ -936,8 +1002,33 @@ class Trainer:
             data_times.append(data_time_meter.val)
             batch = batch.to(self.device, non_blocking=True)  # move tensors in a tensorclass
 
+            # Gradient accumulation: zero gradients at start of accumulation window
+            if data_iter % self.gradient_accumulation_steps == 0:
+                self.optim.zero_grad(set_to_none=True)
+                if self.attacker_optim is not None:
+                    self.attacker_optim.zero_grad(set_to_none=True)
+
             try:
-                self._run_step(batch, phase, loss_mts, extra_loss_mts)
+                is_accumulation_step = (data_iter + 1) % self.gradient_accumulation_steps != 0
+
+                sync_context = self.model.no_sync() if is_accumulation_step else nullcontext()
+                with sync_context:
+                    self._run_step(batch, phase, loss_mts, extra_loss_mts)
+
+                # Measure elapsed time and update progress (for all steps, including accumulation)
+                batch_time_meter.update(time.time() - end)
+                end = time.time()
+
+                self.time_elapsed_meter.update(time.time() - self.start_time + self.ckpt_time_elapsed)
+                mem_meter.update(reset_peak_usage=True)
+
+                if data_iter % self.logging_conf.log_freq == 0:
+                    progress.display(data_iter)
+
+                # Only do optimizer step at end of accumulation window
+                if is_accumulation_step:
+                    # Skip optimizer step, scheduler update, etc. - just accumulate gradients
+                    continue
 
                 # compute gradient and do optim step
                 exact_epoch = self.epoch + float(data_iter) / iters_per_epoch
@@ -958,10 +1049,18 @@ class Trainer:
                                 param_group[option],
                                 self.steps[phase],
                             )
+                    # Log attacker optimizer LR (if exists)
+                    if hasattr(self, "attacker_optim") and self.attacker_optim is not None:
+                        attacker_lr = self.attacker_optim.param_groups[0]["lr"]
+                        self.logger.log("Optim/attacker_lr", attacker_lr, self.steps[phase])
 
                 # Clipping gradients and detecting diverging gradients
+                # Unscale BOTH optimizers before clipping so gradient norms are correct
                 if self.gradient_clipper is not None:
                     self.scaler.unscale_(self.optim.optimizer)
+                    # Also unscale attacker optimizer if it exists and has gradients
+                    if self.attacker_optim is not None and getattr(self, "_attacker_backward_done", False):
+                        self.scaler.unscale_(self.attacker_optim)
                     self.gradient_clipper(model=self.model)
 
                 # Debug: Check for NaN gradients after clipping
@@ -980,6 +1079,10 @@ class Trainer:
                     logging.error(f"[Trainer] NaN/Inf gradients detected after gradient clipping! First 10 problematic params: {nan_param_names}")
                     # Skip optimizer step to prevent corrupting weights
                     self.optim.zero_grad(set_to_none=True)
+                    if self.attacker_optim is not None:
+                        self.attacker_optim.zero_grad(set_to_none=True)
+                    # NOTE: NOT calling scaler.update() here - let the error surface on next iteration
+                    # This ensures we don't mask underlying NaN gradient issues
                     logging.warning("[Trainer] Skipping optimizer step due to NaN gradients")
                     continue  # Skip to next iteration
 
@@ -989,17 +1092,15 @@ class Trainer:
                 # Optimizer step: the scaler will make sure gradients are not
                 # applied if the gradients are infinite
                 self.scaler.step(self.optim.optimizer)
+
+                # === Attacker Optimizer Step ===
+                # If separate attacker optimizer is configured, step it too
+                # Note: Already unscaled above (before gradient clipping)
+                if self.attacker_optim is not None and getattr(self, "_attacker_backward_done", False):
+                    self.scaler.step(self.attacker_optim)
+                    self._attacker_backward_done = False  # Reset flag
+
                 self.scaler.update()
-
-                # measure elapsed time
-                batch_time_meter.update(time.time() - end)
-                end = time.time()
-
-                self.time_elapsed_meter.update(time.time() - self.start_time + self.ckpt_time_elapsed)
-
-                mem_meter.update(reset_peak_usage=True)
-                if data_iter % self.logging_conf.log_freq == 0:
-                    progress.display(data_iter)
 
                 if data_iter % self.logging_conf.log_scalar_frequency == 0:
                     # Log progress meters.
@@ -1009,6 +1110,9 @@ class Trainer:
                             progress_meter.val,
                             self.steps[phase],
                         )
+
+                # Increment step counter after optimizer step (not per forward pass)
+                self.steps[phase] += 1
 
             # Catching NaN/Inf errors in the loss
             except FloatingPointError as e:
@@ -1049,13 +1153,16 @@ class Trainer:
         raise_on_error: bool = True,
     ):
         """
-        Run the forward / backward
-        """
+        Run the forward / backward.
 
-        # it's important to set grads to None, especially with Adam since 0
-        # grads will also update a model even if the step doesn't produce
-        # gradients
-        self.optim.zero_grad(set_to_none=True)
+        Gradient accumulation is handled by the training loop based on
+        gradient_accumulation_steps config.
+
+        === Separate Attacker Optimizer ===
+        If attacker_optim is configured, we run TWO backward passes:
+        1. core_loss.backward(retain_graph=True) → main optimizer updates SAM+BNDL
+        2. attacker_loss.backward() → attacker optimizer updates Style/Deform networks
+        """
         with torch.cuda.amp.autocast(
             enabled=self.optim_conf.amp.enabled,
             dtype=get_amp_type(self.optim_conf.amp.amp_dtype),
@@ -1077,9 +1184,45 @@ class Trainer:
             else:
                 return
 
-        self.scaler.scale(loss).backward()
+        # Scale loss by gradient accumulation steps
+        accum_steps = getattr(self, "gradient_accumulation_steps", 1)
+        scaled_loss = loss / accum_steps
+
+        # === Check for separate attacker backward ===
+        # Get attacker_only_loss from extra_losses (put there by loss_combined.py)
+        attacker_loss = None
+        attacker_loss_key = "_attacker_only_loss"
+        for k, v in extra_losses.items():
+            if k == attacker_loss_key or attacker_loss_key in k:
+                if torch.is_tensor(v) and v.requires_grad:
+                    attacker_loss = v
+                    break
+
+        use_separate_attacker = self.attacker_optim is not None and attacker_loss is not None
+
+        if use_separate_attacker:
+            # Two backward passes: main + attacker
+            # retain_graph=True for main backward because attacker backward needs the graph
+            self.scaler.scale(scaled_loss).backward(retain_graph=True)
+
+            # Scale attacker loss as well
+            scaled_attacker_loss = attacker_loss / accum_steps
+            self.scaler.scale(scaled_attacker_loss).backward()
+
+            # Set flag so optimizer step knows backward was done
+            self._attacker_backward_done = True
+        else:
+            # Single backward pass (normal case)
+            self.scaler.scale(scaled_loss).backward()
+
         loss_mts[loss_key].update(loss.item(), batch_size)
         for extra_loss_key, extra_loss in extra_losses.items():
+            # Skip internal keys (start with _)
+            if extra_loss_key.startswith("_"):
+                continue
+            # Skip None values (e.g., optional AUE losses when not computed)
+            if extra_loss is None:
+                continue
             if extra_loss_key not in extra_loss_mts:
                 extra_loss_mts[extra_loss_key] = AverageMeter(extra_loss_key, self.device, ":.2e")
             if torch.is_tensor(extra_loss):
@@ -1206,7 +1349,39 @@ class Trainer:
         self.gradient_clipper = instantiate(self.optim_conf.gradient_clip) if self.optim_conf else None
         self.gradient_logger = instantiate(self.optim_conf.gradient_logger) if self.optim_conf else None
 
+        # Initialize gradient conflict monitor (for debugging AUE training)
+        self._setup_gradient_conflict_monitor()
+
         logging.info("Finished setting up components: Model, loss, optim, meters etc.")
+
+    def _setup_gradient_conflict_monitor(self):
+        """Setup gradient conflict monitor for debugging AUE training.
+
+        Configured via trainer.gradient_conflict_monitor in YAML:
+            gradient_conflict_monitor:
+              enabled: false
+              sample_rate: 0.05
+              target_params: ["bndl", "iou"]
+        """
+        self.gradient_conflict_monitor = None
+
+        gc_config = getattr(self, "_gradient_conflict_monitor_conf", {}) or {}
+
+        if not gc_config or not gc_config.get("enabled", False):
+            logging.info("Gradient conflict monitor disabled (trainer.gradient_conflict_monitor.enabled=False)")
+            return
+
+        from training.utils.gradient_conflict import GradientConflictMonitor
+
+        sample_rate = gc_config.get("sample_rate", 0.05)
+        target_params = gc_config.get("target_params", ["bndl", "iou"])
+
+        self.gradient_conflict_monitor = GradientConflictMonitor(
+            model=self.model,
+            target_params=target_params,
+            sample_rate=sample_rate,
+        )
+        logging.info(f"Gradient conflict monitor enabled: sample_rate={sample_rate}, target_params={target_params}")
 
     def _setup_evaluators(self):
         """Setup evaluator for validation phase"""
@@ -1258,12 +1433,117 @@ class Trainer:
     def _construct_optimizers(self):
         # Enable anomaly detection to debug NaN gradients
         # torch.autograd.set_detect_anomaly(True)
+
+        # === Exclude attacker params from main optimizer ===
+        # Attacker networks are ALWAYS trained with a separate optimizer when they exist.
+        # This ensures clean parameter isolation between SAM/BNDL and attacker networks.
+        import fnmatch
+
+        attacker_patterns = ["style_attacker.*", "deform_attacker.*", "style_gcn.*"]
+        all_param_names = {name for name, _ in self.model.named_parameters()}
+        excluded_params = set()
+        for name in all_param_names:
+            for pattern in attacker_patterns:
+                if fnmatch.fnmatch(name, pattern):
+                    excluded_params.add(name)
+                    break
+
+        if excluded_params:
+            param_allowlist = all_param_names - excluded_params
+            logging.info(f"[Main Optimizer] Excluding {len(excluded_params)} attacker params (handled by separate optimizer)")
+        else:
+            param_allowlist = None  # No attacker params to exclude
+
         self.optim = construct_optimizer(
             self.model,
             self.optim_conf.optimizer,
             self.optim_conf.options,
             self.optim_conf.param_group_modifiers,
+            param_allowlist=param_allowlist,
+            # Skip validation when using param_allowlist (attacker params handled separately)
+            validate_param_groups=param_allowlist is None,
         )
+
+        # === Separate Attacker Optimizer ===
+        # Always create for attacker networks when they exist.
+        self.attacker_optim = None
+        self._construct_attacker_optimizer()
+
+    def _construct_attacker_optimizer(self):
+        """
+        Construct separate optimizer for attacker networks (Style/Deform).
+
+        This implements the "Separate Optimizer" pattern for isolated attacker training:
+        - Main optimizer: updates SAM + BNDL (using core_loss)
+        - Attacker optimizer: updates only Style/Deform networks (using _attacker_only_loss)
+
+        Always created when attacker networks exist (AUE enabled).
+        Uses CosineAnnealingLR scheduler matching the main optimizer's schedule.
+        """
+        import fnmatch
+
+        model_unwrapped = unwrap_ddp_if_wrapped(self.model)
+
+        # Collect attacker parameters
+        attacker_patterns = ["style_attacker.*", "deform_attacker.*", "style_gcn.*"]
+        attacker_params = []
+        attacker_param_names = []
+
+        for name, param in model_unwrapped.named_parameters():
+            for pattern in attacker_patterns:
+                if fnmatch.fnmatch(name, pattern):
+                    if param.requires_grad:
+                        attacker_params.append(param)
+                        attacker_param_names.append(name)
+                    break
+
+        if not attacker_params:
+            logging.info("[Attacker Optimizer] No attacker parameters found (AUE disabled)")
+            return
+
+        # Read config from optim_conf.attacker_optim (if available)
+        attacker_optim_conf = getattr(self.optim_conf, "attacker_optim", None)
+        if attacker_optim_conf is not None:
+            lr_start = getattr(attacker_optim_conf, "lr_start", 1e-3)
+            lr_end = getattr(attacker_optim_conf, "lr_end", 1e-4)
+            weight_decay = getattr(attacker_optim_conf, "weight_decay", 0.0)
+        else:
+            # Fallback to legacy config or defaults
+            lr_start = getattr(self.optim_conf, "attacker_lr", 1e-3)
+            lr_end = lr_start / 10  # Default: 1/10 decay
+            weight_decay = getattr(self.optim_conf, "attacker_weight_decay", 0.0)
+
+        self.attacker_optim = torch.optim.AdamW(
+            attacker_params,
+            lr=lr_start,
+            weight_decay=weight_decay,
+            betas=(0.9, 0.999),
+        )
+
+        # Create CosineAnnealingLR scheduler
+        # T_max = total training iterations (epochs * steps_per_epoch)
+        # We'll step this scheduler alongside the main optimizer
+        self.attacker_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.attacker_optim,
+            T_max=self.max_epochs,  # Will be stepped per epoch
+            eta_min=lr_end,
+        )
+        self._attacker_lr_start = lr_start
+        self._attacker_lr_end = lr_end
+
+        # Log component breakdown for ablation study clarity
+        style_count = sum(1 for n in attacker_param_names if n.startswith("style_attacker."))
+        deform_count = sum(1 for n in attacker_param_names if n.startswith("deform_attacker."))
+        gcn_count = sum(1 for n in attacker_param_names if n.startswith("style_gcn."))
+        components = []
+        if style_count > 0:
+            components.append(f"StyleAdv({style_count})")
+        if deform_count > 0:
+            components.append(f"DeformAdv({deform_count})")
+        if gcn_count > 0:
+            components.append(f"GCN({gcn_count})")
+
+        logging.info(f"[Attacker Optimizer] Created with {len(attacker_params)} params [{', '.join(components)}], lr={lr_start}→{lr_end} (cosine), wd={weight_decay}")
 
     def _log_loss_detailed_and_return_core_loss(self, loss, loss_str, step, phase):
         core_loss = loss.pop(CORE_LOSS_KEY)
@@ -1295,8 +1575,6 @@ class Trainer:
         bndl_prefix = "BNDL"
         stats_prefix = f"{bndl_prefix}/Stats"
         sign_prefix = f"{bndl_prefix}/Sign"
-        aue_losses_prefix = f"{bndl_prefix}/AUE_Losses"
-        aue_metrics_prefix = f"{bndl_prefix}/AUE_Metrics"
         gcn_prefix = f"{bndl_prefix}/GCN"
 
         # Pixel-level parameters (lambda and k)
@@ -1370,28 +1648,6 @@ class Trainer:
                 sign_abs_mean_w = sign_w.detach().abs().mean()
                 self.logger.log(f"{sign_prefix}/{phase}_sign_abs_mean_w", sign_abs_mean_w, step)
 
-        # AUE metrics (use aue_metrics directly)
-        if "aue_metrics" in bndl_outputs and bndl_outputs["aue_metrics"] is not None:
-            aue_metrics = bndl_outputs["aue_metrics"]
-            # Log loss values
-            loss_keys = ["total_loss", "calibration_loss_clean", "calibration_loss_adversarial"]
-            for key in loss_keys:
-                if key in aue_metrics:
-                    value = aue_metrics[key]
-                    val = value.item() if isinstance(value, torch.Tensor) else value
-                    self.logger.log(f"{aue_losses_prefix}/{phase}_{key}", val, step)
-
-            # Log clean/ and aug/ prefixed metrics
-            for key, value in aue_metrics.items():
-                if key == "aue_visualization" or key in loss_keys:
-                    continue
-                if key.startswith("clean/") or key.startswith("aug/"):
-                    try:
-                        scalar = value.item() if isinstance(value, torch.Tensor) and value.numel() == 1 else (value.mean().item() if isinstance(value, torch.Tensor) else float(value))
-                        self.logger.log(f"{aue_metrics_prefix}/{phase}_{key}", scalar, step)
-                    except (TypeError, ValueError):
-                        continue
-
         # Style GCN statistics (if available)
         gcn_stats = bndl_outputs.get("gcn_stats") if isinstance(bndl_outputs, dict) else None
         if gcn_stats:
@@ -1401,6 +1657,14 @@ class Trainer:
                 except (TypeError, ValueError):
                     continue
                 self.logger.log(f"{gcn_prefix}/{phase}_{key}", scalar, step)
+
+    def _log_aue_metrics_from_outputs(self, outputs, step: int, phase: str):
+        """Legacy method - AUE metrics are now logged via loss_combined.py.
+
+        This method is kept as a no-op for backward compatibility.
+        All AUE loss values are now returned by loss_combined.py and logged under Losses/ prefix.
+        """
+        pass
 
     def _log_style_aue_visualization(self, outputs, step):
         """Log Style AUE visualization: original vs adversarial images with style statistics"""
@@ -1417,27 +1681,46 @@ class Trainer:
         adv_denorm = self._denormalize_images(vis_data.adversarial_images)
 
         # Use stored styles if available, otherwise extract from images
+        # These are per-object styles from GT regions [N, K, 6]
         if vis_data.original_styles is not None and vis_data.adversarial_styles is not None:
-            original_styles = vis_data.original_styles  # [N, K, 6]
-            adv_styles = vis_data.adversarial_styles
-            # For visualization, use global style (average across objects)
-            # Shape: [N, K, 6] -> [N, 6]
-            original_styles_global = original_styles.mean(dim=1)
-            adv_styles_global = adv_styles.mean(dim=1)
+            original_styles = vis_data.original_styles  # [N, K, 6] per-object styles
+            adv_styles = vis_data.adversarial_styles  # [N, K, 6] per-object styles
+
+            # For single-sample visualization, use global style (average across objects)
+            original_styles_global = original_styles.mean(dim=1)  # [N, 6]
+            adv_styles_global = adv_styles.mean(dim=1)  # [N, 6]
+
+            # Log per-object style perturbations (this is the NEW meaningful metric)
+            self._log_style_perturbations_per_object(original_styles, adv_styles, vis_data, step)
+
+            # Use step % batch_size for diversity while ensuring consistency across visualizations
+            batch_size = original_denorm.shape[0]
+            sample_idx = step % batch_size
+
+            # Log Style Delta Overlay and Object Graph Overlay (for paper figures)
+            self._log_style_delta_overlay(original_denorm, original_styles, adv_styles, vis_data, sample_idx, step)
+            self._log_object_graph_overlay(original_denorm, vis_data, sample_idx, step)
+
+            # Log GCN comparison: generate no-GCN version for comparison
+            self._log_gcn_comparison_visualization(original_denorm, original_styles, adv_styles, vis_data, sample_idx, step)
         else:
             from sam2.modeling.style_utils import extract_style_statistics
 
-            original_styles_global = extract_style_statistics(vis_data.original_images)
-            adv_styles_global = extract_style_statistics(vis_data.adversarial_images)
+            # Fallback: extract global image style
+            original_styles_global = extract_style_statistics(vis_data.original_images).mean(dim=1)
+            adv_styles_global = extract_style_statistics(vis_data.adversarial_images).mean(dim=1)
+            original_styles = None
+            adv_styles = None
 
-        # Visualize random sample (for performance)
-        batch_size = original_denorm.shape[0]
-        sample_idx = random.randint(0, batch_size - 1)
+            # Use step % batch_size for diversity
+            batch_size = original_denorm.shape[0]
+            sample_idx = step % batch_size
+
         self._visualize_style_single_sample(
             original_denorm[sample_idx], adv_denorm[sample_idx], original_styles_global[sample_idx], adv_styles_global[sample_idx], vis_data, sample_idx=sample_idx, step=step
         )
 
-        # Log style perturbation statistics
+        # Log global style perturbation statistics (for backward compatibility)
         self._log_style_perturbations(original_styles_global, adv_styles_global, step)
 
         # Log GCN parameters if available
@@ -1508,21 +1791,103 @@ class Trainer:
         denorm = images * std + mean
         return torch.clamp(denorm, 0, 1)
 
+    def _save_image_to_disk(self, image, step, category, name):
+        """Save an image directly to disk under the log directory.
+
+        Images are saved to: {log_dir}/vis/{step}/{category}/{name}.png
+
+        Args:
+            image: Can be one of:
+                - torch.Tensor [C, H, W] or [H, W, C] with values in [0, 1]
+                - numpy.ndarray [H, W, C] with values in [0, 1] or [0, 255]
+                - matplotlib figure (will be rendered)
+            step: Training step number
+            category: Category subdirectory (e.g., 'clean', 'adv', 'StyleAUE', 'DeformAUE')
+            name: Image filename without extension
+        """
+        from PIL import Image as PILImage
+
+        # Build the save path: {log_dir}/vis/{step}/{category}/{name}.png
+        save_dir = os.path.join(self.logging_conf.log_dir, "vis", str(step), category)
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, f"{name}.png")
+
+        try:
+            # Convert to numpy array [H, W, C] in uint8
+            if isinstance(image, torch.Tensor):
+                img_np = image.detach().cpu()
+                # Handle different tensor shapes
+                if img_np.ndim == 3:
+                    if img_np.shape[0] in [1, 3]:  # [C, H, W]
+                        img_np = img_np.permute(1, 2, 0)  # -> [H, W, C]
+                    # else assume [H, W, C]
+                elif img_np.ndim == 2:  # [H, W] grayscale
+                    img_np = img_np.unsqueeze(-1).expand(-1, -1, 3)  # -> [H, W, 3]
+                img_np = img_np.numpy()
+            elif isinstance(image, plt.Figure):
+                # Render matplotlib figure to numpy
+                image.canvas.draw()
+                w, h = image.canvas.get_width_height()
+                img_np = np.frombuffer(image.canvas.buffer_rgba(), dtype=np.uint8).reshape(h, w, 4)[:, :, :3]
+            else:
+                img_np = np.asarray(image)
+
+            # Ensure [H, W, C] shape
+            if img_np.ndim == 2:
+                img_np = np.stack([img_np] * 3, axis=-1)
+            elif img_np.ndim == 3 and img_np.shape[0] in [1, 3] and img_np.shape[2] not in [1, 3]:
+                # Likely [C, H, W], transpose
+                img_np = np.transpose(img_np, (1, 2, 0))
+
+            # Handle single-channel (grayscale) images
+            if img_np.shape[-1] == 1:
+                img_np = np.repeat(img_np, 3, axis=-1)
+
+            # Convert to uint8 [0, 255]
+            if img_np.dtype == np.float32 or img_np.dtype == np.float64:
+                if img_np.max() <= 1.0:
+                    img_np = (img_np * 255).astype(np.uint8)
+                else:
+                    img_np = np.clip(img_np, 0, 255).astype(np.uint8)
+            elif img_np.dtype != np.uint8:
+                img_np = img_np.astype(np.uint8)
+
+            # Save using PIL
+            pil_img = PILImage.fromarray(img_np)
+            pil_img.save(save_path)
+
+        except Exception as e:
+            logging.debug(f"Failed to save image {save_path}: {e}")
+
     def _visualize_style_single_sample(self, original_img, adv_img, original_style, adv_style, vis_data, sample_idx, step, pred_mask=None):
         """Visualize a single sample for Style AUE with multi-object support."""
-        # Extract multi-object data from vis_data (support both dataclass and dict)
-        if hasattr(vis_data, "all_bboxes"):
-            # Dataclass
+        # Extract multi-object data from vis_data (support new AUEVisualizationData dataclass)
+        # New field names from refactored AUE visualization module
+        if hasattr(vis_data, "object_bboxes"):
+            # New AUEVisualizationData dataclass
+            all_bboxes = vis_data.object_bboxes
+            all_masks = vis_data.object_masks
+            combined_mask = None  # Not stored in new dataclass (can be computed from object_masks if needed)
+            area_ratios = vis_data.object_area_ratios
+            epsilon_weights = None  # Not stored in new dataclass (no longer used for visualization)
+        elif hasattr(vis_data, "all_bboxes"):
+            # Legacy dataclass format (backward compatibility)
             all_bboxes = vis_data.all_bboxes
             all_masks = vis_data.all_object_masks
-            combined_mask = vis_data.combined_mask_for_loss
+            combined_mask = getattr(vis_data, "combined_mask_for_loss", None)
             area_ratios = vis_data.area_ratios
-            epsilon_weights = vis_data.epsilon_weights
+            epsilon_weights = getattr(vis_data, "epsilon_weights", None)
+        else:
+            all_bboxes = None
+            all_masks = None
+            combined_mask = None
+            area_ratios = None
+            epsilon_weights = None
 
         # Extract data for this sample
         sample_bboxes = all_bboxes[sample_idx] if all_bboxes is not None else None
         sample_masks = all_masks[sample_idx] if all_masks is not None else None
-        sample_combined_mask = combined_mask[sample_idx, 0] if combined_mask is not None else None
+        sample_combined_mask = combined_mask[sample_idx, 0] if combined_mask is not None and combined_mask.ndim >= 2 else None
         sample_area_ratios = area_ratios[sample_idx] if area_ratios is not None else None
         sample_epsilon_weights = epsilon_weights[sample_idx] if epsilon_weights is not None else None
 
@@ -1564,11 +1929,542 @@ class Trainer:
         )
 
     def _log_style_perturbations(self, original_styles, adv_styles, step):
-        """Log style perturbation statistics."""
+        """Log global style perturbation statistics (for backward compatibility)."""
         style_diff = (adv_styles - original_styles).abs().mean(dim=0)  # [6]
         channels = ["R_mean", "G_mean", "B_mean", "R_std", "G_std", "B_std"]
         for j, channel in enumerate(channels):
-            self.logger.log(f"StyleAUE/perturbation_{channel}", style_diff[j].item(), step)
+            self.logger.log(f"StyleAUE/global_perturbation_{channel}", style_diff[j].item(), step)
+
+    def _log_style_perturbations_per_object(self, original_styles, adv_styles, vis_data, step):
+        """
+        Log per-object style perturbation statistics in attacked regions.
+
+        This is the more meaningful metric: how much does the attack change the style
+        in each GT region, weighted by object area.
+
+        Args:
+            original_styles: [N, K, 6] original style statistics per object
+            adv_styles: [N, K, 6] adversarial style statistics per object
+            vis_data: visualization data containing pixel_gt for area computation
+            step: logging step
+        """
+        if original_styles is None or adv_styles is None:
+            return
+
+        N, K, _ = original_styles.shape
+
+        # Per-object style difference: [N, K, 6]
+        style_diff = (adv_styles - original_styles).abs()
+
+        # Use pre-computed area ratios if available (more efficient)
+        # AUEVisualizationData from visualization.py has: object_area_ratios [N, K]
+        area_ratios = getattr(vis_data, "object_area_ratios", None)
+
+        if area_ratios is not None and area_ratios.shape[1] == K:
+            # Use pre-computed area ratios as weights
+            # Normalize so they sum to 1 per sample
+            area_weights = area_ratios / (area_ratios.sum(dim=1, keepdim=True) + 1e-8)
+            # Weighted average style diff: [N, 6]
+            weighted_diff = (style_diff * area_weights.unsqueeze(-1)).sum(dim=1)
+        elif hasattr(vis_data, "object_masks") and vis_data.object_masks is not None:
+            # Fallback: compute from masks
+            pixel_gt = vis_data.object_masks  # [N, K, H, W]
+            if pixel_gt.ndim == 3:
+                pixel_gt = pixel_gt.unsqueeze(1)  # [N, H, W] -> [N, 1, H, W]
+
+            # Compute area per object: [N, K]
+            object_areas = (pixel_gt > 0.5).float().sum(dim=[2, 3])
+            total_area = object_areas.sum(dim=1, keepdim=True) + 1e-8  # [N, 1]
+
+            # Normalized weights: [N, K]
+            area_weights = object_areas / total_area
+
+            # Weighted average style diff: [N, 6]
+            weighted_diff = (style_diff * area_weights.unsqueeze(-1)).sum(dim=1)
+        else:
+            # Fallback: simple average across objects
+            weighted_diff = style_diff.mean(dim=1)  # [N, 6]
+
+        # Average across batch: [6]
+        mean_diff = weighted_diff.mean(dim=0)
+
+        # Log per-channel metrics
+        channels = ["R_mean", "G_mean", "B_mean", "R_std", "G_std", "B_std"]
+        for j, channel in enumerate(channels):
+            self.logger.log(f"StyleAUE/region_perturbation_{channel}", mean_diff[j].item(), step)
+
+        # Log aggregate metrics
+        mean_perturbation = mean_diff[:3].mean().item()  # Mean shift (channels 0-2)
+        std_perturbation = mean_diff[3:].mean().item()  # Std shift (channels 3-5)
+        total_perturbation = mean_diff.mean().item()  # Overall
+
+        self.logger.log("StyleAUE/region_perturbation_mean_total", mean_perturbation, step)
+        self.logger.log("StyleAUE/region_perturbation_std_total", std_perturbation, step)
+        self.logger.log("StyleAUE/region_perturbation_total", total_perturbation, step)
+
+        # Log per-object breakdown (sampled for efficiency)
+        if K <= 5:  # Only log if reasonable number of objects
+            for k in range(K):
+                obj_diff = style_diff[:, k, :].mean(dim=0)  # [6] averaged over batch
+                self.logger.log(f"StyleAUE/object_{k}_perturbation", obj_diff.mean().item(), step)
+
+    def _log_style_delta_overlay(self, original_denorm, original_styles, adv_styles, vis_data, sample_idx, step):
+        """Log Style Delta Overlay: per-object style perturbation intensity on original image.
+
+        Creates a single image with color-coded overlay showing |Δμ| + |Δσ| intensity.
+        NO TITLE - legend inside image for paper figures.
+        """
+
+        import matplotlib.pyplot as plt
+        import matplotlib.colors as mcolors
+        from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+        import numpy as np
+
+        if original_styles is None or adv_styles is None:
+            return
+        if not hasattr(vis_data, "object_masks") or vis_data.object_masks is None:
+            return
+
+        # Get data for this sample
+        orig_img = original_denorm[sample_idx].permute(1, 2, 0).cpu().numpy()  # [H, W, 3]
+        orig_img = np.clip(orig_img, 0, 1)
+        H, W = orig_img.shape[:2]
+
+        sample_masks = vis_data.object_masks[sample_idx]  # [K, H, W]
+        sample_orig_styles = original_styles[sample_idx]  # [K, 6]
+        sample_adv_styles = adv_styles[sample_idx]  # [K, 6]
+
+        K = sample_masks.shape[0]
+
+        # Compute style delta for each object: |Δμ| + |Δσ|
+        style_diff = (sample_adv_styles - sample_orig_styles).abs()  # [K, 6]
+        delta_mu = style_diff[:, :3].mean(dim=1)  # [K] mean of RGB means
+        delta_sigma = style_diff[:, 3:].mean(dim=1)  # [K] mean of RGB stds
+        delta_total = (delta_mu + delta_sigma).cpu().numpy()  # [K]
+
+        # Normalize to [0, 1] for colormap
+        if delta_total.max() > delta_total.min():
+            delta_norm = (delta_total - delta_total.min()) / (delta_total.max() - delta_total.min() + 1e-8)
+        else:
+            delta_norm = np.zeros_like(delta_total)
+
+        # Create overlay - no margins
+        fig, ax = plt.subplots(1, 1, figsize=(8, 8))
+        ax.imshow(orig_img)
+        ax.axis("off")
+
+        # Create colormap (blue=low, yellow=mid, red=high)
+        cmap = plt.cm.get_cmap("RdYlBu_r")  # Reversed: blue=low, red=high
+
+        # Overlay each object mask with color based on delta intensity
+        model = unwrap_ddp_if_wrapped(self.model)
+        include_background = bool(getattr(model, "adv_enable_background", False))
+
+        for k in range(K):
+            # Skip background if it's the last channel and not visualizing background
+            if not include_background and k == K - 1:
+                continue
+
+            mask_k = sample_masks[k].cpu().numpy()  # [H, W]
+            if mask_k.shape != (H, W):
+                # Resize mask if needed
+                from skimage.transform import resize
+
+                mask_k = resize(mask_k, (H, W), order=0, preserve_range=True)
+
+            if mask_k.sum() < 10:  # Skip empty masks
+                continue
+
+            # Create colored overlay
+            color = cmap(delta_norm[k])[:3]  # RGB
+            overlay = np.zeros((H, W, 4))
+            overlay[mask_k > 0.5, :3] = color
+            overlay[mask_k > 0.5, 3] = 0.4  # Alpha
+
+            ax.imshow(overlay)
+
+        # Add colorbar INSIDE image (bottom-right corner)
+        axins = inset_axes(ax, width="30%", height="3%", loc="lower right", borderpad=2)
+        sm = plt.cm.ScalarMappable(cmap=cmap, norm=mcolors.Normalize(vmin=0, vmax=1))
+        sm.set_array([])
+        cbar = fig.colorbar(sm, cax=axins, orientation="horizontal")
+        cbar.set_ticks([0, 0.5, 1])
+        cbar.set_ticklabels(["Low", "", "High"], fontsize=8)
+        cbar.ax.tick_params(labelsize=8, colors="white")
+        axins.set_title("|Δμ|+|Δσ|", fontsize=8, color="white", pad=2)
+
+        # Remove all margins
+        plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
+
+        # Save to disk
+        fig.canvas.draw()
+        img_array = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+        img_array = img_array.reshape(fig.canvas.get_width_height()[::-1] + (4,))[:, :, :3]
+        self._save_image_to_disk(img_array, step, "StyleAUE", "style_delta_overlay")
+
+        plt.close(fig)
+
+    def _log_object_graph_overlay(self, original_denorm, vis_data, sample_idx, step):
+        """Log Object Graph Overlay: nodes at centroids, edges showing object relationships.
+
+        Creates a single image with graph overlay and mask contours.
+        NO TITLE - legend inside image for paper figures.
+        """
+        import matplotlib.pyplot as plt
+        import matplotlib.patches as mpatches
+        import numpy as np
+        from skimage import measure
+
+        if not hasattr(vis_data, "object_masks") or vis_data.object_masks is None:
+            return
+
+        # Get model for GCN config
+        model = unwrap_ddp_if_wrapped(self.model)
+
+        # Get data for this sample
+        orig_img = original_denorm[sample_idx].permute(1, 2, 0).cpu().numpy()  # [H, W, 3]
+        orig_img = np.clip(orig_img, 0, 1)
+        H, W = orig_img.shape[:2]
+
+        sample_masks = vis_data.object_masks[sample_idx]  # [K, H, W]
+        K = sample_masks.shape[0]
+
+        include_background = bool(getattr(model, "adv_enable_background", False))
+
+        # Create figure - no margins
+        fig, ax = plt.subplots(1, 1, figsize=(8, 8))
+        ax.imshow(orig_img)
+        ax.axis("off")
+
+        # Define colors for objects
+        colors = plt.cm.tab10(np.linspace(0, 1, max(K, 10)))
+
+        # Compute centroids and draw mask contours for each object
+        centroids = []
+        valid_objects = []
+        for k in range(K):
+            # Skip background if it's the last channel and not visualizing background
+            if not include_background and k == K - 1:
+                continue
+
+            mask_k = sample_masks[k].cpu().numpy().astype(np.float32)  # [H, W]
+            if mask_k.shape != (H, W):
+                from skimage.transform import resize
+
+                mask_k = resize(mask_k, (H, W), order=0, preserve_range=True)
+
+            area = mask_k.sum()
+            if area < 10:  # Skip empty masks
+                continue
+
+            # Draw mask contour
+            node_color = colors[k % 10]
+            contours = measure.find_contours(mask_k, 0.5)
+            for contour in contours:
+                ax.plot(contour[:, 1], contour[:, 0], color=node_color, linewidth=2, alpha=0.8)
+
+            # Compute centroid
+            y_coords, x_coords = np.meshgrid(np.arange(H), np.arange(W), indexing="ij")
+            cy = (mask_k * y_coords).sum() / area
+            cx = (mask_k * x_coords).sum() / area
+            centroids.append((cx, cy, k))
+            valid_objects.append(k)
+
+        if len(centroids) < 1:
+            plt.close(fig)
+            return  # Need at least 1 object
+
+        # Use ACTUAL build_object_graph function for accurate GCN edges
+        from sam2.modeling.style_gcn import build_object_graph
+
+        # Get GCN config from model
+        edge_threshold = getattr(model, "style_adv_gcn_edge_threshold", 0.3)
+        distance_threshold = getattr(model, "style_adv_gcn_distance_threshold", 0.2)
+        use_semantic = getattr(model, "style_adv_gcn_use_semantic_edges", False)
+        use_boundary_distance = getattr(model, "style_adv_gcn_use_boundary_distance", True)
+        use_background_edges = include_background and getattr(model, "style_adv_gcn_use_background_edges", False)
+
+        # Build graph for this sample (batch size = 1)
+        sample_masks_4d = sample_masks.unsqueeze(0)  # [1, K, H, W]
+        edge_index, edge_weight, gcn_stats = build_object_graph(
+            sample_masks_4d,
+            img_batch=None,
+            edge_threshold=edge_threshold,
+            use_semantic=use_semantic,
+            use_background=use_background_edges,
+            distance_threshold=distance_threshold,
+            use_boundary_distance=use_boundary_distance,
+        )
+
+        # Parse edges from GCN's edge_index and edge_weight
+        edges = []
+        if edge_index.numel() > 0:
+            edge_index_np = edge_index.cpu().numpy()  # [2, E]
+            edge_weight_np = edge_weight.cpu().numpy()  # [E]
+
+            # Create mapping from node index to centroid index
+            node_to_centroid = {k: i for i, (_, _, k) in enumerate(centroids)}
+
+            # Collect edges (skip self-loops and duplicates)
+            drawn_edges = set()
+            for e in range(edge_index_np.shape[1]):
+                src, tgt = edge_index_np[0, e], edge_index_np[1, e]
+                if src == tgt:
+                    continue  # Skip self-loops
+
+                # Normalize to single-sample indices (batch=1)
+                src_k = src % K
+                tgt_k = tgt % K
+
+                # Skip if either node is not in our valid list
+                if src_k not in node_to_centroid or tgt_k not in node_to_centroid:
+                    continue
+
+                # Skip duplicates (undirected)
+                edge_key = tuple(sorted([src_k, tgt_k]))
+                if edge_key in drawn_edges:
+                    continue
+                drawn_edges.add(edge_key)
+
+                edges.append((node_to_centroid[src_k], node_to_centroid[tgt_k], edge_weight_np[e]))
+
+        # Draw edges
+        for i, j, weight in edges:
+            cx_i, cy_i, _ = centroids[i]
+            cx_j, cy_j, _ = centroids[j]
+
+            # Edge color and width based on weight
+            edge_color = plt.cm.Greens(0.3 + 0.7 * min(weight, 1.0))  # Green intensity
+            line_width = 1 + 4 * min(weight, 1.0)  # 1-5 width
+
+            ax.plot([cx_i, cx_j], [cy_i, cy_j], color=edge_color, linewidth=line_width, alpha=0.8, zorder=1)
+
+            # Add weight label at midpoint
+            mid_x, mid_y = (cx_i + cx_j) / 2, (cy_i + cy_j) / 2
+            ax.text(mid_x, mid_y, f"{weight:.2f}", fontsize=8, color="white", ha="center", va="center", fontweight="bold", bbox=dict(boxstyle="round,pad=0.2", facecolor="black", alpha=0.6))
+
+        # Draw nodes
+        for i, (cx, cy, k) in enumerate(centroids):
+            node_color = colors[k % 10]
+            circle = plt.Circle((cx, cy), radius=min(H, W) * 0.025, color=node_color, ec="white", linewidth=2, zorder=2)
+            ax.add_patch(circle)
+            ax.text(cx, cy, str(k), fontsize=9, color="white", ha="center", va="center", fontweight="bold", zorder=3)
+
+        # Add legend INSIDE image (upper right corner)
+        edge_info = []
+        if gcn_stats:
+            if gcn_stats.get("edges_iou", 0) > 0:
+                edge_info.append("IoU")
+            if gcn_stats.get("edges_distance", 0) > 0:
+                edge_info.append("Dist")
+            if gcn_stats.get("edges_semantic", 0) > 0:
+                edge_info.append("Sem")
+        edge_label = "Edge: " + "+".join(edge_info) if edge_info else "Edge"
+
+        legend_elements = [
+            mpatches.Patch(facecolor="green", alpha=0.6, label=edge_label),
+            plt.Line2D([0], [0], marker="o", color="w", markerfacecolor="gray", markersize=8, label="Node"),
+        ]
+        ax.legend(handles=legend_elements, loc="upper right", fontsize=8, framealpha=0.7, facecolor="black", labelcolor="white")
+
+        # Remove all margins
+        plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
+
+        # Save to disk
+        fig.canvas.draw()
+        img_array = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+        img_array = img_array.reshape(fig.canvas.get_width_height()[::-1] + (4,))[:, :, :3]
+        self._save_image_to_disk(img_array, step, "StyleAUE", "object_graph_overlay")
+
+        plt.close(fig)
+
+    def _log_gcn_comparison_visualization(self, original_denorm, original_styles, adv_styles, vis_data, sample_idx, step):
+        """Generate no-GCN style perturbation visualization for comparison.
+
+        Outputs separate pure images:
+        - styled_image_with_gcn.png: styled image using GCN-coordinated perturbations
+        - styled_image_no_gcn.png: styled image using uncoordinated perturbations
+        - style_delta_overlay_no_gcn.png: style delta heatmap without GCN coordination
+        """
+        import matplotlib.pyplot as plt
+        import matplotlib.colors as mcolors
+        from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+        import numpy as np
+
+        model = unwrap_ddp_if_wrapped(self.model)
+
+        # Check if GCN is enabled and we have the necessary components
+        gcn_enabled = getattr(model, "style_adv_use_gcn", False)
+        has_gcn = model.style_gcn is not None
+        logging.info(f"[GCN Comparison] step={step}, gcn_enabled={gcn_enabled}, has_gcn={has_gcn}")
+
+        if not gcn_enabled or not has_gcn:
+            logging.info(f"[GCN Comparison] Skipping: GCN not enabled or not available")
+            return  # GCN not enabled, no comparison needed
+
+        has_masks = hasattr(vis_data, "object_masks") and vis_data.object_masks is not None
+        has_images = hasattr(vis_data, "original_images") and vis_data.original_images is not None
+        logging.info(f"[GCN Comparison] has_masks={has_masks}, has_images={has_images}")
+
+        if not has_masks:
+            logging.info(f"[GCN Comparison] Skipping: no object_masks in vis_data")
+            return
+        if not has_images:
+            logging.info(f"[GCN Comparison] Skipping: no original_images in vis_data")
+            return
+
+        # Get the style attacker
+        style_attacker = getattr(model, "style_attacker", None)
+        has_impl = style_attacker is not None and hasattr(style_attacker, "impl")
+        logging.info(f"[GCN Comparison] has_style_attacker={style_attacker is not None}, has_impl={has_impl}")
+
+        if style_attacker is None or not has_impl:
+            logging.info(f"[GCN Comparison] Skipping: no style_attacker or impl")
+            return
+
+        logging.info(f"[GCN Comparison] All checks passed, generating comparison images...")
+        try:
+            # === 1. Compute GLOBAL style perturbation (same delta for all objects) ===
+            # This contrasts with GCN-coordinated per-object perturbations
+
+            with torch.no_grad():
+                # Ensure images are on the correct device (may be on CPU from vis_data)
+                device = next(model.parameters()).device
+                original_images = vis_data.original_images
+                if original_images.device != device:
+                    original_images = original_images.to(device)
+                    logging.info(f"[GCN Comparison] Moved original_images to {device}")
+
+                # Get backbone features for the original images
+                backbone_out = model.forward_image(original_images, use_checkpoint=False)
+                clean_features = backbone_out["backbone_fpn"][-1]  # [B, C, H, W]
+
+                # Get pixel_gt from vis_data
+                pixel_gt = vis_data.object_masks  # [B, K, H, W]
+                if pixel_gt.device != device:
+                    pixel_gt = pixel_gt.to(device)
+                if pixel_gt.ndim == 3:
+                    pixel_gt = pixel_gt.unsqueeze(1)
+
+                # Use the style network directly
+                style_impl = style_attacker.impl
+
+                # === GLOBAL ATTACK: Merge all objects into single mask ===
+                # This simulates global style attack (no per-object differentiation)
+                B, K, H_mask, W_mask = pixel_gt.shape
+                pixel_gt_global = pixel_gt.sum(dim=1, keepdim=True).clamp(0, 1)  # [B, 1, H, W]
+
+                # Extract global style (average across entire image, not per-object)
+                from sam2.modeling.style_utils import extract_style_statistics
+
+                original_styles_global = extract_style_statistics(original_images)  # [B, 1, 6]
+
+                # Get global style perturbation (single style for whole image)
+                adv_styles_global = style_impl.style_net(clean_features.detach(), original_styles_global, pixel_gt=pixel_gt_global)  # [B, 1, 6]
+
+                # Apply global style to entire image (no per-object regions)
+                styled_img_global = style_impl._apply_style_to_images(original_images, adv_styles_global, gt_mask=pixel_gt_global)
+
+                # Apply styles with GCN (already computed, stored in vis_data.adversarial_images)
+                styled_img_with_gcn = vis_data.adversarial_images
+                if styled_img_with_gcn.device != device:
+                    styled_img_with_gcn = styled_img_with_gcn.to(device)
+
+            # === 2. Save styled images as pure images ===
+            # Denormalize images
+            styled_global_denorm = self._denormalize_images(styled_img_global)
+            styled_with_gcn_denorm = self._denormalize_images(styled_img_with_gcn)
+
+            # Log style delta comparison (Global vs GCN-coordinated per-object)
+            style_delta_global = (adv_styles_global - original_styles_global).abs()
+            style_delta_with_gcn = (adv_styles - original_styles).abs()
+            logging.info(f"[GCN Comparison] Style Delta (GLOBAL):    mean={style_delta_global.mean().item():.4f}, max={style_delta_global.max().item():.4f}")
+            logging.info(f"[GCN Comparison] Style Delta (GCN multi): mean={style_delta_with_gcn.mean().item():.4f}, max={style_delta_with_gcn.max().item():.4f}")
+
+            # Get sample
+            sample_styled_global = styled_global_denorm[sample_idx].permute(1, 2, 0).cpu().numpy()
+            sample_styled_with_gcn = styled_with_gcn_denorm[sample_idx].permute(1, 2, 0).cpu().numpy()
+            sample_styled_global = np.clip(sample_styled_global, 0, 1)
+            sample_styled_with_gcn = np.clip(sample_styled_with_gcn, 0, 1)
+
+            # Save pure styled images (no extra layout)
+            self._save_image_to_disk(sample_styled_with_gcn, step, "StyleAUE", "styled_image_gcn_multi")
+            self._save_image_to_disk(sample_styled_global, step, "StyleAUE", "styled_image_global")
+
+            # === 3. Generate style delta overlay for GLOBAL version ===
+            # For global attack, all objects have the SAME delta (since there's only 1 style)
+            orig_img = original_denorm[sample_idx].permute(1, 2, 0).cpu().numpy()
+            orig_img = np.clip(orig_img, 0, 1)
+            H, W = orig_img.shape[:2]
+
+            sample_masks = vis_data.object_masks[sample_idx]  # [K, H, W]
+            K = sample_masks.shape[0]
+
+            # Global attack: same delta for all objects
+            global_delta = (adv_styles_global[sample_idx, 0] - original_styles_global[sample_idx, 0]).abs().cpu()  # [6]
+            delta_mu_global = global_delta[:3].mean()
+            delta_sigma_global = global_delta[3:].mean()
+            delta_total_global = (delta_mu_global + delta_sigma_global).item()
+
+            # All objects get the same value (uniform color in heatmap)
+            delta_total_per_obj = np.full(K, delta_total_global)
+
+            # For global attack, normalization is trivial (all same value)
+            # Use fixed color to indicate uniform perturbation
+            delta_norm = np.ones(K) * 0.5  # Middle color for all objects (uniform)
+
+            # Create overlay figure (same style as _log_style_delta_overlay)
+            fig, ax = plt.subplots(1, 1, figsize=(8, 8))
+            ax.imshow(orig_img)
+            ax.axis("off")
+
+            cmap = plt.cm.get_cmap("RdYlBu_r")
+            include_background = bool(getattr(model, "adv_enable_background", False))
+
+            for k in range(K):
+                if not include_background and k == K - 1:
+                    continue
+
+                mask_k = sample_masks[k].cpu().numpy()
+                if mask_k.shape != (H, W):
+                    from skimage.transform import resize
+
+                    mask_k = resize(mask_k, (H, W), order=0, preserve_range=True)
+
+                if mask_k.sum() < 10:
+                    continue
+
+                color = cmap(delta_norm[k])[:3]
+                overlay = np.zeros((H, W, 4))
+                overlay[mask_k > 0.5, :3] = color
+                overlay[mask_k > 0.5, 3] = 0.4
+
+                ax.imshow(overlay)
+
+            # Add colorbar INSIDE image
+            axins = inset_axes(ax, width="30%", height="3%", loc="lower right", borderpad=2)
+            sm = plt.cm.ScalarMappable(cmap=cmap, norm=mcolors.Normalize(vmin=0, vmax=1))
+            sm.set_array([])
+            cbar = fig.colorbar(sm, cax=axins, orientation="horizontal")
+            cbar.set_ticks([0, 0.5, 1])
+            cbar.set_ticklabels(["Low", "", "High"], fontsize=8)
+            cbar.ax.tick_params(labelsize=8, colors="white")
+            axins.set_title("|Δμ|+|Δσ| (Global)", fontsize=8, color="white", pad=2)
+
+            plt.subplots_adjust(left=0, right=1, top=1, bottom=0)
+
+            fig.canvas.draw()
+            img_array = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+            img_array = img_array.reshape(fig.canvas.get_width_height()[::-1] + (4,))[:, :, :3]
+            self._save_image_to_disk(img_array, step, "StyleAUE", "style_delta_overlay_global")
+
+            plt.close(fig)
+
+        except Exception as e:
+            logging.debug(f"GCN comparison visualization failed: {e}")
+            import traceback
+
+            logging.debug(traceback.format_exc())
 
     def _log_deform_aue_visualization(self, outputs, step):
         """Log Deformation AUE visualization: before/after predictions with offset fields"""
@@ -1599,9 +2495,9 @@ class Trainer:
         # Denormalize images
         original_denorm = self._denormalize_images(vis_data.original_images)
 
-        # Visualize random sample (for performance)
+        # Use step % batch_size for diversity while ensuring consistency across visualizations
         batch_size = original_denorm.shape[0]
-        sample_idx = random.randint(0, batch_size - 1)
+        sample_idx = step % batch_size
 
         # Extract prediction for this sample
         pred_mask = self._extract_prediction(outputs, batch_idx=sample_idx)
@@ -1620,13 +2516,21 @@ class Trainer:
         model = unwrap_ddp_if_wrapped(self.model)
         include_background = bool(getattr(model, "adv_enable_background", False))
 
-        # Extract multi-object data from vis_data
-        if hasattr(vis_data, "all_bboxes"):
+        # Extract multi-object data from vis_data (support new AUEVisualizationData dataclass)
+        if hasattr(vis_data, "object_bboxes"):
+            # New AUEVisualizationData dataclass
+            all_bboxes = vis_data.object_bboxes
+            orig_masks = vis_data.object_masks
+            warped_masks_all = getattr(vis_data, "warped_object_masks", None)
+            area_ratios = vis_data.object_area_ratios
+            epsilon_weights = None  # Not stored in new dataclass
+        elif hasattr(vis_data, "all_bboxes"):
+            # Legacy dataclass format (backward compatibility)
             all_bboxes = vis_data.all_bboxes
             orig_masks = vis_data.all_object_masks
             warped_masks_all = getattr(vis_data, "warped_object_masks", None)
-            area_ratios = vis_data.area_ratios
-            epsilon_weights = vis_data.epsilon_weights
+            area_ratios = getattr(vis_data, "area_ratios", None)
+            epsilon_weights = getattr(vis_data, "epsilon_weights", None)
         else:
             all_bboxes = None
             orig_masks = None
@@ -1779,84 +2683,171 @@ class Trainer:
         img_array = img_array.reshape(height, width, 4)[:, :, :3]
         img_tensor = torch.from_numpy(img_array).permute(2, 0, 1).float() / 255.0
 
-        # Log to TensorBoard
-        if self.logger.tb_logger and self.logger.tb_logger._writer:
-            self.logger.tb_logger._writer.add_image(f"DeformAUE/sample_{sample_idx}", img_tensor, step)
-            # === Paper-quality individual images (no statistics overlay) ===
-            # Log original image only
-            orig_tensor = torch.from_numpy(orig_np).permute(2, 0, 1).float()
-            orig_tensor = torch.clamp(orig_tensor, 0, 1)
-            self.logger.tb_logger._writer.add_image(f"DeformAUE/original_sample_{sample_idx}", orig_tensor, step)
+        # Log to TensorBoard and save to disk
+        writer = self.logger.tb_logger._writer if self.logger.tb_logger else None
 
-            # Log original image with bbox overlays (for showing attack region)
-            # Color scheme: Red = primary object (for loss), cyan = other objects
+        # Save combined figure to disk
+        self._save_image_to_disk(fig, step, "DeformAUE", "combined_view")
+
+        if writer:
+            writer.add_image("DeformAUE/combined_view", img_tensor, step)
+
+        # === Paper-quality individual images (no statistics overlay) ===
+        # Log original image only
+        orig_tensor = torch.from_numpy(orig_np).permute(2, 0, 1).float()
+        orig_tensor = torch.clamp(orig_tensor, 0, 1)
+        if writer:
+            writer.add_image(f"DeformAUE/original", orig_tensor, step)
+        # Save to disk
+        self._save_image_to_disk(orig_tensor, step, "DeformAUE", "original")
+
+        # Log original image with bbox overlays (for showing attack region)
+        # Color scheme: Red = primary object (for loss), cyan = other objects
+        if sample_bboxes is not None:
+            orig_with_bbox = self._plot_image_with_bboxes(
+                orig_np, sample_bboxes, primary_obj_idx, include_background=include_background, K=K, masks=gt_masks_orig, ax=None
+            )  # ax=None -> returns uint8 image
+            orig_bbox_tensor = torch.from_numpy(orig_with_bbox).permute(2, 0, 1).float() / 255.0
+            if writer:
+                writer.add_image(f"DeformAUE/original_with_bbox", orig_bbox_tensor, step)
+            # Save to disk
+            self._save_image_to_disk(orig_with_bbox, step, "DeformAUE", "original_with_bbox")
+
+        # Log warped/styled image (the final result after all attacks)
+        if display_np is not None:
+            display_tensor = torch.from_numpy(display_np).permute(2, 0, 1).float()
+            display_tensor = torch.clamp(display_tensor, 0, 1)
+            if writer:
+                writer.add_image(f"DeformAUE/deformed", display_tensor, step)
+            # Save to disk
+            self._save_image_to_disk(display_tensor, step, "DeformAUE", "deformed")
+
+            # Log deformed image with bbox (same color scheme)
             if sample_bboxes is not None:
-                orig_with_bbox = self._plot_image_with_bboxes(
-                    orig_np, sample_bboxes, primary_obj_idx, include_background=include_background, K=K, masks=gt_masks_orig, ax=None
-                )  # ax=None -> returns uint8 image
-                orig_bbox_tensor = torch.from_numpy(orig_with_bbox).permute(2, 0, 1).float() / 255.0
-                self.logger.tb_logger._writer.add_image(f"DeformAUE/original_with_bbox_sample_{sample_idx}", orig_bbox_tensor, step)
+                display_with_bbox = self._plot_image_with_bboxes(display_np, sample_bboxes, primary_obj_idx, include_background=include_background, K=K, masks=gt_masks_warped, ax=None)
+                display_bbox_tensor = torch.from_numpy(display_with_bbox).permute(2, 0, 1).float() / 255.0
+                if writer:
+                    writer.add_image(f"DeformAUE/deformed_with_bbox", display_bbox_tensor, step)
+                # Save to disk
+                self._save_image_to_disk(display_with_bbox, step, "DeformAUE", "deformed_with_bbox")
 
-            # Log warped/styled image (the final result after all attacks)
-            if display_np is not None:
-                display_tensor = torch.from_numpy(display_np).permute(2, 0, 1).float()
-                display_tensor = torch.clamp(display_tensor, 0, 1)
-                self.logger.tb_logger._writer.add_image(f"DeformAUE/deformed_sample_{sample_idx}", display_tensor, step)
+        # Log offset magnitude as heatmap
+        if offsets is not None:
+            offsets_np = offsets.cpu().numpy()  # [K, 2, H, W]
+            offset_magnitude = np.sqrt(offsets_np[:, 0] ** 2 + offsets_np[:, 1] ** 2)  # [K, H, W]
+            offset_mag_combined = offset_magnitude.sum(axis=0)  # [H, W]
 
-                # Log deformed image with bbox (same color scheme)
-                if sample_bboxes is not None:
-                    display_with_bbox = self._plot_image_with_bboxes(display_np, sample_bboxes, primary_obj_idx, include_background=include_background, K=K, masks=gt_masks_warped, ax=None)
-                    display_bbox_tensor = torch.from_numpy(display_with_bbox).permute(2, 0, 1).float() / 255.0
-                    self.logger.tb_logger._writer.add_image(f"DeformAUE/deformed_with_bbox_sample_{sample_idx}", display_bbox_tensor, step)
+            # Normalize and convert to colormap image
+            if offset_mag_combined.max() > 0:
+                offset_normalized = offset_mag_combined / offset_mag_combined.max()
+            else:
+                offset_normalized = offset_mag_combined
 
-            # Log offset magnitude as heatmap
-            if offsets is not None:
-                offsets_np = offsets.cpu().numpy()  # [K, 2, H, W]
-                offset_magnitude = np.sqrt(offsets_np[:, 0] ** 2 + offsets_np[:, 1] ** 2)  # [K, H, W]
-                offset_mag_combined = offset_magnitude.sum(axis=0)  # [H, W]
+            # Apply 'hot' colormap
+            import matplotlib.cm as cm_local
 
-                # Normalize and convert to colormap image
-                if offset_mag_combined.max() > 0:
-                    offset_normalized = offset_mag_combined / offset_mag_combined.max()
-                else:
-                    offset_normalized = offset_mag_combined
+            cmap = cm_local.get_cmap("hot")
+            offset_colored = cmap(offset_normalized)[:, :, :3]  # [H, W, 3]
+            offset_tensor = torch.from_numpy(offset_colored).permute(2, 0, 1).float()
+            if writer:
+                writer.add_image(f"DeformAUE/offset_heatmap", offset_tensor, step)
+            # Save to disk
+            self._save_image_to_disk(offset_tensor, step, "DeformAUE", "offset_heatmap")
 
-                # Apply 'hot' colormap
-                import matplotlib.cm as cm_local
+        # Log GT Mask (Standalone) - background stays black
+        if gt_masks_orig is not None:
+            gt_vis_np = np.zeros((*gt_masks_orig.shape[-2:], 3), dtype=np.uint8)
+            gt_masks_np = gt_masks_orig.cpu().numpy()
+            # Skip background object (last one when include_background is True)
+            n_objs_to_draw = gt_masks_np.shape[0] - 1 if include_background else gt_masks_np.shape[0]
+            colors = [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0], [0, 255, 255]]
+            for k in range(n_objs_to_draw):
+                mask_k = gt_masks_np[k] > 0.5
+                color = colors[k % len(colors)]
+                for c in range(3):
+                    gt_vis_np[..., c] = np.where(mask_k, color[c], gt_vis_np[..., c])
 
-                cmap = cm_local.get_cmap("hot")
-                offset_colored = cmap(offset_normalized)[:, :, :3]  # [H, W, 3]
-                offset_tensor = torch.from_numpy(offset_colored).permute(2, 0, 1).float()
-                self.logger.tb_logger._writer.add_image(f"DeformAUE/offset_heatmap_sample_{sample_idx}", offset_tensor, step)
+            gt_tensor = torch.from_numpy(gt_vis_np).permute(2, 0, 1).float() / 255.0
+            if writer:
+                writer.add_image(f"DeformAUE/gt_mask", gt_tensor, step)
+            # Save to disk
+            self._save_image_to_disk(gt_vis_np, step, "DeformAUE", "gt_mask")
 
-            # Log GT Mask (Standalone)
-            if gt_masks_orig is not None:
-                gt_vis_np = np.zeros((*gt_masks_orig.shape[-2:], 3), dtype=np.uint8)
-                gt_masks_np = gt_masks_orig.cpu().numpy()
-                colors = [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0], [0, 255, 255]]
-                for k in range(gt_masks_np.shape[0]):
-                    mask_k = gt_masks_np[k] > 0.5
-                    color = colors[k % len(colors)]
-                    for c in range(3):
-                        gt_vis_np[..., c] = np.where(mask_k, color[c], gt_vis_np[..., c])
+        # Log Prediction Mask (Standalone)
+        if pred_mask is not None:
+            pred_np = pred_mask.detach().cpu().numpy()
+            pred_bin = pred_np > 0.0
+            pred_vis_np = np.zeros((*pred_bin.shape[-2:], 3), dtype=np.uint8)
+            colors = [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0], [0, 255, 255]]
+            for k in range(pred_bin.shape[0]):
+                mask_k = pred_bin[k]
+                color = colors[k % len(colors)]
+                for c in range(3):
+                    pred_vis_np[..., c] = np.where(mask_k, color[c], pred_vis_np[..., c])
 
-                gt_tensor = torch.from_numpy(gt_vis_np).permute(2, 0, 1).float() / 255.0
-                self.logger.tb_logger._writer.add_image(f"DeformAUE/gt_mask_sample_{sample_idx}", gt_tensor, step)
+            pred_tensor = torch.from_numpy(pred_vis_np).permute(2, 0, 1).float() / 255.0
+            if writer:
+                writer.add_image(f"DeformAUE/pred_mask", pred_tensor, step)
+            # Save to disk
+            self._save_image_to_disk(pred_vis_np, step, "DeformAUE", "pred_mask")
 
-            # Log Prediction Mask (Standalone)
-            if pred_mask is not None:
-                pred_np = pred_mask.cpu().numpy()
-                pred_bin = pred_np > 0.0
-                pred_vis_np = np.zeros((*pred_bin.shape[-2:], 3), dtype=np.uint8)
-                colors = [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0], [0, 255, 255]]
-                for k in range(pred_bin.shape[0]):
-                    mask_k = pred_bin[k]
-                    color = colors[k % len(colors)]
-                    for c in range(3):
-                        pred_vis_np[..., c] = np.where(mask_k, color[c], pred_vis_np[..., c])
+        # Log Mask Difference Visualization (difference regions only, no contours)
+        if gt_masks_orig is not None and gt_masks_warped is not None:
+            # Create visualization on top of deformed image (or original if deformed not available)
+            base_img = display_np if display_np is not None else orig_np
+            H, W = base_img.shape[:2]
 
-                pred_tensor = torch.from_numpy(pred_vis_np).permute(2, 0, 1).float() / 255.0
-                self.logger.tb_logger._writer.add_image(f"DeformAUE/pred_mask_sample_{sample_idx}", pred_tensor, step)
+            # Create figure for difference visualization (no border/padding)
+            fig_diff, ax_diff = plt.subplots(figsize=(8, 8))
+            ax_diff.imshow(base_img)
+            ax_diff.axis("off")
+
+            gt_masks_orig_np = gt_masks_orig.cpu().numpy() if hasattr(gt_masks_orig, "cpu") else gt_masks_orig
+            gt_masks_warped_np = gt_masks_warped.cpu().numpy() if hasattr(gt_masks_warped, "cpu") else gt_masks_warped
+
+            # Accumulate difference regions across all objects
+            added_combined = np.zeros((H, W), dtype=bool)
+            removed_combined = np.zeros((H, W), dtype=bool)
+
+            for k in range(gt_masks_orig_np.shape[0]):
+                mask_orig = gt_masks_orig_np[k] > 0.5
+                mask_warp = gt_masks_warped_np[k] > 0.5
+
+                # Compute difference regions
+                added_combined |= mask_warp & ~mask_orig  # Added region
+                removed_combined |= mask_orig & ~mask_warp  # Removed region
+
+            # Draw added regions (light green, semi-transparent)
+            if added_combined.sum() > 0:
+                added_overlay = np.zeros((H, W, 4), dtype=np.float32)
+                added_overlay[added_combined] = [0.2, 0.8, 0.2, 0.5]  # Light green with alpha
+                ax_diff.imshow(added_overlay)
+
+            # Draw removed regions (light red, semi-transparent)
+            if removed_combined.sum() > 0:
+                removed_overlay = np.zeros((H, W, 4), dtype=np.float32)
+                removed_overlay[removed_combined] = [0.9, 0.2, 0.2, 0.5]  # Light red with alpha
+                ax_diff.imshow(removed_overlay)
+
+            # Remove all padding/margins for clean output
+            plt.subplots_adjust(top=1, bottom=0, right=1, left=0, hspace=0, wspace=0)
+            plt.margins(0, 0)
+            ax_diff.xaxis.set_major_locator(plt.NullLocator())
+            ax_diff.yaxis.set_major_locator(plt.NullLocator())
+
+            fig_diff.canvas.draw()
+            w_diff, h_diff = fig_diff.canvas.get_width_height()
+            diff_array = np.frombuffer(fig_diff.canvas.buffer_rgba(), dtype=np.uint8).reshape(h_diff, w_diff, 4)[:, :, :3]
+            diff_tensor = torch.from_numpy(diff_array).permute(2, 0, 1).float() / 255.0
+            if writer:
+                writer.add_image(f"DeformAUE/mask_diff", diff_tensor, step)
+            # Save to disk
+            self._save_image_to_disk(diff_array, step, "DeformAUE", "mask_diff")
+            plt.close(fig_diff)
+
+        # IMPORTANT: Flush to disk immediately to prevent data loss from TensorBoard caching
+        if writer:
+            writer.flush()
 
         plt.close(fig)
 
@@ -1871,6 +2862,253 @@ class Trainer:
         self.logger.log("DeformAUE/max_offset", max_offset, step)
         self.logger.log("DeformAUE/mean_offset", mean_offset, step)
         self.logger.log("DeformAUE/std_offset", std_offset, step)
+
+    def _log_train_uncertainty_visualization(self, bndl_outputs, batch, targets, outputs, step, frame_index=0):
+        """Log training uncertainty map visualization to TensorBoard under Uncertainty/ section.
+
+        This provides visualization of pixel-level uncertainty from BNDL during training.
+        Outputs a simple grayscale uncertainty map without borders.
+
+        NOTE: pixel_uncertainty has shape [O_t, H, W, K] where O_t is the number of objects
+        in the current frame (frame_index), NOT the number of videos. The batch dimension
+        represents individual objects being processed by the mask decoder.
+
+        Args:
+            frame_index: The frame index within the video sequence. Used to correctly
+                        map objects to images via flat_obj_to_img_idx[frame_index].
+        """
+        import cv2
+
+        if bndl_outputs is None:
+            return
+
+        try:
+            # Get or compute pixel uncertainty
+            pixel_uncertainty = bndl_outputs.get("pixel_uncertainty")
+
+            # If uncertainty not yet computed, compute it now
+            if pixel_uncertainty is None:
+                if targets is not None:
+                    if targets.ndim >= 3 and targets.shape[0] > 0:
+                        current_frame_targets = targets[0] if targets.shape[0] > 0 else targets
+                    else:
+                        current_frame_targets = targets
+                    bndl_outputs = self._calculate_uncertainty_for_bndl(bndl_outputs, batch, current_frame_targets)
+                    pixel_uncertainty = bndl_outputs.get("pixel_uncertainty")
+
+            if pixel_uncertainty is None:
+                return
+
+            # Use pixel_uncertainty's batch size (object-level, O_t) as source of truth
+            # This is the actual batch size processed by mask decoder
+            unc_batch_size = pixel_uncertainty.shape[0]
+            sample_idx = step % unc_batch_size
+
+            # Get uncertainty for this sample
+            uncertainty_sample = pixel_uncertainty[sample_idx]  # [H, W] or [H, W, K]
+            if uncertainty_sample.ndim > 2:
+                uncertainty_sample = uncertainty_sample.mean(dim=-1)  # Average across masks
+            uncertainty_np = uncertainty_sample.detach().cpu().numpy()
+
+            # Extract original image - prefer vis_data for consistency with StyleAUE/DeformAUE
+            # vis_data.original_images has same batch dimension as pixel_uncertainty (object-level)
+            original_img = None
+            vis_data = self._extract_vis_data_from_outputs(outputs)
+            if vis_data is not None and hasattr(vis_data, "original_images") and vis_data.original_images is not None:
+                # Use denormalized original from vis_data (same source as StyleAUE/DeformAUE)
+                original_denorm = self._denormalize_images(vis_data.original_images)
+                if original_denorm is not None and len(original_denorm) > sample_idx:
+                    orig_tensor = original_denorm[sample_idx]  # [C, H, W]
+                    original_img = orig_tensor.cpu().permute(1, 2, 0).numpy()  # [H, W, C]
+                    original_img = np.clip(original_img, 0, 1)
+
+            # Fallback to batch.flat_img_batch using object-to-image mapping
+            # This is needed when vis_data is not available (e.g., AUE not enabled)
+            if original_img is None:
+                # Use flat_img_batch [(B*T), C, H, W] and flat_obj_to_img_idx for correct mapping
+                if hasattr(batch, "flat_img_batch") and hasattr(batch, "flat_obj_to_img_idx"):
+                    flat_imgs = batch.flat_img_batch  # [(B*T), C, H, W]
+                    # Get the current frame's object-to-image indices
+                    flat_obj_idx = batch.flat_obj_to_img_idx[frame_index]  # [O_t] for frame frame_index
+                    if sample_idx < len(flat_obj_idx):
+                        img_idx = flat_obj_idx[sample_idx].item()
+                        if img_idx < len(flat_imgs):
+                            img_tensor = flat_imgs[img_idx]  # [C, H, W]
+                            if img_tensor.is_cuda:
+                                img_tensor = img_tensor.cpu()
+                            img_np = img_tensor.numpy().transpose(1, 2, 0)  # [H, W, C]
+                            # Denormalize ImageNet
+                            mean = np.array([0.485, 0.456, 0.406])
+                            std = np.array([0.229, 0.224, 0.225])
+                            original_img = img_np * std + mean
+                            original_img = np.clip(original_img, 0, 1)
+
+                # Last resort: use simple extraction (for legacy compatibility)
+                if original_img is None:
+                    original_img = self._extract_original_image(batch, frame_idx=0, batch_idx=0)
+
+            # Resize uncertainty to match original image size (smoothing out grid artifacts)
+            if original_img is not None:
+                H_img, W_img = original_img.shape[:2]
+                H_unc, W_unc = uncertainty_np.shape
+                if H_unc != H_img or W_unc != W_img:
+                    import cv2
+
+                    # Use INTER_LINEAR (Bilinear) to smooth out grid artifacts from components
+                    uncertainty_np = cv2.resize(uncertainty_np, (W_img, H_img), interpolation=cv2.INTER_LINEAR)
+
+            # Normalize uncertainty using robust percentiles to [0, 1]
+            unc_p1 = np.percentile(uncertainty_np, 1)
+            unc_p99 = np.percentile(uncertainty_np, 99)
+            if unc_p99 - unc_p1 > 1e-6:
+                uncertainty_norm = np.clip((uncertainty_np - unc_p1) / (unc_p99 - unc_p1), 0, 1)
+            else:
+                uncertainty_norm = np.clip(uncertainty_np, 0, 1)
+
+            # Log to TensorBoard - only log if BOTH uncertainty and original image are available
+            # This ensures consistent step numbers across all Uncertainty/* visualizations
+            if self.logger.tb_logger and self.logger.tb_logger._writer and original_img is not None:
+                # Log grayscale uncertainty map [1, H, W]
+                unc_tensor = torch.from_numpy(uncertainty_norm.astype(np.float32)).unsqueeze(0)
+                self.logger.tb_logger._writer.add_image(f"Uncertainty/train_uncertainty_map", unc_tensor, step)
+
+                # Log original input image (always available if we reach here)
+                # original_img is [H, W, 3] numpy array with values in [0, 1]
+                orig_tensor = torch.from_numpy(original_img.astype(np.float32)).permute(2, 0, 1)  # [3, H, W]
+                self.logger.tb_logger._writer.add_image(f"Uncertainty/train_original_input", orig_tensor, step)
+
+                # Log uncertainty scalar statistics
+                self.logger.log("Uncertainty/train_mean", float(uncertainty_np.mean()), step)
+                self.logger.log("Uncertainty/train_max", float(uncertainty_np.max()), step)
+                self.logger.log("Uncertainty/train_std", float(uncertainty_np.std()), step)
+
+                # Flush to disk to prevent data loss from TensorBoard caching
+                self.logger.tb_logger._writer.flush()
+
+        except Exception as e:
+            logging.debug(f"Uncertainty visualization failed at step {step}: {e}")
+
+    def _log_clean_vs_adv_comparison(self, bndl_outputs, batch, outputs, step, frame_index=0):
+        """Log raw images to Clean/ and Adv/ sections in TensorBoard.
+
+        Logs individual images without any modification or overlay:
+        - Clean/input, Clean/segmentation, Clean/uncertainty
+        - Adv/input, Adv/segmentation, Adv/uncertainty
+
+        Also saves images to disk at: {log_dir}/vis/{step}/clean/ and {log_dir}/vis/{step}/adv/
+        """
+        import cv2
+
+        if bndl_outputs is None:
+            return
+
+        # Check if adversarial outputs are available
+        adv_outputs = bndl_outputs.get("adv_outputs")
+        if adv_outputs is None:
+            return
+
+        try:
+            writer = self.logger.tb_logger._writer if self.logger.tb_logger else None
+
+            # === Extract Clean Branch Data ===
+            clean_uncertainty = bndl_outputs.get("pixel_uncertainty")
+            clean_masks = bndl_outputs.get("masks_bndl")  # [B, K, H, W]
+
+            # === Extract Adversarial Branch Data ===
+            adv_aux = adv_outputs.get("aux_outputs", {})
+            adv_bndl = adv_aux.get("bndl", {}) if isinstance(adv_aux, dict) else {}
+            adv_uncertainty = adv_bndl.get("pixel_uncertainty")
+            adv_pred_masks = adv_outputs.get("pred_masks")  # [B, M, H, W]
+
+            if clean_uncertainty is None:
+                return
+
+            # === Get sample index ===
+            unc_batch_size = clean_uncertainty.shape[0]
+            sample_idx = step % unc_batch_size
+
+            # === Extract images from vis_data ===
+            vis_data = self._extract_vis_data_from_outputs(outputs)
+            if vis_data is None:
+                return
+
+            original_denorm = self._denormalize_images(vis_data.original_images)
+            adv_denorm = self._denormalize_images(vis_data.adversarial_images)
+
+            if original_denorm is None or sample_idx >= len(original_denorm):
+                return
+
+            # === Log Clean Branch ===
+            # Clean input image [3, H, W]
+            clean_img_tensor = original_denorm[sample_idx].cpu().clamp(0, 1)
+            if writer:
+                writer.add_image("Clean/input", clean_img_tensor, step)
+            # Save to disk
+            self._save_image_to_disk(clean_img_tensor, step, "clean", "input")
+
+            # Clean segmentation mask [1, H, W]
+            if clean_masks is not None and sample_idx < clean_masks.shape[0]:
+                clean_mask = clean_masks[sample_idx, 0:1].detach().cpu().float()  # [1, H, W]
+                clean_mask = (clean_mask > 0).float()  # Binary mask
+                if writer:
+                    writer.add_image("Clean/segmentation", clean_mask, step)
+                # Save to disk
+                self._save_image_to_disk(clean_mask, step, "clean", "segmentation")
+
+            # Clean uncertainty [1, H, W]
+            clean_unc_sample = clean_uncertainty[sample_idx]
+            if clean_unc_sample.ndim > 2:
+                clean_unc_sample = clean_unc_sample.mean(dim=-1)  # [H, W]
+            clean_unc_tensor = clean_unc_sample.detach().cpu().unsqueeze(0)  # [1, H, W]
+            # Normalize to [0, 1]
+            unc_min, unc_max = clean_unc_tensor.min(), clean_unc_tensor.max()
+            if unc_max - unc_min > 1e-6:
+                clean_unc_tensor = (clean_unc_tensor - unc_min) / (unc_max - unc_min)
+            if writer:
+                writer.add_image("Clean/uncertainty", clean_unc_tensor, step)
+            # Save to disk
+            self._save_image_to_disk(clean_unc_tensor, step, "clean", "uncertainty")
+
+            # === Log Adversarial Branch ===
+            if adv_denorm is not None and sample_idx < len(adv_denorm):
+                # Adv input image [3, H, W]
+                adv_img_tensor = adv_denorm[sample_idx].cpu().clamp(0, 1)
+                if writer:
+                    writer.add_image("Adv/input", adv_img_tensor, step)
+                # Save to disk
+                self._save_image_to_disk(adv_img_tensor, step, "adv", "input")
+
+            # Adv segmentation mask [1, H, W]
+            if adv_pred_masks is not None:
+                adv_sample_idx = min(sample_idx, adv_pred_masks.shape[0] - 1)
+                adv_mask = adv_pred_masks[adv_sample_idx, 0:1].detach().cpu().float()  # [1, H, W]
+                adv_mask = (adv_mask > 0).float()  # Binary mask
+                if writer:
+                    writer.add_image("Adv/segmentation", adv_mask, step)
+                # Save to disk
+                self._save_image_to_disk(adv_mask, step, "adv", "segmentation")
+
+            # Adv uncertainty [1, H, W]
+            if adv_uncertainty is not None:
+                adv_sample_idx = min(sample_idx, adv_uncertainty.shape[0] - 1)
+                adv_unc_sample = adv_uncertainty[adv_sample_idx]
+                if adv_unc_sample.ndim > 2:
+                    adv_unc_sample = adv_unc_sample.mean(dim=-1)  # [H, W]
+                adv_unc_tensor = adv_unc_sample.detach().cpu().unsqueeze(0)  # [1, H, W]
+                # Normalize to [0, 1]
+                unc_min, unc_max = adv_unc_tensor.min(), adv_unc_tensor.max()
+                if unc_max - unc_min > 1e-6:
+                    adv_unc_tensor = (adv_unc_tensor - unc_min) / (unc_max - unc_min)
+                if writer:
+                    writer.add_image("Adv/uncertainty", adv_unc_tensor, step)
+                # Save to disk
+                self._save_image_to_disk(adv_unc_tensor, step, "adv", "uncertainty")
+
+            if writer:
+                writer.flush()
+
+        except Exception as e:
+            logging.debug(f"Clean vs Adv logging failed at step {step}: {e}")
 
     def _plot_image_with_bboxes(self, img_np, bboxes=None, primary_idx=0, include_background=False, K=None, masks=None, epsilon_weights=None, ax=None):
         """Standardized plotting function for image with bboxes/masks using Matplotlib.
@@ -1944,17 +3182,17 @@ class Trainer:
             if is_bg_obj:
                 color = "lime"
                 linestyle = "--"
-                linewidth = 2
+                linewidth = 1.0  # Thin contour for better visibility of small deformations
                 label_suffix = " (BG)"
             elif k == primary_idx:
                 color = "red"
                 linestyle = "-"
-                linewidth = 3  # Thicker for primary
+                linewidth = 1.0  # Thin contour for better visibility of small deformations
                 label_suffix = "*"
             else:
                 color = "cyan"
                 linestyle = "-"
-                linewidth = 2
+                linewidth = 1.0  # Thin contour for better visibility of small deformations
                 label_suffix = ""
 
             # Add epsilon info if available
@@ -1962,14 +3200,8 @@ class Trainer:
                 eps = epsilon_weights[k].item()
                 label_suffix += f" ε{eps:.2f}"
 
-            # Draw BBox
-            if is_valid_bbox:
-                rect = patches.Rectangle((x1, y1), x2 - x1, y2 - y1, linewidth=linewidth, edgecolor=color, facecolor="none", linestyle=linestyle, alpha=0.8)
-                ax.add_patch(rect)
-
-                # Add label (optional, maybe make configurable?)
-                # ax.text(x1, y1-2, f"O{k}{label_suffix}", color=color, fontsize=8, fontweight='bold',
-                #        bbox=dict(facecolor='black', alpha=0.5, pad=0, edgecolor='none'))
+            # BBox drawing removed for cleaner visualization
+            # (bbox was too cluttered and didn't add useful info for deformation visualization)
 
             # Draw Contour (if masks provided)
             if masks is not None:
@@ -1978,7 +3210,7 @@ class Trainer:
                     mask_k = mask_k.cpu().numpy()
                 contours = measure.find_contours(mask_k, 0.5)
                 for contour in contours:
-                    ax.plot(contour[:, 1], contour[:, 0], color=color, linewidth=linewidth, linestyle=linestyle, alpha=0.6)
+                    ax.plot(contour[:, 1], contour[:, 0], color=color, linewidth=linewidth, linestyle=linestyle, alpha=0.8)
 
         # Return logic
         if standalone:
@@ -2197,97 +3429,136 @@ class Trainer:
         img_array = img_array.reshape(height, width, 4)[:, :, :3]
         img_tensor = torch.from_numpy(img_array).permute(2, 0, 1).float() / 255.0
 
-        # Log to TensorBoard
-        if self.logger.tb_logger and self.logger.tb_logger._writer:
+        # Log to TensorBoard and save to disk
+        writer = self.logger.tb_logger._writer if self.logger.tb_logger else None
+
+        # Save combined figure to disk
+        self._save_image_to_disk(fig, step, "StyleAUE", "combined_view")
+
+        if writer:
             tag_suffix = "multi_object" if is_multi_object else "single_object"
-            self.logger.tb_logger._writer.add_image(f"StyleAUE/{tag_suffix}_sample_{sample_id}", img_tensor, step)
-            # === Paper-quality individual images (no statistics overlay) ===
-            # Log original image only
-            orig_tensor = torch.from_numpy(orig_np).permute(2, 0, 1).float()
-            orig_tensor = torch.clamp(orig_tensor, 0, 1)
-            self.logger.tb_logger._writer.add_image(f"StyleAUE/original_sample_{sample_id}", orig_tensor, step)
+            writer.add_image(f"StyleAUE/{tag_suffix}", img_tensor, step)
 
-            # Log original image with bbox overlays (for showing attack region)
-            # Color scheme: Red = primary object (for loss), cyan = other objects
-            # Use loss_object_idx if available (passed from training), otherwise default to 0
-            primary_obj_idx = loss_object_idx if loss_object_idx is not None else 0
+        # === Paper-quality individual images (no statistics overlay) ===
+        # Log original image only
+        orig_tensor = torch.from_numpy(orig_np).permute(2, 0, 1).float()
+        orig_tensor = torch.clamp(orig_tensor, 0, 1)
+        if writer:
+            writer.add_image(f"StyleAUE/original", orig_tensor, step)
+        # Save to disk
+        self._save_image_to_disk(orig_tensor, step, "StyleAUE", "original")
 
-            if all_bboxes is not None:
-                K_val = all_bboxes.shape[0]
-                orig_with_bbox = self._plot_image_with_bboxes(orig_np, all_bboxes, primary_obj_idx, include_background=include_background, K=K_val, masks=all_masks, ax=None)
-                orig_bbox_tensor = torch.from_numpy(orig_with_bbox).permute(2, 0, 1).float() / 255.0
-                self.logger.tb_logger._writer.add_image(f"StyleAUE/original_with_bbox_sample_{sample_id}", orig_bbox_tensor, step)
-            elif bbox is not None:
-                # Single bbox - wrap in array for helper function
-                single_bbox = bbox.unsqueeze(0) if hasattr(bbox, "unsqueeze") else np.expand_dims(bbox, 0)
-                orig_with_bbox = self._plot_image_with_bboxes(
-                    orig_np,
-                    single_bbox,
-                    0,
-                    include_background=False,
-                    K=1,
-                    masks=gt_mask.unsqueeze(0) if hasattr(gt_mask, "unsqueeze") else np.expand_dims(gt_mask, 0) if gt_mask is not None else None,
-                    ax=None,
-                )
-                orig_bbox_tensor = torch.from_numpy(orig_with_bbox).permute(2, 0, 1).float() / 255.0
-                self.logger.tb_logger._writer.add_image(f"StyleAUE/original_with_bbox_sample_{sample_id}", orig_bbox_tensor, step)
+        # Log original image with bbox overlays (for showing attack region)
+        # Color scheme: Red = primary object (for loss), cyan = other objects
+        # Use loss_object_idx if available (passed from training), otherwise default to 0
+        primary_obj_idx = loss_object_idx if loss_object_idx is not None else 0
 
-            # Log adversarial image only
-            adv_tensor = torch.from_numpy(adv_np).permute(2, 0, 1).float()
-            adv_tensor = torch.clamp(adv_tensor, 0, 1)
-            self.logger.tb_logger._writer.add_image(f"StyleAUE/adversarial_sample_{sample_id}", adv_tensor, step)
+        if all_bboxes is not None:
+            K_val = all_bboxes.shape[0]
+            orig_with_bbox = self._plot_image_with_bboxes(orig_np, all_bboxes, primary_obj_idx, include_background=include_background, K=K_val, masks=all_masks, ax=None)
+            orig_bbox_tensor = torch.from_numpy(orig_with_bbox).permute(2, 0, 1).float() / 255.0
+            if writer:
+                writer.add_image(f"StyleAUE/original_with_bbox", orig_bbox_tensor, step)
+            # Save to disk
+            self._save_image_to_disk(orig_with_bbox, step, "StyleAUE", "original_with_bbox")
+        elif bbox is not None:
+            # Single bbox - wrap in array for helper function
+            single_bbox = bbox.unsqueeze(0) if hasattr(bbox, "unsqueeze") else np.expand_dims(bbox, 0)
+            orig_with_bbox = self._plot_image_with_bboxes(
+                orig_np,
+                single_bbox,
+                0,
+                include_background=False,
+                K=1,
+                masks=gt_mask.unsqueeze(0) if hasattr(gt_mask, "unsqueeze") else np.expand_dims(gt_mask, 0) if gt_mask is not None else None,
+                ax=None,
+            )
+            orig_bbox_tensor = torch.from_numpy(orig_with_bbox).permute(2, 0, 1).float() / 255.0
+            if writer:
+                writer.add_image(f"StyleAUE/original_with_bbox", orig_bbox_tensor, step)
+            # Save to disk
+            self._save_image_to_disk(orig_with_bbox, step, "StyleAUE", "original_with_bbox")
 
-            # Log adversarial image with bbox overlays (same color scheme)
-            if all_bboxes is not None:
-                K_val = all_bboxes.shape[0]
-                adv_with_bbox = self._plot_image_with_bboxes(adv_np, all_bboxes, primary_obj_idx, include_background=include_background, K=K_val, masks=all_masks, ax=None)
-                adv_bbox_tensor = torch.from_numpy(adv_with_bbox).permute(2, 0, 1).float() / 255.0
-                self.logger.tb_logger._writer.add_image(f"StyleAUE/adversarial_with_bbox_sample_{sample_id}", adv_bbox_tensor, step)
+        # Log adversarial image only
+        adv_tensor = torch.from_numpy(adv_np).permute(2, 0, 1).float()
+        adv_tensor = torch.clamp(adv_tensor, 0, 1)
+        if writer:
+            writer.add_image(f"StyleAUE/adversarial", adv_tensor, step)
+        # Save to disk
+        self._save_image_to_disk(adv_tensor, step, "StyleAUE", "adversarial")
 
-            # Log difference image (amplified for visibility)
-            diff = np.abs(adv_np - orig_np)
-            diff_amplified = np.clip(diff * 5.0, 0, 1)  # Amplify by 5x
-            diff_tensor = torch.from_numpy(diff_amplified).permute(2, 0, 1).float()
-            self.logger.tb_logger._writer.add_image(f"StyleAUE/difference_sample_{sample_id}", diff_tensor, step)
+        # Log adversarial image with bbox overlays (same color scheme)
+        if all_bboxes is not None:
+            K_val = all_bboxes.shape[0]
+            adv_with_bbox = self._plot_image_with_bboxes(adv_np, all_bboxes, primary_obj_idx, include_background=include_background, K=K_val, masks=all_masks, ax=None)
+            adv_bbox_tensor = torch.from_numpy(adv_with_bbox).permute(2, 0, 1).float() / 255.0
+            if writer:
+                writer.add_image(f"StyleAUE/adversarial_with_bbox", adv_bbox_tensor, step)
+            # Save to disk
+            self._save_image_to_disk(adv_with_bbox, step, "StyleAUE", "adversarial_with_bbox")
 
-            # Log GT Mask (Standalone)
-            if all_masks is not None:
-                gt_masks_np = all_masks.cpu().numpy()
-                gt_vis_np = np.zeros((*gt_masks_np.shape[-2:], 3), dtype=np.uint8)
-                colors = [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0], [0, 255, 255]]
-                for k in range(gt_masks_np.shape[0]):
-                    mask_k = gt_masks_np[k] > 0.5
-                    color = colors[k % len(colors)]
-                    for c in range(3):
-                        gt_vis_np[..., c] = np.where(mask_k, color[c], gt_vis_np[..., c])
+        # Log difference image (amplified for visibility)
+        diff = np.abs(adv_np - orig_np)
+        diff_amplified = np.clip(diff * 5.0, 0, 1)  # Amplify by 5x
+        diff_tensor = torch.from_numpy(diff_amplified).permute(2, 0, 1).float()
+        if writer:
+            writer.add_image(f"StyleAUE/difference", diff_tensor, step)
+        # Save to disk
+        self._save_image_to_disk(diff_tensor, step, "StyleAUE", "difference")
 
-                gt_tensor = torch.from_numpy(gt_vis_np).permute(2, 0, 1).float() / 255.0
-                self.logger.tb_logger._writer.add_image(f"StyleAUE/gt_mask_sample_{sample_id}", gt_tensor, step)
-            elif gt_mask is not None:
-                # Single mask
-                gt_mask_np = gt_mask.cpu().numpy() if hasattr(gt_mask, "cpu") else gt_mask
-                gt_vis_np = np.zeros((*gt_mask_np.shape[-2:], 3), dtype=np.uint8)
-                mask_k = gt_mask_np > 0.5
-                # Use cyan for single mask
-                gt_vis_np[..., 1] = np.where(mask_k, 255, 0)
-                gt_vis_np[..., 2] = np.where(mask_k, 255, 0)
-                gt_tensor = torch.from_numpy(gt_vis_np).permute(2, 0, 1).float() / 255.0
-                self.logger.tb_logger._writer.add_image(f"StyleAUE/gt_mask_sample_{sample_id}", gt_tensor, step)
+        # Log GT Mask (Standalone) - background stays black
+        if all_masks is not None:
+            gt_masks_np = all_masks.cpu().numpy()
+            gt_vis_np = np.zeros((*gt_masks_np.shape[-2:], 3), dtype=np.uint8)
+            # Skip background object (last one when include_background is True)
+            n_objs_to_draw = gt_masks_np.shape[0] - 1 if include_background else gt_masks_np.shape[0]
+            colors = [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0], [0, 255, 255]]
+            for k in range(n_objs_to_draw):
+                mask_k = gt_masks_np[k] > 0.5
+                color = colors[k % len(colors)]
+                for c in range(3):
+                    gt_vis_np[..., c] = np.where(mask_k, color[c], gt_vis_np[..., c])
 
-            # Log Prediction Mask (Standalone)
-            if pred_mask is not None:
-                pred_np = pred_mask.cpu().numpy()
-                pred_bin = pred_np > 0.0
-                pred_vis_np = np.zeros((*pred_bin.shape[-2:], 3), dtype=np.uint8)
-                colors = [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0], [0, 255, 255]]
-                for k in range(pred_bin.shape[0]):
-                    mask_k = pred_bin[k]
-                    color = colors[k % len(colors)]
-                    for c in range(3):
-                        pred_vis_np[..., c] = np.where(mask_k, color[c], pred_vis_np[..., c])
+            gt_tensor = torch.from_numpy(gt_vis_np).permute(2, 0, 1).float() / 255.0
+            if writer:
+                writer.add_image(f"StyleAUE/gt_mask", gt_tensor, step)
+            # Save to disk
+            self._save_image_to_disk(gt_vis_np, step, "StyleAUE", "gt_mask")
+        elif gt_mask is not None:
+            # Single mask
+            gt_mask_np = gt_mask.cpu().numpy() if hasattr(gt_mask, "cpu") else gt_mask
+            gt_vis_np = np.zeros((*gt_mask_np.shape[-2:], 3), dtype=np.uint8)
+            mask_k = gt_mask_np > 0.5
+            # Use cyan for single mask
+            gt_vis_np[..., 1] = np.where(mask_k, 255, 0)
+            gt_vis_np[..., 2] = np.where(mask_k, 255, 0)
+            gt_tensor = torch.from_numpy(gt_vis_np).permute(2, 0, 1).float() / 255.0
+            if writer:
+                writer.add_image(f"StyleAUE/gt_mask", gt_tensor, step)
+            # Save to disk
+            self._save_image_to_disk(gt_vis_np, step, "StyleAUE", "gt_mask")
 
-                pred_tensor = torch.from_numpy(pred_vis_np).permute(2, 0, 1).float() / 255.0
-                self.logger.tb_logger._writer.add_image(f"StyleAUE/pred_mask_sample_{sample_id}", pred_tensor, step)
+        # Log Prediction Mask (Standalone)
+        if pred_mask is not None:
+            pred_np = pred_mask.cpu().numpy()
+            pred_bin = pred_np > 0.0
+            pred_vis_np = np.zeros((*pred_bin.shape[-2:], 3), dtype=np.uint8)
+            colors = [[255, 0, 0], [0, 255, 0], [0, 0, 255], [255, 255, 0], [0, 255, 255]]
+            for k in range(pred_bin.shape[0]):
+                mask_k = pred_bin[k]
+                color = colors[k % len(colors)]
+                for c in range(3):
+                    pred_vis_np[..., c] = np.where(mask_k, color[c], pred_vis_np[..., c])
+
+            pred_tensor = torch.from_numpy(pred_vis_np).permute(2, 0, 1).float() / 255.0
+            if writer:
+                writer.add_image(f"StyleAUE/pred_mask", pred_tensor, step)
+            # Save to disk
+            self._save_image_to_disk(pred_vis_np, step, "StyleAUE", "pred_mask")
+
+        # IMPORTANT: Flush to disk immediately to prevent data loss from TensorBoard caching
+        if writer:
+            writer.flush()
 
         plt.close(fig)
 
@@ -2720,11 +3991,14 @@ class Trainer:
 
             # Extract specific batch and frame
             if len(img_batch.shape) == 5:  # [T, B, C, H, W]
-                T = img_batch.shape[0]
+                T, B = img_batch.shape[0], img_batch.shape[1]
                 safe_t = max(0, min(int(frame_idx), T - 1))
-                orig_tensor = img_batch[safe_t, batch_idx]  # [C, H, W]
+                safe_b = max(0, min(int(batch_idx), B - 1))
+                orig_tensor = img_batch[safe_t, safe_b]  # [C, H, W]
             elif len(img_batch.shape) == 4:  # [B, C, H, W]
-                orig_tensor = img_batch[batch_idx]  # [C, H, W]
+                B = img_batch.shape[0]
+                safe_b = max(0, min(int(batch_idx), B - 1))
+                orig_tensor = img_batch[safe_b]  # [C, H, W]
             else:
                 return None
 
@@ -2756,7 +4030,12 @@ class Trainer:
             return None
 
     def _extract_prediction(self, outputs, batch_idx, frame_idx=0):
-        """Extract predicted mask for a specific batch index."""
+        """Extract predicted mask for a specific batch index.
+
+        NOTE: Uses high-resolution masks (pred_masks_high_res) for visualization,
+        as low-resolution masks (pred_masks) are 256x256 while images are 1024x1024.
+        Using low-res masks directly causes noise-like visualization artifacts.
+        """
         try:
             # If outputs is a list of frames, get the specific frame
             if isinstance(outputs, list):
@@ -2765,11 +4044,21 @@ class Trainer:
                 else:
                     outputs = outputs[0]  # Fallback
 
-            # Check for pred_masks in dict
-            if isinstance(outputs, dict) and "pred_masks" in outputs:
-                pred_masks = outputs["pred_masks"]  # [B, K, H, W]
-                if pred_masks is not None and batch_idx < pred_masks.shape[0]:
-                    return pred_masks[batch_idx]
+            # Prefer high-resolution masks for visualization
+            # pred_masks_high_res: [B, K, H_img, W_img] (1024x1024)
+            # pred_masks: [B, K, H*4, W*4] (256x256) - too low for visualization
+            if isinstance(outputs, dict):
+                # Try high-res first (correct resolution for visualization)
+                if "pred_masks_high_res" in outputs:
+                    pred_masks = outputs["pred_masks_high_res"]
+                    if pred_masks is not None and batch_idx < pred_masks.shape[0]:
+                        return pred_masks[batch_idx]
+
+                # Fallback to low-res (but note: will need upsampling for proper visualization)
+                if "pred_masks" in outputs:
+                    pred_masks = outputs["pred_masks"]
+                    if pred_masks is not None and batch_idx < pred_masks.shape[0]:
+                        return pred_masks[batch_idx]
 
             return None
         except Exception:

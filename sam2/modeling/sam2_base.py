@@ -18,44 +18,11 @@ from sam2.modeling.sam.mask_decoder import MaskDecoder
 from sam2.modeling.sam.prompt_encoder import PromptEncoder
 from sam2.modeling.sam.transformer import TwoWayTransformer
 from sam2.modeling.sam2_utils import get_1d_sine_pe, MLP, select_closest_cond_frames
+from sam2.modeling.aue.config import AUEConfig
+from sam2.modeling.aue.module import AUEModule
 
 # a large negative value as a placeholder score for missing objects
 NO_OBJ_SCORE = -1024.0
-
-
-@dataclass
-class AUEVisualizationData:
-    """Container for AUE visualization data."""
-
-    original_images: torch.Tensor  # [N, 3, H, W] CPU
-    adversarial_images: torch.Tensor  # [N, 3, H, W] CPU
-    original_styles: torch.Tensor | None  # [N, K, 6] CPU
-    adversarial_styles: torch.Tensor | None  # [N, K, 6] CPU
-    num_objects: int  # K
-    all_object_masks: torch.Tensor | None  # [N, K, H, W] CPU
-    all_bboxes: torch.Tensor | None  # [N, K, 4] CPU
-    area_ratios: torch.Tensor | None  # [N, K] CPU
-    epsilon_weights: torch.Tensor | None  # [N, K] CPU
-    combined_mask_for_loss: torch.Tensor | None  # [N, 1, H, W] CPU
-    # Deformation visualization data
-    deform_offsets: torch.Tensor | None  # [N, K, 2, H, W] CPU (deformation offset fields)
-    warped_images: torch.Tensor | None  # [N, 3, H, W] CPU (soft-composited warped images from offsets)
-    warped_object_masks: torch.Tensor | None = None  # [N, K, H, W] CPU (post-deformation masks)
-    attack_order: list[str] | None = None  # Applied adversarial order for visualization selection
-    # Track which object index (within K objects) is being trained for each sample
-    # This is the "primary" object for loss computation, should be highlighted in visualization
-    loss_object_indices: torch.Tensor | None = None  # [N] CPU - local object index for each batch sample
-    # Style visualization data (already included above via original/adversarial images and styles)
-
-
-@dataclass
-class AUEAdversarialBatch:
-    """Container for adversarial generation results."""
-
-    adv_images: torch.Tensor | None  # [M, 3, H, W]
-    adv_gts: torch.Tensor | None  # [M, H, W]
-    adv_prompts: torch.Tensor | None  # [M, 4]
-    visualization_data: AUEVisualizationData | None = None
 
 
 @dataclass
@@ -68,58 +35,10 @@ class BNDLOutputs:
     pixel_uncertainty: torch.Tensor | None = None  # [B, H, W]
 
 
-# Import nn for LoRA implementation
 import torch.nn as nn
 
-
-class _LoRA_qkv_hiera(nn.Module):
-    """LoRA wrapper for Hiera's MultiScaleAttention.qkv layer.
-
-    In Hiera's MultiScaleAttention:
-        self.qkv = nn.Linear(dim, dim_out * 3)
-        qkv = self.qkv(x).reshape(B, H * W, 3, self.num_heads, -1)
-        q, k, v = torch.unbind(qkv, 2)
-
-    We apply LoRA to Q and V only (not K), following SAMed's design.
-    """
-
-    def __init__(
-        self,
-        qkv: nn.Module,
-        linear_a_q: nn.Module,
-        linear_b_q: nn.Module,
-        linear_a_v: nn.Module,
-        linear_b_v: nn.Module,
-    ):
-        super().__init__()
-        self.qkv = qkv
-        self.linear_a_q = linear_a_q
-        self.linear_b_q = linear_b_q
-        self.linear_a_v = linear_a_v
-        self.linear_b_v = linear_b_v
-        self.dim_in = qkv.in_features
-        self.dim_out = qkv.out_features // 3  # dim_out for each of Q, K, V
-        # Store in_features and out_features for compatibility
-        self.in_features = qkv.in_features
-        self.out_features = qkv.out_features
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Original QKV output: [B, H, W, dim_out * 3]
-        qkv = self.qkv(x)
-
-        # LoRA additions for Q and V
-        # x shape: [B, H, W, dim_in]
-        new_q = self.linear_b_q(self.linear_a_q(x))  # [B, H, W, dim_out]
-        new_v = self.linear_b_v(self.linear_a_v(x))  # [B, H, W, dim_out]
-
-        # Add LoRA outputs to Q and V parts
-        # QKV layout: [Q, K, V] each of size dim_out
-        qkv = qkv.clone()  # Avoid in-place modification
-        qkv[..., : self.dim_out] = qkv[..., : self.dim_out] + new_q  # Q
-        qkv[..., -self.dim_out :] = qkv[..., -self.dim_out :] + new_v  # V
-        # K (middle part) remains unchanged
-
-        return qkv
+# LoRA is now implemented via Hugging Face PEFT library for memory efficiency
+# See _apply_lora_to_image_encoder() for the PEFT-based implementation
 
 
 class SAM2Base(torch.nn.Module):
@@ -202,16 +121,14 @@ class SAM2Base(torch.nn.Module):
         compile_image_encoder: bool = False,
         # AUE options (Adversarial Uncertainty Estimation)
         use_aue: bool = False,
+        # Alternating training: probability of running AUE branch per step (0~1)
+        aue_probability: float = 0.5,
         # Number of adversarial samples in the bank
         aue_num_adversarial_samples: int = 32,
         # Whether to initialize adversarial samples from dataset
         aue_init_from_dataset: bool = False,
         # Diversity regularization for adversarial samples
         aue_diversity_loss_weight: float = 0.0,  # Weight for diversity regularization (0 = disabled)
-        # Constraint weight for adversarial samples (L1 distance to initial)
-        aue_constraint_loss_weight: float = 0.0,  # Weight for constraint regularization (0 = disabled)
-        # Attack mode: "cooperative" (parallel prediction, joint application) or "sequential" (iterative)
-        aue_attack_mode: str = "cooperative",
         # Style Adversarial options (alternative to AUE, for domain generalization)
         use_style_adv: bool = False,
         style_adv_mode: str = "image_level",  # "image_level" or "feature_level"
@@ -224,8 +141,6 @@ class SAM2Base(torch.nn.Module):
         style_adv_use_global_local_mix: bool = False,  # Enable global+local mixed style perturbation
         style_adv_global_epsilon: float = 1.5,  # Perturbation budget for global style
         style_adv_global_weight: float = 0.7,  # Weight of global style shift (0=local only, 1=global only)
-        # Distribution matching configuration for AUE calibration loss
-        aue_dist_matching_config: dict | None = None,  # Nested config dict
         # Analytic uncertainty computation (from Weibull parameters, with gradients)
         aue_use_analytic_uncertainty: bool = True,  # Use analytic uncertainty (enables bidirectional optimization)
         # GCN-based multi-object style refinement
@@ -240,7 +155,6 @@ class SAM2Base(torch.nn.Module):
         style_adv_gcn_use_visual_features: bool = False,  # Enable visual features in GCN for semantic edges
         style_adv_gcn_feature_dim: int = 256,  # Feature dimension (matches backbone_fpn[-1])
         style_adv_gcn_feature_sim_threshold: float = 0.5,  # Cosine similarity threshold for semantic edges
-        style_adv_gcn_grl_alpha: float = 0.1,  # GRL alpha for GCN path (lower = more stable)
         # Deformation Adversarial options (DG-Font style, feature-level)
         use_deform_adv: bool = False,
         deform_adv_epsilon: float = 30.0,  # Deformation strength in pixels (image space)
@@ -254,7 +168,6 @@ class SAM2Base(torch.nn.Module):
         deform_adv_freeze_encoder_components: bool = False,  # Freeze all encoder components (mask_encoder, img_feat_proj, fuser)
         deform_adv_zero_mean_offsets: bool = False,  # Remove global shift in flow fields
         deform_adv_local_offset_gain: float = 1.0,  # Boost local deformation after centering
-        deform_adv_grl_alpha: float = 0.1,  # GRL alpha for deformation offsets (lower = more stable)
         # Adversarial pipeline control
         adversarial_attack_order: list[str] | None = None,  # Order of attacks, e.g., ["deform", "style"]
         # Max number of objects (for AUE tensor allocation, matches dataset sampler)
@@ -268,21 +181,36 @@ class SAM2Base(torch.nn.Module):
         lora_target_modules: list[str] | None = None,  # e.g., ["attn.qkv", "attn.proj", "mlp"]
         lora_expert_scales: list[float] | None = None,  # Conv-LoRA only
         lora_top_k: int = 1,  # Conv-LoRA only
+        # Memory optimization: gradient checkpointing for AUE decoder
+        use_aue_decoder_checkpoint: bool = True,  # Enable checkpoint for AUE branch decoder (reduces memory ~40%)
     ):
         super().__init__()
+        self.use_aue_decoder_checkpoint = use_aue_decoder_checkpoint
         self.max_num_objects = max_num_objects
-        self.aue_attack_mode = aue_attack_mode
+
+        # Helper function to instantiate modules from Hydra DictConfig
+        def _maybe_instantiate(module, name: str):
+            """Instantiate module from Hydra config if needed."""
+            try:
+                from omegaconf import DictConfig
+                from hydra.utils import instantiate
+
+                if isinstance(module, DictConfig):
+                    logging.debug(f"Instantiating {name} from Hydra config...")
+                    return instantiate(module)
+            except ImportError:
+                pass  # omegaconf not available
+            return module
 
         # Part 1: the image backbone
-        self.image_encoder = image_encoder
+        self.image_encoder = _maybe_instantiate(image_encoder, "image_encoder")
 
         # Apply LoRA if enabled (parameter-efficient fine-tuning)
-        # Uses SAMed-style manual LoRA: only Q and V, not K
+        # Uses PEFT library for memory-efficient LoRA
         self.use_lora = use_lora
         self.lora_rank = lora_rank
-        self.lora_layers: list[int] | None = None  # Will be set when LoRA is applied
-        self.lora_w_As: nn.ModuleList | None = None
-        self.lora_w_Bs: nn.ModuleList | None = None
+        self.lora_alpha = lora_alpha
+        self.lora_dropout = lora_dropout
 
         if use_lora:
             self._apply_lora_to_image_encoder(lora_rank)
@@ -305,11 +233,11 @@ class SAM2Base(torch.nn.Module):
 
         # Part 2: memory attention to condition current frame's visual features
         # with memories (and obj ptrs) from past frames
-        self.memory_attention = memory_attention
-        self.hidden_dim = image_encoder.neck.d_model
+        self.memory_attention = _maybe_instantiate(memory_attention, "memory_attention")
+        self.hidden_dim = self.image_encoder.neck.d_model
 
         # Part 3: memory encoder for the previous frame's outputs
-        self.memory_encoder = memory_encoder
+        self.memory_encoder = _maybe_instantiate(memory_encoder, "memory_encoder")
         self.mem_dim = self.hidden_dim
         if hasattr(self.memory_encoder, "out_proj") and hasattr(self.memory_encoder.out_proj, "weight"):
             # if there is compression of memories along channel dim
@@ -367,103 +295,57 @@ class SAM2Base(torch.nn.Module):
         self._build_sam_heads()
         self.max_cond_frames_in_attn = max_cond_frames_in_attn
 
-        # AUE components
-        self.use_aue = bool(use_aue)
-        self.aue_num_adversarial_samples = int(aue_num_adversarial_samples)
-        self.aue_init_from_dataset = bool(aue_init_from_dataset)
-        self.aue_diversity_loss_weight = float(aue_diversity_loss_weight)
-        self.aue_constraint_loss_weight = float(aue_constraint_loss_weight)
-        # Distribution matching configuration (nested config only)
-        self.aue_dist_matching_config = self._parse_dist_matching_config(aue_dist_matching_config)
+        # ========================================================================
+        # AUE Configuration (Adversarial Uncertainty Estimation)
+        # ========================================================================
+        # Build AUEConfig from constructor kwargs (backward compatible with flat YAML)
+        self.aue_config = AUEConfig.from_model_kwargs(
+            use_aue=use_aue,
+            aue_probability=aue_probability,
+            aue_use_analytic_uncertainty=aue_use_analytic_uncertainty,
+            adv_use_multi_object=adv_use_multi_object,
+            adv_enable_background=adv_enable_background,
+            aue_num_adversarial_samples=aue_num_adversarial_samples,
+            aue_init_from_dataset=aue_init_from_dataset,
+            aue_diversity_loss_weight=aue_diversity_loss_weight,
+            max_num_objects=max_num_objects,
+            # Style adversarial params
+            use_style_adv=use_style_adv,
+            style_adv_mode=style_adv_mode,
+            style_adv_epsilon=style_adv_epsilon,
+            style_adv_use_gt_region_style=style_adv_use_gt_region_style,
+            style_adv_use_global_local_mix=style_adv_use_global_local_mix,
+            style_adv_global_epsilon=style_adv_global_epsilon,
+            style_adv_global_weight=style_adv_global_weight,
+            style_adv_use_gcn=style_adv_use_gcn,
+            style_adv_gcn_hidden_dim=style_adv_gcn_hidden_dim,
+            style_adv_gcn_num_layers=style_adv_gcn_num_layers,
+            style_adv_gcn_edge_threshold=style_adv_gcn_edge_threshold,
+            style_adv_gcn_use_semantic_edges=style_adv_gcn_use_semantic_edges,
+            style_adv_gcn_use_background_edges=style_adv_gcn_use_background_edges,
+            style_adv_gcn_distance_threshold=style_adv_gcn_distance_threshold,
+            style_adv_gcn_use_boundary_distance=style_adv_gcn_use_boundary_distance,
+            style_adv_gcn_use_visual_features=style_adv_gcn_use_visual_features,
+            style_adv_gcn_feature_dim=style_adv_gcn_feature_dim,
+            style_adv_gcn_feature_sim_threshold=style_adv_gcn_feature_sim_threshold,
+            # Deformation adversarial params
+            use_deform_adv=use_deform_adv,
+            deform_adv_epsilon=deform_adv_epsilon,
+            deform_adv_use_soft_composite=deform_adv_use_soft_composite,
+            deform_adv_temperature=deform_adv_temperature,
+            deform_adv_use_gcn=deform_adv_use_gcn,
+            deform_adv_gcn_num_layers=deform_adv_gcn_num_layers,
+            deform_adv_num_deform_groups=deform_adv_num_deform_groups,
+            deform_adv_init_from_memory_encoder=deform_adv_init_from_memory_encoder,
+            deform_adv_freeze_encoder_components=deform_adv_freeze_encoder_components,
+            deform_adv_zero_mean_offsets=deform_adv_zero_mean_offsets,
+            deform_adv_local_offset_gain=deform_adv_local_offset_gain,
+            # Attack ordering
+            adversarial_attack_order=adversarial_attack_order,
+        )
 
-        # Extract commonly used values for convenience
-        self.aue_calibration_method = self.aue_dist_matching_config["method"]
-        self.aue_use_patches = self.aue_dist_matching_config["use_patches"]
-        self.aue_patch_size = self.aue_dist_matching_config["patch_size"]
-
-        # Analytic uncertainty configuration
-        self.aue_use_analytic_uncertainty = aue_use_analytic_uncertainty
-
-        # Initialize distribution matcher for calibration loss
-        if self.use_aue:
-            from sam2.modeling.distribution_matching import DistributionMatcher
-
-            cfg = self.aue_dist_matching_config
-
-            # Determine max_samples based on active method
-            if cfg["method"] == "domain_aware_soft_mmd":
-                current_max_samples = cfg.get("domain_aware_soft_mmd", {}).get("max_samples", 4096)
-            else:
-                current_max_samples = cfg.get("mmd_hard_aware", {}).get("max_samples", 4096)
-
-            self.distribution_matcher = DistributionMatcher(
-                method=cfg["method"],
-                patch_size=cfg["patch_size"],
-                kernel=cfg.get("mmd", {}).get("kernel", "rbf"),
-                bandwidth=cfg.get("mmd", {}).get("bandwidth", 0.1),
-                cka_use_linear_kernel=cfg.get("cka", {}).get("use_linear_kernel", True),
-                cka_use_minibatch=cfg.get("cka", {}).get("use_minibatch", True),
-                cka_minibatch_size=cfg.get("cka", {}).get("minibatch_size", 512),
-                # Hard-Aware MMD parameters
-                top_k_percent=cfg.get("mmd_hard_aware", {}).get("top_k_percent", 0.25),
-                max_samples=current_max_samples,
-                # Domain-Aware Soft MMD parameters (NEW)
-                diversity_weight=cfg.get("domain_aware_soft_mmd", {}).get("diversity_weight", 0.4),
-                temperature=cfg.get("domain_aware_soft_mmd", {}).get("temperature", 0.1),
-                diversity_method=cfg.get("domain_aware_soft_mmd", {}).get("diversity_method", "channel_std"),
-                enable_monitoring=cfg.get("domain_aware_soft_mmd", {}).get("enable_monitoring", False),
-                # Checkpointing for memory optimization (enabled by default)
-                use_checkpoint=cfg.get("use_checkpoint", True),
-            )
-            self._build_aue_components()
-
-        # Style Adversarial components (alternative to AUE)
-        self.use_style_adv = bool(use_style_adv)
-        self.style_adv_mode = str(style_adv_mode)
-        self.style_adv_epsilon = float(style_adv_epsilon)
-        self.style_adv_use_gt_region_style = bool(style_adv_use_gt_region_style)
-        # Multi-object style attack control
-        self.adv_use_multi_object = bool(adv_use_multi_object)
-        self.adv_enable_background = bool(adv_enable_background)
-        # Global-Local Mixed Style parameters
-        self.style_adv_use_global_local_mix = bool(style_adv_use_global_local_mix)
-        self.style_adv_global_epsilon = float(style_adv_global_epsilon)
-        self.style_adv_global_weight = float(style_adv_global_weight)
-        # GCN parameters
-        self.style_adv_use_gcn = bool(style_adv_use_gcn)
-        self.style_adv_gcn_hidden_dim = int(style_adv_gcn_hidden_dim)  # Deprecated
-        self.style_adv_gcn_num_layers = int(style_adv_gcn_num_layers)
-        self.style_adv_gcn_edge_threshold = float(style_adv_gcn_edge_threshold)
-        self.style_adv_gcn_use_semantic_edges = bool(style_adv_gcn_use_semantic_edges)
-        self.style_adv_gcn_use_background_edges = bool(style_adv_gcn_use_background_edges)
-        self.style_adv_gcn_distance_threshold = float(style_adv_gcn_distance_threshold) if style_adv_gcn_distance_threshold is not None else None
-        self.style_adv_gcn_use_boundary_distance = bool(style_adv_gcn_use_boundary_distance)
-        self.style_adv_gcn_use_visual_features = bool(style_adv_gcn_use_visual_features)
-        self.style_adv_gcn_feature_dim = int(style_adv_gcn_feature_dim)
-        self.style_adv_gcn_feature_sim_threshold = float(style_adv_gcn_feature_sim_threshold)
-        self.style_adv_gcn_grl_alpha = float(style_adv_gcn_grl_alpha)
-        self._latest_gcn_stats: dict[str, float] | None = None
-        if self.use_style_adv:
-            self._build_style_adv_components()
-
-        # Deformation Adversarial components (DG-Font style)
-        self.use_deform_adv = bool(use_deform_adv)
-        self.deform_adv_epsilon = float(deform_adv_epsilon)
-        self.deform_adv_use_soft_composite = bool(deform_adv_use_soft_composite)
-        self.deform_adv_temperature = float(deform_adv_temperature)
-        self.deform_adv_use_gcn = bool(deform_adv_use_gcn)
-        self.deform_adv_gcn_num_layers = int(deform_adv_gcn_num_layers)
-        self.deform_adv_num_deform_groups = int(deform_adv_num_deform_groups)
-        self.deform_adv_init_from_memory_encoder = bool(deform_adv_init_from_memory_encoder)
-        self.deform_adv_freeze_encoder_components = bool(deform_adv_freeze_encoder_components)
-        self.deform_adv_zero_mean_offsets = bool(deform_adv_zero_mean_offsets)
-        self.deform_adv_local_offset_gain = float(deform_adv_local_offset_gain)
-        self.deform_adv_grl_alpha = float(deform_adv_grl_alpha)
-        if self.use_deform_adv:
-            self._build_deform_adv_components()
-
-        # Adversarial pipeline ordering
-        self.adversarial_attack_order = adversarial_attack_order or ["deform", "style"]
+        # Apply AUE configuration to instance attributes (backward compatibility)
+        self._apply_aue_config()
 
         # Model compilation
         if compile_image_encoder:
@@ -477,180 +359,170 @@ class SAM2Base(torch.nn.Module):
             )
 
     def _apply_lora_to_image_encoder(self, lora_rank: int) -> None:
-        """Apply SAMed-style LoRA to the Hiera image encoder.
+        """Apply LoRA to the Hiera image encoder using PEFT library.
 
-        Following SAMed's design:
-        - Only apply LoRA to Q and V projections, NOT K
-        - Freeze original weights
-        - Use kaiming_uniform_ for A, zeros_ for B
+        Uses Hugging Face PEFT for memory-efficient LoRA implementation.
+        Following FS-SAM2's design: LoRA on image encoder with small rank.
 
         Args:
             lora_rank: Rank of the low-rank adaptation matrices
         """
-        import math
+        try:
+            from peft import LoraConfig, get_peft_model
+        except ImportError:
+            raise ImportError("PEFT library is required for LoRA. Install with: pip install peft")
 
-        # Access Hiera trunk
-        trunk = self.image_encoder.trunk
+        # Configure LoRA for Hiera image encoder
+        # Target 'qkv' and 'proj' layers in attention blocks
+        peft_config = LoraConfig(
+            inference_mode=False,
+            r=lora_rank,
+            lora_alpha=self.lora_alpha,
+            lora_dropout=self.lora_dropout,
+            target_modules=["qkv", "proj"],  # Hiera attention layers
+            bias="none",
+        )
 
-        # Freeze original image encoder parameters
-        for param in self.image_encoder.parameters():
-            param.requires_grad = False
+        # Apply PEFT to image encoder
+        self.image_encoder = get_peft_model(self.image_encoder, peft_config)
 
-        # Storage for LoRA parameters
-        self.lora_w_As = nn.ModuleList()
-        self.lora_w_Bs = nn.ModuleList()
-        self.lora_layers = list(range(len(trunk.blocks)))
+        # Log trainable parameters
+        trainable_params = sum(p.numel() for p in self.image_encoder.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in self.image_encoder.parameters())
+        frozen_params = total_params - trainable_params
 
-        lora_count = 0
-        for i, blk in enumerate(trunk.blocks):
-            attn = blk.attn
-            w_qkv_linear = attn.qkv
-
-            dim_in = w_qkv_linear.in_features
-            dim_out = w_qkv_linear.out_features // 3
-
-            # Create LoRA matrices for Q
-            w_a_linear_q = nn.Linear(dim_in, lora_rank, bias=False)
-            w_b_linear_q = nn.Linear(lora_rank, dim_out, bias=False)
-
-            # Create LoRA matrices for V
-            w_a_linear_v = nn.Linear(dim_in, lora_rank, bias=False)
-            w_b_linear_v = nn.Linear(lora_rank, dim_out, bias=False)
-
-            # Initialize: A with kaiming, B with zeros
-            nn.init.kaiming_uniform_(w_a_linear_q.weight, a=math.sqrt(5))
-            nn.init.kaiming_uniform_(w_a_linear_v.weight, a=math.sqrt(5))
-            nn.init.zeros_(w_b_linear_q.weight)
-            nn.init.zeros_(w_b_linear_v.weight)
-
-            # Store in ModuleList
-            self.lora_w_As.append(w_a_linear_q)
-            self.lora_w_Bs.append(w_b_linear_q)
-            self.lora_w_As.append(w_a_linear_v)
-            self.lora_w_Bs.append(w_b_linear_v)
-
-            # Replace qkv with LoRA-wrapped version
-            attn.qkv = _LoRA_qkv_hiera(
-                w_qkv_linear,
-                w_a_linear_q,
-                w_b_linear_q,
-                w_a_linear_v,
-                w_b_linear_v,
-            )
-            lora_count += 1
-
-        # Calculate trainable parameters
-        lora_params = sum(p.numel() for p in self.lora_w_As.parameters()) + sum(p.numel() for p in self.lora_w_Bs.parameters())
-        total_params = sum(p.numel() for p in self.parameters())
-
-        logging.info(f"SAMed-style LoRA applied to {lora_count} attention layers, rank={lora_rank}")
-        logging.info(f"LoRA trainable params: {lora_params:,} | Total params: {total_params:,} | Trainable%: {100 * lora_params / total_params:.2f}%")
+        logging.info(f"PEFT LoRA applied to image_encoder: rank={lora_rank}, alpha={self.lora_alpha}")
+        logging.info(f"Image encoder: {trainable_params:,} trainable / {frozen_params:,} frozen / {total_params:,} total params")
+        logging.info(f"Trainable ratio: {100 * trainable_params / total_params:.2f}%")
 
     def load_state_dict(self, state_dict: dict[str, Any], strict: bool = True):
         """
-        Override load_state_dict to handle LoRA parameters.
+        Override load_state_dict to handle PEFT LoRA parameters.
 
-        With SAMed-style manual LoRA, no complex remapping is needed.
-        LoRA weights are stored separately with 'lora_' prefix.
+        When LoRA is enabled via PEFT, the model structure changes:
+        - Vanilla: image_encoder.trunk.blocks.X.attn.qkv.weight
+        - PEFT:    image_encoder.base_model.model.trunk.blocks.X.attn.qkv.base_layer.weight
+                   + image_encoder.base_model.model.trunk.blocks.X.attn.qkv.lora_A.default.weight
+                   + image_encoder.base_model.model.trunk.blocks.X.attn.qkv.lora_B.default.weight
+
+        This method remaps vanilla checkpoint keys to the PEFT structure.
         """
         if self.use_lora:
-            # Load LoRA A and B matrices if present
-            lora_a_loaded = 0
-            lora_b_loaded = 0
+            new_state_dict = {}
+            remapped_count = 0
 
-            for i, w_A in enumerate(self.lora_w_As or []):
-                key = f"lora_w_a_{i:03d}"
-                if key in state_dict:
-                    w_A.weight.data.copy_(state_dict.pop(key))
-                    lora_a_loaded += 1
+            for key, value in state_dict.items():
+                # PEFT wraps the original module, so we need to remap keys
+                # Vanilla: image_encoder.trunk.X -> PEFT: image_encoder.base_model.model.trunk.X.base_layer
+                if key.startswith("image_encoder.") and not key.startswith("image_encoder.base_model."):
+                    # Check if this is a LoRA target layer (qkv or proj)
+                    if ".qkv." in key or ".proj." in key:
+                        # Remap to PEFT's base_layer structure
+                        # image_encoder.trunk.X.attn.qkv.weight -> image_encoder.base_model.model.trunk.X.attn.qkv.base_layer.weight
+                        new_key = key.replace("image_encoder.", "image_encoder.base_model.model.")
+                        # Insert .base_layer before .weight or .bias
+                        if ".weight" in new_key:
+                            new_key = new_key.replace(".weight", ".base_layer.weight")
+                        elif ".bias" in new_key:
+                            new_key = new_key.replace(".bias", ".base_layer.bias")
+                        new_state_dict[new_key] = value
+                        remapped_count += 1
+                    else:
+                        # Non-LoRA layers: just add base_model.model prefix
+                        new_key = key.replace("image_encoder.", "image_encoder.base_model.model.")
+                        new_state_dict[new_key] = value
+                        remapped_count += 1
+                else:
+                    new_state_dict[key] = value
 
-            for i, w_B in enumerate(self.lora_w_Bs or []):
-                key = f"lora_w_b_{i:03d}"
-                if key in state_dict:
-                    w_B.weight.data.copy_(state_dict.pop(key))
-                    lora_b_loaded += 1
+            if remapped_count > 0:
+                logging.info(f"PEFT LoRA: Remapped {remapped_count} keys from vanilla checkpoint")
 
-            if lora_a_loaded > 0 or lora_b_loaded > 0:
-                logging.info(f"Loaded LoRA parameters: {lora_a_loaded} A matrices, {lora_b_loaded} B matrices")
+            state_dict = new_state_dict
 
-        return super().load_state_dict(state_dict, strict)
+        return super().load_state_dict(state_dict, strict=False)  # Use strict=False for PEFT compatibility
 
-    def _parse_dist_matching_config(self, config: dict | None) -> dict:
+    def _apply_aue_config(self) -> None:
         """
-        Parse and validate distribution matching config.
+        Apply AUEConfig to instance attributes for backward compatibility.
 
-        Expected config format:
-        {
-            'method': 'cka',  # 'mmd' | 'cka' | 'gram'
-            'use_patches': True,
-            'patch_size': 32,
-            'mmd': {'kernel': 'rbf', 'bandwidth': 0.1, ...},
-            'cka': {'use_linear_kernel': True, 'use_minibatch': True, ...},
-            'gram': {'center': True, 'normalize': True, ...}
-        }
-
-        Args:
-            config: Nested config dict (required)
-
-        Returns:
-            Parsed config dict with all defaults filled
+        This method maps the structured AUEConfig dataclass fields to the flat
+        instance attributes that existing code expects. It also initializes
+        the distribution matcher and builds AUE components.
         """
-        if config is None:
-            # Provide sensible defaults if no config specified
-            config = {}
+        cfg = self.aue_config
 
-        # Make a copy to avoid mutating input
-        config = config.copy()
+        # === Master flags ===
+        self.use_aue = cfg.enabled
+        self.aue_probability = cfg.probability  # Probability of running AUE per step (0~1)
+        self.aue_use_analytic_uncertainty = cfg.use_analytic_uncertainty
+        self.adv_use_multi_object = cfg.use_multi_object
+        self.adv_enable_background = cfg.enable_background
 
-        # Set top-level defaults
-        config.setdefault("method", "mmd")
-        config.setdefault("use_patches", True)
-        config.setdefault("patch_size", 16)
+        # === Legacy AUE options ===
+        self.aue_num_adversarial_samples = cfg.num_adversarial_samples
+        self.aue_init_from_dataset = cfg.init_from_dataset
+        self.aue_diversity_loss_weight = cfg.diversity_loss_weight
 
-        # Set MMD defaults
-        if "mmd" not in config:
-            config["mmd"] = {}
-        config["mmd"].setdefault("kernel", "rbf")
-        config["mmd"].setdefault("bandwidth", 0.1)
-        config["mmd"].setdefault("batch_size", 256)
-        config["mmd"].setdefault("n_batches", 10)
+        # === Style Adversarial ===
+        self.use_style_adv = cfg.style.enabled
+        self.style_adv_mode = cfg.style.mode
+        self.style_adv_epsilon = cfg.style.epsilon
+        self.style_adv_use_gt_region_style = cfg.style.use_gt_region_style
+        self.style_adv_use_global_local_mix = cfg.style.use_global_local_mix
+        self.style_adv_global_epsilon = cfg.style.global_epsilon
+        self.style_adv_global_weight = cfg.style.global_weight
+        # Style GCN
+        self.style_adv_use_gcn = cfg.style.gcn.enabled
+        self.style_adv_gcn_hidden_dim = cfg.style.gcn.hidden_dim
+        self.style_adv_gcn_num_layers = cfg.style.gcn.num_layers
+        self.style_adv_gcn_edge_threshold = cfg.style.gcn.edge_threshold
+        self.style_adv_gcn_use_semantic_edges = cfg.style.gcn.use_semantic_edges
+        self.style_adv_gcn_use_background_edges = cfg.style.gcn.use_background_edges
+        self.style_adv_gcn_distance_threshold = cfg.style.gcn.distance_threshold
+        self.style_adv_gcn_use_boundary_distance = cfg.style.gcn.use_boundary_distance
+        self.style_adv_gcn_use_visual_features = cfg.style.gcn.use_visual_features
+        self.style_adv_gcn_feature_dim = cfg.style.gcn.feature_dim
+        self.style_adv_gcn_feature_sim_threshold = cfg.style.gcn.feature_sim_threshold
+        self._latest_gcn_stats: dict[str, float] | None = None
 
-        # Set CKA defaults
-        if "cka" not in config:
-            config["cka"] = {}
-        config["cka"].setdefault("use_linear_kernel", True)
-        config["cka"].setdefault("use_minibatch", True)
-        config["cka"].setdefault("minibatch_size", 512)
+        # === Deformation Adversarial ===
+        self.use_deform_adv = cfg.deform.enabled
+        self.deform_adv_epsilon = cfg.deform.epsilon
+        self.deform_adv_use_soft_composite = cfg.deform.use_soft_composite
+        self.deform_adv_temperature = cfg.deform.temperature
+        self.deform_adv_use_gcn = cfg.deform.use_gcn
+        self.deform_adv_gcn_num_layers = cfg.deform.gcn_num_layers
+        self.deform_adv_num_deform_groups = cfg.deform.num_deform_groups
+        self.deform_adv_init_from_memory_encoder = cfg.deform.init_from_memory_encoder
+        self.deform_adv_freeze_encoder_components = cfg.deform.freeze_encoder_components
+        self.deform_adv_zero_mean_offsets = cfg.deform.zero_mean_offsets
+        self.deform_adv_local_offset_gain = cfg.deform.local_offset_gain
 
-        # Set Gram defaults
-        if "gram" not in config:
-            config["gram"] = {}
-        config["gram"].setdefault("center", True)
-        config["gram"].setdefault("normalize", True)
+        # === Attack ordering ===
+        self.adversarial_attack_order = cfg.attack_order
 
-        # Set Hard-Aware MMD defaults
-        if "mmd_hard_aware" not in config:
-            config["mmd_hard_aware"] = {}
-        config["mmd_hard_aware"].setdefault("top_k_percent", 0.25)
-        config["mmd_hard_aware"].setdefault("max_samples", 4096)
+        # === Initialize components ===
+        if self.use_aue:
+            # Log AUE configuration
+            uncertainty_type = "analytic (Weibull-based, with gradients)" if self.aue_use_analytic_uncertainty else "sampling (entropy-based, detached)"
+            logging.info("Style-based AUE enabled (adversarial task loss computed inline in track_step)")
+            logging.info(f"AUE uncertainty computation: {uncertainty_type}")
+            logging.info(f"AUE alternating training probability: {self.aue_probability:.2f} (1.0 = every step, <1.0 = memory optimization)")
+            logging.info("MMD calibration config: passed to loss modules via scratch.mmd_config")
 
-        # Set Domain-Aware Soft MMD defaults (NEW)
-        if "domain_aware_soft_mmd" not in config:
-            config["domain_aware_soft_mmd"] = {}
-        config["domain_aware_soft_mmd"].setdefault("diversity_weight", 0.4)
-        config["domain_aware_soft_mmd"].setdefault("temperature", 0.1)
-        config["domain_aware_soft_mmd"].setdefault("max_samples", 4096)
-        config["domain_aware_soft_mmd"].setdefault("diversity_method", "channel_std")
-        config["domain_aware_soft_mmd"].setdefault("enable_monitoring", False)
+            # Build adversarial attack components (only when AUE is enabled)
+            if self.use_style_adv:
+                self._build_style_adv_components()
 
-        # Validate method
-        valid_methods = ["mmd", "cka", "gram", "mmd_hard_aware", "domain_aware_soft_mmd"]
-        if config["method"] not in valid_methods:
-            raise ValueError(f"Invalid distribution matching method: {config['method']}. Must be one of {valid_methods}")
+            if self.use_deform_adv:
+                self._build_deform_adv_components()
 
-        logging.info(f"Distribution matching config: method={config['method']}, use_patches={config['use_patches']}, patch_size={config['patch_size']}")
-
-        return config
+            # Initialize AUE module (composition pattern)
+            self._aue_module = AUEModule(self)
+            self._aue_module.initialize()
+        else:
+            self._aue_module = None
 
     def _build_style_adv_components(self) -> None:
         """
@@ -705,7 +577,6 @@ class SAM2Base(torch.nn.Module):
             global_epsilon=self.style_adv_global_epsilon,
             global_weight=self.style_adv_global_weight,
             num_objects=self.max_num_objects + (1 if self.adv_enable_background else 0),
-            gcn_grl_alpha=self.style_adv_gcn_grl_alpha,
         )
 
         logging.info(f"Style augmentation components built: mode={self.style_adv_mode}, epsilon={self.style_adv_epsilon}")
@@ -737,7 +608,6 @@ class SAM2Base(torch.nn.Module):
             image_size=self.image_size,  # Pass image_size for image-level offset prediction
             zero_mean_offsets=self.deform_adv_zero_mean_offsets,
             local_offset_gain=self.deform_adv_local_offset_gain,
-            grl_alpha=self.deform_adv_grl_alpha,
         )
 
         # Load pretrained weights from memory encoder if enabled
@@ -752,1138 +622,6 @@ class SAM2Base(torch.nn.Module):
             f"init_from_memory_encoder={self.deform_adv_init_from_memory_encoder}, "
             f"freeze_encoder_components={self.deform_adv_freeze_encoder_components}"
         )
-
-    def _build_aue_components(self) -> None:
-        """
-        Build components for Style-based AUE.
-
-        Note: The old feature bank approach has been removed due to OOM issues.
-        Style-based AUE does not require pre-allocated feature banks.
-        """
-        # Initialize SAM loss for PGD attacks (consistent with training config)
-        from training.loss_fns import MultiStepMultiMasksAndIous
-
-        # Use only segmentation-related losses for adversarial attacks
-        # Focus on mask quality (focal + dice), not prediction heads (iou + class)
-        weight_dict = {
-            "loss_mask": 20.0,  # Higher weight for focal loss (segmentation quality)
-            "loss_dice": 1.0,  # Dice loss (segmentation quality)
-            "loss_iou": 0.0,  # Disable IoU prediction head loss
-            "loss_class": 0.0,  # Disable object existence prediction head loss
-        }
-
-        self.sam_loss_fn = MultiStepMultiMasksAndIous(
-            weight_dict=weight_dict,
-            focal_alpha=0.25,  # Default from loss_fns.py
-            focal_gamma=2,  # Default from loss_fns.py
-            supervise_all_iou=False,  # Disable IoU supervision for adversarial attacks
-            iou_use_l1_loss=False,  # Not relevant when iou loss is disabled
-            pred_obj_scores=False,  # Disable object score prediction for adversarial attacks
-            focal_gamma_obj_score=0.0,  # Not relevant when pred_obj_scores=False
-            focal_alpha_obj_score=-1.0,  # Not relevant when pred_obj_scores=False
-        )
-
-        dist_type = "patch-based" if self.aue_use_patches else "global"
-        uncertainty_type = "analytic (Weibull-based, with gradients)" if self.aue_use_analytic_uncertainty else "sampling (entropy-based, detached)"
-        logging.info("Style-based AUE enabled with SAM loss for PGD attacks (matching training config)")
-        logging.info(f"AUE calibration loss: {self.aue_calibration_method.upper()} ({dist_type}, patch_size={self.aue_patch_size if self.aue_use_patches else 'N/A'})")
-        logging.info(f"AUE uncertainty computation: {uncertainty_type}")
-
-    # Image-space constraint methods removed (not needed for feature-space AUE)
-
-    def _apply_offset_to_image(
-        self,
-        image: torch.Tensor,
-        offset_field: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Apply spatial offset field to warp an image using grid_sample.
-
-        Args:
-            image: [B, 3, H, W] Input image
-            offset_field: [B, 2, H, W] Offset field (Δx, Δy)
-
-        Returns:
-            warped_image: [B, 3, H, W] Warped image
-        """
-        B, _, H, W = image.shape
-        device = image.device
-        orig_dtype = image.dtype
-        image_f32 = image.to(dtype=torch.float32)
-
-        # Create identity grid (standard sampling positions)
-        y_grid, x_grid = torch.meshgrid(
-            torch.arange(H, device=device, dtype=torch.float32),
-            torch.arange(W, device=device, dtype=torch.float32),
-            indexing="ij",
-        )
-
-        # Add offset (offset order is [Δx, Δy]); guard against malformed channels
-        if offset_field.shape[1] < 2:
-            # If only one channel is present, treat missing axis as zero shift
-            pad = torch.zeros_like(offset_field[:, :1, :, :])
-            offset_field = torch.cat([offset_field, pad], dim=1)
-        elif offset_field.shape[1] > 2:
-            offset_field = offset_field[:, :2, :, :]
-
-        offset_field_f32 = offset_field.to(dtype=torch.float32)
-
-        offset_x = offset_field_f32[:, 0, :, :]  # [B, H, W]
-        offset_y = offset_field_f32[:, 1, :, :]  # [B, H, W]
-
-        # New sampling positions
-        sampling_x = x_grid.unsqueeze(0) + offset_x  # [B, H, W]
-        sampling_y = y_grid.unsqueeze(0) + offset_y  # [B, H, W]
-
-        # Normalize to [-1, 1] (required by grid_sample).
-        # With align_corners=False, the correct mapping is:
-        #   x_norm = 2 * (x + 0.5) / W - 1
-        #   y_norm = 2 * (y + 0.5) / H - 1
-        # Guard H/W==1 to avoid division by zero in edge cases.
-        if W > 1:
-            sampling_x_norm = 2.0 * (sampling_x + 0.5) / float(W) - 1.0
-        else:
-            sampling_x_norm = torch.zeros_like(sampling_x)
-        if H > 1:
-            sampling_y_norm = 2.0 * (sampling_y + 0.5) / float(H) - 1.0
-        else:
-            sampling_y_norm = torch.zeros_like(sampling_y)
-
-        # Stack into grid format [B, H, W, 2] (last dimension is x, y)
-        sampling_grid = torch.stack([sampling_x_norm, sampling_y_norm], dim=-1)
-
-        # Apply warping using grid_sample
-        warped_image_f32 = F.grid_sample(
-            image_f32,
-            sampling_grid,
-            mode="bilinear",
-            padding_mode="border",
-            align_corners=False,
-        )
-
-        return warped_image_f32.to(dtype=orig_dtype)
-
-    def _prepare_aue_visualization_data(
-        self,
-        img_batch: torch.Tensor,
-        adv_images: torch.Tensor,
-        pixel_gt: torch.Tensor | None,
-        num_vis_samples: int,
-        original_styles: torch.Tensor | None = None,
-        adv_styles: torch.Tensor | None = None,
-        deform_offsets: torch.Tensor | None = None,
-        warped_images: torch.Tensor | None = None,
-        warped_masks: torch.Tensor | None = None,
-        attack_order: list[str] | None = None,
-        loss_object_indices: torch.Tensor | None = None,
-    ) -> AUEVisualizationData:
-        """
-        Prepare visualization data for Style AUE multi-object training.
-
-        This method computes all necessary visualization data from masks on-demand,
-        avoiding extra memory overhead during training. Bounding boxes, area ratios,
-        and epsilon weights are computed here only when visualization is enabled.
-
-        Args:
-            img_batch: [B, 3, H, W] original images (normalized)
-            adv_images: [M, 3, H, W] adversarial images (normalized)
-            pixel_gt: [B, K, H, W] ground truth masks for K objects (optional)
-            num_vis_samples: number of samples to visualize
-            loss_object_indices: [B] local object index for each sample (which of K objects is being trained)
-
-        Returns:
-            AUEVisualizationData containing all visualization tensors
-        """
-        from sam2.modeling.aue_utils import masks_to_boxes
-
-        # Save images (move to CPU to free GPU memory)
-        original_images_cpu = img_batch[:num_vis_samples].detach().cpu()
-        adversarial_images_cpu = adv_images[:num_vis_samples].detach().cpu()
-
-        # Process styles if provided (handle both GPU and CPU tensors)
-        # Styles are [B, K, 6] where K is number of objects
-        if original_styles is not None:
-            if original_styles.is_cuda:
-                original_styles_cpu = original_styles[:num_vis_samples].detach().cpu()
-            else:
-                original_styles_cpu = original_styles[:num_vis_samples].detach()
-        else:
-            original_styles_cpu = None
-
-        if adv_styles is not None:
-            if adv_styles.is_cuda:
-                adv_styles_cpu = adv_styles[:num_vis_samples].detach().cpu()
-            else:
-                adv_styles_cpu = adv_styles[:num_vis_samples].detach()
-        else:
-            adv_styles_cpu = None
-
-        # Add multi-object visualization data (masks and bboxes)
-        if pixel_gt is not None and pixel_gt.ndim == 4:
-            K = pixel_gt.shape[1]
-
-            # Save multi-object masks for visualization
-            all_object_masks = pixel_gt[:num_vis_samples].detach().cpu()  # [N, K, H, W]
-
-            # Compute bounding boxes from masks (lightweight operation, <1ms per sample)
-            all_bboxes_list = []
-            all_area_ratios_list = []
-
-            for i in range(num_vis_samples):
-                sample_masks = pixel_gt[i]  # [K, H, W]
-
-                # Compute bboxes
-                sample_bboxes = masks_to_boxes(sample_masks)  # [K, 4]
-                all_bboxes_list.append(sample_bboxes)
-
-                # Compute area ratios for each object
-                total_pixels = sample_masks.shape[1] * sample_masks.shape[2]
-                object_areas = sample_masks.sum(dim=[1, 2])  # [K]
-                area_ratio = object_areas.float() / total_pixels  # [K]
-                all_area_ratios_list.append(area_ratio)
-
-            all_bboxes = torch.stack(all_bboxes_list).detach().cpu()  # [N, K, 4]
-            area_ratios = torch.stack(all_area_ratios_list).detach().cpu()  # [N, K]
-
-            # Compute epsilon weights based on area ratios (larger objects get higher weight)
-            all_epsilon_weights_list = []
-            for area_ratio in all_area_ratios_list:
-                max_area = area_ratio.max()
-                if max_area > 0:
-                    epsilon_weights = 0.5 + 0.5 * (area_ratio / max_area)
-                else:
-                    epsilon_weights = torch.ones_like(area_ratio)
-                all_epsilon_weights_list.append(epsilon_weights)
-
-            epsilon_weights = torch.stack(all_epsilon_weights_list).detach().cpu()  # [N, K]
-
-            # Also save the combined mask used for loss
-            if pixel_gt.shape[1] > 1:
-                combined_mask = pixel_gt.sum(dim=1, keepdim=True).clamp(0, 1)  # [B, 1, H, W]
-            else:
-                combined_mask = pixel_gt
-            combined_mask_for_loss = combined_mask[:num_vis_samples].detach().cpu()
-        else:
-            K = 1
-            all_object_masks = None
-            all_bboxes = None
-            area_ratios = None
-            epsilon_weights = None
-            combined_mask_for_loss = None
-
-        if deform_offsets is not None:
-            if deform_offsets.is_cuda:
-                deform_offsets_cpu = deform_offsets[:num_vis_samples].detach().cpu()
-            else:
-                deform_offsets_cpu = deform_offsets[:num_vis_samples].detach()
-        else:
-            deform_offsets_cpu = None
-
-        # Process warped images if provided
-        if warped_images is not None:
-            if warped_images.is_cuda:
-                warped_images_cpu = warped_images[:num_vis_samples].detach().cpu()
-            else:
-                warped_images_cpu = warped_images[:num_vis_samples].detach()
-        else:
-            warped_images_cpu = None
-
-        # Process warped masks if provided
-        if warped_masks is not None:
-            if warped_masks.is_cuda:
-                warped_masks_cpu = warped_masks[:num_vis_samples].detach().cpu()
-            else:
-                warped_masks_cpu = warped_masks[:num_vis_samples].detach()
-        else:
-            warped_masks_cpu = None
-
-        # Process loss_object_indices if provided
-        if loss_object_indices is not None:
-            if loss_object_indices.is_cuda:
-                loss_object_indices_cpu = loss_object_indices[:num_vis_samples].detach().cpu()
-            else:
-                loss_object_indices_cpu = loss_object_indices[:num_vis_samples].detach()
-        else:
-            loss_object_indices_cpu = None
-
-        return AUEVisualizationData(
-            original_images=original_images_cpu,
-            adversarial_images=adversarial_images_cpu,
-            original_styles=original_styles_cpu,
-            adversarial_styles=adv_styles_cpu,
-            num_objects=K,
-            all_object_masks=all_object_masks,
-            all_bboxes=all_bboxes,
-            area_ratios=area_ratios,
-            epsilon_weights=epsilon_weights,
-            combined_mask_for_loss=combined_mask_for_loss,
-            deform_offsets=deform_offsets_cpu,
-            warped_images=warped_images_cpu,
-            warped_object_masks=warped_masks_cpu,
-            attack_order=attack_order,
-            loss_object_indices=loss_object_indices_cpu,
-        )
-
-    def _cleanup_augmentation_results(self, results_to_cleanup: list) -> None:
-        """
-        Clean up augmentation results to free GPU memory.
-
-        Args:
-            results_to_cleanup: List of augmentation result objects with release_intermediate() method.
-                               Results are cleaned up in reverse order (LIFO).
-        """
-        for result in reversed(results_to_cleanup):
-            result.release_intermediate()
-
-    def _extract_bndl_outputs(
-        self,
-        aux_outputs: dict,
-        pixel_bndl_model,
-        compute_logits: bool = True,
-        compute_uncertainty: bool = False,
-        compute_analytic_uncertainty: bool = False,
-        uq_sample_num: int = 20,
-    ) -> BNDLOutputs | None:
-        """
-        Extract and process BNDL outputs from aux_outputs dict.
-
-        Centralizes the pattern of extracting pixel_feat, external_w, logits, uncertainty.
-
-        Args:
-            aux_outputs: Auxiliary outputs containing BNDL dict
-            pixel_bndl_model: BNDL model for computing logits/uncertainty
-            compute_logits: Whether to compute logits if not present
-            compute_uncertainty: Whether to compute sampling-based uncertainty (no grad)
-            compute_analytic_uncertainty: Whether to compute analytic uncertainty (with grad)
-            uq_sample_num: Number of samples for uncertainty estimation (only for sampling)
-
-        Returns:
-            BNDLOutputs containing pixel_feat, external_w, pixel_logits, pixel_uncertainty
-            or None if extraction fails
-        """
-        bndl = aux_outputs.get("bndl", {})
-        pixel_feat = bndl.get("pixel_feat_grad", bndl.get("pixel_feat"))
-
-        if pixel_feat is None:
-            return None
-
-        # Extract mask_tokens_out for AUE's analytic uncertainty computation
-        # In training mode, this preserves gradients for bidirectional optimization
-        external_w = bndl.get("mask_tokens_out")  # [B, K, 256] - may have gradients
-
-        # Compute logits if requested
-        pixel_logits = None
-        if compute_logits:
-            pixel_logits = bndl.get("pixel_logits", bndl.get("masks_bndl_raw", None))
-            if pixel_logits is None and pixel_bndl_model is not None:
-                factor_z_pos = getattr(pixel_bndl_model, "default_factor_z_pos", getattr(pixel_bndl_model, "default_factor_z", 0.0))
-                factor_z_neg = getattr(pixel_bndl_model, "default_factor_z_neg", None)
-                if factor_z_neg is None:
-                    factor_z_neg = factor_z_pos
-                factor_w_pos = getattr(pixel_bndl_model, "default_factor_w_pos", getattr(pixel_bndl_model, "default_factor_w", 0.0))
-                factor_w_neg = getattr(pixel_bndl_model, "default_factor_w_neg", None)
-                if factor_w_neg is None:
-                    factor_w_neg = factor_w_pos
-                pixel_logits, *_ = pixel_bndl_model(
-                    pixel_feat,
-                    force_sample=False,
-                    external_pre_out_w=external_w,
-                    factor_z=factor_z_pos,
-                    factor_z_neg=factor_z_neg,
-                    factor_w=factor_w_pos,
-                    factor_w_neg=factor_w_neg,
-                )
-
-        # Compute uncertainty if requested
-        pixel_uncertainty = None
-        if compute_analytic_uncertainty:
-            # Analytic uncertainty from Weibull parameters (with gradients)
-            use_analytic = getattr(self, "aue_use_analytic_uncertainty", True)
-            if use_analytic and pixel_bndl_model is not None:
-                from sam2.modeling.bndl_utils import pixel_weibull_to_entropy_uncertainty
-
-                pixel_uncertainty = pixel_weibull_to_entropy_uncertainty(
-                    pixel_bndl_model=pixel_bndl_model,
-                    pixel_feat=pixel_feat,
-                    external_pre_out_w=external_w,
-                    per_channel=False,
-                ).clamp(0.0, 1.0)
-            elif pixel_logits is not None:
-                # Fallback: 1 - confidence
-                if pixel_logits.ndim == 4:  # [B, H, W, K]
-                    confidence = torch.sigmoid(pixel_logits).max(dim=-1)[0]
-                else:  # [B, H, W]
-                    confidence = torch.sigmoid(pixel_logits)
-                pixel_uncertainty = (1.0 - confidence).clamp(0.0, 1.0)
-        elif compute_uncertainty:
-            # Sampling-based uncertainty (no gradients)
-            with torch.no_grad():
-                from BNDL.BNDL_upload.ViT_Sparse.utils.bndl import pixel_entropy_uncertainty
-
-                pixel_uncertainty = pixel_entropy_uncertainty(pixel_bndl_model, pixel_feat, external_w, uq_sample_num, per_channel=False)
-
-        return BNDLOutputs(
-            pixel_feat=pixel_feat,
-            external_w=external_w,
-            pixel_logits=pixel_logits,
-            pixel_uncertainty=pixel_uncertainty,
-        )
-
-    def _prepare_gt_for_loss(
-        self,
-        pixel_gt: torch.Tensor,
-        target_size: tuple[int, int],
-    ) -> torch.Tensor:
-        """
-        Prepare GT masks: combine multi-object and resize to target resolution.
-
-        Args:
-            pixel_gt: [B, K, H, W] ground truth masks
-            target_size: (H_feat, W_feat) target spatial size
-
-        Returns:
-            [B, H_feat, W_feat] combined and resized GT
-        """
-        # Combine K objects with sum(dim=1).clamp(0, 1) if K > 1
-        if pixel_gt.shape[1] > 1:
-            pixel_gt_combined = pixel_gt.sum(dim=1, keepdim=True).clamp(0, 1)
-        else:
-            pixel_gt_combined = pixel_gt
-
-        # Resize to target_size using F.interpolate
-        pixel_gt_resized = F.interpolate(pixel_gt_combined.float(), size=target_size, mode="nearest").squeeze(1)
-
-        return pixel_gt_resized
-
-    def _compute_augmented_calibration_loss(
-        self,
-        aux_outputs: dict,
-        pixel_gt: torch.Tensor,
-        pixel_bndl_model,
-        uq_sample_num: int,
-        high_res_features: list[torch.Tensor] | None = None,
-    ) -> tuple[torch.Tensor, dict, torch.Tensor]:
-        """
-        Compute calibration loss for augmented features (deformation or style).
-
-        This is a helper method to avoid code duplication between style and deformation branches.
-
-        Args:
-            aux_outputs: Auxiliary outputs from _forward_sam_heads containing BNDL outputs
-            pixel_gt: [B, K, H, W] Ground truth masks
-            pixel_bndl_model: BNDL model for uncertainty estimation
-            uq_sample_num: Number of samples for uncertainty estimation
-            high_res_features: List of high-res features [stride 4, stride 8]
-
-        Returns:
-            calibration_loss: Scalar loss
-            metrics: Dict of metrics
-            adv_uncertainty: [B, H, W] uncertainty map
-        """
-        # 1. Extract BNDL outputs with analytic uncertainty
-        bndl_outputs = self._extract_bndl_outputs(aux_outputs, pixel_bndl_model, compute_logits=True, compute_analytic_uncertainty=True, uq_sample_num=uq_sample_num)
-        if bndl_outputs is None:
-            logging.warning("No pixel features in augmented outputs, returning zero loss")
-            device = pixel_gt.device
-            return (torch.tensor(0.0, device=device, dtype=torch.float32), {}, torch.zeros(pixel_gt.shape[0], 1, 1, device=device, dtype=torch.float32))
-
-        # 2. Extract adversarial uncertainty (already computed in _extract_bndl_outputs)
-        adv_uncertainty = bndl_outputs.pixel_uncertainty  # [B, H, W]
-
-        # 3. Prepare GT
-        if bndl_outputs.pixel_logits is not None:
-            H, W = bndl_outputs.pixel_logits.shape[1:3]
-        else:
-            H, W = bndl_outputs.pixel_feat.shape[1:3]
-        pixel_gt_prepared = self._prepare_gt_for_loss(pixel_gt, target_size=(H, W))
-
-        # Select feature map for domain-aware method
-        feature_map_for_calibration = None
-        if self.aue_dist_matching_config["method"] == "domain_aware_soft_mmd":
-            if high_res_features is not None and len(high_res_features) > 0:
-                feature_map_for_calibration = high_res_features[0]
-            else:
-                feature_map_for_calibration = None
-
-        # 4. Compute calibration loss
-        calibration_loss, metrics, _ = self._compute_uncertainty_calibration_loss(
-            bndl_outputs,
-            pixel_gt_prepared,
-            pixel_bndl_model=pixel_bndl_model,
-            backbone_features=feature_map_for_calibration,
-            tag="augmented",
-        )
-
-        return calibration_loss, metrics, adv_uncertainty
-
-    def _apply_adversarial_attack_pipeline(
-        self,
-        img_batch: torch.Tensor,
-        backbone_features: torch.Tensor,
-        high_res_features: list[torch.Tensor],
-        pixel_gt: torch.Tensor,
-        enable_vis: bool = False,
-        uq_sample_num: int = 8,
-        memory_context: dict | None = None,
-    ) -> dict:
-        """
-        Apply adversarial attack pipeline (cooperative or sequential).
-
-        Modes:
-        - Cooperative: Predict all params first (parallel), then apply (jointly).
-        - Sequential: Predict and apply iteratively (legacy).
-
-        Args:
-        warped_img = (
-            vis_data.warped_images[sample_idx]
-            if hasattr(vis_data, 'warped_images') and vis_data.warped_images is not None
-            else None
-        )
-        styled_img = (
-            vis_data.adversarial_images[sample_idx]
-            if getattr(vis_data, "adversarial_images", None) is not None
-            else None
-        )
-            backbone_features: [B, C, H/4, W/4]
-        if styled_img is not None:
-            styled_denorm = self._denormalize_images(styled_img.unsqueeze(0))[0]
-            styled_np = styled_denorm.permute(1, 2, 0).cpu().numpy()
-            styled_np = np.clip(styled_np, 0, 1)
-        else:
-            styled_np = None
-
-        if warped_img is not None:
-            warped_img_denorm = self._denormalize_images(warped_img.unsqueeze(0))[0]
-            warped_np = warped_img_denorm.permute(1, 2, 0).cpu().numpy()
-            warped_np = np.clip(warped_np, 0, 1)
-        else:
-            warped_np = None
-                - vis_refs: dict (if enable_vis=True)
-        """
-        # === Initialize pipeline state ===
-        state = {
-            "img": img_batch,
-            "features": backbone_features,
-            "high_res": high_res_features,
-            "pixel_gt": pixel_gt,
-        }
-
-        vis_refs = {}
-        if enable_vis:
-            vis_refs["img_batch"] = img_batch.detach().cpu()
-            vis_refs["pixel_gt"] = pixel_gt.detach().cpu()
-            vis_refs["attack_order"] = list(self.adversarial_attack_order)
-
-        if self.aue_attack_mode == "cooperative":
-            state = self._apply_cooperative_attack(
-                state,
-                enable_vis,
-                vis_refs,
-                memory_context=memory_context,
-            )
-
-        # === Compute adversarial calibration loss ===
-        final_features = state["features"]
-        final_high_res = state["high_res"]
-        final_pixel_gt = state["pixel_gt"]
-
-        # Forward through SAM heads
-        calibration_loss_adversarial = torch.tensor(0.0, device=img_batch.device, dtype=img_batch.dtype)
-        aug_metrics = {}
-        adv_uncertainty = None
-
-        if final_features is not backbone_features:
-            prev_suppress = getattr(self, "_suppress_nested_aue", False)
-            self._suppress_nested_aue = True
-            try:
-                *_, aux_outputs = self._forward_sam_heads(
-                    backbone_features=final_features,
-                    high_res_features=final_high_res,
-                    pixel_gt_for_aue=None,
-                    multimask_output=False,
-                )
-            finally:
-                self._suppress_nested_aue = prev_suppress
-
-            # Compute calibration loss and extract uncertainty
-            pixel_bndl_model = None
-            if hasattr(self.sam_mask_decoder, "pixel_bndl"):
-                pixel_bndl_model = self.sam_mask_decoder.pixel_bndl
-
-            calibration_loss_adversarial, aug_metrics, adv_uncertainty = self._compute_augmented_calibration_loss(
-                aux_outputs=aux_outputs,
-                pixel_gt=final_pixel_gt,
-                pixel_bndl_model=pixel_bndl_model,
-                uq_sample_num=uq_sample_num,
-                high_res_features=final_high_res,
-            )
-
-            del aux_outputs
-
-        return {
-            "calibration_loss_adversarial": calibration_loss_adversarial,
-            "aug_metrics": aug_metrics,  # Return augmented metrics
-            "adv_uncertainty": adv_uncertainty,  # Return adversarial uncertainty
-            "vis_refs": vis_refs,
-        }
-
-    def _apply_cooperative_attack(
-        self,
-        state: dict,
-        enable_vis: bool,
-        vis_refs: dict,
-        memory_context: dict | None = None,
-    ) -> dict:
-        """
-        Apply cooperative adversarial attack.
-
-        Strategy:
-        1. Predict parameters for all active attackers using CLEAN features.
-           This allows joint optimization as gradients flow back to all parameter networks
-           from the final loss, without interference from intermediate steps.
-        2. Apply transformations sequentially using the predicted parameters.
-        """
-        aug_params = {}
-        clean_features = state["features"]
-        pixel_gt = state["pixel_gt"]
-        img_batch = state["img"]
-
-        # === Phase 1: Predict (Parallel) ===
-        for aug_name in self.adversarial_attack_order:
-            attacker = getattr(self, f"{aug_name}_attacker", None)
-            if attacker is not None:
-                # Predict params using clean features
-                # Note: predict_params implementations handle detaching input features
-                # to prevent backbone updates from the prediction path.
-                params = attacker.predict_params(
-                    clean_features=clean_features,
-                    pixel_gt=pixel_gt,
-                    model=self,
-                    img_batch=img_batch,  # Needed for style
-                )
-                aug_params[aug_name] = params
-
-        # === Phase 2: Apply (Sequential) ===
-        for aug_name in self.adversarial_attack_order:
-            if aug_name not in aug_params:
-                continue
-
-            attacker = getattr(self, f"{aug_name}_attacker")
-            params = aug_params[aug_name]
-
-            # Apply transform
-            # Note: We pass the CURRENT state features/images, which might have been
-            # modified by previous augmentations in the loop.
-
-            if attacker.mode == "image_level":
-                # Image level attack (e.g. Style)
-                styled_images = attacker.apply_transform(img_batch=state["img"], params=params, pixel_gt=state["pixel_gt"], model=self)
-                state["img"] = styled_images
-
-                # Re-encode (checkpointed) and optionally re-apply memory conditioning
-                backbone_out = self.forward_image(styled_images, use_checkpoint=True)
-                if memory_context:
-                    recond = self._reapply_memory_conditioning(backbone_out, memory_context)
-                    state["features"] = recond["features"]
-                    state["high_res"] = recond["high_res"]
-                else:
-                    state["features"] = backbone_out["backbone_fpn"][-1]
-                    if self.use_high_res_features_in_sam:
-                        state["high_res"] = [backbone_out["backbone_fpn"][0], backbone_out["backbone_fpn"][1]]
-
-                # Visualization data (always record styled images when enabled)
-                if enable_vis:
-                    vis_refs["styled_images"] = styled_images.detach().cpu()
-                    if attacker.aug_type == "style":
-                        vis_refs["adversarial_styles"] = params.detach().cpu()
-
-            elif attacker.mode == "feature_level":
-                # Feature level attack (e.g. Deform) — always warp image/GT and re-encode
-                offsets = params["image_offsets"] if isinstance(params, dict) else params
-
-                warped_img, warped_gt = self._apply_deformation_to_images(
-                    state["img"],
-                    state["pixel_gt"],
-                    offsets,
-                    enable_vis=enable_vis,
-                    vis_refs=vis_refs if enable_vis else {},
-                )
-                state["img"] = warped_img
-                state["pixel_gt"] = warped_gt
-
-                # Re-encode warped image (checkpointed) and optionally reapply memory conditioning
-                backbone_out = self.forward_image(warped_img, use_checkpoint=True)
-                if memory_context:
-                    recond = self._reapply_memory_conditioning(backbone_out, memory_context)
-                    state["features"] = recond["features"]
-                    state["high_res"] = recond["high_res"]
-                else:
-                    state["features"] = backbone_out["backbone_fpn"][-1]
-                    if self.use_high_res_features_in_sam:
-                        state["high_res"] = [backbone_out["backbone_fpn"][0], backbone_out["backbone_fpn"][1]]
-
-                # Visualization payloads (already computed by _apply_deformation_to_images when enable_vis)
-                if enable_vis:
-                    vis_refs["deform_offsets"] = offsets.detach().cpu()
-                    vis_refs.setdefault("warped_images", warped_img.detach().cpu())
-                    vis_refs.setdefault("warped_pixel_gt", warped_gt.detach().cpu())
-
-        return state
-
-    def _reapply_memory_conditioning(
-        self,
-        backbone_out: dict,
-        memory_context: dict,
-    ) -> dict:
-        """
-        Re-run memory conditioning on newly encoded features using cached context
-        from the clean forward pass.
-
-        CRITICAL for AUE stability:
-        We SKIP memory conditioning and use backbone_fpn directly because:
-        1. Memory is computed from CLEAN features (not adversarial features)
-        2. Mixing adversarial backbone features with clean memory can cause feature mismatch
-        3. This prevents GRL gradients from flowing through memory_attention
-        4. style_net still receives gradients through: adv_loss → backbone_fpn → styled_images → style_params
-
-        The adversarial branch only tests whether the model can handle style perturbations
-        on the visual features, which backbone_fpn captures without needing memory context.
-        """
-        # Use backbone_fpn directly without memory conditioning
-        pix_feat_with_mem = backbone_out["backbone_fpn"][-1]
-        high_res_features = None
-        if self.use_high_res_features_in_sam:
-            high_res_features = [
-                backbone_out["backbone_fpn"][0],
-                backbone_out["backbone_fpn"][1],
-            ]
-        return {"features": pix_feat_with_mem, "high_res": high_res_features}
-
-    def _apply_deformation_attack(
-        self,
-        state: dict,
-        enable_vis: bool,
-        vis_refs: dict,
-    ) -> None:
-        """Apply deformation attack and update state."""
-        if not (self.use_deform_adv and hasattr(self, "deform_attacker")):
-            return
-
-        # Respect adv_use_multi_object: collapse to single-object mask when disabled
-        deform_pixel_gt = state["pixel_gt"]
-        if (not getattr(self, "adv_use_multi_object", False)) and deform_pixel_gt.shape[1] > 1:
-            deform_pixel_gt = deform_pixel_gt.sum(dim=1, keepdim=True).clamp(0, 1)
-
-        # Apply deformation
-        orig_img_for_vis = state["img"]
-        orig_gt_for_vis = deform_pixel_gt
-        deform_result = self.deform_attacker.apply(
-            img_batch=state["img"],
-            clean_features=state["features"],
-            clean_high_res=state["high_res"],
-            pixel_gt=deform_pixel_gt,
-            model=self,
-        )
-
-        # Update state with deformation results
-        deform_offsets = deform_result.deformation_offsets  # [B, K, 2, H, W]
-
-        if deform_offsets is not None:
-            # Warp image and GT using predicted offsets
-            augmented_img, warped_pixel_gt = self._apply_deformation_to_images(state["img"], deform_pixel_gt, deform_offsets, enable_vis, vis_refs)
-
-            state["img"] = augmented_img
-            state["pixel_gt"] = warped_pixel_gt
-
-            # CRITICAL: Re-encode warped image to get spatially consistent features
-            #
-            # Design rationale:
-            # - Deformable conv produces feature-level deformation (for learning guidance)
-            # - But we warped the IMAGE using predicted offsets
-            # - All features (main + high_res) must come from the SAME spatial locations
-            # - Therefore: re-encode the warped image to get consistent feature pyramid
-            #
-            # Alternative design (not chosen):
-            # - Use deformable conv output for main features only
-            # - Problem: Creates spatial inconsistency between main (64×64) and high-res (256×256)
-            #
-            # Memory Optimization & Gradient Flow:
-            # - We MUST allow gradients to flow through the backbone to the image
-            #   so that the deformation network (adversary) can be trained.
-            # Re-encode (checkpointed) so gradients can flow back to offsets/backbone
-            # AMP can occasionally produce NaNs on adversarially-warped inputs.
-            # Force the backbone re-encode to run in fp32 for numerical robustness.
-            if augmented_img.is_cuda:
-                with torch.autocast(device_type="cuda", enabled=False):
-                    backbone_out = self.forward_image(augmented_img.to(dtype=torch.float32), use_checkpoint=True)
-            else:
-                backbone_out = self.forward_image(augmented_img, use_checkpoint=True)
-
-            # Fail fast with a precise source if the backbone blows up.
-            fpn = backbone_out.get("backbone_fpn", None)
-            if isinstance(fpn, (list, tuple)) and len(fpn) > 0:
-                for level, feat in enumerate(fpn):
-                    if isinstance(feat, torch.Tensor) and not torch.isfinite(feat).all():
-                        raise RuntimeError(
-                            "Deformation re-encode produced NaN/Inf in backbone_fpn. "
-                            f"level={level}, shape={tuple(feat.shape)}, "
-                            f"NaN={torch.isnan(feat).sum().item()}, Inf={torch.isinf(feat).sum().item()}"
-                        )
-            state["features"] = backbone_out["backbone_fpn"][-1]
-            if self.use_high_res_features_in_sam:
-                state["high_res"] = [
-                    backbone_out["backbone_fpn"][0],  # 256×256
-                    backbone_out["backbone_fpn"][1],  # 128×128
-                ]
-            else:
-                state["high_res"] = None
-
-            # Explicitly delete backbone_out to free graph references not needed
-            del backbone_out
-
-        # Visualization
-        if enable_vis and deform_offsets is not None:
-            # Cache originals and warped results for downstream visualization
-            vis_refs.setdefault("img_batch", orig_img_for_vis.detach().cpu())
-            vis_refs.setdefault("pixel_gt", orig_gt_for_vis.detach().cpu())
-            vis_refs["warped_images"] = augmented_img.detach().cpu()
-            vis_refs["warped_pixel_gt"] = warped_pixel_gt.detach().cpu()
-            vis_refs["deform_offsets"] = deform_offsets.detach().cpu()
-
-        # Cleanup
-        self._cleanup_augmentation_results([deform_result])
-
-    def _apply_style_attack(
-        self,
-        state: dict,
-        enable_vis: bool,
-        vis_refs: dict,
-    ) -> None:
-        """Apply style attack and update state."""
-        if not (self.use_style_adv and hasattr(self, "style_attacker")):
-            return
-
-        # Detach image to prevent gradient flow through deformation
-        img_detached = state["img"].detach() if state["img"].requires_grad else state["img"]
-
-        # Apply style
-        style_result = self.style_attacker.apply(
-            img_batch=img_detached,
-            clean_features=state["features"],
-            clean_high_res=state["high_res"],
-            pixel_gt=state["pixel_gt"],
-            model=self,
-        )
-
-        # Update state with style results
-        if style_result.intermediate_images is not None:
-            state["img"] = style_result.intermediate_images
-        state["features"] = style_result.features
-        state["high_res"] = style_result.high_res_features
-
-        # Visualization (no fallback: styled_images must be recorded)
-        if enable_vis:
-            vis_refs["styled_images"] = state["img"].detach().cpu()
-            vis_refs.setdefault("img_batch", state["img"].detach().cpu())
-            vis_refs.setdefault("pixel_gt", state["pixel_gt"].detach().cpu())
-            if hasattr(style_result, "original_styles") and style_result.original_styles is not None:
-                vis_refs["original_styles"] = style_result.original_styles.detach().cpu()
-            if hasattr(style_result, "adversarial_styles") and style_result.adversarial_styles is not None:
-                vis_refs["adversarial_styles"] = style_result.adversarial_styles.detach().cpu()
-
-        # Cleanup
-        self._cleanup_augmentation_results([style_result])
-
-    def _apply_deformation_to_images(
-        self,
-        img_batch: torch.Tensor,
-        pixel_gt: torch.Tensor,
-        deform_offsets: torch.Tensor | None,
-        enable_vis: bool,
-        vis_refs: dict,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Apply deformation offsets to images and GT masks (vectorized)."""
-        if deform_offsets is None:
-            return img_batch, pixel_gt.clone()
-
-        B, K, _, H_img, W_img = deform_offsets.shape
-        warped_pixel_gt = pixel_gt.clone()
-
-        # Identify valid objects (non-empty, non-background)
-        # Ensure masks are binary to avoid numerical issues
-        masks_float = (pixel_gt > 0.5).float()
-        mask_areas = masks_float.sum(dim=(2, 3))
-        is_empty = mask_areas.sum(dim=0) == 0
-        mask_area_ratio = mask_areas / (H_img * W_img)
-        is_bg_per_sample = mask_area_ratio > 0.5
-
-        # Always keep background out of deformation. If a background slot exists (last channel
-        # dominating the image) or background deformation is explicitly enabled, mark it as BG.
-        include_background = bool(getattr(self, "adv_enable_background", False))
-        is_bg = torch.zeros(K, dtype=torch.bool, device=img_batch.device)
-        if K > 0:
-            bg_candidate = is_bg_per_sample[:, -1].all()
-            is_bg[-1] = include_background or bg_candidate
-        valid_objects = ~(is_empty | is_bg)
-        valid_indices = torch.where(valid_objects)[0]
-
-        if len(valid_indices) == 0:
-            return img_batch, warped_pixel_gt
-
-        # Initialize: start with original image, then selectively replace deformed objects
-        # Only remove objects that will be deformed (keep non-deformed objects in place)
-        valid_masks = masks_float[:, valid_indices, :, :]  # [B, K_valid, H, W]
-        valid_masks_union = valid_masks.sum(dim=1, keepdim=True).clamp(0, 1)  # [B, 1, H, W]
-
-        # Start with image where valid objects are removed (keep other objects + background)
-        base_img = img_batch * (1 - valid_masks_union)
-
-        # Composite warped objects sequentially (forward order: later objects overwrite earlier ones)
-        warped_imgs_list = []
-        warped_masks_list = []
-        for idx_pos, k_idx in enumerate(valid_indices):
-            k_idx_scalar = k_idx.item()
-            offset_k = deform_offsets[:, k_idx_scalar, :, :, :]  # [B, 2, H, W]
-            mask_k = masks_float[:, k_idx_scalar, :, :].unsqueeze(1)  # [B, 1, H, W]
-
-            # Warp full image then gate with warped mask to keep object content
-            warped_img_full = self._apply_offset_to_image(img_batch, offset_k)
-            warped_mask_k = self._apply_offset_to_image(mask_k, offset_k)
-            warped_mask_bin = (warped_mask_k.squeeze(1) > 0.5).float().unsqueeze(1)
-            warped_obj_k = warped_img_full * warped_mask_bin
-
-            warped_imgs_list.append(warped_obj_k)
-            warped_masks_list.append(warped_mask_bin)
-
-            # Cleanup immediately (no storage needed)
-            del offset_k, mask_k, warped_img_full, warped_obj_k, warped_mask_k, warped_mask_bin
-
-        # === Compositing Strategy: Gap Filling ===
-        # 1. Stack all warped images and masks
-        if len(warped_imgs_list) > 0:
-            img_stack = torch.stack(warped_imgs_list, dim=1)  # [B, N_valid, 3, H, W]
-            mask_stack = torch.stack(warped_masks_list, dim=1)  # [B, N_valid, 1, H, W]
-
-            # 2. Compute combined mask of all foreground objects
-            # This represents regions covered by at least one object
-            sum_mask = mask_stack.sum(dim=1).clamp(0, 1)  # [B, 1, H, W]
-
-            # 3. Compute background part (original image where no object is present)
-            # This fills the "holes" left by moving objects with the original background
-            background = base_img * (1 - sum_mask)
-
-            # 4. Compute foreground part (warped objects)
-            # For overlapping objects, we can use simple sum (if masks are disjoint enough)
-            # or a more sophisticated blending. Here we use simple sum weighted by masks.
-            # foreground = (img_stack * mask_stack).sum(dim=1)
-
-            # Improved compositing: Average overlapping regions to prevent value explosion
-            # (which can cause NaNs in backbone)
-            overlap_count = mask_stack.sum(dim=1)  # [B, 1, H, W]
-            foreground_sum = (img_stack * mask_stack).sum(dim=1)  # [B, 3, H, W]
-
-            # Avoid division by zero (where overlap_count is 0, foreground_sum is 0 anyway)
-            foreground = foreground_sum / overlap_count.clamp(min=1.0)
-
-            # 5. Combine
-            augmented_img = background + foreground
-        else:
-            augmented_img = base_img.clone()
-
-        # Update pixel_gt with warped masks
-        # We need to map back the warped masks to their original indices
-        warped_pixel_gt = pixel_gt.clone()
-        for i, k in enumerate(valid_indices):
-            warped_pixel_gt[:, k : k + 1, :, :] = warped_masks_list[i]
-
-        # Save for visualization
-        if enable_vis:
-            vis_refs["warped_images"] = augmented_img.detach().cpu()
-            vis_refs["warped_pixel_gt"] = warped_pixel_gt.detach().cpu()
-
-        # Cleanup
-        del masks_float
-
-        return augmented_img, warped_pixel_gt
-
-    def compute_aue_loss(
-        self,
-        pixel_feat: torch.Tensor,
-        pixel_uncertainty: torch.Tensor | None = None,
-        pixel_gt: torch.Tensor | None = None,
-        pixel_logits: torch.Tensor | None = None,
-        adversarial_sample_M: int | None = 1,
-        pixel_bndl_model=None,
-        uq_sample_num: int = 8,
-        # Style-based AUE parameters
-        img_batch: torch.Tensor | None = None,
-        backbone_features: torch.Tensor | None = None,  # [B, C, H, W] detached backbone features for GCN
-        high_res_features: list[torch.Tensor] | None = None,  # High-res features for SAM decoder
-        external_pre_out_w: torch.Tensor | None = None,  # [B, C', K] for hyper_in (analytic uncertainty)
-    ) -> tuple[dict, dict]:
-        B, H, W, _ = pixel_feat.shape
-        device = pixel_feat.device
-        dtype = pixel_feat.dtype
-
-        # Validate high_res_features when use_high_res_features_in_sam is True
-        if self.use_high_res_features_in_sam and high_res_features is None:
-            raise ValueError("use_high_res_features_in_sam=True requires high_res_features to be provided, but got None. Please ensure high_res_features is passed to compute_aue_loss.")
-
-        # Early exit if no GT is available (AUE requires GT for calibration)
-        if pixel_gt is None:
-            logging.debug("AUE: No pixel_gt provided, skipping AUE loss")
-            zero_loss = torch.tensor(0.0, device=device, dtype=dtype)
-            return {"clean": zero_loss, "adversarial": zero_loss}, {}
-
-        # Compute positive sample ratio (strict shape checks; logits must be provided)
-        if pixel_logits is None:
-            raise ValueError("AUE expects non-null pixel_logits of shape [B,H,W,K]")
-        # Expect logits in channels-last format: [B, Hf, Wf, K]
-        if not (pixel_logits.ndim == 4 and pixel_logits.shape[-1] >= 1):
-            raise ValueError(f"AUE expects pixel_logits of shape [B,H,W,K], got {tuple(pixel_logits.shape)}")
-        H_feat, W_feat = int(pixel_logits.shape[1]), int(pixel_logits.shape[2])
-
-        # Optional GT: support both single-object [B,1,H,W] and multi-object [B,K,H,W]
-        pixel_gt_resized = None
-        if pixel_gt is not None:
-            if not (pixel_gt.ndim == 4 and pixel_gt.shape[1] >= 1):
-                raise ValueError(f"AUE expects pixel_gt of shape [B,K,H,W], got {tuple(pixel_gt.shape)}")
-
-            # For multi-object (K>1), combine all objects for calibration loss
-            if pixel_gt.shape[1] > 1:
-                # Combine multiple objects into single mask: [B, K, H, W] → [B, 1, H, W]
-                pixel_gt_combined = pixel_gt.sum(dim=1, keepdim=True).clamp(0, 1)
-            else:
-                # Single object: use as is
-                pixel_gt_combined = pixel_gt
-
-            # Resize to feature map resolution
-            pixel_gt_resized = F.interpolate(pixel_gt_combined.float(), size=(H_feat, W_feat), mode="nearest").squeeze(1)
-
-        # Wrap inputs in BNDLOutputs for compatibility
-        from sam2.modeling.bndl_utils import BNDLOutputs
-
-        bndl_outputs = BNDLOutputs(pixel_feat=pixel_feat, pixel_logits=pixel_logits, external_w=external_pre_out_w, pixel_uncertainty=pixel_uncertainty)
-
-        # Extract feature map for domain-aware method
-        # Priority: High-Res Features (Stride 4, 256x256) > Backbone Features (Stride 16, 64x64)
-        feature_map_for_calibration = None
-        if self.aue_dist_matching_config["method"] == "domain_aware_soft_mmd":
-            if high_res_features is not None and len(high_res_features) > 0:
-                # Use High-Res Feature (Stride 4) - matches error resolution (256x256)
-                feature_map_for_calibration = high_res_features[0]
-            elif backbone_features is not None:
-                # Fallback to Backbone Feature (Stride 16) - requires interpolation
-                feature_map_for_calibration = backbone_features
-
-        calibration_loss_clean, clean_metrics, clean_uncertainty = self._compute_uncertainty_calibration_loss(
-            bndl_outputs=bndl_outputs,
-            pixel_gt=pixel_gt_resized,
-            pixel_bndl_model=pixel_bndl_model,
-            backbone_features=feature_map_for_calibration,  # NEW: Pass for domain-aware method
-            tag="clean",  # NEW: Debug tag
-        )
-
-        # Adversarial augmentation branch (串行: 形变 → 风格)
-        calibration_loss_adversarial = torch.tensor(0.0, device=device, dtype=dtype)
-        aug_metrics = {}  # Initialize empty metrics for augmented branch
-        vis_data = None  # Initialize outside try block for visualization
-        vis_refs = {}  # Initialize vis_refs
-        adv_uncertainty = None  # Initialize adv_uncertainty
-
-        if (self.use_deform_adv or self.use_style_adv) and backbone_features is not None:
-            # Clear cache before memory-intensive adversarial branch
-            torch.cuda.empty_cache()
-
-            # ========================================================================
-            # Adversarial Augmentation Pipeline (串行: 形变 → 风格)
-            # ========================================================================
-            # vis_refs = {}  # Already initialized outside
-            enable_vis = getattr(self, "_enable_style_visualization", False)
-
-            if enable_vis:
-                # Save original image and GT for visualization (move to CPU immediately)
-                vis_refs["img_batch"] = img_batch.detach().cpu()
-                vis_refs["pixel_gt"] = pixel_gt.detach().cpu()
-
-            # Apply adversarial augmentations and get adversarial calibration loss
-            augmentation_result = self._apply_adversarial_attack_pipeline(
-                img_batch=img_batch,
-                pixel_gt=pixel_gt,
-                backbone_features=backbone_features,
-                high_res_features=high_res_features,
-                enable_vis=enable_vis,
-                uq_sample_num=uq_sample_num,
-                memory_context=getattr(self, "_aue_memory_context", None),
-            )
-
-            # Extract adversarial calibration loss: MMD(UQ_adv, Err_adv)
-            calibration_loss_adversarial = augmentation_result.get("calibration_loss_adversarial", torch.tensor(0.0, device=device, dtype=dtype))
-            aug_metrics = augmentation_result["aug_metrics"]  # Get augmented metrics
-            adv_uncertainty = augmentation_result.get("adv_uncertainty", None)  # Get adv uncertainty
-
-            if "vis_refs" in augmentation_result:
-                vis_refs.update(augmentation_result["vis_refs"])
-
-        # ========================================================================
-        # Prepare visualization data (AFTER cleanup, using CPU tensors)
-        # ========================================================================
-        # All visualization data has been moved to CPU during computation,
-        # so this can safely happen after GPU memory cleanup without conflicts.
-        vis_data = None
-        if vis_refs:
-            with torch.no_grad():
-
-                def _select_style_adv_image(vis_refs):
-                    # For style visualization, prefer pure styled outputs; fall back to warped, then clean
-                    if "styled_images" in vis_refs and vis_refs["styled_images"] is not None:
-                        return vis_refs["styled_images"]
-                    if "warped_images" in vis_refs and vis_refs["warped_images"] is not None:
-                        return vis_refs["warped_images"]
-                    return vis_refs["img_batch"]
-
-                adv_images_for_vis = _select_style_adv_image(vis_refs)
-
-                vis_data = self._prepare_aue_visualization_data(
-                    img_batch=vis_refs["img_batch"],  # Original image (before deformation)
-                    adv_images=adv_images_for_vis,
-                    pixel_gt=vis_refs["pixel_gt"],
-                    num_vis_samples=min(4, vis_refs["img_batch"].shape[0]),
-                    original_styles=vis_refs.get("original_styles"),
-                    adv_styles=vis_refs.get("adversarial_styles"),
-                    deform_offsets=vis_refs.get("deform_offsets"),
-                    warped_images=vis_refs.get("warped_images"),
-                    warped_masks=vis_refs.get("warped_pixel_gt"),
-                    attack_order=vis_refs.get("attack_order"),
-                )
-
-        # ========================================================================
-        # Assemble final loss dictionary
-        # ========================================================================
-        # Combine losses: Calibration on clean + Calibration on adversarial
-        # Loss = MMD(UQ_main, Err_main) + MMD(UQ_adv, Err_adv)
-        total_loss = calibration_loss_clean + calibration_loss_adversarial
-
-        # Aggregate metrics
-        aue_metrics = {}
-
-        # Add loss values to metrics for logging (detached for logging, original used for backward pass)
-        aue_metrics["calibration_loss_clean"] = calibration_loss_clean.detach() if isinstance(calibration_loss_clean, torch.Tensor) else calibration_loss_clean
-        aue_metrics["calibration_loss_adversarial"] = calibration_loss_adversarial.detach() if isinstance(calibration_loss_adversarial, torch.Tensor) else calibration_loss_adversarial
-        aue_metrics["total_loss"] = total_loss.detach() if isinstance(total_loss, torch.Tensor) else total_loss
-
-        for k, v in clean_metrics.items():
-            aue_metrics[f"clean/{k}"] = v
-        for k, v in aug_metrics.items():
-            aue_metrics[f"aug/{k}"] = v
-
-        # Save visualization data if available (prepared after cleanup)
-        # Note: This contains both style and deformation visualization data
-        if vis_data is not None:
-            aue_metrics["aue_visualization"] = vis_data
-
-        losses = {"clean": calibration_loss_clean, "adversarial": calibration_loss_adversarial}
-        return losses, aue_metrics
 
     def _generate_bbox_prompts_from_gt(self, gt_masks: torch.Tensor) -> torch.Tensor:
         """
@@ -1926,240 +664,6 @@ class SAM2Base(torch.nn.Module):
     @property
     def device(self):
         return next(self.parameters()).device
-
-    # --------------------------- AUE helpers ---------------------------
-    def _compute_uncertainty_calibration_loss(
-        self,
-        bndl_outputs: BNDLOutputs,
-        pixel_gt: torch.Tensor | None,
-        pixel_bndl_model=None,
-        backbone_features: torch.Tensor | None = None,  # NEW: for domain_aware_soft_mmd
-        tag: str = "unknown",  # NEW: Debug tag
-    ) -> tuple[torch.Tensor, dict, torch.Tensor | None]:
-        """Compute uncertainty calibration loss via distribution matching.
-
-        Theory: For zero-shot robustness, uncertainty distribution should match
-        error distribution using Maximum Mean Discrepancy (MMD).
-
-        Loss = MMD(P_U, P_Error) + 0.3 * MSE(U, Error)
-
-        Key innovation: Uses analytic uncertainty (from Weibull parameters) to enable
-        bidirectional optimization - both uncertainty and error are optimized to align.
-
-        Gradient flow:
-        - Analytic mode: MMD(uncertainty, error) → gradients to BOTH BNDL and encoder
-        - Sampling mode: MMD(uncertainty.detach(), error) → gradients only to encoder
-
-        References:
-        - Gretton et al. (2012): "A Kernel Two-Sample Test"
-        - Long et al. (2015): "Learning Transferable Features with DAN"
-
-        Args:
-            bndl_outputs: BNDLOutputs containing pixel_feat, pixel_logits, external_w, pixel_uncertainty
-            pixel_gt: [B, H, W] ground truth masks (already combined and resized)
-            pixel_bndl_model: BNDL model (required for analytic uncertainty)
-            backbone_features: [B, C, H, W] feature map from image encoder's last layer
-                              (required for domain_aware_soft_mmd method)
-
-        Returns:
-        Returns:
-            calibration_loss: MMD-based distribution matching loss
-            metrics: Dict of metrics for logging (e.g. correlation)
-            uncertainty: [B, H, W] uncertainty map (for consistency loss)
-        """
-        # Extract fields from bndl_outputs
-        pixel_logits = bndl_outputs.pixel_logits
-        pixel_feat = bndl_outputs.pixel_feat
-        external_pre_out_w = bndl_outputs.external_w
-        pixel_uncertainty = bndl_outputs.pixel_uncertainty
-
-        # Extract device and dtype from pixel_feat
-        device = pixel_feat.device
-        dtype = pixel_feat.dtype
-
-        if pixel_logits is None:
-            return torch.tensor(0.0, device=device, dtype=dtype, requires_grad=True), {}, None
-
-        # 1. Compute prediction error [B, H, W] in [0, 1]
-        error = self._compute_prediction_error(
-            pixel_logits=pixel_logits,
-            pixel_gt=pixel_gt,
-        )
-
-        # 2. Get uncertainty [B, H, W] in [0, 1]
-        # Choose between analytic (with gradients) or sampling (detached)
-        use_analytic = getattr(self, "aue_use_analytic_uncertainty", True)
-
-        if use_analytic and pixel_feat is not None and pixel_bndl_model is not None:
-            # ✅ Analytic uncertainty (preserves gradients to BNDL)
-            from sam2.modeling.bndl_utils import pixel_weibull_to_entropy_uncertainty
-
-            uncertainty = pixel_weibull_to_entropy_uncertainty(
-                pixel_bndl_model=pixel_bndl_model,
-                pixel_feat=pixel_feat,
-                external_pre_out_w=external_pre_out_w,
-                per_channel=False,
-            )  # [B, H, W] with gradients!
-
-            # Clamp to [0, 1] for numerical stability
-            uncertainty = uncertainty.clamp(0.0, 1.0)
-
-        elif pixel_uncertainty is not None:
-            # Sampling-based uncertainty (provided externally, typically detached)
-            uncertainty = pixel_uncertainty.clamp(0.0, 1.0)
-        else:
-            # Fallback: use 1 - confidence
-            confidence = self._aue_compute_confidence(pixel_logits, pixel_gt)
-            uncertainty = (1.0 - confidence).clamp(0.0, 1.0)
-
-        # 3. Distribution matching loss (primary: MMD/CKA/Gram)
-        # Gradients flow through error to encoder/decoder (and optionally through uncertainty to BNDL)
-        dist_loss, metrics = self.distribution_matcher.compute_loss(
-            uncertainty=uncertainty,
-            error=error,
-            use_patches=self.aue_use_patches,
-            feature_map=backbone_features,  # NEW: Pass feature map for domain_aware_soft_mmd
-            tag=tag,  # Pass tag
-        )
-
-        # 4. MSE loss (regularization: point-wise alignment)
-        mse_loss = F.mse_loss(uncertainty, error, reduction="mean")
-
-        # 5. Combine losses
-        total_loss = 1.0 * dist_loss + 0.3 * mse_loss
-
-        # Add MSE to metrics
-        metrics["mse_loss"] = mse_loss.item()
-
-        return total_loss, metrics, uncertainty
-
-    def _compute_prediction_error(
-        self,
-        pixel_logits: torch.Tensor,
-        pixel_gt: torch.Tensor,
-    ) -> torch.Tensor:
-        """Compute per-pixel prediction error in [0, 1].
-
-        Error = |sigmoid(logits) - GT|
-
-        Args:
-            pixel_logits: [B, H, W, K] or [B, H, W] logits
-            pixel_gt: [B, H, W] or [B, 1, H, W] ground truth
-
-        Returns:
-            error: [B, H, W] in [0, 1], where 0=perfect, 1=wrong
-        """
-        # Extract logits value
-        if pixel_logits.ndim == 4 and pixel_logits.shape[-1] >= 1:
-            logits_val = pixel_logits.max(dim=-1).values  # [B, H, W]
-        elif pixel_logits.ndim == 3:
-            logits_val = pixel_logits
-        elif pixel_logits.ndim == 4 and pixel_logits.shape[1] == 1:
-            logits_val = pixel_logits[:, 0]
-        else:
-            B, H, W = pixel_logits.shape[:3]
-            logits_val = pixel_logits.view(B, H, W, -1).max(dim=-1).values
-
-        # Extract GT mask [B, H, W]
-        H, W = logits_val.shape[1], logits_val.shape[2]
-        B = logits_val.shape[0]
-        gt_mask = self._extract_mask_from_gt(
-            pixel_gt=pixel_gt,
-            spatial_hw=(H, W),
-            batch_size=B,
-            device=logits_val.device,
-        )
-
-        # Compute prediction probability
-        pred_prob = torch.sigmoid(logits_val)  # [B, H, W] in [0, 1]
-
-        # Compute absolute error
-        gt_float = gt_mask.float()  # [B, H, W] in {0, 1}
-        error = torch.abs(pred_prob - gt_float)  # [B, H, W] in [0, 1]
-
-        return error
-
-    def _extract_mask_from_gt(
-        self,
-        pixel_gt: torch.Tensor | None,
-        spatial_hw: tuple[int, int],
-        batch_size: int,
-        device: torch.device,
-    ) -> torch.Tensor:
-        """Extract positive mask from GT tensor [B, H, W]."""
-        H, W = spatial_hw
-
-        if pixel_gt is None:
-            return torch.ones((batch_size, H, W), device=device, dtype=torch.bool, requires_grad=True)
-
-        gt = pixel_gt
-        if gt.ndim == 4 and gt.shape[-1] > 1:
-            pos = (gt > 0).any(dim=-1)
-        elif gt.ndim == 4 and gt.shape[1] == 1 and gt.shape[2] == H and gt.shape[3] == W:
-            pos = gt[:, 0] > 0
-        elif gt.ndim == 3 and gt.shape[1] == H and gt.shape[2] == W:
-            pos = gt > 0
-        else:
-            try:
-                B = gt.shape[0]
-                pos = (gt.view(B, H, W, -1) > 0).any(dim=-1)
-            except Exception:
-                pos = torch.ones((gt.shape[0], H, W), device=gt.device, dtype=torch.bool)
-
-        return pos.to(torch.bool)
-
-    def _aue_compute_confidence(
-        self,
-        pixel_logits: torch.Tensor,
-        pixel_gt: torch.Tensor,
-        tau_conf: float = 2.0,
-    ) -> torch.Tensor:
-        """Compute GT-aligned per-pixel confidence in [0,1], [B, H, W].
-
-        Confidence reflects prediction correctness:
-        - GT=1, logits=+5 → high confidence (correct foreground)
-        - GT=0, logits=-5 → high confidence (correct background)
-        - GT=1, logits=-5 → low confidence (wrong prediction)
-
-        Formula: c = sigmoid((logits * (2*gt - 1)) / tau_conf)
-        """
-        # Extract logits value based on shape
-        if pixel_logits.ndim == 4 and pixel_logits.shape[-1] >= 1:
-            logits_val = pixel_logits.max(dim=-1).values  # [B, H, W, C] -> [B, H, W]
-        elif pixel_logits.ndim == 3:
-            logits_val = pixel_logits  # [B, H, W]
-        elif pixel_logits.ndim == 4 and pixel_logits.shape[1] == 1:
-            logits_val = pixel_logits[:, 0]  # [B, 1, H, W] -> [B, H, W]
-        else:
-            B, H, W = pixel_logits.shape[0], pixel_logits.shape[1], pixel_logits.shape[2]
-            logits_val = pixel_logits.view(B, H, W, -1).mean(dim=-1)
-
-        # Extract GT mask [B, H, W] as boolean
-        H, W = logits_val.shape[1], logits_val.shape[2]
-        B = logits_val.shape[0]
-        gt_mask = self._extract_mask_from_gt(
-            pixel_gt=pixel_gt,
-            spatial_hw=(H, W),
-            batch_size=B,
-            device=logits_val.device,
-        )
-
-        # Convert GT boolean mask to sign: [0,1] -> [-1,+1]
-        # GT=1 (foreground) → +1, GT=0 (background) → -1
-        gt_sign = 2.0 * gt_mask.float() - 1.0  # [B, H, W]
-
-        # Align logits with GT direction
-        aligned_logits = logits_val * gt_sign
-
-        # Compute confidence from aligned logits
-        return torch.sigmoid(aligned_logits / float(tau_conf))
-
-    def _aue_compute_conf_from_logits_tensor(self, logits: torch.Tensor, tau_conf: float = 2.0) -> torch.Tensor:
-        """Compute confidence from logits tensor [*, H, W, K] -> [*, H, W] via sigmoid(max(|logit|)/tau)."""
-        if logits.ndim < 3:
-            raise ValueError("logits tensor rank too low")
-        mag = logits.abs().max(dim=-1).values  # [..., H, W]
-        return torch.sigmoid(mag / float(tau_conf)).to(mag.dtype)
 
     def forward(self, *args, **kwargs):
         raise NotImplementedError(
@@ -2223,8 +727,7 @@ class SAM2Base(torch.nn.Module):
         mask_inputs=None,
         high_res_features=None,
         multimask_output=False,
-        pixel_gt_for_aue: torch.Tensor | None = None,
-        img_batch_for_style_aue: torch.Tensor | None = None,
+        use_checkpoint=False,  # Enable gradient checkpointing for memory efficiency (used by AUE branch)
     ):
         """
         Forward SAM prompt encoders and mask heads.
@@ -2307,15 +810,43 @@ class SAM2Base(torch.nn.Module):
             masks=sam_mask_prompt,
         )
 
-        mask_decoder_outputs = self.sam_mask_decoder(
-            image_embeddings=backbone_features,
-            image_pe=self.sam_prompt_encoder.get_dense_pe(),
-            sparse_prompt_embeddings=sparse_embeddings,
-            dense_prompt_embeddings=dense_embeddings,
-            multimask_output=multimask_output,
-            repeat_image=False,  # the image is already batched
-            high_res_features=high_res_features,
-        )
+        # Apply gradient checkpointing to decoder if requested (for AUE memory optimization)
+        if use_checkpoint and backbone_features.requires_grad:
+            from torch.utils.checkpoint import checkpoint as checkpoint_fn
+
+            def _decoder_forward(img_embed, img_pe, sparse_embed, dense_embed, multimask, high_res):
+                return self.sam_mask_decoder(
+                    image_embeddings=img_embed,
+                    image_pe=img_pe,
+                    sparse_prompt_embeddings=sparse_embed,
+                    dense_prompt_embeddings=dense_embed,
+                    multimask_output=multimask,
+                    repeat_image=False,
+                    high_res_features=high_res,
+                )
+
+            # Note: checkpoint requires tensors as inputs, so we pass high_res_features separately
+            # and use use_reentrant=False for cleaner gradient handling
+            mask_decoder_outputs = checkpoint_fn(
+                _decoder_forward,
+                backbone_features,
+                self.sam_prompt_encoder.get_dense_pe(),
+                sparse_embeddings,
+                dense_embeddings,
+                multimask_output,
+                high_res_features,
+                use_reentrant=False,
+            )
+        else:
+            mask_decoder_outputs = self.sam_mask_decoder(
+                image_embeddings=backbone_features,
+                image_pe=self.sam_prompt_encoder.get_dense_pe(),
+                sparse_prompt_embeddings=sparse_embeddings,
+                dense_prompt_embeddings=dense_embeddings,
+                multimask_output=multimask_output,
+                repeat_image=False,  # the image is already batched
+                high_res_features=high_res_features,
+            )
 
         # mask_decoder always returns 5 elements (masks, iou_pred, sam_tokens_out, object_score_logits, aux_outputs)
         (
@@ -2399,51 +930,18 @@ class SAM2Base(torch.nn.Module):
                     batch_inds = torch.arange(mask_tokens_out_full.size(0), device=device)
                     mask_tokens_out_selected = mask_tokens_out_full[batch_inds, selected_mask_index]  # [B, C']
                     bndl_outputs["mask_tokens_out_selected"] = mask_tokens_out_selected.detach()
-            # Optional per-frame uncertainty for AUE
+            # Optional per-frame uncertainty for AUE (cached for later use in track_step level)
             pixel_uncertainty = bndl_outputs.get("pixel_uncertainty", None)
 
-            # Adversarial training: unified AUE loss (supports both style-based and feature-based)
-            if self.training and self.use_aue and (pixel_feat is not None) and not getattr(self, "_suppress_nested_aue", False):
-                # Prefer gradient-carrying logits key when training
-                pixel_logits_for_aue = bndl_outputs.get(
-                    "pixel_logits",
-                    bndl_outputs.get("masks_bndl_raw", bndl_outputs.get("mean_pixel_logits", None)),
-                )
+            # NOTE: AUE computation has been moved to track_step level (_compute_aue_with_refinement)
+            # This enables:
+            # 1. Adversarial branch to use refinement (iterative point sampling)
+            # 2. Task loss computation on adversarial samples for OOD robustness
+            # 3. Proper prompt generation for warped GT (deform attacks)
+            #
+            # The AUE-related data is still available in bndl_outputs for the track_step to use:
+            # - pixel_feat, pixel_logits, mask_tokens_out, pixel_uncertainty
 
-                # Extract external_pre_out_w (hyper_in) for analytic uncertainty computation
-                external_w_for_aue = bndl_outputs.get("hyper_in", None)
-                if external_w_for_aue is None:
-                    raise RuntimeError(
-                        f"SAM2Base._forward_sam_heads: use_bndl_for_pixels=True and use_aue=True, but bndl_outputs['hyper_in'] is None! bndl_outputs keys: {list(bndl_outputs.keys())}"
-                    )
-
-                # Unified AUE loss: automatically switches between style-based and feature-based
-                aue_losses, aue_metrics = self.compute_aue_loss(
-                    pixel_feat=pixel_feat,
-                    pixel_uncertainty=pixel_uncertainty,
-                    pixel_gt=pixel_gt_for_aue,
-                    pixel_logits=pixel_logits_for_aue,
-                    pixel_bndl_model=self.sam_mask_decoder.pixel_bndl if getattr(self.sam_mask_decoder, "pixel_bndl", None) is not None else None,
-                    # Style-based AUE parameters (optional, used if use_style_aug=True)
-                    img_batch=img_batch_for_style_aue,
-                    # CRITICAL: Do NOT detach backbone_features!
-                    # With GRL properly positioned in the adversarial networks,
-                    # gradients will flow: loss -> encoder (reversed by GRL) and loss -> adv_net (normal)
-                    backbone_features=backbone_features,
-                    high_res_features=high_res_features,  # Pass high_res_features for deform augmentation
-                    external_pre_out_w=external_w_for_aue,
-                )
-                # bndl_outputs["aue_aux_loss"] = aue_loss  # Removed as per user request
-                bndl_outputs["aue_metrics"] = aue_metrics
-                bndl_outputs["aue_loss_clean"] = aue_losses["clean"]
-                bndl_outputs["aue_loss_adv"] = aue_losses["adversarial"]
-
-                # After AUE computation, check if GCN stats were generated and add them
-                gcn_stats = getattr(self, "_latest_gcn_stats", None)
-                if gcn_stats and isinstance(bndl_outputs, dict):
-                    bndl_outputs["gcn_stats"] = gcn_stats
-                    logging.debug(f"Added GCN stats to bndl_outputs: {gcn_stats}")
-                    self._latest_gcn_stats = None
             # Write back updated BNDL namespace
             aux_outputs["bndl"] = bndl_outputs
             return (
@@ -2491,17 +989,11 @@ class SAM2Base(torch.nn.Module):
             obj_ptr = torch.zeros(mask_inputs.size(0), self.hidden_dim, device=mask_inputs.device)
         else:
             # produce an object pointer using the SAM decoder from the mask input
-            # Suppress nested AUE here to avoid noisy supervision in this "mask-as-output" path
-            prev_suppress = getattr(self, "_suppress_nested_aue", False)
-            self._suppress_nested_aue = True
-            try:
-                _, _, _, _, _, obj_ptr, _, *_ = self._forward_sam_heads(
-                    backbone_features=backbone_features,
-                    mask_inputs=self.mask_downsample(mask_inputs_float),
-                    high_res_features=high_res_features,
-                )
-            finally:
-                self._suppress_nested_aue = prev_suppress
+            _, _, _, _, _, obj_ptr, _, *_ = self._forward_sam_heads(
+                backbone_features=backbone_features,
+                mask_inputs=self.mask_downsample(mask_inputs_float),
+                high_res_features=high_res_features,
+            )
         # In this method, we are treating mask_input as output, e.g. using it directly to create spatial mem;
         # Below, we follow the same design axiom to use mask_input to decide if obj appears or not instead of relying
         # on the object_scores from the SAM decoder.
@@ -2818,8 +1310,6 @@ class SAM2Base(torch.nn.Module):
         num_frames,
         track_in_reverse,
         prev_sam_mask_logits,
-        pixel_gt_for_aue: torch.Tensor | None = None,
-        current_img_batch: torch.Tensor | None = None,
     ):
         current_out = {"point_inputs": point_inputs, "mask_inputs": mask_inputs}
         # High-resolution feature maps for the SAM head, reshape (HW)BC => BCHW
@@ -2865,8 +1355,6 @@ class SAM2Base(torch.nn.Module):
                 mask_inputs=mask_inputs,
                 high_res_features=high_res_features,
                 multimask_output=multimask_output,
-                pixel_gt_for_aue=pixel_gt_for_aue,
-                img_batch_for_style_aue=current_img_batch,
             )
 
         return current_out, sam_outputs, high_res_features, pix_feat
@@ -2916,7 +1404,6 @@ class SAM2Base(torch.nn.Module):
         run_mem_encoder=True,
         # The previously predicted SAM mask logits (which can be fed together with new clicks in demo).
         prev_sam_mask_logits=None,
-        pixel_gt_for_aue: torch.Tensor | None = None,
     ):
         current_out, sam_outputs, _, _ = self._track_step(
             frame_idx,
@@ -2930,7 +1417,6 @@ class SAM2Base(torch.nn.Module):
             num_frames,
             track_in_reverse,
             prev_sam_mask_logits,
-            pixel_gt_for_aue,
         )
 
         # If SAM head returned auxiliary outputs (BNDL/UR-ERN), sam_outputs will have 8 elements
