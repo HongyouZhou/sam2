@@ -444,7 +444,13 @@ class AUELoss(nn.Module):
 
     def _compute_attacker_mmd_loss(self, bndl_ns: dict, device: torch.device) -> torch.Tensor | None:
         """
-        Compute MMD-based miscalibration loss for training the attacker.
+        Compute calibration loss L_cal for training the attacker (RUAC paper §3.4 Eq. 5).
+
+            L_cal = e · exp(-sg[u]) + (1 - e) · exp(sg[u])
+
+        Attacker (via GRL sign flip inside Style/Deform networks) maximizes L_cal,
+        complementing L_seg^adv: L_seg^adv drives the confident-wrong failure mode,
+        L_cal drives the uncertain-correct one.
 
         === SEPARATE OPTIMIZER DESIGN ===
         This loss is returned separately (not added to core_loss) and used by a
@@ -453,7 +459,7 @@ class AUELoss(nn.Module):
         those parameters won't be updated.
 
         === GRADIENT FLOW ===
-        miscalibration_loss → pixel_logits → mask_decoder → backbone → attacker
+        L_cal → e → sigmoid → pixel_logits → decoder → backbone → I^adv → GRL → attacker
 
         The attacker optimizer's param_groups only include Style/Deform networks,
         so only those parameters receive updates. SAM/BNDL gradients are computed
@@ -464,7 +470,7 @@ class AUELoss(nn.Module):
             device: Computation device
 
         Returns:
-            MMD-like miscalibration loss value
+            L_cal scalar tensor (mean over pixels), with gradients to attacker only.
         """
         from sam2.modeling.aue.loss import prepare_gt_for_loss
 
@@ -537,13 +543,12 @@ class AUELoss(nn.Module):
                 align_corners=False,
             ).squeeze(1)
 
-        # === Compute miscalibration loss ===
-        # MSE between uncertainty and error measures calibration quality
-        # Attacker learns to maximize this (make predictions where uncertainty != error)
-        miscalibration_loss = torch.nn.functional.mse_loss(
-            uncertainty.clamp(0.0, 1.0).detach(),  # target (uncertainty) is detached
-            error.clamp(0.0, 1.0),  # prediction (error) has gradients to attacker
-            reduction="mean",
-        )
+        # === Compute L_cal (RUAC paper §3.4 Eq. 5) ===
+        # L_cal = e · exp(-sg[u]) + (1 - e) · exp(sg[u])
+        # Attacker maximizes via GRL sign flip; pairs with L_seg^adv to cover both
+        # confident-wrong (driven by L_seg^adv) and uncertain-correct (driven by L_cal).
+        u_sg = uncertainty.clamp(0.0, 1.0).detach()
+        e = error.clamp(0.0, 1.0)
+        cal_loss = e * torch.exp(-u_sg) + (1.0 - e) * torch.exp(u_sg)
 
-        return miscalibration_loss
+        return cal_loss.mean()
