@@ -1201,13 +1201,30 @@ class Trainer:
         use_separate_attacker = self.attacker_optim is not None and attacker_loss is not None
 
         if use_separate_attacker:
-            # Two backward passes: main + attacker
-            # retain_graph=True for main backward because attacker backward needs the graph
+            # 1. Main backward fills .grad of every trainable param with core_loss
+            #    gradients. retain_graph=True keeps the graph alive for attacker backward.
             self.scaler.scale(scaled_loss).backward(retain_graph=True)
 
-            # Scale attacker loss as well
+            # 2. Snapshot main params' .grad before attacker backward.
+            #    attacker_loss = lambda * L_cal flows back through:
+            #      error -> sigmoid -> pixel_logits -> decoder -> backbone -> I^adv -> GRL -> attacker
+            #    The decoder/backbone path causes attacker_loss.backward() to add into
+            #    main params' .grad. We snapshot here, restore after, so main_optim.step()
+            #    sees only core_loss gradients on main params. Attacker params are
+            #    excluded from _main_params so their .grad is left to accumulate the
+            #    GRL-flipped core_loss + attacker_loss contributions as designed.
+            saved_main_grads = [
+                p.grad.detach().clone() if p.grad is not None else None
+                for p in self._main_params
+            ]
+
+            # 3. Attacker backward — also writes to main params .grad (we'll restore).
             scaled_attacker_loss = attacker_loss / accum_steps
             self.scaler.scale(scaled_attacker_loss).backward()
+
+            # 4. Restore main params .grad — kills attacker_loss contamination.
+            for p, saved in zip(self._main_params, saved_main_grads):
+                p.grad = saved  # may be None for params with no core_loss contribution
 
             # Set flag so optimizer step knows backward was done
             self._attacker_backward_done = True
@@ -1496,6 +1513,15 @@ class Trainer:
                         attacker_params.append(param)
                         attacker_param_names.append(name)
                     break
+
+        # Cache for the snapshot/restore logic in _run_step that prevents
+        # attacker_loss.backward() from polluting main params' .grad
+        # (decoder/backbone are touched via the error -> logits -> decoder path).
+        self._attacker_param_ids = {id(p) for p in attacker_params}
+        self._main_params = [
+            p for _, p in model_unwrapped.named_parameters()
+            if p.requires_grad and id(p) not in self._attacker_param_ids
+        ]
 
         if not attacker_params:
             logging.info("[Attacker Optimizer] No attacker parameters found (AUE disabled)")
