@@ -145,6 +145,24 @@ class AdversarialAttacker(nn.Module):
             else:
                 raise ValueError(f"Unknown mode for deformation: {self.mode}")
 
+        elif self.aug_type == "pgd":
+            if self.mode == "image_level":
+                return ImageLevelPGDImpl(**kwargs)
+            else:
+                raise ValueError(f"PGD only supports image_level mode, got {self.mode}")
+
+        elif self.aug_type == "patch":
+            if self.mode == "image_level":
+                return ImageLevelPatchImpl(**kwargs)
+            else:
+                raise ValueError(f"Patch only supports image_level mode, got {self.mode}")
+
+        elif self.aug_type == "random_noise":
+            if self.mode == "image_level":
+                return ImageLevelRandomNoiseImpl(**kwargs)
+            else:
+                raise ValueError(f"RandomNoise only supports image_level mode, got {self.mode}")
+
         else:
             raise ValueError(f"Unknown augmentation type: {self.aug_type}")
 
@@ -739,6 +757,347 @@ class ImageLevelStyleImpl(nn.Module):
         else:
             logging.debug("GCN graph build returned None")
         return edge_index, edge_weight, stats
+
+
+# =============================================================================
+# PGD Attack (Rebuttal Baseline)
+# =============================================================================
+class ImageLevelPGDImpl(nn.Module):
+    """
+    Pixel-space PGD attack (Madry et al.) as rebuttal baseline.
+
+    No learnable parameters. Uses iterative gradient ascent on pixel delta
+    to maximize segmentation loss within an L∞ ε-ball.
+
+    Inner loop: find worst-case perturbation (maximize seg loss)
+    Outer loop: train decoder + BNDL on perturbed images (minimize loss)
+    """
+
+    def __init__(self, epsilon: float = 0.03, num_steps: int = 5, step_size: float = 0.01, random_start: bool = True, **kwargs):
+        super().__init__()
+        self.epsilon = epsilon
+        self.num_steps = num_steps
+        self.step_size = step_size
+        self.random_start = random_start
+        self.mode = "image_level"
+        self.aug_type = "pgd"
+
+    def predict_params(self, clean_features: torch.Tensor, pixel_gt: torch.Tensor, model: nn.Module, img_batch: torch.Tensor | None = None, **kwargs) -> torch.Tensor:
+        """
+        PGD inner loop: find delta that maximizes segmentation loss.
+
+        Args:
+            clean_features: [B, C, H, W] Clean backbone features (unused, for interface compat)
+            pixel_gt: [B, K, H, W] Ground truth masks
+            model: SAM2Base model
+            img_batch: [B, 3, H, W] Input images (required)
+
+        Returns:
+            delta: [B, 3, H, W] Perturbation (detached)
+        """
+        if img_batch is None:
+            raise ValueError("PGD requires img_batch")
+
+        img_detached = img_batch.detach()
+
+        # Initialize perturbation
+        if self.random_start:
+            delta = torch.empty_like(img_detached).uniform_(-self.epsilon, self.epsilon)
+        else:
+            delta = torch.zeros_like(img_detached)
+
+        # Prepare GT for loss computation (merge multi-object to single mask)
+        gt_combined = pixel_gt.float().sum(dim=1, keepdim=True).clamp(0, 1)
+
+        # PGD inner loop — model params frozen, only optimize delta
+        for _ in range(self.num_steps):
+            delta = delta.detach().requires_grad_(True)
+            adv_img = (img_detached + delta).clamp(-3.0, 3.0)
+
+            # Full forward through backbone + decoder (with grad for delta)
+            backbone_out = model.forward_image(adv_img, use_checkpoint=False)
+            adv_features = backbone_out["backbone_fpn"][-1]
+            high_res = None
+            if model.use_high_res_features_in_sam:
+                high_res = [backbone_out["backbone_fpn"][0], backbone_out["backbone_fpn"][1]]
+
+            # Forward through SAM decoder (no prompts, dense prediction)
+            (_, _, _, _, _, _, _, aux_outputs) = model._forward_sam_heads(
+                backbone_features=adv_features,
+                point_inputs=None,
+                mask_inputs=None,
+                high_res_features=high_res,
+                multimask_output=False,
+            )
+
+            # Extract mask logits and compute loss to maximize
+            bndl_data = aux_outputs.get("bndl", {}) if isinstance(aux_outputs, dict) else {}
+            pred_logits = bndl_data.get("pixel_logits")
+            if pred_logits is None:
+                break
+
+            # pixel_logits shape: [B, H, W, K] (K mask candidates) → reduce to [B, H, W]
+            if pred_logits.ndim == 4 and pred_logits.shape[-1] >= 1:
+                pred_logits_reduced = pred_logits.max(dim=-1).values  # [B, H, W]
+            elif pred_logits.ndim == 3:
+                pred_logits_reduced = pred_logits  # [B, H, W]
+            else:
+                pred_logits_reduced = pred_logits.view(pred_logits.shape[0], -1).max(dim=-1).values
+                break  # Unexpected shape, skip this step
+
+            gt_resized = F.interpolate(gt_combined, size=pred_logits_reduced.shape[-2:], mode="bilinear", align_corners=False)
+            gt_resized = gt_resized.squeeze(1)  # [B, 1, H, W] → [B, H, W]
+            loss = F.binary_cross_entropy_with_logits(pred_logits_reduced, gt_resized)
+
+            # Compute gradient w.r.t. delta only (model params not updated)
+            (grad,) = torch.autograd.grad(loss, delta, retain_graph=False)
+
+            # PGD step: gradient ascent (maximize loss)
+            delta = delta.detach() + self.step_size * grad.sign()
+            delta = delta.clamp(-self.epsilon, self.epsilon)
+
+        return delta.detach()
+
+    def apply_transform(self, img_batch: torch.Tensor, params: torch.Tensor, **kwargs) -> torch.Tensor:
+        """Apply perturbation delta to image."""
+        return (img_batch + params).clamp(-3.0, 3.0)
+
+    def apply(
+        self,
+        img_batch: torch.Tensor,
+        clean_features: torch.Tensor,
+        clean_high_res: list[torch.Tensor] | None,
+        pixel_gt: torch.Tensor,
+        model: nn.Module,
+    ) -> AdversarialResult:
+        """Full apply (predict + transform + backbone forward)."""
+        delta = self.predict_params(clean_features, pixel_gt, model, img_batch=img_batch)
+        adv_img = self.apply_transform(img_batch, delta)
+        backbone_out = model.forward_image(adv_img, use_checkpoint=True)
+        adv_features = backbone_out["backbone_fpn"][-1]
+        adv_high_res = None
+        if model.use_high_res_features_in_sam:
+            adv_high_res = [backbone_out["backbone_fpn"][0], backbone_out["backbone_fpn"][1]]
+        return AdversarialResult(
+            features=adv_features,
+            high_res_features=adv_high_res,
+            intermediate_images=adv_img,
+            num_backbone_forwards=self.num_steps + 1,
+            mode="image_level",
+            aug_type="pgd",
+        )
+
+
+# =============================================================================
+# Adversarial Patch Attack (Rebuttal Baseline)
+# =============================================================================
+class ImageLevelPatchImpl(nn.Module):
+    """
+    Adversarial Patch attack (Brown et al. 2017, Nesti et al. WACV 2022).
+
+    Optimizes a learnable patch pasted at random positions (EOT).
+    Unlike PGD (global L∞), this is a localized, unconstrained perturbation.
+    Loss is computed only on non-patch pixels (Nesti et al.).
+    """
+
+    def __init__(self, patch_size_ratio: float = 0.1, num_steps: int = 5, step_size: float = 0.5, random_start: bool = True, **kwargs):
+        super().__init__()
+        self.patch_size_ratio = patch_size_ratio
+        self.num_steps = num_steps
+        self.step_size = step_size
+        self.random_start = random_start
+        self.mode = "image_level"
+        self.aug_type = "patch"
+
+    def _apply_patch_to_image(self, img: torch.Tensor, patch: torch.Tensor, top: torch.Tensor, left: torch.Tensor) -> torch.Tensor:
+        """Paste patch onto image at given positions. Differentiable via clone+assign."""
+        B, C, H, W = img.shape
+        _, _, pH, pW = patch.shape
+        result = img.clone()
+        for b in range(B):
+            t, l = top[b].item(), left[b].item()
+            result[b, :, t : t + pH, l : l + pW] = patch[b]
+        return result
+
+    def predict_params(self, clean_features: torch.Tensor, pixel_gt: torch.Tensor, model: nn.Module, img_batch: torch.Tensor | None = None, **kwargs) -> dict:
+        """
+        Inner loop: optimize patch pixels to maximize segmentation loss.
+
+        Returns:
+            dict with "patch" [B, 3, pH, pW], "top" [B], "left" [B]
+        """
+        if img_batch is None:
+            raise ValueError("Patch attack requires img_batch")
+
+        B, C, H, W = img_batch.shape
+        img_detached = img_batch.detach()
+
+        # Patch dimensions
+        pH = max(int(H * self.patch_size_ratio), 1)
+        pW = max(int(W * self.patch_size_ratio), 1)
+
+        # Initialize patch
+        if self.random_start:
+            patch = torch.empty(B, C, pH, pW, device=img_batch.device).uniform_(-3.0, 3.0)
+        else:
+            patch = torch.zeros(B, C, pH, pW, device=img_batch.device)
+
+        # Prepare GT
+        gt_combined = pixel_gt.float().sum(dim=1, keepdim=True).clamp(0, 1)
+
+        # Store last placement for apply_transform
+        top = left = None
+
+        for _ in range(self.num_steps):
+            patch = patch.detach().requires_grad_(True)
+
+            # EOT: random placement each step
+            max_y = max(H - pH, 1)
+            max_x = max(W - pW, 1)
+            top = torch.randint(0, max_y, (B,), device=img_batch.device)
+            left = torch.randint(0, max_x, (B,), device=img_batch.device)
+
+            # Apply patch to image
+            adv_img = self._apply_patch_to_image(img_detached, patch.clamp(-3.0, 3.0), top, left)
+
+            # Forward through backbone + decoder (same as PGD)
+            backbone_out = model.forward_image(adv_img, use_checkpoint=False)
+            adv_features = backbone_out["backbone_fpn"][-1]
+            high_res = None
+            if model.use_high_res_features_in_sam:
+                high_res = [backbone_out["backbone_fpn"][0], backbone_out["backbone_fpn"][1]]
+
+            (_, _, _, _, _, _, _, aux_outputs) = model._forward_sam_heads(
+                backbone_features=adv_features,
+                point_inputs=None,
+                mask_inputs=None,
+                high_res_features=high_res,
+                multimask_output=False,
+            )
+
+            bndl_data = aux_outputs.get("bndl", {}) if isinstance(aux_outputs, dict) else {}
+            pred_logits = bndl_data.get("pixel_logits")
+            if pred_logits is None:
+                break
+
+            if pred_logits.ndim == 4 and pred_logits.shape[-1] >= 1:
+                pred_logits_reduced = pred_logits.max(dim=-1).values
+            elif pred_logits.ndim == 3:
+                pred_logits_reduced = pred_logits
+            else:
+                break
+
+            # Loss on non-patch pixels only (Nesti et al. WACV 2022)
+            pred_h, pred_w = pred_logits_reduced.shape[-2:]
+            patch_mask = torch.zeros(B, 1, H, W, device=img_batch.device)
+            for b in range(B):
+                t, l = top[b].item(), left[b].item()
+                patch_mask[b, :, t : t + pH, l : l + pW] = 1.0
+            non_patch_mask = 1.0 - F.interpolate(patch_mask, size=(pred_h, pred_w), mode="nearest").squeeze(1)
+
+            gt_resized = F.interpolate(gt_combined, size=(pred_h, pred_w), mode="bilinear", align_corners=False).squeeze(1)
+            pixel_loss = F.binary_cross_entropy_with_logits(pred_logits_reduced, gt_resized, reduction="none")
+            loss = (pixel_loss * non_patch_mask).sum() / non_patch_mask.sum().clamp(min=1)
+
+            # Gradient ascent (unconstrained, clip to valid pixel range)
+            (grad,) = torch.autograd.grad(loss, patch, retain_graph=False)
+            patch = patch.detach() + self.step_size * grad.sign()
+            patch = patch.clamp(-3.0, 3.0)
+
+        return {"patch": patch.detach(), "top": top, "left": left}
+
+    def apply_transform(self, img_batch: torch.Tensor, params: dict, **kwargs) -> torch.Tensor:
+        """Apply optimized patch at stored positions."""
+        return self._apply_patch_to_image(img_batch, params["patch"].clamp(-3.0, 3.0), params["top"], params["left"])
+
+    def apply(
+        self,
+        img_batch: torch.Tensor,
+        clean_features: torch.Tensor,
+        clean_high_res: list[torch.Tensor] | None,
+        pixel_gt: torch.Tensor,
+        model: nn.Module,
+    ) -> AdversarialResult:
+        """Full apply (predict + transform + backbone forward)."""
+        params = self.predict_params(clean_features, pixel_gt, model, img_batch=img_batch)
+        adv_img = self.apply_transform(img_batch, params)
+        backbone_out = model.forward_image(adv_img, use_checkpoint=True)
+        adv_features = backbone_out["backbone_fpn"][-1]
+        adv_high_res = None
+        if model.use_high_res_features_in_sam:
+            adv_high_res = [backbone_out["backbone_fpn"][0], backbone_out["backbone_fpn"][1]]
+        return AdversarialResult(
+            features=adv_features,
+            high_res_features=adv_high_res,
+            intermediate_images=adv_img,
+            num_backbone_forwards=self.num_steps + 1,
+            mode="image_level",
+            aug_type="patch",
+        )
+
+
+# =============================================================================
+# Random Noise Attack (Rebuttal Baseline)
+# =============================================================================
+class ImageLevelRandomNoiseImpl(nn.Module):
+    """
+    Random noise injection baseline (no gradient guidance).
+
+    Simply adds Gaussian or uniform noise to images during training.
+    The simplest possible perturbation strategy — no optimization, no adversarial objective.
+    """
+
+    def __init__(self, epsilon: float = 0.03, noise_type: str = "gaussian", **kwargs):
+        super().__init__()
+        self.epsilon = epsilon
+        self.noise_type = noise_type
+        self.mode = "image_level"
+        self.aug_type = "random_noise"
+
+    def predict_params(self, clean_features: torch.Tensor, pixel_gt: torch.Tensor, model: nn.Module, img_batch: torch.Tensor | None = None, **kwargs) -> torch.Tensor:
+        """
+        Sample random noise (no optimization).
+
+        Returns:
+            delta: [B, 3, H, W] Random perturbation (detached)
+        """
+        if img_batch is None:
+            raise ValueError("RandomNoise requires img_batch")
+        if self.noise_type == "uniform":
+            delta = torch.empty_like(img_batch).uniform_(-self.epsilon, self.epsilon)
+        else:  # gaussian
+            delta = torch.randn_like(img_batch) * self.epsilon
+            delta = delta.clamp(-3 * self.epsilon, 3 * self.epsilon)  # Truncated Gaussian
+        return delta.detach()
+
+    def apply_transform(self, img_batch: torch.Tensor, params: torch.Tensor, **kwargs) -> torch.Tensor:
+        """Apply noise delta to image."""
+        return (img_batch + params).clamp(-3.0, 3.0)
+
+    def apply(
+        self,
+        img_batch: torch.Tensor,
+        clean_features: torch.Tensor,
+        clean_high_res: list[torch.Tensor] | None,
+        pixel_gt: torch.Tensor,
+        model: nn.Module,
+    ) -> AdversarialResult:
+        """Full apply (predict + transform + backbone forward)."""
+        delta = self.predict_params(clean_features, pixel_gt, model, img_batch=img_batch)
+        adv_img = self.apply_transform(img_batch, delta)
+        backbone_out = model.forward_image(adv_img, use_checkpoint=True)
+        features = backbone_out["backbone_fpn"][-1]
+        high_res = None
+        if model.use_high_res_features_in_sam:
+            high_res = [backbone_out["backbone_fpn"][0], backbone_out["backbone_fpn"][1]]
+        return AdversarialResult(
+            features=features,
+            high_res_features=high_res,
+            intermediate_images=adv_img,
+            num_backbone_forwards=1,
+            mode="image_level",
+            aug_type="random_noise",
+        )
 
 
 class FeatureLevelStyleImpl(nn.Module):

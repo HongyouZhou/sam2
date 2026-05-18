@@ -44,6 +44,7 @@ class AUELoss(nn.Module):
         attacker_uncertainty_weight: float = 0.0,  # Attacker maximizes raw uncertainty
         attacker_mmd_weight: float = 0.0,  # Attacker maximizes miscalibration (uncertainty ≠ error)
         attacker_task_weight: float = 0.0,  # NEW: Task loss only updates attacker (NO SAM update)
+        dual_sg_l2_weight: float = 1.0,  # Multiplier on L2 mirror term inside L_cal_sym (asymmetric Dual-SG)
         mmd_config: dict | None = None,
         sam_loss_fn: nn.Module | None = None,
         bndl_loss_fn: nn.Module | None = None,
@@ -67,6 +68,7 @@ class AUELoss(nn.Module):
         self.attacker_uncertainty_weight = attacker_uncertainty_weight
         self.attacker_mmd_weight = attacker_mmd_weight
         self.attacker_task_weight = attacker_task_weight
+        self.dual_sg_l2_weight = dual_sg_l2_weight
         self.sam_loss_fn = sam_loss_fn
         self.bndl_loss_fn = bndl_loss_fn
 
@@ -444,13 +446,16 @@ class AUELoss(nn.Module):
 
     def _compute_attacker_mmd_loss(self, bndl_ns: dict, device: torch.device) -> torch.Tensor | None:
         """
-        Compute calibration loss L_cal for training the attacker (RUAC paper §3.4 Eq. 5).
+        Compute symmetric calibration loss L_cal_sym (Dual-SG extension of paper Eq. 5).
 
-            L_cal = e · exp(-sg[u]) + (1 - e) · exp(sg[u])
+            L1 = e · exp(-sg[u]) + (1 - e) · exp(sg[u])         (paper Eq. 5, sampling u)
+            L2 = sg[e] · exp(-u) + (1 - sg[e]) · exp(u)         (symmetric mirror, analytic u)
+            L_cal_sym = (L1 + L2).mean()
 
-        Attacker (via GRL sign flip inside Style/Deform networks) maximizes L_cal,
-        complementing L_seg^adv: L_seg^adv drives the confident-wrong failure mode,
-        L_cal drives the uncertain-correct one.
+        Motivation: original Eq. 5 has ∂L/∂e = exp(-u) - exp(u) ≈ 0 at u≈0, so the
+        attacker (via GRL) has no gradient signal in the confident region and cannot
+        drive the confident-wrong failure mode. L2 restores a ∂/∂u channel via the
+        analytic uncertainty, symmetrically covering both UC and CW failure modes.
 
         === SEPARATE OPTIMIZER DESIGN ===
         This loss is returned separately (not added to core_loss) and used by a
@@ -459,11 +464,12 @@ class AUELoss(nn.Module):
         those parameters won't be updated.
 
         === GRADIENT FLOW ===
-        L_cal → e → sigmoid → pixel_logits → decoder → backbone → I^adv → GRL → attacker
+        L1 → e → sigmoid → pixel_logits → decoder → backbone → I^adv → GRL → attacker
+        L2 → u_analytic → BNDL hyper_in → decoder → backbone → I^adv → GRL → attacker
 
-        The attacker optimizer's param_groups only include Style/Deform networks,
-        so only those parameters receive updates. SAM/BNDL gradients are computed
-        but not applied.
+        BNDL contamination from L2 is wiped by trainer.py snapshot/restore (4234079);
+        attacker_optim's param_groups only include Style/Deform, so SAM/BNDL grads
+        are computed but not applied.
 
         Args:
             bndl_ns: BNDL namespace containing adversarial outputs
@@ -489,18 +495,19 @@ class AUELoss(nn.Module):
         if pixel_gt is None:
             return None
 
-        # === Get uncertainty (can use either sampling or analytic) ===
-        # For attacker training, we use sampling uncertainty (no gradients to BNDL)
-        # This ensures BNDL is not updated by this loss even without separate optimizer
-        pixel_uncertainty = adv_bndl.get("pixel_uncertainty_sampling")
-        if pixel_uncertainty is None:
-            pixel_uncertainty = adv_bndl.get("pixel_uncertainty")
-        if pixel_uncertainty is None:
+        # === Get uncertainty: sampling (no grad) for L1, analytic (with grad) for L2 ===
+        # L1 (paper Eq.5) needs sg[u] => sampling is fine (already gradient-free).
+        # L2 (mirror term) needs gradient on u to drive attacker via the u-channel
+        # u_analytic -> BNDL hyper_in -> decoder -> backbone -> I^adv -> GRL -> attacker.
+        # BNDL contamination from L2 is wiped by trainer.py snapshot/restore (4234079).
+        pixel_u_sample = adv_bndl.get("pixel_uncertainty_sampling")
+        if pixel_u_sample is None:
+            pixel_u_sample = adv_bndl.get("pixel_uncertainty")
+        if pixel_u_sample is None:
             return None
-
-        # Detach uncertainty to prevent BNDL updates (extra safety)
-        if pixel_uncertainty.requires_grad:
-            pixel_uncertainty = pixel_uncertainty.detach()
+        if pixel_u_sample.requires_grad:
+            pixel_u_sample = pixel_u_sample.detach()
+        pixel_u_analy = adv_bndl.get("pixel_uncertainty_analytic")  # may be None in eval
 
         # === Get pixel_logits (keep gradients for attacker) ===
         # With separate optimizer, we don't need to detach - only attacker params are updated
@@ -528,27 +535,40 @@ class AUELoss(nn.Module):
         pred_prob = torch.sigmoid(logits_val)
         error = torch.abs(pred_prob - pixel_gt_resized.float().detach())  # GT is detached
 
-        # === Average uncertainty over masks to get [B, H, W] ===
-        if pixel_uncertainty.ndim == 4:  # [B, H, W, K]
-            uncertainty = pixel_uncertainty.mean(dim=-1)  # [B, H, W]
-        else:
-            uncertainty = pixel_uncertainty
+        # === Average uncertainty over masks to get [B, H, W] (both sampling & analytic) ===
+        def _reduce_and_resize(u, target_shape):
+            if u is None:
+                return None
+            if u.ndim == 4:
+                u = u.mean(dim=-1)
+            if u.shape[1:] != target_shape:
+                u = torch.nn.functional.interpolate(
+                    u.unsqueeze(1), size=target_shape, mode="bilinear", align_corners=False
+                ).squeeze(1)
+            return u
 
-        # Resize if needed
-        if uncertainty.shape[1:] != error.shape[1:]:
-            uncertainty = torch.nn.functional.interpolate(
-                uncertainty.unsqueeze(1),
-                size=error.shape[1:],
-                mode="bilinear",
-                align_corners=False,
-            ).squeeze(1)
+        u_sample = _reduce_and_resize(pixel_u_sample, error.shape[1:])
+        u_analy = _reduce_and_resize(pixel_u_analy, error.shape[1:])
 
-        # === Compute L_cal (RUAC paper §3.4 Eq. 5) ===
-        # L_cal = e · exp(-sg[u]) + (1 - e) · exp(sg[u])
-        # Attacker maximizes via GRL sign flip; pairs with L_seg^adv to cover both
-        # confident-wrong (driven by L_seg^adv) and uncertain-correct (driven by L_cal).
-        u_sg = uncertainty.clamp(0.0, 1.0).detach()
-        e = error.clamp(0.0, 1.0)
-        cal_loss = e * torch.exp(-u_sg) + (1.0 - e) * torch.exp(u_sg)
+        # === L1: paper Eq.5, sg[u] (sampling u, no grad) ===
+        # L1 = e · exp(-sg[u]) + (1 - e) · exp(sg[u])
+        u_sg = u_sample.clamp(0.0, 1.0).detach()
+        e_clamp = error.clamp(0.0, 1.0)
+        loss_e = e_clamp * torch.exp(-u_sg) + (1.0 - e_clamp) * torch.exp(u_sg)
 
-        return cal_loss.mean()
+        # === L2: symmetric mirror, sg[e] (analytic u, with grad) ===
+        # L2 = sg[e] · exp(-u) + (1 - sg[e]) · exp(u)
+        # Drives ∂/∂u channel: at confident-wrong (e=1, u≈0), ∂L2/∂u = -1, so attacker
+        # (via GRL) is pushed to keep u low while raising e -> CW failure mode covered.
+        if u_analy is not None:
+            assert u_analy.requires_grad, "L2: u_analytic must carry gradient to drive attacker"
+            assert u_analy.shape == u_sample.shape, (
+                f"L2: u shape mismatch analytic={u_analy.shape} vs sampling={u_sample.shape}"
+            )
+            e_sg = e_clamp.detach()
+            u_clamp = u_analy.clamp(0.0, 1.0)
+            loss_u = e_sg * torch.exp(-u_clamp) + (1.0 - e_sg) * torch.exp(u_clamp)
+            return (loss_e + self.dual_sg_l2_weight * loss_u).mean()
+
+        # Fallback (eval-time or analytic missing): plain Eq.5 only
+        return loss_e.mean()

@@ -556,6 +556,9 @@ def _inference_with_bndl_impl(
     # UC-TTA parameters (optional test-time adaptation)
     uctta_config: UCTTAConfig | None = None,
     uctta_adapter: UCTTAAdapter | None = None,
+    # Uncertainty correction (SeCo-inspired, inference-time post-processing)
+    enable_uncertainty_correction: bool = False,
+    uc_component_threshold: float = 0.5,
 ):
     """
     Single-frame inference with BNDL using SAM2ImagePredictor.
@@ -576,6 +579,10 @@ def _inference_with_bndl_impl(
         save_uncertainty_maps = True
         print("  📊 Saving uncertainty maps enabled via ZS_SAVE_UNCERTAINTY_MAPS env var")
 
+    collect_decoder_features = os.environ.get("ZS_COLLECT_DECODER_FEATURES", "").lower() in ("true", "1", "yes")
+    decoder_features_buffer = [] if collect_decoder_features else None
+    decoder_features_max = 2000
+
     # Allow environment variable to control colored vs grayscale
     if os.environ.get("ZS_COLORED_UNCERTAINTY", "").lower() in ("false", "0", "no"):
         colored_uncertainty_maps = False
@@ -588,6 +595,11 @@ def _inference_with_bndl_impl(
 
     print(f"BNDL ({click_protocol}) inference on {len(video_names)} videos")
     print(f"  multimask_output={multimask_output} (selects best mask by IoU prediction)")
+    print(f"  bndl_sample_num={bndl_sample_num}")
+
+    # Set MC sample count on mask decoder
+    if hasattr(predictor, "model") and hasattr(predictor.model, "sam_mask_decoder"):
+        predictor.model.sam_mask_decoder.bndl_sample_num = bndl_sample_num
 
     # Log UC-TTA status
     if uctta_adapter is not None and uctta_config is not None and uctta_config.enabled:
@@ -733,7 +745,37 @@ def _inference_with_bndl_impl(
                 else:
                     binary_mask = (scaled_logits > score_thresh).astype(bool)
 
+            # === Uncertainty Correction (SeCo-inspired) ===
+            if enable_uncertainty_correction:
+                aux_uc = predictor.get_last_aux_outputs()
+                if aux_uc is not None and "bndl" in aux_uc:
+                    pixel_unc = aux_uc["bndl"].get("pixel_uncertainty")
+                    if pixel_unc is not None:
+                        if pixel_unc.dim() == 4:
+                            unc_np = pixel_unc[0].mean(dim=-1).cpu().numpy()
+                        else:
+                            unc_np = pixel_unc[0].cpu().numpy()
+                        # Resize uncertainty (256x256) to mask shape if needed
+                        if unc_np.shape != binary_mask.shape:
+                            import torch.nn.functional as F
+
+                            unc_tensor = torch.from_numpy(unc_np).unsqueeze(0).unsqueeze(0).float()
+                            unc_np = F.interpolate(unc_tensor, size=binary_mask.shape, mode="bilinear", align_corners=False).squeeze().numpy()
+                        from uncertainty_correction import apply_uncertainty_correction
+
+                        binary_mask, corr_meta = apply_uncertainty_correction(binary_mask, unc_np, component_threshold=uc_component_threshold)
+                        if corr_meta["n_removed"] > 0:
+                            logger.info(f"UC: vid={vid}, obj={obj_id}: removed {corr_meta['n_removed']}/{corr_meta['n_components']} components")
+
             seg[obj_id] = binary_mask
+
+            # Collect decoder mask_tokens_out for t-SNE/UMAP analysis
+            if decoder_features_buffer is not None and len(decoder_features_buffer) < decoder_features_max:
+                _aux = predictor.get_last_aux_outputs()
+                if _aux is not None and "bndl" in _aux:
+                    _mto = _aux["bndl"].get("mask_tokens_out")
+                    if _mto is not None:
+                        decoder_features_buffer.append(_mto[0].detach().cpu())  # [K, 256]
 
             # Debug: Check for all-foreground anomaly
             fg_ratio = binary_mask.sum() / binary_mask.size
@@ -998,6 +1040,15 @@ def _inference_with_bndl_impl(
         if uncertainty_metrics:
             dataset_statistics["_uncertainty_metrics"] = uncertainty_metrics
 
+    # Save collected decoder features for t-SNE/UMAP analysis
+    if decoder_features_buffer:
+        features = torch.cat(decoder_features_buffer, dim=0)  # [N*K, 256]
+        if features.shape[0] > decoder_features_max:
+            features = features[torch.randperm(features.shape[0])[:decoder_features_max]]
+        save_path = out_dir / f"decoder_features_{dataset_name}.pt"
+        torch.save({"features": features, "dataset": dataset_name, "n_original": len(decoder_features_buffer)}, save_path)
+        print(f"  💾 Saved decoder features: {features.shape} → {save_path}")
+
     return dataset_statistics if collect_statistics else None
 
 
@@ -1033,6 +1084,9 @@ def inference_with_bndl(
     uctta_use_fisher_reg: bool = False,
     uctta_entropy_threshold: float = 0.4,
     uctta_selection_p: float = 0.1,
+    # Uncertainty correction (SeCo-inspired)
+    enable_uncertainty_correction: bool = False,
+    uc_component_threshold: float = 0.5,
 ):
     """
     Wrapper function for BNDL inference with optional UC-TTA support.
@@ -1094,6 +1148,8 @@ def inference_with_bndl(
             colored_uncertainty_maps=colored_uncertainty_maps,
             uctta_config=uctta_config,
             uctta_adapter=uctta_adapter,
+            enable_uncertainty_correction=enable_uncertainty_correction,
+            uc_component_threshold=uc_component_threshold,
         )
     else:
         # Standard BNDL inference with inference_mode for speed
@@ -1125,6 +1181,8 @@ def inference_with_bndl(
                     colored_uncertainty_maps=colored_uncertainty_maps,
                     uctta_config=None,
                     uctta_adapter=None,
+                    enable_uncertainty_correction=enable_uncertainty_correction,
+                    uc_component_threshold=uc_component_threshold,
                 )
 
 
@@ -1164,6 +1222,9 @@ def run_single_dataset_with_bndl(
     uctta_use_fisher_reg: bool = False,
     uctta_entropy_threshold: float = 0.4,
     uctta_selection_p: float = 0.1,
+    # Uncertainty correction (SeCo-inspired)
+    enable_uncertainty_correction: bool = False,
+    uc_component_threshold: float = 0.5,
 ) -> tuple[float, float, float, dict]:
     """Run evaluation on single dataset using SAM2ImagePredictor.
 
@@ -1226,6 +1287,9 @@ def run_single_dataset_with_bndl(
         uctta_use_fisher_reg=uctta_use_fisher_reg,
         uctta_entropy_threshold=uctta_entropy_threshold,
         uctta_selection_p=uctta_selection_p,
+        # Uncertainty correction
+        enable_uncertainty_correction=enable_uncertainty_correction,
+        uc_component_threshold=uc_component_threshold,
     )
 
     if stats:
@@ -1354,6 +1418,12 @@ def parse_args():
         help="Learning rate for UC-TTA adaptation (default: 3e-4)",
     )
     parser.add_argument(
+        "--bndl-sample-num",
+        type=int,
+        default=20,
+        help="Number of MC samples for BNDL uncertainty estimation (default: 20)",
+    )
+    parser.add_argument(
         "--uctta-no-bn-adapt",
         action="store_true",
         help="Disable BN/LN layer adaptation (temperature-only mode)",
@@ -1443,6 +1513,7 @@ def main():
             uctta_enable_bn_adapt=not args.uctta_no_bn_adapt,
             uctta_entropy_threshold=args.uctta_entropy_threshold,
             uctta_selection_p=args.uctta_selection_p,
+            bndl_sample_num=args.bndl_sample_num,
         )
 
         results[dataset_name] = (jf, j, f)

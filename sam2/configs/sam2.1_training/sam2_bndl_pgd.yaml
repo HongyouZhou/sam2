@@ -223,7 +223,6 @@ trainer:
     sam_mask_decoder_extra_args:
       bndl_factor_z: 0.0
       bndl_factor_w: 0.0
-      bndl_sample_num: 20  # MC samples for sampling-based uncertainty; override to 50 for higher quality
     # === BNDL_CONFIG_END ===
     # Compilation flag
     # Freeze image encoder to save memory
@@ -253,51 +252,26 @@ trainer:
     max_num_objects: ${scratch.max_num_objects}
     # === MAX_OBJECTS_CONFIG_END ===
 
-    # === AUE_GCN_CONFIG_START ===
-    # AUE (Adversarial Uncertainty Estimation) with Style-based augmentation
+    # === PGD ADVERSARIAL TRAINING (Rebuttal Baseline) ===
+    # Pixel-space PGD attack (Madry et al.) — no learnable attacker parameters
     use_aue: true
-    # Style Adversarial options (alternative to AUE, for domain generalization)
-    use_style_adv: true
-    style_adv_mode: "image_level"  # "image_level" or "feature_level"
-    style_adv_epsilon: 0.3
-    style_adv_use_gt_region_style: true
-    
-    # Multi-object style attack control
+    # Disable Style/Deform attacks
+    use_style_adv: false
+    use_deform_adv: false
+
+    # Multi-object control (kept for BNDL compatibility)
     adv_use_multi_object: true
     adv_enable_background: true
-    
-    # Global-Local Mixed Style Adversarial
-    style_adv_use_global_local_mix: false
-    style_adv_global_epsilon: 0.5
-    style_adv_global_weight: 0.5
 
-    # GCN-based multi-object style refinement
-    style_adv_use_gcn: true  # Not needed for global-only style
-    style_adv_gcn_hidden_dim: 64
-    style_adv_gcn_num_layers: 2
-    style_adv_gcn_edge_threshold: 0.0
-    style_adv_gcn_use_semantic_edges: true
-    style_adv_gcn_use_background_edges: true
-    style_adv_gcn_distance_threshold: 1.0
-    style_adv_gcn_use_boundary_distance: true
-    style_adv_gcn_use_visual_features: true
-    style_adv_gcn_feature_dim: 256  # Feature dimension (matches backbone_fpn[-1] d_model)
-    
-    # Deformation Adversarial (feature-level, memory encoder based)
-    use_deform_adv: true
-    deform_adv_epsilon: 0.15
-    deform_adv_use_soft_composite: true
-    deform_adv_temperature: 1.0
-    deform_adv_use_gcn: false
-    deform_adv_gcn_num_layers: 2
-    deform_adv_num_deform_groups: 4
-    deform_adv_init_from_memory_encoder: true  # Initialize from pretrained memory encoder
-    deform_adv_freeze_encoder_components: true  # Freeze all encoder components (mask_encoder, img_feat_proj, fuser) to prevent GRL gradient instability
-    deform_adv_zero_mean_offsets: true  # Remove global translation while keeping local warps
-    deform_adv_local_offset_gain: 1.0
-    
+    # PGD Adversarial options
+    use_pgd_adv: true
+    pgd_adv_epsilon: 0.03       # L∞ budget in normalized pixel space (~8/255)
+    pgd_adv_num_steps: 5        # Inner loop iterations
+    pgd_adv_step_size: 0.01     # Per-step magnitude (α)
+    pgd_adv_random_start: true  # Random init within ε-ball
+
     # Adversarial Pipeline Ordering
-    adversarial_attack_order: ["style", "deform"]
+    adversarial_attack_order: ["pgd"]
     
     # Analytic uncertainty computation (from Weibull parameters)
     # true = use analytic uncertainty (with gradients to BNDL, bidirectional optimization)
@@ -749,12 +723,8 @@ trainer:
       norm_type: 2
 
     # === Attacker Optimizer Configuration ===
-    # Separate optimizer for Style/Deform attacker networks
-    # Uses cosine annealing LR schedule (1e-3 → 1e-4)
-    attacker_optim:
-      lr_start: 1.0e-3
-      lr_end: 1.0e-4
-      weight_decay: 0.0
+    # PGD has no learnable parameters — no attacker optimizer needed
+    attacker_optim: null
 
     param_group_modifiers:
       - _target_: training.optimizer.layer_decay_param_modifier
@@ -881,12 +851,11 @@ trainer:
       aue_loss:
         _target_: training.loss_aue.AUELoss
         task_weight: 1.0       # Task loss updates SAM + attacker (via GRL) - set 0 for isolation
-        bndl_weight: 0.05      # Aligned with paper: BNDL KL on adv samples (matches clean branch post-warmup)
+        bndl_weight: 0.0
         mmd_weight: 0.0
         attacker_uncertainty_weight: 0.0  # Attacker maximizes uncertainty (NO BNDL update)
-        attacker_mmd_weight: 0.1  # λ from paper Table; weighting on L_cal (Eq. 5). Attacker maximizes via GRL.
+        attacker_mmd_weight: 0.3  # Attacker maximizes miscalibration (NO SAM/BNDL update)
         attacker_task_weight: 0.0  # NEW: Task loss only updates attacker (NO SAM update) - complete isolation
-        dual_sg_l2_weight: 1.0  # Multiplier on L2 mirror term in Dual-SG L_cal_sym (1.0 = symmetric; >1 = asymmetric, push CW harder)
         mmd_config: ${scratch.mmd_config}
       # === UR-ERN Loss Configuration ===
       # UR-ERN paper (arXiv:2401.01484) Eq. 11: L^UR-ERN = L^NLL + λ·L^R + λ₁·L^U

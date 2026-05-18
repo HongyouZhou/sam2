@@ -321,13 +321,22 @@ def build_task_command(
         if hasattr(args, "bndl_aue_uctta_lr"):
             cmd.extend(["--bndl_aue_uctta_lr", str(args.bndl_aue_uctta_lr)])
 
+    # Uncertainty correction threshold for CORR methods
+    if method in ("BNDL_CORR", "BNDL_AUE_CORR") and hasattr(args, "uc_component_threshold"):
+        cmd.extend(["--uc_component_threshold", str(args.uc_component_threshold)])
+
+    # BNDL MC sample number
+    methods_supporting_bndl = ["BNDL", "BNDL_AUE", "BNDL_CORR", "BNDL_AUE_CORR"]
+    if method in methods_supporting_bndl and hasattr(args, "bndl_sample_num"):
+        cmd.extend(["--bndl_sample_num", str(args.bndl_sample_num)])
+
     # Statistics & Visualization
     # Applied to relevant methods
-    methods_supporting_stats = ["BNDL", "BNDL_AUE", "UR-ERN"]
+    methods_supporting_stats = ["BNDL", "BNDL_AUE", "UR-ERN", "BNDL_CORR", "BNDL_AUE_CORR"]
     if method in methods_supporting_stats and args.collect_bndl_stats:
         cmd.append("--collect_bndl_stats")
 
-    methods_supporting_vis = ["SAM", "SAM_FT", "BNDL_AUE"]
+    methods_supporting_vis = ["SAM", "SAM_FT", "BNDL_AUE", "BNDL_AUE_CORR"]
     if method in methods_supporting_vis and hasattr(args, "save_vis") and args.save_vis:
         cmd.append("--save_vis")
         if hasattr(args, "max_vis_per_video"):
@@ -391,9 +400,9 @@ def run_task(
     checkpoint_path = None
     if method == "SAM_FT" and hasattr(args, "sam_ft_checkpoint") and args.sam_ft_checkpoint:
         checkpoint_path = args.sam_ft_checkpoint
-    elif method == "BNDL_AUE" and hasattr(args, "bndl_aue_checkpoint") and args.bndl_aue_checkpoint:
+    elif method in ("BNDL_AUE", "BNDL_AUE_CORR") and hasattr(args, "bndl_aue_checkpoint") and args.bndl_aue_checkpoint:
         checkpoint_path = args.bndl_aue_checkpoint
-    elif method == "BNDL" and hasattr(args, "bndl_checkpoint") and args.bndl_checkpoint:
+    elif method in ("BNDL", "BNDL_CORR") and hasattr(args, "bndl_checkpoint") and args.bndl_checkpoint:
         checkpoint_path = args.bndl_checkpoint
     elif method == "UR-ERN" and hasattr(args, "ur_ern_checkpoint") and args.ur_ern_checkpoint:
         checkpoint_path = args.ur_ern_checkpoint
@@ -442,7 +451,7 @@ def run_task(
 
     # 🧪 EXPERIMENTAL: Set config/checkpoint env vars for per-video model reinitialization
     # This allows zero_shot_multi_dataset_sam_bndl.py to rebuild the predictor for each video
-    if method == "BNDL_AUE":
+    if method in ("BNDL_AUE", "BNDL_AUE_CORR"):
         if hasattr(args, "bndl_aue_cfg") and args.bndl_aue_cfg:
             env["BNDL_AUE_CFG"] = args.bndl_aue_cfg
         if hasattr(args, "bndl_aue_checkpoint") and args.bndl_aue_checkpoint:
@@ -1424,8 +1433,12 @@ def main():
     parser.add_argument("--uctta_fisher_reg", action="store_true", default=True)
 
     # BNDL参数 - 默认启用统计收集以获取PCC/AUROC等不确定性指标
+    parser.add_argument("--bndl_sample_num", type=int, default=20, help="Number of MC samples for BNDL uncertainty estimation (default: 20)")
     parser.add_argument("--collect_bndl_stats", action="store_true", default=True, help="启用BNDL统计收集（PCC/AUROC/PAvPU等）。默认启用。")
     parser.add_argument("--no_collect_bndl_stats", dest="collect_bndl_stats", action="store_false", help="禁用BNDL统计收集以加速评估。")
+
+    # Uncertainty correction (SeCo-inspired)
+    parser.add_argument("--uc_component_threshold", type=float, default=0.5, help="Uncertainty threshold for component filtering (default: 0.5)")
 
     # 可视化输出（SAM 和 BNDL_AUE 均支持）
     parser.add_argument(
@@ -1447,6 +1460,11 @@ def main():
     parser.add_argument("--bndl_aue_version", type=str, default="017_bndl_lora")
     parser.add_argument("--bndl_version", type=str, default="013_01")
     parser.add_argument("--ur_ern_version", type=str, default="001_01")
+    # Rebuttal baselines
+    parser.add_argument("--bndl_patch_version", type=str, default="022_patch")
+    parser.add_argument("--bndl_mixstyle_version", type=str, default="022_mixstyle")
+    parser.add_argument("--bndl_dsu_version", type=str, default="022_dsu")
+    parser.add_argument("--bndl_stylegen_version", type=str, default="022_stylegen")
 
     # BNDL_AUE + UCTTA combined mode
     parser.add_argument("--bndl_aue_enable_uctta", action="store_true", default=False, help="Enable UCTTA within BNDL_AUE evaluation")
@@ -1482,6 +1500,13 @@ def main():
         "BNDL_AUE": args.bndl_aue_version,
         "BNDL": args.bndl_version,
         "UR-ERN": args.ur_ern_version,
+        "BNDL_CORR": args.bndl_version,
+        "BNDL_AUE_CORR": args.bndl_aue_version,
+        # Rebuttal baselines
+        "BNDL_PATCH": args.bndl_patch_version,
+        "BNDL_MIXSTYLE": args.bndl_mixstyle_version,
+        "BNDL_DSU": args.bndl_dsu_version,
+        "BNDL_STYLEGEN": args.bndl_stylegen_version,
     }
 
     # 显示当前运行使用的方法版本

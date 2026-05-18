@@ -67,8 +67,8 @@ class AUEModule:
         if not getattr(model, "use_aue", False):
             return
 
-        # Initialize adversarial pipeline (Style/Deform attackers)
-        if getattr(model, "use_style_adv", False) or getattr(model, "use_deform_adv", False):
+        # Initialize adversarial pipeline (Style/Deform/PGD/RandomNoise attackers)
+        if getattr(model, "use_style_adv", False) or getattr(model, "use_deform_adv", False) or getattr(model, "use_pgd_adv", False) or getattr(model, "use_patch_adv", False) or getattr(model, "use_random_noise_adv", False):
             self._pipeline = AdversarialPipeline(model)
 
     def generate_adversarial_samples(

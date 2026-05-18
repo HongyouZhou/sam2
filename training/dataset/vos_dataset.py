@@ -47,6 +47,7 @@ class VOSDataset(VisionDataset):
         self.curr_epoch = 0  # Used in case data loader behavior changes across epochs
         self.always_target = always_target
         self.target_segments_available = target_segments_available
+        self._deterministic_retry = False  # Set True by collect_only for cross-method consistency
 
     def _get_datapoint(self, idx):
 
@@ -63,13 +64,21 @@ class VOSDataset(VisionDataset):
                 break  # Succesfully loaded video
             except Exception as e:
                 if self.training:
-                    logging.warning(
+                    logging.debug(
                         f"Loading failed (id={idx}); Retry {retry} with exception: {e}"
                     )
-                    idx = random.randrange(0, len(self.video_dataset))
+                    # Deterministic fallback for collect_only: use large prime step
+                    # to ensure cross-method consistency while avoiding stuck regions
+                    if self._deterministic_retry:
+                        idx = (idx + 97 * (retry + 1)) % len(self.video_dataset)
+                    else:
+                        idx = random.randrange(0, len(self.video_dataset))
                 else:
                     # Shouldn't fail to load a val video
                     raise e
+        else:
+            # All retries exhausted — raise so DataLoader can handle it
+            raise RuntimeError(f"Failed to load any valid sample after {MAX_RETRIES} retries (last idx={idx})")
 
         datapoint = self.construct(video, sampled_frms_and_objs, segment_loader)
         for transform in self._transforms:

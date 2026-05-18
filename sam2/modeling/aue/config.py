@@ -135,6 +135,77 @@ class DeformAdvConfig:
 
 
 # =============================================================================
+# PGD Adversarial Configuration (Rebuttal Baseline)
+# =============================================================================
+@dataclass
+class PGDAdvConfig:
+    """Pixel-space PGD adversarial attack configuration (Madry et al.)."""
+
+    enabled: bool = False
+    epsilon: float = 0.03  # L∞ budget in normalized pixel space (~8/255)
+    num_steps: int = 5  # Inner loop iterations
+    step_size: float = 0.01  # Per-step magnitude (α)
+    random_start: bool = True  # Random init within ε-ball
+
+    @classmethod
+    def from_flat_dict(cls, d: dict[str, Any]) -> PGDAdvConfig:
+        """Construct from flat config dict (backward compatible)."""
+        return cls(
+            enabled=d.get("use_pgd_adv", False),
+            epsilon=d.get("pgd_adv_epsilon", 0.03),
+            num_steps=d.get("pgd_adv_num_steps", 5),
+            step_size=d.get("pgd_adv_step_size", 0.01),
+            random_start=d.get("pgd_adv_random_start", True),
+        )
+
+
+# =============================================================================
+# Adversarial Patch Configuration (Rebuttal Baseline)
+# =============================================================================
+@dataclass
+class PatchAdvConfig:
+    """Adversarial Patch attack (Brown et al. 2017, Nesti et al. WACV 2022)."""
+
+    enabled: bool = False
+    patch_size_ratio: float = 0.1  # Patch size as fraction of image dimension
+    num_steps: int = 5  # Inner loop optimization steps
+    step_size: float = 0.5  # Step size (larger than PGD since unconstrained)
+    random_start: bool = True  # Random patch initialization
+
+    @classmethod
+    def from_flat_dict(cls, d: dict[str, Any]) -> PatchAdvConfig:
+        """Construct from flat config dict (backward compatible)."""
+        return cls(
+            enabled=d.get("use_patch_adv", False),
+            patch_size_ratio=d.get("patch_adv_size_ratio", 0.1),
+            num_steps=d.get("patch_adv_num_steps", 5),
+            step_size=d.get("patch_adv_step_size", 0.5),
+            random_start=d.get("patch_adv_random_start", True),
+        )
+
+
+# =============================================================================
+# Random Noise Adversarial Configuration (Rebuttal Baseline)
+# =============================================================================
+@dataclass
+class RandomNoiseAdvConfig:
+    """Random noise injection baseline configuration."""
+
+    enabled: bool = False
+    epsilon: float = 0.03  # Noise magnitude in normalized pixel space
+    noise_type: str = "gaussian"  # "gaussian" or "uniform"
+
+    @classmethod
+    def from_flat_dict(cls, d: dict[str, Any]) -> RandomNoiseAdvConfig:
+        """Construct from flat config dict (backward compatible)."""
+        return cls(
+            enabled=d.get("use_random_noise_adv", False),
+            epsilon=d.get("random_noise_adv_epsilon", 0.03),
+            noise_type=d.get("random_noise_adv_type", "gaussian"),
+        )
+
+
+# =============================================================================
 # Distribution Matching Configuration
 # =============================================================================
 @dataclass
@@ -328,6 +399,9 @@ class AUEConfig:
     # Sub-configs
     style: StyleAdvConfig = field(default_factory=StyleAdvConfig)
     deform: DeformAdvConfig = field(default_factory=DeformAdvConfig)
+    pgd: PGDAdvConfig = field(default_factory=PGDAdvConfig)
+    patch: PatchAdvConfig = field(default_factory=PatchAdvConfig)
+    random_noise: RandomNoiseAdvConfig = field(default_factory=RandomNoiseAdvConfig)
     dist_matching: DistMatchingConfig = field(default_factory=DistMatchingConfig)
 
     # Attack ordering
@@ -359,6 +433,9 @@ class AUEConfig:
             max_num_objects=kwargs.get("max_num_objects", 11),
             style=StyleAdvConfig.from_flat_dict(kwargs),
             deform=DeformAdvConfig.from_flat_dict(kwargs),
+            pgd=PGDAdvConfig.from_flat_dict(kwargs),
+            patch=PatchAdvConfig.from_flat_dict(kwargs),
+            random_noise=RandomNoiseAdvConfig.from_flat_dict(kwargs),
             dist_matching=DistMatchingConfig.from_flat_dict(kwargs),
             attack_order=kwargs.get("adversarial_attack_order", ["style", "deform"]),
         )
@@ -391,10 +468,17 @@ class AUEConfig:
             # Deform
             "use_deform_adv": self.deform.enabled,
             "deform_adv_epsilon": self.deform.epsilon,
+            # PGD
+            "use_pgd_adv": self.pgd.enabled,
+            "pgd_adv_epsilon": self.pgd.epsilon,
+            "pgd_adv_num_steps": self.pgd.num_steps,
+            # Random Noise
+            "use_random_noise_adv": self.random_noise.enabled,
+            "random_noise_adv_epsilon": self.random_noise.epsilon,
             "adversarial_attack_order": self.attack_order,
         }
 
     @property
     def any_adversarial_enabled(self) -> bool:
         """Check if any adversarial attack is enabled."""
-        return self.style.enabled or self.deform.enabled
+        return self.style.enabled or self.deform.enabled or self.pgd.enabled or self.random_noise.enabled

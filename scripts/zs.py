@@ -219,6 +219,12 @@ def run_comparison_evaluation(
     bndl_aue_enable_uctta: bool = False,
     bndl_aue_uctta_steps: int = 2,
     bndl_aue_uctta_lr: float = 3e-4,
+    # BNDL MC sampling
+    bndl_sample_num: int = 20,
+    # Uncertainty correction (SeCo-inspired)
+    run_bndl_corr: bool = False,
+    run_bndl_aue_corr: bool = False,
+    uc_component_threshold: float = 0.5,
 ) -> tuple[
     dict[str, tuple[float, float, float]],  # sam2_results
     dict[str, tuple[float, float, float]],  # bndl_aue_results
@@ -254,6 +260,14 @@ def run_comparison_evaluation(
     if run_ur_ern:
         ur_ern_output.mkdir(parents=True, exist_ok=True)
 
+    # Uncertainty correction output directories
+    bndl_corr_output = output_path / "bndl_corr_results"
+    bndl_aue_corr_output = output_path / "bndl_aue_corr_results"
+    if run_bndl_corr:
+        bndl_corr_output.mkdir(parents=True, exist_ok=True)
+    if run_bndl_aue_corr:
+        bndl_aue_corr_output.mkdir(parents=True, exist_ok=True)
+
     # Load predictors using unified helper function
     # SAM-2 predictor (needed for SAM and UCTTA)
     sam2_predictor = _load_predictor("SAM-2", sam2_cfg, sam2_checkpoint, device, required=False) if (run_sam or run_uctta) else None
@@ -280,6 +294,10 @@ def run_comparison_evaluation(
     uctta_statistics = {}  # Store UCTTA statistics per dataset
     ur_ern_statistics = {}  # Store UR-ERN statistics per dataset
     ua_data_per_dataset = {}  # Store UA data for each dataset
+    bndl_corr_results = {}
+    bndl_corr_statistics = {}
+    bndl_aue_corr_results = {}
+    bndl_aue_corr_statistics = {}
 
     total_start_time = time.time()
 
@@ -379,6 +397,12 @@ def run_comparison_evaluation(
                 bndl_configs.append(("BNDL", bndl_output, bndl_per_thresh, bndl_statistics, bndl_cfg, bndl_checkpoint))
             if run_bndl_aue:
                 bndl_configs.append(("BNDL_AUE", bndl_aue_output, bndl_aue_per_thresh, bndl_aue_statistics, bndl_aue_cfg, bndl_aue_checkpoint))
+            if run_bndl_corr:
+                bndl_corr_per_thresh = bndl_corr_results.setdefault(dataset_name, [])
+                bndl_configs.append(("BNDL_CORR", bndl_corr_output, bndl_corr_per_thresh, bndl_corr_statistics, bndl_cfg, bndl_checkpoint))
+            if run_bndl_aue_corr:
+                bndl_aue_corr_per_thresh = bndl_aue_corr_results.setdefault(dataset_name, [])
+                bndl_configs.append(("BNDL_AUE_CORR", bndl_aue_corr_output, bndl_aue_corr_per_thresh, bndl_aue_corr_statistics, bndl_aue_cfg, bndl_aue_checkpoint))
 
             for m_name, m_out, m_list, m_stats, m_cfg, m_ckpt in bndl_configs:
                 bndl_kwargs = {
@@ -393,7 +417,12 @@ def run_comparison_evaluation(
                     "max_vis_per_video": max_vis_per_video,
                     "save_vis_pdf": save_vis_pdf,
                     "save_masks": not no_save_masks,
+                    "bndl_sample_num": bndl_sample_num,
                 }
+                # Add uncertainty correction for CORR methods
+                if m_name in ("BNDL_CORR", "BNDL_AUE_CORR"):
+                    bndl_kwargs["enable_uncertainty_correction"] = True
+                    bndl_kwargs["uc_component_threshold"] = uc_component_threshold
                 # Add UCTTA support for BNDL_AUE if enabled
                 if m_name == "BNDL_AUE" and bndl_aue_enable_uctta:
                     bndl_kwargs["enable_uctta"] = True
@@ -526,6 +555,14 @@ def run_comparison_evaluation(
             print("Per-threshold summary (UR-ERN):")
             for th, jf, j, f in ur_ern_results[dataset_name]:
                 print(f"  th={th:.2f}: J&F={jf:.2f}, J={j:.2f}, F={f:.2f}")
+        if run_bndl_corr and dataset_name in bndl_corr_results and bndl_corr_results[dataset_name]:
+            print("Per-threshold summary (BNDL_CORR):")
+            for th, jf, j, f in bndl_corr_results[dataset_name]:
+                print(f"  th={th:.2f}: J&F={jf:.2f}, J={j:.2f}, F={f:.2f}")
+        if run_bndl_aue_corr and dataset_name in bndl_aue_corr_results and bndl_aue_corr_results[dataset_name]:
+            print("Per-threshold summary (BNDL_AUE_CORR):")
+            for th, jf, j, f in bndl_aue_corr_results[dataset_name]:
+                print(f"  th={th:.2f}: J&F={jf:.2f}, J={j:.2f}, F={f:.2f}")
 
         # Select best-threshold result per method by J&F
         if run_sam and sam2_per_thresh:
@@ -545,6 +582,12 @@ def run_comparison_evaluation(
             best_ur_ern = max(ur_ern_results[dataset_name], key=lambda x: x[1])
             # Replace list with best tuple
             ur_ern_results[dataset_name] = (best_ur_ern[1], best_ur_ern[2], best_ur_ern[3])
+        if run_bndl_corr and dataset_name in bndl_corr_results and bndl_corr_results[dataset_name]:
+            best_bndl_corr = max(bndl_corr_results[dataset_name], key=lambda x: x[1])
+            bndl_corr_results[dataset_name] = (best_bndl_corr[1], best_bndl_corr[2], best_bndl_corr[3])
+        if run_bndl_aue_corr and dataset_name in bndl_aue_corr_results and bndl_aue_corr_results[dataset_name]:
+            best_bndl_aue_corr = max(bndl_aue_corr_results[dataset_name], key=lambda x: x[1])
+            bndl_aue_corr_results[dataset_name] = (best_bndl_aue_corr[1], best_bndl_aue_corr[2], best_bndl_aue_corr[3])
 
         if run_sam and sam2_per_thresh:
             print(f"\nBest (SAM-2) th={best_sam2[0]:.2f} -> J&F: {best_sam2[1]:.2f}, J: {best_sam2[2]:.2f}, F: {best_sam2[3]:.2f}")
@@ -587,6 +630,10 @@ def run_comparison_evaluation(
         ua_data_per_dataset,
         uctta_statistics,
         ur_ern_statistics,
+        bndl_corr_results,
+        bndl_corr_statistics,
+        bndl_aue_corr_results,
+        bndl_aue_corr_statistics,
     )
 
 
@@ -602,6 +649,10 @@ def save_detailed_results(
     uctta_statistics: dict[str, Any] | None = None,
     ur_ern_statistics: dict[str, Any] | None = None,
     ua_data: dict[str, dict[str, Any]] | None = None,
+    bndl_corr_results: dict[str, tuple[float, float, float]] | None = None,
+    bndl_corr_statistics: dict[str, Any] | None = None,
+    bndl_aue_corr_results: dict[str, tuple[float, float, float]] | None = None,
+    bndl_aue_corr_statistics: dict[str, Any] | None = None,
 ) -> Path:
     """Save detailed results to JSON file
 
@@ -635,6 +686,10 @@ def save_detailed_results(
         "bndl_statistics": bndl_statistics if bndl_statistics else {},
         "uctta_statistics": uctta_statistics if uctta_statistics else {},
         "ur_ern_statistics": ur_ern_statistics if ur_ern_statistics else {},
+        "bndl_corr_results": {k: {"jf": v[0], "j": v[1], "f": v[2]} for k, v in bndl_corr_results.items()} if bndl_corr_results else {},
+        "bndl_corr_statistics": bndl_corr_statistics if bndl_corr_statistics else {},
+        "bndl_aue_corr_results": {k: {"jf": v[0], "j": v[1], "f": v[2]} for k, v in bndl_aue_corr_results.items()} if bndl_aue_corr_results else {},
+        "bndl_aue_corr_statistics": bndl_aue_corr_statistics if bndl_aue_corr_statistics else {},
         "ua_data": ua_data if ua_data else {},
     }
 
@@ -892,6 +947,10 @@ def parse_args():
     p.add_argument("--run_bndl", action="store_true", default=False, help="Run BNDL branch")
     p.add_argument("--run_bndl_aue", action="store_true", default=False, help="Run BNDL_AUE branch")
     p.add_argument("--run_ur_ern", action="store_true", default=False, help="Run SAM-2 + UR-ERN branch")
+    # Uncertainty correction methods (SeCo-inspired)
+    p.add_argument("--run_bndl_corr", action="store_true", default=False, help="Run BNDL + uncertainty correction")
+    p.add_argument("--run_bndl_aue_corr", action="store_true", default=False, help="Run BNDL_AUE + uncertainty correction")
+    p.add_argument("--uc_component_threshold", type=float, default=0.5, help="Uncertainty threshold for component filtering (default: 0.5)")
     # UCTTA options
     p.add_argument("--uctta_steps", type=int, default=2, help="UCTTA adaptation steps per frame/batch")
     p.add_argument("--uctta_lr", type=float, default=3e-4, help="UCTTA learning rate")
@@ -902,6 +961,7 @@ def parse_args():
     p.add_argument("--uctta_selection_p", type=float, default=0.1, help="Fraction of samples to select")
 
     # Optimization
+    p.add_argument("--bndl_sample_num", type=int, default=20, help="Number of MC samples for BNDL uncertainty estimation (default: 20)")
     p.add_argument("--no_save_masks", action="store_true", default=False, help="Disable mask saving to speed up evaluation")
 
     # BNDL_AUE + UCTTA combined baseline
@@ -960,7 +1020,7 @@ def main():
             print(f"BNDL checkpoint: {args.bndl_checkpoint}")
             print(f"BNDL_AUE config: {args.bndl_aue_cfg}")
             print(f"BNDL_AUE checkpoint: {args.bndl_aue_checkpoint}")
-            sam2_results, bndl_aue_results, bndl_aue_statistics, bndl_results, bndl_statistics, uctta_results, ur_ern_results, ua_data, uctta_statistics, ur_ern_statistics = (
+            sam2_results, bndl_aue_results, bndl_aue_statistics, bndl_results, bndl_statistics, uctta_results, ur_ern_results, ua_data, uctta_statistics, ur_ern_statistics, bndl_corr_results, bndl_corr_statistics, bndl_aue_corr_results, bndl_aue_corr_statistics = (
                 run_comparison_evaluation(
                     datasets=args.datasets,
                     sam2_cfg=args.sam2_cfg,
@@ -1002,10 +1062,16 @@ def main():
                     max_vis_per_video=args.max_vis_per_video,
                     save_vis_pdf=True,  # Always save PDF for professional use
                     no_save_masks=args.no_save_masks,
+                    # BNDL MC sampling
+                    bndl_sample_num=args.bndl_sample_num,
                     # BNDL_AUE + UCTTA combined baseline
                     bndl_aue_enable_uctta=args.bndl_aue_enable_uctta,
                     bndl_aue_uctta_steps=args.bndl_aue_uctta_steps,
                     bndl_aue_uctta_lr=args.bndl_aue_uctta_lr,
+                    # Uncertainty correction
+                    run_bndl_corr=args.run_bndl_corr,
+                    run_bndl_aue_corr=args.run_bndl_aue_corr,
+                    uc_component_threshold=args.uc_component_threshold,
                 )
             )
 
@@ -1023,6 +1089,10 @@ def main():
                 uctta_statistics=uctta_statistics,
                 ur_ern_statistics=ur_ern_statistics,
                 ua_data=ua_data,
+                bndl_corr_results=bndl_corr_results,
+                bndl_corr_statistics=bndl_corr_statistics,
+                bndl_aue_corr_results=bndl_aue_corr_results,
+                bndl_aue_corr_statistics=bndl_aue_corr_statistics,
             )
 
         # Generate plots if requested or if plot_only mode

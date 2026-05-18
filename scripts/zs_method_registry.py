@@ -136,6 +136,77 @@ METHOD_REGISTRY: dict[str, MethodConfig] = {
         ckpt_arg="--ur_ern_checkpoint",
         requires_sam_prompts=True,
     ),
+    # SeCo-inspired uncertainty correction methods (inference-time post-processing)
+    "BNDL_CORR": MethodConfig(
+        name="BNDL_CORR",
+        flags=["--run_bndl_corr"],
+        output_suffix="bndl_corr",
+        result_key="bndl_corr_results",
+        stats_key="bndl_corr_statistics",
+        color="\033[36m",  # Dark Cyan
+        cfg_arg="--bndl_cfg",
+        ckpt_arg="--bndl_checkpoint",
+        requires_sam_prompts=True,
+        extra_args={"enable_uncertainty_correction": True},
+    ),
+    "BNDL_AUE_CORR": MethodConfig(
+        name="BNDL_AUE_CORR",
+        flags=["--run_bndl_aue_corr"],
+        output_suffix="bndl_aue_corr",
+        result_key="bndl_aue_corr_results",
+        stats_key="bndl_aue_corr_statistics",
+        color="\033[33m",  # Dark Yellow
+        cfg_arg="--bndl_aue_cfg",
+        ckpt_arg="--bndl_aue_checkpoint",
+        requires_sam_prompts=True,
+        extra_args={"enable_uncertainty_correction": True},
+    ),
+    # Adversarial patch baseline (rebuttal)
+    "BNDL_PATCH": MethodConfig(
+        name="BNDL_PATCH",
+        flags=["--run_bndl_aue"],
+        output_suffix="bndl_patch",
+        result_key="bndl_aue_results",
+        stats_key="bndl_aue_statistics",
+        color="\033[90m",  # Gray
+        cfg_arg="--bndl_aue_cfg",
+        ckpt_arg="--bndl_aue_checkpoint",
+        requires_sam_prompts=True,
+    ),
+    # Non-adversarial style augmentation baselines (rebuttal)
+    "BNDL_MIXSTYLE": MethodConfig(
+        name="BNDL_MIXSTYLE",
+        flags=["--run_bndl_aue"],  # Reuse BNDL_AUE inference (MixStyle is training-only)
+        output_suffix="bndl_mixstyle",
+        result_key="bndl_aue_results",
+        stats_key="bndl_aue_statistics",
+        color="\033[35m",  # Magenta
+        cfg_arg="--bndl_aue_cfg",
+        ckpt_arg="--bndl_aue_checkpoint",
+        requires_sam_prompts=True,
+    ),
+    "BNDL_DSU": MethodConfig(
+        name="BNDL_DSU",
+        flags=["--run_bndl_aue"],  # Reuse BNDL_AUE inference (DSU is training-only)
+        output_suffix="bndl_dsu",
+        result_key="bndl_aue_results",
+        stats_key="bndl_aue_statistics",
+        color="\033[32m",  # Green
+        cfg_arg="--bndl_aue_cfg",
+        ckpt_arg="--bndl_aue_checkpoint",
+        requires_sam_prompts=True,
+    ),
+    "BNDL_STYLEGEN": MethodConfig(
+        name="BNDL_STYLEGEN",
+        flags=["--run_bndl_aue"],  # Reuse BNDL_AUE inference (StyleGen is data-only)
+        output_suffix="bndl_stylegen",
+        result_key="bndl_aue_results",
+        stats_key="bndl_aue_statistics",
+        color="\033[91m",  # Light Red
+        cfg_arg="--bndl_aue_cfg",
+        ckpt_arg="--bndl_aue_checkpoint",
+        requires_sam_prompts=True,
+    ),
 }
 
 # All available methods (ordered)

@@ -39,6 +39,7 @@ class MaskDecoder(nn.Module):
         use_ur_ern_for_pixels: bool = False,
         # BNDL eval mode control
         bndl_force_single_sample: bool = False,  # If True, use single sampling in eval mode (match training behavior)
+        bndl_sample_num: int = 20,  # MC samples for sampling-based uncertainty (used by entropy_uncertainty path)
     ) -> None:
         """
         Predicts masks given an image and prompt embeddings, using a
@@ -59,6 +60,7 @@ class MaskDecoder(nn.Module):
         super().__init__()
         self.transformer_dim = transformer_dim
         self.transformer = transformer
+        self.bndl_sample_num = bndl_sample_num
 
         self.num_multimask_outputs = num_multimask_outputs
 
@@ -293,7 +295,7 @@ class MaskDecoder(nn.Module):
                 self.pixel_bndl,
                 pixel_feat,
                 mask_tokens_out,  # [B, K, 256] - use full Transformer output
-                sample_num=20,
+                sample_num=getattr(self, "bndl_sample_num", 20),
                 factor_z=self.bndl_factor_z,
                 factor_w=self.bndl_factor_w,
             )

@@ -168,10 +168,33 @@ class SAM2Base(torch.nn.Module):
         deform_adv_freeze_encoder_components: bool = False,  # Freeze all encoder components (mask_encoder, img_feat_proj, fuser)
         deform_adv_zero_mean_offsets: bool = False,  # Remove global shift in flow fields
         deform_adv_local_offset_gain: float = 1.0,  # Boost local deformation after centering
+        # PGD Adversarial options (rebuttal baseline)
+        use_pgd_adv: bool = False,
+        pgd_adv_epsilon: float = 0.03,
+        pgd_adv_num_steps: int = 5,
+        pgd_adv_step_size: float = 0.01,
+        pgd_adv_random_start: bool = True,
+        # Adversarial Patch options (rebuttal baseline)
+        use_patch_adv: bool = False,
+        patch_adv_size_ratio: float = 0.1,
+        patch_adv_num_steps: int = 5,
+        patch_adv_step_size: float = 0.5,
+        patch_adv_random_start: bool = True,
+        # Random Noise options (rebuttal baseline)
+        use_random_noise_adv: bool = False,
+        random_noise_adv_epsilon: float = 0.03,
+        random_noise_adv_type: str = "gaussian",
         # Adversarial pipeline control
         adversarial_attack_order: list[str] | None = None,  # Order of attacks, e.g., ["deform", "style"]
         # Max number of objects (for AUE tensor allocation, matches dataset sampler)
         max_num_objects: int = 11,  # Default: 10 objects + 1 background
+        # Non-adversarial style augmentation (rebuttal baselines)
+        use_mixstyle: bool = False,
+        mixstyle_p: float = 0.5,
+        mixstyle_alpha: float = 0.1,
+        use_dsu: bool = False,
+        dsu_p: float = 0.5,
+        dsu_alpha: float = 0.5,
         # LoRA options (parameter-efficient fine-tuning)
         use_lora: bool = False,
         lora_mode: str = "standard",  # "standard", "dora", "convlora"
@@ -340,12 +363,39 @@ class SAM2Base(torch.nn.Module):
             deform_adv_freeze_encoder_components=deform_adv_freeze_encoder_components,
             deform_adv_zero_mean_offsets=deform_adv_zero_mean_offsets,
             deform_adv_local_offset_gain=deform_adv_local_offset_gain,
+            # PGD adversarial params (rebuttal baseline)
+            use_pgd_adv=use_pgd_adv,
+            pgd_adv_epsilon=pgd_adv_epsilon,
+            pgd_adv_num_steps=pgd_adv_num_steps,
+            pgd_adv_step_size=pgd_adv_step_size,
+            pgd_adv_random_start=pgd_adv_random_start,
+            # Adversarial patch params (rebuttal baseline)
+            use_patch_adv=use_patch_adv,
+            patch_adv_size_ratio=patch_adv_size_ratio,
+            patch_adv_num_steps=patch_adv_num_steps,
+            patch_adv_step_size=patch_adv_step_size,
+            patch_adv_random_start=patch_adv_random_start,
+            # Random noise params (rebuttal baseline)
+            use_random_noise_adv=use_random_noise_adv,
+            random_noise_adv_epsilon=random_noise_adv_epsilon,
+            random_noise_adv_type=random_noise_adv_type,
             # Attack ordering
             adversarial_attack_order=adversarial_attack_order,
         )
 
         # Apply AUE configuration to instance attributes (backward compatibility)
         self._apply_aue_config()
+
+        # Non-adversarial style augmentation (MixStyle/DSU, rebuttal baselines)
+        self._style_aug = None
+        if use_mixstyle:
+            from sam2.modeling.style_augmentation import MixStyle
+
+            self._style_aug = MixStyle(p=mixstyle_p, alpha=mixstyle_alpha)
+        elif use_dsu:
+            from sam2.modeling.style_augmentation import DSU
+
+            self._style_aug = DSU(p=dsu_p, alpha=dsu_alpha)
 
         # Model compilation
         if compile_image_encoder:
@@ -499,6 +549,25 @@ class SAM2Base(torch.nn.Module):
         self.deform_adv_zero_mean_offsets = cfg.deform.zero_mean_offsets
         self.deform_adv_local_offset_gain = cfg.deform.local_offset_gain
 
+        # === PGD Adversarial (Rebuttal Baseline) ===
+        self.use_pgd_adv = cfg.pgd.enabled
+        self.pgd_adv_epsilon = cfg.pgd.epsilon
+        self.pgd_adv_num_steps = cfg.pgd.num_steps
+        self.pgd_adv_step_size = cfg.pgd.step_size
+        self.pgd_adv_random_start = cfg.pgd.random_start
+
+        # === Adversarial Patch (Rebuttal Baseline) ===
+        self.use_patch_adv = cfg.patch.enabled
+        self.patch_adv_size_ratio = cfg.patch.patch_size_ratio
+        self.patch_adv_num_steps = cfg.patch.num_steps
+        self.patch_adv_step_size = cfg.patch.step_size
+        self.patch_adv_random_start = cfg.patch.random_start
+
+        # === Random Noise Adversarial (Rebuttal Baseline) ===
+        self.use_random_noise_adv = cfg.random_noise.enabled
+        self.random_noise_adv_epsilon = cfg.random_noise.epsilon
+        self.random_noise_adv_type = cfg.random_noise.noise_type
+
         # === Attack ordering ===
         self.adversarial_attack_order = cfg.attack_order
 
@@ -517,6 +586,15 @@ class SAM2Base(torch.nn.Module):
 
             if self.use_deform_adv:
                 self._build_deform_adv_components()
+
+            if self.use_pgd_adv:
+                self._build_pgd_adv_components()
+
+            if self.use_patch_adv:
+                self._build_patch_adv_components()
+
+            if self.use_random_noise_adv:
+                self._build_random_noise_adv_components()
 
             # Initialize AUE module (composition pattern)
             self._aue_module = AUEModule(self)
@@ -622,6 +700,46 @@ class SAM2Base(torch.nn.Module):
             f"init_from_memory_encoder={self.deform_adv_init_from_memory_encoder}, "
             f"freeze_encoder_components={self.deform_adv_freeze_encoder_components}"
         )
+
+    def _build_pgd_adv_components(self) -> None:
+        """Build pixel-space PGD adversarial attack (rebuttal baseline). No learnable parameters."""
+        from sam2.modeling.adversarial_augmentation import AdversarialAttacker
+
+        self.pgd_attacker = AdversarialAttacker(
+            mode="image_level",
+            aug_type="pgd",
+            epsilon=self.pgd_adv_epsilon,
+            num_steps=self.pgd_adv_num_steps,
+            step_size=self.pgd_adv_step_size,
+            random_start=self.pgd_adv_random_start,
+        )
+        logging.info(f"PGD adversarial attack built: epsilon={self.pgd_adv_epsilon}, num_steps={self.pgd_adv_num_steps}, step_size={self.pgd_adv_step_size}")
+
+    def _build_patch_adv_components(self) -> None:
+        """Build adversarial patch attack (rebuttal baseline). No learnable parameters."""
+        from sam2.modeling.adversarial_augmentation import AdversarialAttacker
+
+        self.patch_attacker = AdversarialAttacker(
+            mode="image_level",
+            aug_type="patch",
+            patch_size_ratio=self.patch_adv_size_ratio,
+            num_steps=self.patch_adv_num_steps,
+            step_size=self.patch_adv_step_size,
+            random_start=self.patch_adv_random_start,
+        )
+        logging.info(f"Adversarial patch attack built: size_ratio={self.patch_adv_size_ratio}, num_steps={self.patch_adv_num_steps}, step_size={self.patch_adv_step_size}")
+
+    def _build_random_noise_adv_components(self) -> None:
+        """Build random noise injection (rebuttal baseline). No learnable parameters."""
+        from sam2.modeling.adversarial_augmentation import AdversarialAttacker
+
+        self.random_noise_attacker = AdversarialAttacker(
+            mode="image_level",
+            aug_type="random_noise",
+            epsilon=self.random_noise_adv_epsilon,
+            noise_type=self.random_noise_adv_type,
+        )
+        logging.info(f"Random noise attack built: epsilon={self.random_noise_adv_epsilon}, type={self.random_noise_adv_type}")
 
     def _generate_bbox_prompts_from_gt(self, gt_masks: torch.Tensor) -> torch.Tensor:
         """
@@ -1031,6 +1149,9 @@ class SAM2Base(torch.nn.Module):
                 backbone_out = self._forward_image_with_checkpoint(img_batch)
             else:
                 backbone_out = self.image_encoder(img_batch)
+        # Non-adversarial style augmentation (training only, bypasses AUE)
+        if self._style_aug is not None and self.training:
+            backbone_out["backbone_fpn"] = [self._style_aug(feat) for feat in backbone_out["backbone_fpn"]]
         if self.use_high_res_features_in_sam:
             # precompute projected level 0 and level 1 features in SAM decoder
             # to avoid running it again on every SAM click

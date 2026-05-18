@@ -158,6 +158,10 @@ class LoggingConf:
     visualize_pavpu_overlay: bool = True  # Enable PAvPU overlay visualization on original images
     enable_pavpu_eval: bool = True  # Enable PAvPU evaluator computation during validation
     uncertainty_sample_num: int = 50
+    collect_decoder_features: bool = False  # Collect mask_tokens_out for t-SNE/UMAP analysis
+    collect_decoder_features_max: int = 2000  # Max samples per branch (clean/adv)
+    collect_features_tag: str = "MOSE"  # Tag for feature file naming (e.g. "MOSE", "OOD")
+    collect_adversarial_features: bool = False  # Run AUE forward in collect_only to get adv branch features
     correlation_foreground_dilation: int = 0  # Foreground dilation radius (pixels), 0 means no dilation (only used when use_full_image=False)
     correlation_per_pixel: bool = True  # Use per-pixel statistics (vs per-image)
     correlation_use_full_image: bool = True  # Use full image statistics (True, default) or foreground only (False)
@@ -240,6 +244,17 @@ class Trainer:
         self._setup_dataloaders()
 
         self.time_elapsed_meter = DurationMeter("Time Elapsed", self.device, ":.2f")
+
+        # Feature collection buffer (for t-SNE/UMAP analysis)
+        # Collects both encoder-level (pixel_feat GAP) and decoder-level (mask_tokens_out_selected)
+        self._decoder_features_buffer = {
+            "clean": [], "adv": [], "count_clean": 0, "count_adv": 0,
+            "encoder_clean": [], "encoder_adv": [],
+            "fg_pixel_clean": [], "fg_pixel_adv": [],
+            "fg_logit_clean": [], "fg_logit_adv": [],
+            "fg_pixelwise_clean": [], "fg_pixelwise_adv": [],
+            "fg_logitwise_clean": [], "fg_logitwise_adv": [],
+        }
 
         if self.checkpoint_conf.resume_from is not None:
             assert os.path.exists(self.checkpoint_conf.resume_from), f"The 'resume_from' checkpoint {self.checkpoint_conf.resume_from} does not exist!"
@@ -439,6 +454,11 @@ class Trainer:
             ignore_missing_keys=self.checkpoint_conf.skip_saving_parameters,
         )
 
+        if self.mode == "collect_only":
+            # Only need model weights for feature collection, skip optimizer/loss
+            self.epoch = checkpoint["epoch"]
+            return
+
         self.optim.optimizer.load_state_dict(checkpoint["optimizer"])
         self.loss.load_state_dict(checkpoint["loss"], strict=True)
         self.epoch = checkpoint["epoch"]
@@ -555,6 +575,22 @@ class Trainer:
         if phase == "train" and self.distributed_rank == 0 and getattr(self.logging_conf, "visualize_aue", False) and _model._enable_style_visualization and bndl_outputs is not None:
             self._log_clean_vs_adv_comparison(bndl_outputs, batch, outputs, self.steps[phase], frame_index=frame_index)
 
+        # Collect decoder features for t-SNE/UMAP analysis (rebuttal experiment)
+        if phase == "train" and self.distributed_rank == 0 and self.logging_conf.collect_decoder_features and bndl_outputs is not None:
+            self._collect_decoder_features(bndl_outputs, targets, frame_index)
+
+            # Dual-pass for style-aug methods (MixStyle/DSU): collect clean features without augmentation
+            if self.mode == "collect_only" and getattr(_model, "_style_aug", None) is not None:
+                _model._style_aug_backup = _model._style_aug
+                _model._style_aug = None
+                with torch.no_grad():
+                    clean_outputs = model(batch)
+                _model._style_aug = _model._style_aug_backup
+                del _model._style_aug_backup
+                clean_bndl, _, clean_fi = self._extract_bndl_outputs(clean_outputs)
+                if clean_bndl is not None:
+                    self._collect_decoder_features(clean_bndl, targets, clean_fi, is_clean_pass=True)
+
         if isinstance(loss, dict):
             if CORE_LOSS_KEY not in loss:
                 raise KeyError(f"Missing {CORE_LOSS_KEY} in loss dict for phase={phase}, key={key}")
@@ -625,7 +661,7 @@ class Trainer:
         return ret_tuple
 
     def run(self):
-        assert self.mode in ["train", "train_only", "val"]
+        assert self.mode in ["train", "train_only", "val", "collect_only"]
         if self.mode == "train":
             if self.epoch > 0:
                 logging.info(f"Resuming training from epoch: {self.epoch}")
@@ -641,6 +677,36 @@ class Trainer:
             self.run_val()
         elif self.mode == "train_only":
             self.run_train()
+        elif self.mode == "collect_only":
+            # Forward-only for 1 epoch to collect decoder features
+            self.logging_conf.collect_decoder_features = True
+            # Fix epoch=0 for all methods so DistributedSampler produces identical ordering
+            self.epoch = 0
+            self.actual_max_epochs = 1
+            # For OOD collection: disable style augmentation (MixStyle/DSU) to get clean features
+            # Dual-pass (clean+aug) only runs for ID (MOSE) collection
+            tag = getattr(self.logging_conf, "collect_features_tag", "MOSE")
+            if tag.lower().startswith("ood"):
+                _model = unwrap_ddp_if_wrapped(self.model)
+                if getattr(_model, "_style_aug", None) is not None:
+                    logging.info(f"OOD collect: disabling _style_aug for clean features (tag={tag})")
+                    _model._style_aug = None
+            # Enable deterministic retry in dataset for cross-method sampling consistency
+            if self.train_dataset is not None:
+                def _set_deterministic(ds):
+                    if hasattr(ds, "_deterministic_retry"):
+                        ds._deterministic_retry = True
+                    # Recurse into ConcatDataset or similar wrappers
+                    for attr in ("datasets", "dataset"):
+                        inner = getattr(ds, attr, None)
+                        if isinstance(inner, (list, tuple)):
+                            for sub in inner:
+                                _set_deterministic(sub)
+                        elif inner is not None:
+                            _set_deterministic(inner)
+                for ds in self.train_dataset.datasets:
+                    _set_deterministic(ds)
+            self.run_train()
 
     def _setup_dataloaders(self):
         # Initialize if not already done by _setup_components for AUE
@@ -652,7 +718,7 @@ class Trainer:
         if self.mode in ["train", "val"]:
             self.val_dataset = instantiate(self.data_conf.get(Phase.VAL, None))
 
-        if self.mode in ["train", "train_only"] and self.train_dataset is None:
+        if self.mode in ["train", "train_only", "collect_only"] and self.train_dataset is None:
             self.train_dataset = instantiate(self.data_conf.train)
 
     def run_train(self):
@@ -670,8 +736,9 @@ class Trainer:
                 ) as f:
                     f.write(json.dumps(outs) + "\n")
 
-            # Save checkpoint before validating
-            self.save_checkpoint(self.epoch + 1)
+            # Save checkpoint before validating (skip in collect_only mode)
+            if self.mode != "collect_only":
+                self.save_checkpoint(self.epoch + 1)
 
             del dataloader
             gc.collect()
@@ -696,6 +763,10 @@ class Trainer:
                 self.attacker_scheduler.step()
         # epoch was incremented in the loop but the val step runs out of the loop
         self.epoch -= 1
+
+        # Save collected decoder features (if any)
+        if self.distributed_rank == 0 and self.logging_conf.collect_decoder_features:
+            self._save_decoder_features()
 
     def run_val(self):
         if not self.val_dataset:
@@ -989,7 +1060,12 @@ class Trainer:
             model_unwrapped.apply_epsilon_decay(self.epoch)
 
         if "all" in self.loss and hasattr(self.loss["all"], "aue_weight"):
-            skip_aue = self.loss["all"].aue_weight == 0
+            # Normal training: skip AUE when aue_weight=0 (warmup phase)
+            # collect_only: skip unless collect_adversarial_features is explicitly set in config
+            if self.mode == "collect_only":
+                skip_aue = not self.logging_conf.collect_adversarial_features
+            else:
+                skip_aue = self.loss["all"].aue_weight == 0
             setattr(model_unwrapped, "_skip_aue_forward", skip_aue)
             if skip_aue and self.epoch == 0:
                 logging.info(f"AUE forward pass skipped (aue_weight=0) - AUE networks will not train until weight > 0")
@@ -1028,6 +1104,28 @@ class Trainer:
                 # Only do optimizer step at end of accumulation window
                 if is_accumulation_step:
                     # Skip optimizer step, scheduler update, etc. - just accumulate gradients
+                    continue
+
+                # In collect_only mode, skip all optimizer/scheduler logic
+                if self.mode == "collect_only":
+                    self.steps[phase] += 1
+                    # Early exit once enough features collected (all ranks must agree)
+                    buf = self._decoder_features_buffer
+                    max_samples = self.logging_conf.collect_decoder_features_max
+                    # rank 0 collects features; other ranks check step count
+                    if self.distributed_rank == 0:
+                        done = buf["count_clean"] >= max_samples and (buf["count_adv"] >= max_samples or not buf["adv"])
+                    else:
+                        done = False
+                    # Broadcast decision from rank 0 to all ranks
+                    if dist.is_initialized():
+                        done_tensor = torch.tensor([1 if done else 0], device=self.device)
+                        dist.broadcast(done_tensor, src=0)
+                        done = done_tensor.item() == 1
+                    if done:
+                        if self.distributed_rank == 0:
+                            logging.info(f"Collected enough features (clean={buf['count_clean']}, adv={buf['count_adv']}), stopping early at step {data_iter}")
+                        break
                     continue
 
                 # compute gradient and do optim step
@@ -1163,18 +1261,31 @@ class Trainer:
         1. core_loss.backward(retain_graph=True) → main optimizer updates SAM+BNDL
         2. attacker_loss.backward() → attacker optimizer updates Style/Deform networks
         """
-        with torch.cuda.amp.autocast(
-            enabled=self.optim_conf.amp.enabled,
-            dtype=get_amp_type(self.optim_conf.amp.amp_dtype),
-        ):
-            loss_dict, batch_size, extra_losses = self._step(
-                batch,
-                self.model,
-                phase,
-            )
+        with nullcontext():
+            with torch.cuda.amp.autocast(
+                enabled=self.optim_conf.amp.enabled,
+                dtype=get_amp_type(self.optim_conf.amp.amp_dtype),
+            ):
+                loss_dict, batch_size, extra_losses = self._step(
+                    batch,
+                    self.model,
+                    phase,
+                )
 
         assert len(loss_dict) == 1
         loss_key, loss = loss_dict.popitem()
+
+        # In collect_only mode, skip backward pass entirely
+        if self.mode == "collect_only":
+            loss_mts[loss_key].update(loss.item(), batch_size)
+            for extra_loss_key, extra_loss in extra_losses.items():
+                if extra_loss_key.startswith("_"):
+                    continue
+                if extra_loss_key not in extra_loss_mts:
+                    extra_loss_mts[extra_loss_key] = AverageMeter(extra_loss_key, ":.4e")
+                if torch.is_tensor(extra_loss):
+                    extra_loss_mts[extra_loss_key].update(extra_loss.item(), batch_size)
+            return
 
         if not math.isfinite(loss.item()):
             error_msg = f"Loss is {loss.item()}, attempting to stop training"
@@ -2322,33 +2433,33 @@ class Trainer:
         # Check if GCN is enabled and we have the necessary components
         gcn_enabled = getattr(model, "style_adv_use_gcn", False)
         has_gcn = model.style_gcn is not None
-        logging.info(f"[GCN Comparison] step={step}, gcn_enabled={gcn_enabled}, has_gcn={has_gcn}")
+        logging.debug(f"[GCN Comparison] step={step}, gcn_enabled={gcn_enabled}, has_gcn={has_gcn}")
 
         if not gcn_enabled or not has_gcn:
-            logging.info(f"[GCN Comparison] Skipping: GCN not enabled or not available")
+            logging.debug(f"[GCN Comparison] Skipping: GCN not enabled or not available")
             return  # GCN not enabled, no comparison needed
 
         has_masks = hasattr(vis_data, "object_masks") and vis_data.object_masks is not None
         has_images = hasattr(vis_data, "original_images") and vis_data.original_images is not None
-        logging.info(f"[GCN Comparison] has_masks={has_masks}, has_images={has_images}")
+        logging.debug(f"[GCN Comparison] has_masks={has_masks}, has_images={has_images}")
 
         if not has_masks:
-            logging.info(f"[GCN Comparison] Skipping: no object_masks in vis_data")
+            logging.debug(f"[GCN Comparison] Skipping: no object_masks in vis_data")
             return
         if not has_images:
-            logging.info(f"[GCN Comparison] Skipping: no original_images in vis_data")
+            logging.debug(f"[GCN Comparison] Skipping: no original_images in vis_data")
             return
 
         # Get the style attacker
         style_attacker = getattr(model, "style_attacker", None)
         has_impl = style_attacker is not None and hasattr(style_attacker, "impl")
-        logging.info(f"[GCN Comparison] has_style_attacker={style_attacker is not None}, has_impl={has_impl}")
+        logging.debug(f"[GCN Comparison] has_style_attacker={style_attacker is not None}, has_impl={has_impl}")
 
         if style_attacker is None or not has_impl:
-            logging.info(f"[GCN Comparison] Skipping: no style_attacker or impl")
+            logging.debug(f"[GCN Comparison] Skipping: no style_attacker or impl")
             return
 
-        logging.info(f"[GCN Comparison] All checks passed, generating comparison images...")
+        logging.debug(f"[GCN Comparison] All checks passed, generating comparison images...")
         try:
             # === 1. Compute GLOBAL style perturbation (same delta for all objects) ===
             # This contrasts with GCN-coordinated per-object perturbations
@@ -2359,7 +2470,7 @@ class Trainer:
                 original_images = vis_data.original_images
                 if original_images.device != device:
                     original_images = original_images.to(device)
-                    logging.info(f"[GCN Comparison] Moved original_images to {device}")
+                    logging.debug(f"[GCN Comparison] Moved original_images to {device}")
 
                 # Get backbone features for the original images
                 backbone_out = model.forward_image(original_images, use_checkpoint=False)
@@ -2404,8 +2515,8 @@ class Trainer:
             # Log style delta comparison (Global vs GCN-coordinated per-object)
             style_delta_global = (adv_styles_global - original_styles_global).abs()
             style_delta_with_gcn = (adv_styles - original_styles).abs()
-            logging.info(f"[GCN Comparison] Style Delta (GLOBAL):    mean={style_delta_global.mean().item():.4f}, max={style_delta_global.max().item():.4f}")
-            logging.info(f"[GCN Comparison] Style Delta (GCN multi): mean={style_delta_with_gcn.mean().item():.4f}, max={style_delta_with_gcn.max().item():.4f}")
+            logging.debug(f"[GCN Comparison] Style Delta (GLOBAL):    mean={style_delta_global.mean().item():.4f}, max={style_delta_global.max().item():.4f}")
+            logging.debug(f"[GCN Comparison] Style Delta (GCN multi): mean={style_delta_with_gcn.mean().item():.4f}, max={style_delta_with_gcn.max().item():.4f}")
 
             # Get sample
             sample_styled_global = styled_global_denorm[sample_idx].permute(1, 2, 0).cpu().numpy()
@@ -3613,6 +3724,225 @@ class Trainer:
             return None
         except Exception:
             return None
+
+    @staticmethod
+    def _build_fg_mask(targets, frame_index, B, H_feat, W_feat, device):
+        """Build dilated foreground mask at pixel_feat resolution.
+
+        Returns [B, H_feat, W_feat] bool tensor, or None if targets unavailable.
+        """
+        if targets is None:
+            return None
+        gt = targets[frame_index] if frame_index is not None and targets.ndim == 4 else targets
+        # Multi-object union: [O, H, W] → [1, H, W]
+        if gt.ndim == 3 and gt.shape[0] != B:
+            gt = gt.any(dim=0, keepdim=True).expand(B, -1, -1)
+        elif gt.ndim == 2:
+            gt = gt.unsqueeze(0).expand(B, -1, -1)
+        gt = gt.float()
+        # Resize to pixel_feat spatial dims
+        if gt.shape[-2:] != (H_feat, W_feat):
+            gt = F.interpolate(gt.unsqueeze(1), size=(H_feat, W_feat), mode="nearest").squeeze(1)
+        # Dilate: kernel=11 at stride-4 ≈ 44px at original resolution
+        dilation_kernel = 11
+        padding = (dilation_kernel - 1) // 2
+        gt = F.max_pool2d(gt.unsqueeze(1), kernel_size=dilation_kernel, stride=1, padding=padding).squeeze(1)
+        return gt.to(device) > 0.5
+
+    @staticmethod
+    def _fg_pixel_stats(pf, fg_mask):
+        """Compute foreground-only mean+std of pixel_feat. Returns [B, 2C] or None."""
+        if fg_mask is None or pf is None:
+            return None
+        mask_exp = fg_mask.unsqueeze(-1)  # [B, H, W, 1]
+        fg_counts = fg_mask.sum(dim=(1, 2)).clamp(min=1).unsqueeze(-1)  # [B, 1]
+        fg_mean = (pf * mask_exp).sum(dim=(1, 2)) / fg_counts  # [B, C]
+        fg_var = ((pf - fg_mean.unsqueeze(1).unsqueeze(1)) ** 2 * mask_exp).sum(dim=(1, 2)) / fg_counts
+        return torch.cat([fg_mean, fg_var.sqrt()], dim=-1).detach().cpu()
+
+    @staticmethod
+    def _fg_pixelwise(pf, fg_mask):
+        """Extract per-pixel pixel_feat within foreground mask. Returns [N_fg, C] or None."""
+        if fg_mask is None or pf is None:
+            return None
+        # pf: [B, H, W, C], fg_mask: [B, H, W]
+        return pf[fg_mask].detach().cpu()  # [N_fg, C]
+
+    @staticmethod
+    def _fg_pixelwise_logit(logits, fg_mask):
+        """Extract per-pixel mask logit (channel 0) within foreground mask. Returns [N_fg] or None."""
+        if fg_mask is None or logits is None:
+            return None
+        logit = logits[..., 0]  # [B, H, W]
+        return logit[fg_mask].detach().cpu()  # [N_fg]
+
+    @staticmethod
+    def _fg_logit_stats(logits, fg_mask):
+        """Compute foreground-only mask logit statistics. Returns [B, 3] or None."""
+        if fg_mask is None or logits is None:
+            return None
+        logit = logits[..., 0]  # [B, H, W] — best mask channel
+        mask_f = fg_mask.float()
+        fg_counts = mask_f.sum(dim=(1, 2)).clamp(min=1)  # [B]
+        fg_mean = (logit * mask_f).sum(dim=(1, 2)) / fg_counts
+        fg_var = (((logit - fg_mean.unsqueeze(-1).unsqueeze(-1)) ** 2) * mask_f).sum(dim=(1, 2)) / fg_counts
+        fg_conf = (torch.sigmoid(logit) * mask_f).sum(dim=(1, 2)) / fg_counts
+        return torch.stack([fg_mean, fg_var.sqrt(), fg_conf], dim=-1).detach().cpu()
+
+    def _collect_decoder_features(self, bndl_outputs, targets, frame_index, is_clean_pass=False):
+        """Collect mask_tokens_out and GT-conditioned foreground features for analysis.
+
+        Collects both global features (backward-compatible) and foreground-only features
+        within a dilated GT mask region to isolate object-level method differences.
+
+        For style-aug methods (MixStyle/DSU): the normal forward pass has augmentation ON,
+        so features go to _adv keys. A second clean pass (is_clean_pass=True) populates _clean keys.
+        """
+        max_samples = self.logging_conf.collect_decoder_features_max
+        buf = self._decoder_features_buffer
+
+        # --- Detect style-aug routing ---
+        # For style-aug methods (MixStyle/DSU): normal forward has augmentation ON (model.train()),
+        # so those features are "augmented" → route to adv keys.
+        # The dual-pass clean forward calls this with is_clean_pass=True → route to clean keys.
+        _model = unwrap_ddp_if_wrapped(self.model)
+        style_aug_active = getattr(_model, "_style_aug", None) is not None and self.mode == "collect_only"
+        if style_aug_active and not is_clean_pass:
+            suffix = "adv"
+            count_key = "count_adv"
+        else:
+            suffix = "clean"
+            count_key = "count_clean"
+
+        # --- Build dilated foreground mask ---
+        pf = bndl_outputs.get("pixel_feat")
+        fg_mask = None
+        if pf is not None and isinstance(pf, torch.Tensor) and pf.ndim == 4:
+            B, H_feat, W_feat, C = pf.shape
+            fg_mask = self._build_fg_mask(targets, frame_index, B, H_feat, W_feat, pf.device)
+
+        # --- Collect features into clean or adv keys ---
+        if buf[count_key] < max_samples:
+            mto = bndl_outputs.get("mask_tokens_out_selected")
+            if mto is None:
+                mto_full = bndl_outputs.get("mask_tokens_out")
+                if mto_full is not None and isinstance(mto_full, torch.Tensor) and mto_full.ndim == 3:
+                    mto = mto_full[:, 0, :]
+            if mto is not None and isinstance(mto, torch.Tensor):
+                buf[suffix].append(mto.detach().cpu())  # "clean" or "adv"
+                buf[count_key] += mto.shape[0]
+
+            if pf is not None and isinstance(pf, torch.Tensor) and pf.ndim == 4:
+                pf_mean = pf.mean(dim=(1, 2))
+                pf_std = pf.std(dim=(1, 2))
+                buf[f"encoder_{suffix}"].append(torch.cat([pf_mean, pf_std], dim=-1).detach().cpu())
+
+            fg_pf = self._fg_pixel_stats(pf, fg_mask)
+            if fg_pf is not None:
+                buf[f"fg_pixel_{suffix}"].append(fg_pf)
+
+            fg_lg = self._fg_logit_stats(bndl_outputs.get("pixel_logits"), fg_mask)
+            if fg_lg is not None:
+                buf[f"fg_logit_{suffix}"].append(fg_lg)
+
+            fg_pw = self._fg_pixelwise(pf, fg_mask)
+            if fg_pw is not None:
+                buf[f"fg_pixelwise_{suffix}"].append(fg_pw)
+
+            fg_lw = self._fg_pixelwise_logit(bndl_outputs.get("pixel_logits"), fg_mask)
+            if fg_lw is not None:
+                buf[f"fg_logitwise_{suffix}"].append(fg_lw)
+
+        # --- Adversarial branch ---
+        if buf["count_adv"] < max_samples:
+            adv_outputs = bndl_outputs.get("adv_outputs")
+            if adv_outputs is not None:
+                adv_bndl = adv_outputs.get("aux_outputs", {}).get("bndl", {})
+                adv_mto = adv_bndl.get("mask_tokens_out_selected")
+                if adv_mto is None:
+                    adv_mto_full = adv_bndl.get("mask_tokens_out")
+                    if adv_mto_full is not None and isinstance(adv_mto_full, torch.Tensor) and adv_mto_full.ndim == 3:
+                        adv_mto = adv_mto_full[:, 0, :]
+                if adv_mto is not None and isinstance(adv_mto, torch.Tensor):
+                    buf["adv"].append(adv_mto.detach().cpu())
+                    buf["count_adv"] += adv_mto.shape[0]
+
+                # Global pixel_feat for adv
+                adv_pf = adv_bndl.get("pixel_feat")
+                if adv_pf is not None and isinstance(adv_pf, torch.Tensor) and adv_pf.ndim == 4:
+                    adv_mean = adv_pf.mean(dim=(1, 2))
+                    adv_std = adv_pf.std(dim=(1, 2))
+                    buf["encoder_adv"].append(torch.cat([adv_mean, adv_std], dim=-1).detach().cpu())
+
+                # Foreground-only for adv branch (same fg_mask from clean GT)
+                fg_adv_pf = self._fg_pixel_stats(adv_pf, fg_mask)
+                if fg_adv_pf is not None:
+                    buf["fg_pixel_adv"].append(fg_adv_pf)
+
+                fg_adv_lg = self._fg_logit_stats(adv_bndl.get("pixel_logits"), fg_mask)
+                if fg_adv_lg is not None:
+                    buf["fg_logit_adv"].append(fg_adv_lg)
+
+                fg_adv_pw = self._fg_pixelwise(adv_pf, fg_mask)
+                if fg_adv_pw is not None:
+                    buf["fg_pixelwise_adv"].append(fg_adv_pw)
+
+                fg_adv_lw = self._fg_pixelwise_logit(adv_bndl.get("pixel_logits"), fg_mask)
+                if fg_adv_lw is not None:
+                    buf["fg_logitwise_adv"].append(fg_adv_lw)
+
+    def _save_decoder_features(self):
+        """Save collected decoder features to disk."""
+        buf = self._decoder_features_buffer
+        if not buf["clean"] and not buf["adv"]:
+            return
+
+        save_dir = os.path.join(self.logging_conf.log_dir, "decoder_features")
+        os.makedirs(save_dir, exist_ok=True)
+
+        max_samples = self.logging_conf.collect_decoder_features_max
+
+        def _cat(key):
+            return torch.cat(buf[key], dim=0)[:max_samples] if buf.get(key) else None
+
+        clean = _cat("clean")
+        adv = _cat("adv")
+        encoder_clean = _cat("encoder_clean")
+        encoder_adv = _cat("encoder_adv")
+        fg_pixel_clean = _cat("fg_pixel_clean")
+        fg_pixel_adv = _cat("fg_pixel_adv")
+        fg_logit_clean = _cat("fg_logit_clean")
+        fg_logit_adv = _cat("fg_logit_adv")
+
+        # Per-pixel fg features: concat all, no per-sample max (already bounded by max_samples images)
+        def _cat_pixelwise(key):
+            return torch.cat(buf[key], dim=0) if buf.get(key) else None
+
+        fg_pixelwise_clean = _cat_pixelwise("fg_pixelwise_clean")
+        fg_pixelwise_adv = _cat_pixelwise("fg_pixelwise_adv")
+        fg_logitwise_clean = _cat_pixelwise("fg_logitwise_clean")
+        fg_logitwise_adv = _cat_pixelwise("fg_logitwise_adv")
+
+        tag = getattr(self.logging_conf, "collect_features_tag", "MOSE")
+        filename = f"features_{tag.lower()}.pt"
+        save_path = os.path.join(save_dir, filename)
+        torch.save({
+            "clean": clean, "adv": adv,
+            "encoder_clean": encoder_clean, "encoder_adv": encoder_adv,
+            "fg_pixel_clean": fg_pixel_clean, "fg_pixel_adv": fg_pixel_adv,
+            "fg_logit_clean": fg_logit_clean, "fg_logit_adv": fg_logit_adv,
+            "fg_pixelwise_clean": fg_pixelwise_clean, "fg_pixelwise_adv": fg_pixelwise_adv,
+            "fg_logitwise_clean": fg_logitwise_clean, "fg_logitwise_adv": fg_logitwise_adv,
+            "dataset": tag,
+        }, save_path)
+
+        def _s(t):
+            return t.shape if t is not None else None
+
+        logging.info(f"Saved features: clean={_s(clean)}, adv={_s(adv)}, "
+                     f"encoder_clean={_s(encoder_clean)}, encoder_adv={_s(encoder_adv)}, "
+                     f"fg_pixel_clean={_s(fg_pixel_clean)}, fg_pixel_adv={_s(fg_pixel_adv)}, "
+                     f"fg_logit_clean={_s(fg_logit_clean)}, fg_logit_adv={_s(fg_logit_adv)} → {save_path}")
 
     def _extract_bndl_outputs(self, outputs):
         """提取BNDL输出（从统一的 aux_outputs）"""

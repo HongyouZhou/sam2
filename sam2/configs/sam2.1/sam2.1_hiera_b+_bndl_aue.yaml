@@ -120,6 +120,7 @@ model:
   sam_mask_decoder_extra_args:
     bndl_factor_z: 0.0
     bndl_factor_w: 0.0
+    bndl_sample_num: 20  # MC samples for sampling-based uncertainty; override to 50 for higher quality
   # === BNDL_CONFIG_END ===
   # Compilation flag
   # compile_image_encoder: False
