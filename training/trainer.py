@@ -90,7 +90,6 @@ class OptimConf:
     amp: Optional[Dict[str, Any]] = None
     gradient_clip: Any = None
     gradient_logger: Any = None
-    attacker_optim: Optional[Dict[str, Any]] = None  # Config for separate attacker optimizer
 
     def __post_init__(self):
         # amp
@@ -600,14 +599,6 @@ class Trainer:
                 if k == CORE_LOSS_KEY:
                     continue
 
-                # Preserve _attacker_only_loss for separate optimizer (keep tensor with gradients)
-                # Also log with proper prefix for TensorBoard categorization
-                if k == "_attacker_only_loss":
-                    step_losses[k] = v  # Keep as-is for optimizer (tensor with gradients)
-                    # Also add a prefixed version for TensorBoard logging
-                    step_losses[f"Losses/{phase}_{key}{k}"] = v.detach() if torch.is_tensor(v) else v
-                    continue
-
                 ref_idx = k.find("_refinement_")
                 if ref_idx != -1:
                     # Route refinement metrics to Refinement/ prefix
@@ -757,10 +748,6 @@ class Trainer:
                     f.write(json.dumps(self.best_meter_values) + "\n")
 
             self.epoch += 1
-
-            # Step attacker LR scheduler (if exists)
-            if hasattr(self, "attacker_scheduler") and self.attacker_scheduler is not None:
-                self.attacker_scheduler.step()
         # epoch was incremented in the loop but the val step runs out of the loop
         self.epoch -= 1
 
@@ -1081,8 +1068,6 @@ class Trainer:
             # Gradient accumulation: zero gradients at start of accumulation window
             if data_iter % self.gradient_accumulation_steps == 0:
                 self.optim.zero_grad(set_to_none=True)
-                if self.attacker_optim is not None:
-                    self.attacker_optim.zero_grad(set_to_none=True)
 
             try:
                 is_accumulation_step = (data_iter + 1) % self.gradient_accumulation_steps != 0
@@ -1147,18 +1132,9 @@ class Trainer:
                                 param_group[option],
                                 self.steps[phase],
                             )
-                    # Log attacker optimizer LR (if exists)
-                    if hasattr(self, "attacker_optim") and self.attacker_optim is not None:
-                        attacker_lr = self.attacker_optim.param_groups[0]["lr"]
-                        self.logger.log("Optim/attacker_lr", attacker_lr, self.steps[phase])
-
                 # Clipping gradients and detecting diverging gradients
-                # Unscale BOTH optimizers before clipping so gradient norms are correct
                 if self.gradient_clipper is not None:
                     self.scaler.unscale_(self.optim.optimizer)
-                    # Also unscale attacker optimizer if it exists and has gradients
-                    if self.attacker_optim is not None and getattr(self, "_attacker_backward_done", False):
-                        self.scaler.unscale_(self.attacker_optim)
                     self.gradient_clipper(model=self.model)
 
                 # Debug: Check for NaN gradients after clipping
@@ -1177,8 +1153,6 @@ class Trainer:
                     logging.error(f"[Trainer] NaN/Inf gradients detected after gradient clipping! First 10 problematic params: {nan_param_names}")
                     # Skip optimizer step to prevent corrupting weights
                     self.optim.zero_grad(set_to_none=True)
-                    if self.attacker_optim is not None:
-                        self.attacker_optim.zero_grad(set_to_none=True)
                     # NOTE: NOT calling scaler.update() here - let the error surface on next iteration
                     # This ensures we don't mask underlying NaN gradient issues
                     logging.warning("[Trainer] Skipping optimizer step due to NaN gradients")
@@ -1190,13 +1164,6 @@ class Trainer:
                 # Optimizer step: the scaler will make sure gradients are not
                 # applied if the gradients are infinite
                 self.scaler.step(self.optim.optimizer)
-
-                # === Attacker Optimizer Step ===
-                # If separate attacker optimizer is configured, step it too
-                # Note: Already unscaled above (before gradient clipping)
-                if self.attacker_optim is not None and getattr(self, "_attacker_backward_done", False):
-                    self.scaler.step(self.attacker_optim)
-                    self._attacker_backward_done = False  # Reset flag
 
                 self.scaler.update()
 
@@ -1256,10 +1223,9 @@ class Trainer:
         Gradient accumulation is handled by the training loop based on
         gradient_accumulation_steps config.
 
-        === Separate Attacker Optimizer ===
-        If attacker_optim is configured, we run TWO backward passes:
-        1. core_loss.backward(retain_graph=True) → main optimizer updates SAM+BNDL
-        2. attacker_loss.backward() → attacker optimizer updates Style/Deform networks
+        Single backward pass for joint min-max optimization: GRL in Style/Deform
+        networks flips gradients on attacker params, so they maximize the same
+        core_loss that decoder/BNDL minimize.
         """
         with nullcontext():
             with torch.cuda.amp.autocast(
@@ -1299,49 +1265,9 @@ class Trainer:
         accum_steps = getattr(self, "gradient_accumulation_steps", 1)
         scaled_loss = loss / accum_steps
 
-        # === Check for separate attacker backward ===
-        # Get attacker_only_loss from extra_losses (put there by loss_combined.py)
-        attacker_loss = None
-        attacker_loss_key = "_attacker_only_loss"
-        for k, v in extra_losses.items():
-            if k == attacker_loss_key or attacker_loss_key in k:
-                if torch.is_tensor(v) and v.requires_grad:
-                    attacker_loss = v
-                    break
-
-        use_separate_attacker = self.attacker_optim is not None and attacker_loss is not None
-
-        if use_separate_attacker:
-            # 1. Main backward fills .grad of every trainable param with core_loss
-            #    gradients. retain_graph=True keeps the graph alive for attacker backward.
-            self.scaler.scale(scaled_loss).backward(retain_graph=True)
-
-            # 2. Snapshot main params' .grad before attacker backward.
-            #    attacker_loss = lambda * L_cal flows back through:
-            #      error -> sigmoid -> pixel_logits -> decoder -> backbone -> I^adv -> GRL -> attacker
-            #    The decoder/backbone path causes attacker_loss.backward() to add into
-            #    main params' .grad. We snapshot here, restore after, so main_optim.step()
-            #    sees only core_loss gradients on main params. Attacker params are
-            #    excluded from _main_params so their .grad is left to accumulate the
-            #    GRL-flipped core_loss + attacker_loss contributions as designed.
-            saved_main_grads = [
-                p.grad.detach().clone() if p.grad is not None else None
-                for p in self._main_params
-            ]
-
-            # 3. Attacker backward — also writes to main params .grad (we'll restore).
-            scaled_attacker_loss = attacker_loss / accum_steps
-            self.scaler.scale(scaled_attacker_loss).backward()
-
-            # 4. Restore main params .grad — kills attacker_loss contamination.
-            for p, saved in zip(self._main_params, saved_main_grads):
-                p.grad = saved  # may be None for params with no core_loss contribution
-
-            # Set flag so optimizer step knows backward was done
-            self._attacker_backward_done = True
-        else:
-            # Single backward pass (normal case)
-            self.scaler.scale(scaled_loss).backward()
+        # Single backward pass: GRL inside Style/Deform attackers flips the sign
+        # for attacker params, so one .backward() implements joint min-max.
+        self.scaler.scale(scaled_loss).backward()
 
         loss_mts[loss_key].update(loss.item(), batch_size)
         for extra_loss_key, extra_loss in extra_losses.items():
@@ -1559,128 +1485,12 @@ class Trainer:
             logging.warning(f"Failed to add data to evaluator: {e}")
 
     def _construct_optimizers(self):
-        # Enable anomaly detection to debug NaN gradients
-        # torch.autograd.set_detect_anomaly(True)
-
-        # === Exclude attacker params from main optimizer ===
-        # Attacker networks are ALWAYS trained with a separate optimizer when they exist.
-        # This ensures clean parameter isolation between SAM/BNDL and attacker networks.
-        import fnmatch
-
-        attacker_patterns = ["style_attacker.*", "deform_attacker.*", "style_gcn.*"]
-        all_param_names = {name for name, _ in self.model.named_parameters()}
-        excluded_params = set()
-        for name in all_param_names:
-            for pattern in attacker_patterns:
-                if fnmatch.fnmatch(name, pattern):
-                    excluded_params.add(name)
-                    break
-
-        if excluded_params:
-            param_allowlist = all_param_names - excluded_params
-            logging.info(f"[Main Optimizer] Excluding {len(excluded_params)} attacker params (handled by separate optimizer)")
-        else:
-            param_allowlist = None  # No attacker params to exclude
-
         self.optim = construct_optimizer(
             self.model,
             self.optim_conf.optimizer,
             self.optim_conf.options,
             self.optim_conf.param_group_modifiers,
-            param_allowlist=param_allowlist,
-            # Skip validation when using param_allowlist (attacker params handled separately)
-            validate_param_groups=param_allowlist is None,
         )
-
-        # === Separate Attacker Optimizer ===
-        # Always create for attacker networks when they exist.
-        self.attacker_optim = None
-        self._construct_attacker_optimizer()
-
-    def _construct_attacker_optimizer(self):
-        """
-        Construct separate optimizer for attacker networks (Style/Deform).
-
-        This implements the "Separate Optimizer" pattern for isolated attacker training:
-        - Main optimizer: updates SAM + BNDL (using core_loss)
-        - Attacker optimizer: updates only Style/Deform networks (using _attacker_only_loss)
-
-        Always created when attacker networks exist (AUE enabled).
-        Uses CosineAnnealingLR scheduler matching the main optimizer's schedule.
-        """
-        import fnmatch
-
-        model_unwrapped = unwrap_ddp_if_wrapped(self.model)
-
-        # Collect attacker parameters
-        attacker_patterns = ["style_attacker.*", "deform_attacker.*", "style_gcn.*"]
-        attacker_params = []
-        attacker_param_names = []
-
-        for name, param in model_unwrapped.named_parameters():
-            for pattern in attacker_patterns:
-                if fnmatch.fnmatch(name, pattern):
-                    if param.requires_grad:
-                        attacker_params.append(param)
-                        attacker_param_names.append(name)
-                    break
-
-        # Cache for the snapshot/restore logic in _run_step that prevents
-        # attacker_loss.backward() from polluting main params' .grad
-        # (decoder/backbone are touched via the error -> logits -> decoder path).
-        self._attacker_param_ids = {id(p) for p in attacker_params}
-        self._main_params = [
-            p for _, p in model_unwrapped.named_parameters()
-            if p.requires_grad and id(p) not in self._attacker_param_ids
-        ]
-
-        if not attacker_params:
-            logging.info("[Attacker Optimizer] No attacker parameters found (AUE disabled)")
-            return
-
-        # Read config from optim_conf.attacker_optim (if available)
-        attacker_optim_conf = getattr(self.optim_conf, "attacker_optim", None)
-        if attacker_optim_conf is not None:
-            lr_start = getattr(attacker_optim_conf, "lr_start", 1e-3)
-            lr_end = getattr(attacker_optim_conf, "lr_end", 1e-4)
-            weight_decay = getattr(attacker_optim_conf, "weight_decay", 0.0)
-        else:
-            # Fallback to legacy config or defaults
-            lr_start = getattr(self.optim_conf, "attacker_lr", 1e-3)
-            lr_end = lr_start / 10  # Default: 1/10 decay
-            weight_decay = getattr(self.optim_conf, "attacker_weight_decay", 0.0)
-
-        self.attacker_optim = torch.optim.AdamW(
-            attacker_params,
-            lr=lr_start,
-            weight_decay=weight_decay,
-            betas=(0.9, 0.999),
-        )
-
-        # Create CosineAnnealingLR scheduler
-        # T_max = total training iterations (epochs * steps_per_epoch)
-        # We'll step this scheduler alongside the main optimizer
-        self.attacker_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            self.attacker_optim,
-            T_max=self.max_epochs,  # Will be stepped per epoch
-            eta_min=lr_end,
-        )
-        self._attacker_lr_start = lr_start
-        self._attacker_lr_end = lr_end
-
-        # Log component breakdown for ablation study clarity
-        style_count = sum(1 for n in attacker_param_names if n.startswith("style_attacker."))
-        deform_count = sum(1 for n in attacker_param_names if n.startswith("deform_attacker."))
-        gcn_count = sum(1 for n in attacker_param_names if n.startswith("style_gcn."))
-        components = []
-        if style_count > 0:
-            components.append(f"StyleAdv({style_count})")
-        if deform_count > 0:
-            components.append(f"DeformAdv({deform_count})")
-        if gcn_count > 0:
-            components.append(f"GCN({gcn_count})")
-
-        logging.info(f"[Attacker Optimizer] Created with {len(attacker_params)} params [{', '.join(components)}], lr={lr_start}→{lr_end} (cosine), wd={weight_decay}")
 
     def _log_loss_detailed_and_return_core_loss(self, loss, loss_str, step, phase):
         core_loss = loss.pop(CORE_LOSS_KEY)

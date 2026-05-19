@@ -721,8 +721,6 @@ trainer:
       norm_type: 2
 
     # === Attacker Optimizer Configuration ===
-    # PGD has no learnable parameters — no attacker optimizer needed
-    attacker_optim: null
 
     param_group_modifiers:
       - _target_: training.optimizer.layer_decay_param_modifier
@@ -851,9 +849,7 @@ trainer:
         task_weight: 1.0       # Task loss updates SAM + attacker (via GRL) - set 0 for isolation
         bndl_weight: 0.0
         mmd_weight: 0.0
-        attacker_uncertainty_weight: 0.0  # Attacker maximizes uncertainty (NO BNDL update)
-        attacker_mmd_weight: 0.3  # Attacker maximizes miscalibration (NO SAM/BNDL update)
-        attacker_task_weight: 0.0  # NEW: Task loss only updates attacker (NO SAM update) - complete isolation
+        cal_weight: 0.3  # Attacker maximizes miscalibration (NO SAM/BNDL update)
         mmd_config: ${scratch.mmd_config}
       # === UR-ERN Loss Configuration ===
       # UR-ERN paper (arXiv:2401.01484) Eq. 11: L^UR-ERN = L^NLL + λ·L^R + λ₁·L^U

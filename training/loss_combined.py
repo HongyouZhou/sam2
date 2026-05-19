@@ -174,11 +174,11 @@ class CombinedSAMBNDLLoss(nn.Module):
                     key_name = f"mmd_{k}" if self.prefix_keys else k
                     combined_losses[key_name] = v
 
-        # add aue loss (adversarial task/BNDL loss, affects attacker via GRL)
+        # add aue loss (adversarial task/BNDL/cal loss, joint min-max via GRL)
         if aue_losses is not None:
             for k, v in aue_losses.items():
                 if v is None:
-                    continue  # Skip None values (e.g., attacker_mmd_loss when not computed)
+                    continue
                 if k == CORE_LOSS_KEY:
                     combined_losses["aue_core_loss"] = v * self.aue_weight
                 else:
@@ -200,34 +200,6 @@ class CombinedSAMBNDLLoss(nn.Module):
             core = core + combined_losses["aue_core_loss"]
 
         combined_losses[CORE_LOSS_KEY] = core
-
-        # === Attacker-only loss for separate optimizer ===
-        # This loss is NOT added to core_loss. It's used by a separate attacker optimizer.
-        # It allows training the attacker (Style/Deform networks) without affecting SAM/BNDL.
-        attacker_only_losses = []
-        if aue_losses is not None:
-            # attacker_mmd_loss trains attacker to maximize miscalibration
-            if "attacker_mmd_loss" in aue_losses and aue_losses["attacker_mmd_loss"] is not None:
-                attacker_mmd = aue_losses["attacker_mmd_loss"]
-                if torch.is_tensor(attacker_mmd) and attacker_mmd.requires_grad:
-                    # Get weight from aue_loss module
-                    attacker_mmd_weight = getattr(self.aue_loss, "attacker_mmd_weight", 1.0)
-                    attacker_only_losses.append(attacker_mmd_weight * attacker_mmd)
-                    combined_losses["_attacker_mmd_loss_for_optim"] = attacker_mmd.detach()
-
-            # attacker_task_loss trains attacker with task loss (NO SAM update)
-            if "attacker_task_loss" in aue_losses and aue_losses["attacker_task_loss"] is not None:
-                attacker_task = aue_losses["attacker_task_loss"]
-                if torch.is_tensor(attacker_task) and attacker_task.requires_grad:
-                    attacker_task_weight = getattr(self.aue_loss, "attacker_task_weight", 1.0)
-                    attacker_only_losses.append(attacker_task_weight * attacker_task)
-                    combined_losses["_attacker_task_loss_for_optim"] = attacker_task.detach()
-
-        if attacker_only_losses:
-            combined_losses["_attacker_only_loss"] = sum(attacker_only_losses)
-        else:
-            # Zero placeholder if no attacker loss
-            combined_losses["_attacker_only_loss"] = torch.tensor(0.0, device=core.device, requires_grad=False)
 
         # === Clean vs Adversarial comparison metrics ===
         # For monitoring adversarial training dynamics

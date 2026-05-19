@@ -7,12 +7,9 @@
 """
 AUE (Adversarial Uncertainty Estimation) Loss.
 
-Computes losses on adversarial samples using the SAME loss functions as the
-main branch (sam_loss, bndl_loss). These losses update:
-- Model (Decoder): via normal gradient descent
-- Attacker (Style/Deform): via GRL (gradient reversal)
-
-MMD calibration is now computed here (not in model) following SAM's pattern.
+Computes losses on adversarial samples (task loss, BNDL KL, MMD/L_cal calibration).
+All terms enter the single core_loss; backward through GRL in Style/Deform
+networks flips the sign for attacker params, giving joint min-max in one pass.
 """
 
 import logging
@@ -41,9 +38,7 @@ class AUELoss(nn.Module):
         task_weight: float = 1.0,
         bndl_weight: float = 0.0,
         mmd_weight: float = 0.0,
-        attacker_uncertainty_weight: float = 0.0,  # Attacker maximizes raw uncertainty
-        attacker_mmd_weight: float = 0.0,  # Attacker maximizes miscalibration (uncertainty ≠ error)
-        attacker_task_weight: float = 0.0,  # NEW: Task loss only updates attacker (NO SAM update)
+        cal_weight: float = 0.0,  # λ from paper Eq. 5; coefficient on L_cal_sym in core_loss
         dual_sg_l2_weight: float = 1.0,  # Multiplier on L2 mirror term inside L_cal_sym (asymmetric Dual-SG)
         mmd_config: dict | None = None,
         sam_loss_fn: nn.Module | None = None,
@@ -53,10 +48,9 @@ class AUELoss(nn.Module):
         Args:
             task_weight: Weight for SAM task loss on adv samples (updates SAM + attacker via GRL)
             bndl_weight: Weight for BNDL KL loss on adv samples (updates BNDL + attacker via GRL)
-            mmd_weight: Weight for MMD loss on adv samples (updates BNDL calibration + attacker via GRL)
-            attacker_uncertainty_weight: Attacker maximizes uncertainty (NO BNDL update)
-            attacker_mmd_weight: Attacker maximizes miscalibration (NO SAM/BNDL update)
-            attacker_task_weight: Task loss only updates attacker (NO SAM update) - for complete isolation
+            mmd_weight: Weight for MMD calibration loss on adv samples (updates BNDL + attacker via GRL)
+            cal_weight: Weight λ on L_cal_sym (paper Eq. 5); updates decoder/BNDL via L1/L2 paths, attacker via GRL
+            dual_sg_l2_weight: Multiplier on L2 mirror term inside L_cal_sym
             mmd_config: Distribution matching config for adversarial MMD
             sam_loss_fn: Reference to SAM loss (injected by CombinedLoss)
             bndl_loss_fn: Reference to BNDL loss (injected by CombinedLoss)
@@ -65,9 +59,7 @@ class AUELoss(nn.Module):
         self.task_weight = task_weight
         self.bndl_weight = bndl_weight
         self.mmd_weight = mmd_weight
-        self.attacker_uncertainty_weight = attacker_uncertainty_weight
-        self.attacker_mmd_weight = attacker_mmd_weight
-        self.attacker_task_weight = attacker_task_weight
+        self.cal_weight = cal_weight
         self.dual_sg_l2_weight = dual_sg_l2_weight
         self.sam_loss_fn = sam_loss_fn
         self.bndl_loss_fn = bndl_loss_fn
@@ -76,7 +68,7 @@ class AUELoss(nn.Module):
         self._loss_computer = None
         self._distribution_matcher = None
 
-        if mmd_config and (mmd_weight > 0 or attacker_mmd_weight > 0):
+        if mmd_config and mmd_weight > 0:
             self._init_mmd_from_config(mmd_config)
 
     def _init_mmd_from_config(self, config: dict) -> None:
@@ -121,8 +113,7 @@ class AUELoss(nn.Module):
         task_losses = []
         bndl_losses = []
         mmd_losses = []
-        attacker_uncertainty_losses = []
-        attacker_mmd_losses = []  # NEW
+        cal_losses = []
 
         for outs in outs_batch:
             # Get bndl_outputs list
@@ -164,30 +155,26 @@ class AUELoss(nn.Module):
                     if adv_mmd is not None and adv_mmd.requires_grad:
                         mmd_losses.append(adv_mmd)
 
-                # === Attacker Uncertainty Loss (trains attacker to maximize uncertainty) ===
-                if "adv_outputs" in b and self.attacker_uncertainty_weight > 0:
-                    adv_out = b["adv_outputs"]
-                    attacker_unc_loss = self._compute_attacker_uncertainty_loss(adv_out, device)
-                    if attacker_unc_loss is not None and attacker_unc_loss.requires_grad:
-                        attacker_uncertainty_losses.append(attacker_unc_loss)
-
-                # === Attacker MMD Loss (trains attacker to maximize miscalibration, NO BNDL update) ===
-                if "adv_outputs" in b and self.attacker_mmd_weight > 0:
-                    adv_out = b["adv_outputs"]
-                    attacker_mmd = self._compute_attacker_mmd_loss(b, device)
-                    if attacker_mmd is not None and attacker_mmd.requires_grad:
-                        attacker_mmd_losses.append(attacker_mmd)
+                # === Calibration Loss L_cal_sym (paper Eq. 5 + dual-SG L2 mirror) ===
+                # Routed through GRL in Style/Deform networks: attacker maximizes L_cal,
+                # decoder/BNDL minimize it (joint min-max via single backward).
+                if "adv_outputs" in b and self.cal_weight > 0:
+                    cal_loss = self._compute_calibration_loss(b, device)
+                    if cal_loss is not None and cal_loss.requires_grad:
+                        cal_losses.append(cal_loss)
 
                 break  # Only use first valid bndl_outputs
 
-        # Aggregate losses
-        total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        # Aggregate losses into a single core loss (paper Eq. 7 joint min-max via GRL).
+        # All terms go through a single backward pass; GRL in Style/Deform networks
+        # flips the sign for attacker params, so decoder/BNDL minimize and attackers
+        # maximize the same scalar.
+        total_loss = torch.tensor(0.0, device=device)
 
-        # Track individual components for logging
         task_loss_val = torch.tensor(0.0, device=device)
         bndl_loss_val = torch.tensor(0.0, device=device)
         mmd_loss_val = torch.tensor(0.0, device=device)
-        attacker_unc_loss_val = torch.tensor(0.0, device=device)
+        cal_loss_val = torch.tensor(0.0, device=device)
 
         if task_losses:
             task_loss_val = torch.stack(task_losses).mean()
@@ -201,46 +188,17 @@ class AUELoss(nn.Module):
             mmd_loss_val = torch.stack(mmd_losses).mean()
             total_loss = total_loss + self.mmd_weight * mmd_loss_val
 
-        if attacker_uncertainty_losses:
-            attacker_unc_loss_val = torch.stack(attacker_uncertainty_losses).mean()
-            total_loss = total_loss + self.attacker_uncertainty_weight * attacker_unc_loss_val
+        if cal_losses:
+            cal_loss_val = torch.stack(cal_losses).mean()
+            total_loss = total_loss + self.cal_weight * cal_loss_val
 
-        # === SEPARATE OPTIMIZER DESIGN ===
-        # attacker_mmd_loss is NOT added to total_loss (core_loss)
-        # Instead, it's returned separately WITH gradients for the attacker optimizer
-        # This ensures only attacker parameters (Style/Deform networks) are updated by this loss
-        attacker_mmd_loss_val = None  # Will be tensor with gradients if available
-        attacker_mmd_loss_scalar = torch.tensor(0.0, device=device)  # For logging only
-        if attacker_mmd_losses:
-            # Return the loss WITH gradients for separate optimizer
-            attacker_mmd_loss_val = torch.stack(attacker_mmd_losses).mean()
-            attacker_mmd_loss_scalar = attacker_mmd_loss_val.detach()
-            # NOTE: We do NOT add to total_loss - separate optimizer handles this
-
-        # === attacker_task_loss: Task loss only updates attacker (NO SAM update) ===
-        # Same as attacker_mmd_loss - returned separately for attacker_optimizer
-        attacker_task_loss_val = None
-        attacker_task_loss_scalar = torch.tensor(0.0, device=device)
-        if self.attacker_task_weight > 0 and task_losses:
-            # Use the same task_loss but don't add to core_loss
-            attacker_task_loss_val = torch.stack(task_losses).mean()
-            attacker_task_loss_scalar = attacker_task_loss_val.detach()
-            # NOTE: We do NOT add to total_loss - separate optimizer handles this
-
-        # Build return dict
         result = {
             CORE_LOSS_KEY: total_loss,
             "aue_scalar": total_loss.detach(),
             "task_loss": task_loss_val.detach(),
             "bndl_loss": bndl_loss_val.detach(),
             "mmd_loss": mmd_loss_val.detach(),
-            "attacker_unc_loss": attacker_unc_loss_val.detach(),
-            "attacker_mmd_loss_scalar": attacker_mmd_loss_scalar,  # For logging
-            "attacker_task_loss_scalar": attacker_task_loss_scalar,  # For logging
-            # === Keys for separate optimizer ===
-            # These tensors retain gradients and are used by attacker optimizer only
-            "attacker_mmd_loss": attacker_mmd_loss_val,  # Tensor WITH gradients (or None)
-            "attacker_task_loss": attacker_task_loss_val,  # Tensor WITH gradients (or None)
+            "cal_loss": cal_loss_val.detach(),
         }
 
         # Add detailed SAM losses if available
@@ -387,64 +345,7 @@ class AUELoss(nn.Module):
 
         return loss
 
-    def _compute_attacker_uncertainty_loss(self, adv_out: dict, device: torch.device) -> torch.Tensor | None:
-        """
-        Compute uncertainty-based loss for training the attacker.
-
-        The attacker should learn to generate perturbations that MAXIMIZE model uncertainty.
-        This loss returns the mean uncertainty, which will be added to total_loss.
-        Since uncertainty flows through GRL in attacker networks, this effectively
-        trains the attacker to maximize uncertainty.
-
-        === DESIGN: Uses SAMPLING uncertainty (no gradients to BNDL) ===
-        - Sampling uncertainty is detached (computed in torch.no_grad)
-        - Gradients only flow to attacker networks (via GRL)
-        - SAM's BNDL module is NOT updated by this loss
-        - This ensures attacker training doesn't interfere with BNDL calibration
-
-        Args:
-            adv_out: Adversarial outputs containing BNDL predictions
-            device: Computation device
-
-        Returns:
-            Mean uncertainty value (positive; attacker maximizes this via GRL)
-        """
-        adv_aux = adv_out.get("aux_outputs")
-        if adv_aux is None or "bndl" not in adv_aux:
-            return None
-
-        bndl_outputs = adv_aux["bndl"]
-        if not isinstance(bndl_outputs, dict):
-            return None
-
-        # === EXPLICIT: Use SAMPLING uncertainty for attacker training ===
-        # Sampling uncertainty has NO gradients, so BNDL is not updated
-        # Gradients only flow to attacker via GRL (gradient reversal layer)
-        pixel_uncertainty = bndl_outputs.get("pixel_uncertainty_sampling")
-        if pixel_uncertainty is None:
-            # Legacy fallback to "pixel_uncertainty" (which should also be sampling)
-            pixel_uncertainty = bndl_outputs.get("pixel_uncertainty")
-
-        if pixel_uncertainty is None:
-            # No uncertainty available - cannot compute attacker loss
-            import logging
-
-            logging.debug("[AUE Attacker] pixel_uncertainty_sampling not available, skipping attacker uncertainty loss")
-            return None
-
-        # Verify no gradients (sampling uncertainty should be detached)
-        # This is a safety check - if uncertainty has gradients, it would incorrectly update BNDL
-        if pixel_uncertainty.requires_grad:
-            import logging
-
-            logging.warning("[AUE Attacker] pixel_uncertainty has gradients! This may incorrectly update BNDL. Detaching to prevent unintended gradient flow to BNDL.")
-            pixel_uncertainty = pixel_uncertainty.detach()
-
-        # Return mean uncertainty (positive value)
-        # Attacker maximizes this via GRL (gradients are reversed)
-        return pixel_uncertainty.mean()
-
-    def _compute_attacker_mmd_loss(self, bndl_ns: dict, device: torch.device) -> torch.Tensor | None:
+    def _compute_calibration_loss(self, bndl_ns: dict, device: torch.device) -> torch.Tensor | None:
         """
         Compute symmetric calibration loss L_cal_sym (Dual-SG extension of paper Eq. 5).
 
@@ -457,26 +358,22 @@ class AUELoss(nn.Module):
         drive the confident-wrong failure mode. L2 restores a ∂/∂u channel via the
         analytic uncertainty, symmetrically covering both UC and CW failure modes.
 
-        === SEPARATE OPTIMIZER DESIGN ===
-        This loss is returned separately (not added to core_loss) and used by a
-        dedicated attacker optimizer. The attacker optimizer only updates
-        Style/Deform network parameters, so even if gradients flow to SAM/BNDL,
-        those parameters won't be updated.
+        === JOINT MIN-MAX (paper Eq. 7) ===
+        Added to core_loss with weight ``cal_weight`` (= λ). Single backward pass:
+        decoder/BNDL minimize L_cal_sym via the L1 (e) and L2 (u_analytic) gradient
+        channels; Style/Deform attackers receive GRL-flipped gradients and so
+        maximize the same scalar. No separate optimizer, no snapshot/restore.
 
         === GRADIENT FLOW ===
         L1 → e → sigmoid → pixel_logits → decoder → backbone → I^adv → GRL → attacker
         L2 → u_analytic → BNDL hyper_in → decoder → backbone → I^adv → GRL → attacker
-
-        BNDL contamination from L2 is wiped by trainer.py snapshot/restore (4234079);
-        attacker_optim's param_groups only include Style/Deform, so SAM/BNDL grads
-        are computed but not applied.
 
         Args:
             bndl_ns: BNDL namespace containing adversarial outputs
             device: Computation device
 
         Returns:
-            L_cal scalar tensor (mean over pixels), with gradients to attacker only.
+            L_cal_sym scalar tensor (mean over pixels).
         """
         from sam2.modeling.aue.loss import prepare_gt_for_loss
 
